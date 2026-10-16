@@ -9,15 +9,21 @@ per-job result; phase and campaign gates are recorded separately.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import heapq
 import hashlib
 import json
 import os
 import re
-import secrets
+import shutil
 import stat
 import sys
+import tarfile
+import tempfile
+import threading
 import time
 import types
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -26,6 +32,30 @@ from typing import Any
 EXECUTION_SCHEMA = "allocatbelt.application-source5-campaign-execution.v1"
 EXECUTION_SCHEMA_V2 = "allocatbelt.application-source5-campaign-execution.v2"
 EXECUTION_SCHEMA_V3 = "allocatbelt.application-source5-campaign-execution.v3"
+EXECUTION_SCHEMA_V4 = "allocatbelt.application-source5-campaign-execution.v4"
+PREPARATORY_BUDGET_SCHEMA = \
+    "allocatbelt.application-source5-preparatory-exploration-budget.v1"
+PREPARATORY_BUDGET_SOURCE_PATH = \
+    "scripts/application-source5-preparatory-budget.py"
+PREPARATORY_EXECUTION_SCHEMA = (
+    "allocatbelt.application-source5-preparatory-exploration-execution.v1"
+)
+PREPARATORY_SCOPE = "preparatory_exploration"
+PREPARATORY_SETUP_EVENT = "source5_prepared_capacity_registered"
+PREPARATORY_WIDTH_SCHEMA = \
+    "allocatbelt.application-source5-preparatory-journal-width-contract.v1"
+BOUNDED_EXECUTION_SCHEMAS = frozenset({
+    EXECUTION_SCHEMA_V3, EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA,
+})
+ARCHIVE_SIGNER_CONTEXT_SCHEMA_V1 = \
+    "allocatbelt.application-source5-archive-signer-context.v1"
+EVIDENCE_BUDGET_SOURCE_PATH = "scripts/application-source5-evidence-budget.py"
+EVIDENCE_CATALOGUE_SOURCE_PATH = "scripts/application-source5-evidence-catalogue.py"
+EVIDENCE_ARCHIVE_SOURCE_PATH = "scripts/application-source5-evidence-archive.py"
+EVIDENCE_TRANSFER_PACKET_SOURCE_PATH = \
+    "scripts/application-source5-evidence-transfer-packet.py"
+SOURCE5_INPUT_PREPARATION_SOURCE_PATH = \
+    "scripts/application-source5-input-preparation.py"
 HELPER_INPUT_SCHEMA = "allocatbelt.application-source5-helper-input.v1"
 JOB_RECORD_SCHEMA = "allocatbelt.application-source5-job-record.v1"
 ANALYSIS_SCHEMA = "allocatbelt.application-source5-phase-analysis.v1"
@@ -45,6 +75,41 @@ MAX_MANIFEST_BYTES = 256 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
 MAX_SCRIPT_BYTES = 8 * 1024 * 1024
 MAX_LEDGER_BYTES = 256 * 1024 * 1024
+MAX_SOURCE5_DISPOSITION_REASON_BYTES = 4096
+MAX_ARCHIVE_SIGNER_CONTEXT_BYTES = 64 * 1024
+MAX_ARCHIVE_KEYRING_BYTES = 16 * 1024 * 1024
+MAX_ARCHIVE_GPGV_BYTES = 64 * 1024 * 1024
+SOURCE5_JOURNAL_WIDTH_CONTRACT_SCHEMA = \
+    "allocatbelt.application-source5-journal-width-contract.v1"
+SOURCE5_JOURNAL_EVENT_KINDS = (
+    "source5_authorized", "source5_app_started",
+    "source5_app_terminal", "source5_job_terminal",
+)
+SOURCE5_ANALYSIS_EVENT_PHASES = (
+    "exploration", "aa", "fixed_analysis", "pressure_analysis",
+    "soak", "final_analysis",
+)
+MAX_SOURCE5_CLEANUP_ERROR_TEXT_BYTES = 8192
+MAX_SOURCE5_CLEANUP_SIGNAL_SNAPSHOTS = 5
+MAX_SOURCE5_CLEANUP_ERROR_ENTRIES = 1348
+SOURCE5_ARCHIVE_READ_REQUEST_SCHEMA_V1 = \
+    "allocatbelt.application-source5-archive-read-request.v1"
+SOURCE5_ARCHIVE_READ_RESPONSE_SCHEMA_V1 = \
+    "allocatbelt.application-source5-archive-read-response.v1"
+SOURCE5_ARCHIVE_READ_CONTROL_SCHEMA_V1 = \
+    "allocatbelt.application-source5-archive-read-control.v1"
+SOURCE5_ARCHIVE_READ_CONTROL_EVENT_SCHEMA_V1 = \
+    "allocatbelt.application-source5-archive-read-control-event.v1"
+SOURCE5_ARCHIVE_READ_PURPOSES = frozenset({
+    "exploration", "aa", "fixed_analysis", "pressure_analysis", "soak",
+    "final_analysis", "host_evidence_finalization",
+})
+SOURCE5_ARCHIVE_READ_COPY_BYTES = 1024 * 1024
+MAX_SOURCE5_ARCHIVE_READ_METADATA_BYTES = 16 * 1024 * 1024
+MAX_SOURCE5_ARCHIVE_READ_OBJECTS = 262_144
+MIN_SOURCE5_ARCHIVE_READ_BUNDLE_BYTES = 10 * 1024
+_SOURCE5_JOB_METRIC_BOUND_CACHE = {}
+_SOURCE5_CPU_AFFINITY_COUNT_CACHE = {}
 
 
 class Source5CampaignError(ValueError):
@@ -79,7 +144,11 @@ def exact(value: object, keys: set[str], label: str) -> dict[str, Any]:
     return value
 
 
-def read_stable(path: Path, label: str, maximum: int) -> tuple[bytes, str, os.stat_result]:
+def read_stable(
+    path: Path, label: str, maximum: int, expected_raw_sha256: str | None = None,
+) -> tuple[bytes, str, os.stat_result]:
+    require(expected_raw_sha256 is None or is_sha(expected_raw_sha256),
+            f"{label} expected raw pin is malformed")
     require(path.is_absolute() and path.resolve(strict=True) == path,
             f"{label} path is not canonical")
     before_path = path.lstat()
@@ -106,7 +175,10 @@ def read_stable(path: Path, label: str, maximum: int) -> tuple[bytes, str, os.st
                 count == before.st_size,
                 f"{label} changed during its bounded read")
         raw = b"".join(parts)
-        return raw, sha256(raw), before
+        actual_sha256 = sha256(raw)
+        require(expected_raw_sha256 is None or actual_sha256 == expected_raw_sha256,
+                f"{label} bytes differ from the expected raw pin")
+        return raw, actual_sha256, before
     finally:
         os.close(fd)
 
@@ -182,6 +254,7 @@ class CampaignContext:
     host_id: str
     spec: dict[str, Any]
     plan: dict[str, Any]
+    plan_raw: bytes
     spec_pin: dict[str, str]
     plan_pin: dict[str, str]
     spec_semantic_sha256: str
@@ -201,6 +274,50 @@ class CampaignContext:
     fixed_pair: types.ModuleType
     pressure_pair: types.ModuleType
     modules: dict[str, types.ModuleType]
+    owner_evidence_contract: dict[str, Any]
+    host_evidence_budget_pin: dict[str, str] | None = None
+    host_evidence_budget_raw: bytes | None = None
+    source5_archive_ack_pins: dict[tuple[str, str], dict[str, str]] | None = None
+    source5_archive_closures: dict[tuple[str, str], dict[str, Any]] | None = None
+    source5_archive_read_slot_paths: dict[str, str] | None = None
+    source5_archive_read_caps: dict[str, int] | None = None
+    source5_archive_read_schedule: list[dict[str, Any]] | None = None
+    source5_archive_read_ordinal: int = 0
+    source5_archive_read_event_count: int = 0
+    source5_archive_read_previous_sha256: str = "0" * 64
+    source5_archive_read_references: dict[tuple[str, str], dict[str, Any]] | None = None
+    source5_archive_read_pending_request_pin: dict[str, Any] | None = None
+    source5_archive_read_ledger_loaded: bool = False
+    source5_archive_read_ledger_raw_sha256: str | None = None
+    source5_archive_read_ledger_byte_count: int | None = None
+    source5_archive_read_ledger_file_identity: tuple[int, ...] | None = None
+    source5_analyzer_scratch_root: Path | None = None
+    source5_analyzer_scratch_projection: dict[str, Any] | None = None
+    source5_fixed_capacity_projections: dict[
+        tuple[str, str], dict[str, Any]
+    ] | None = None
+    archive_signer_context: dict[str, Any] | None = None
+    archive_signer_context_pin: dict[str, str] | None = None
+    job_path_catalogue_pins: dict[tuple[str, str], dict[str, Any]] | None = None
+    journal_width_budget_pin: dict[str, str] | None = None
+    journal_width_jobs: dict[str, list[dict[str, Any]]] | None = None
+    journal_width_soak_materials: dict[str, Any] | None = None
+    journal_width_tmpdir_budget: dict[str, Any] | None = None
+    journal_width_original_pins: dict[str, Any] | None = None
+    journal_width_observed_host: dict[str, Any] | None = None
+    journal_width_cleanup_source_bytes: int | None = None
+    journal_width_contract: dict[str, Any] | None = None
+    journal_width_contract_pin: dict[str, str] | None = None
+    preparatory_capacity_generation: dict[str, Any] | None = None
+    preparatory_capacity_registration: dict[str, Any] | None = None
+    preparatory_execution_basis_sha256: str | None = None
+    preparatory_width_contract: dict[str, Any] | None = None
+    preparatory_width_pin: dict[str, str] | None = None
+    preparatory_budget: dict[str, Any] | None = None
+    preparatory_budget_raw: bytes | None = None
+    preparatory_budget_pin: dict[str, str] | None = None
+    fixed_spec_host_pin: dict[str, str] | None = None
+    prepared_fixed_host_binding: dict[str, Any] | None = None
 
 
 def _safe_child(root: Path, relative: object, label: str) -> Path:
@@ -246,11 +363,100 @@ def _load_source_module(context_data: dict[str, Any], source: dict[str, Any],
     return _load_module(raw, path, label.replace(" ", "_"))
 
 
-def load_context(manifest_path: Path, host_id: str) -> CampaignContext:
-    manifest, manifest_raw, manifest_sha = read_json(
-        manifest_path.resolve(strict=True), "Source5 execution manifest",
-        MAX_MANIFEST_BYTES,
+def _load_archive_signer_context(
+    manifest: dict[str, Any], host_id: str,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Validate one private, public-verification-only archive signer context."""
+    expected_hosts = ({host_id} if manifest.get("schema") ==
+                      PREPARATORY_EXECUTION_SCHEMA else set(manifest["hosts"]))
+    host_contexts = exact(
+        manifest.get("archive_signer_contexts"), expected_hosts,
+        "Source5 private archive signer-context pin map",
     )
+    reference = exact(host_contexts[host_id], {
+        "artifact", "semantic_sha256",
+    }, f"{host_id} private archive signer-context reference")
+    pin = raw_pin(reference["artifact"],
+                  f"{host_id} private archive signer-context artifact")
+    raw, raw_sha, info = read_stable(
+        Path(pin["path"]), f"{host_id} private archive signer context",
+        MAX_ARCHIVE_SIGNER_CONTEXT_BYTES,
+    )
+    require(raw_sha == pin["raw_sha256"] and
+            stat.S_ISREG(info.st_mode) and info.st_nlink == 1,
+            "private archive signer-context artifact changed its raw identity")
+    try:
+        value = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            f"{host_id} private archive signer context is malformed",
+        ) from error
+    value = exact(value, {
+        "schema", "campaign_id", "host_id",
+        "authorized_primary_fingerprint", "maximum_signature_bytes",
+        "keyring_pin", "gpgv_pin", "signature_format",
+        "signer_context_sha256",
+    }, f"{host_id} private archive signer context")
+    body = {key: item for key, item in value.items()
+            if key != "signer_context_sha256"}
+    fingerprint = value["authorized_primary_fingerprint"]
+    require(value["schema"] == ARCHIVE_SIGNER_CONTEXT_SCHEMA_V1 and
+            value["campaign_id"] == manifest["campaign_id"] and
+            value["host_id"] == host_id and
+            type(fingerprint) is str and
+            re.fullmatch(r"[A-F0-9]{40}|[A-F0-9]{64}", fingerprint) is not None and
+            type(value["maximum_signature_bytes"]) is int and
+            value["maximum_signature_bytes"] == 4096 and
+            value["signature_format"] ==
+                "binary_detached_primary_sha256_v1" and
+            value["signer_context_sha256"] ==
+                sha256(canonical_bytes(body)) and
+            raw == canonical_bytes(value) and
+            reference["semantic_sha256"] == value["signer_context_sha256"],
+            "private archive signer context schema/identity/quota/self-digest differs")
+    for name, maximum, executable in (
+        ("keyring_pin", MAX_ARCHIVE_KEYRING_BYTES, False),
+        ("gpgv_pin", MAX_ARCHIVE_GPGV_BYTES, True),
+    ):
+        tool_pin = exact(value[name], {"path", "raw_sha256"},
+                         f"{host_id} archive signer {name}")
+        tool_path = tool_pin["path"]
+        require(type(tool_path) is str and Path(tool_path).is_absolute() and
+                str(Path(tool_path)) == tool_path and is_sha(tool_pin["raw_sha256"]),
+                f"{host_id} archive signer {name} raw pin is malformed")
+        _tool_raw, tool_sha, tool_info = read_stable(
+            Path(tool_path), f"{host_id} archive signer {name}", maximum,
+        )
+        require(tool_sha == tool_pin["raw_sha256"] and
+                stat.S_ISREG(tool_info.st_mode) and tool_info.st_nlink == 1 and
+                (not executable or tool_info.st_mode & 0o111 != 0),
+                f"{host_id} archive signer {name} differs from its exact raw pin")
+    return value, {
+        "path": pin["path"], "raw_sha256": raw_sha,
+        "semantic_sha256": value["signer_context_sha256"],
+    }
+
+
+def load_context(
+    manifest_path: Path, host_id: str, *,
+    manifest_value: dict[str, Any] | None = None,
+    manifest_raw_sha256: str | None = None,
+    allow_preparatory_core: bool = False,
+) -> CampaignContext:
+    if manifest_value is None:
+        manifest_path = manifest_path.resolve(strict=True)
+        manifest, manifest_raw, manifest_sha = read_json(
+            manifest_path, "Source5 execution manifest", MAX_MANIFEST_BYTES,
+        )
+    else:
+        require(allow_preparatory_core and
+                isinstance(manifest_path, Path) and manifest_path.is_absolute() and
+                manifest_path.parent.is_dir() and
+                type(manifest_raw_sha256) is str and is_sha(manifest_raw_sha256),
+                "in-memory Source5 context is reserved for the explicit prep core builder")
+        manifest = manifest_value
+        manifest_raw = canonical_bytes(manifest)
+        manifest_sha = manifest_raw_sha256
     base_manifest_fields = {
         "schema", "campaign_id", "hosts", "original_inputs", "execution_sources",
         "modules", "observed_hosts", "capacity_completions", "artifact_root",
@@ -258,6 +464,7 @@ def load_context(manifest_path: Path, host_id: str) -> CampaignContext:
         "manifest_sha256",
     }
     schema = manifest.get("schema")
+    preparatory_core = False
     if schema == EXECUTION_SCHEMA:
         exact(manifest, base_manifest_fields, "Source5 execution manifest v1")
         manifest_scope = None
@@ -293,15 +500,84 @@ def load_context(manifest_path: Path, host_id: str) -> CampaignContext:
             "completion", "host_completion", "host_verification", "ledger",
             "capacity_schedule_sha256", "registration_head",
         }, "Source5 bounded prepared-capacity registration")
+    elif schema == EXECUTION_SCHEMA_V4:
+        exact(manifest, (base_manifest_fields - {"capacity_completions"}) | {
+            "scope", "prepared_input_generation",
+            "prepared_capacity_registration", "archive_signer_contexts",
+            "journal_width_contracts",
+        }, "Source5 execution manifest v4")
+        manifest_scope = manifest["scope"]
+        require(manifest_scope == "final_prepared_bounded",
+                "Source5 execution manifest v4 accepts only the bounded final-prepared scope")
+        prepared_generation = exact(manifest["prepared_input_generation"], {
+            "completion", "provenance",
+        }, "Source5 v4 bounded prepared-input generation")
+        capacity_registration = exact(manifest["prepared_capacity_registration"], {
+            "completion", "host_completion", "host_verification", "ledger",
+            "capacity_schedule_sha256", "registration_head",
+        }, "Source5 v4 bounded prepared-capacity registration")
+    elif schema == PREPARATORY_EXECUTION_SCHEMA:
+        # The active typed Source module supplies the public schema validator;
+        # before modules are loaded the closed field set is kept here as well.
+        prep_core_fields = {
+            "schema", "campaign_id", "host_id", "hosts", "original_inputs",
+            "execution_sources", "modules", "observed_hosts", "artifact_root",
+            "output_root", "scope", "phase_order", "protocol_sha256",
+            "preparatory_capacity_generation", "preparatory_capacity_registration",
+            "archive_signer_contexts", "qualification_eligible",
+        }
+        prep_full_fields = prep_core_fields | {
+            "preparatory_journal_width_contracts", "preparatory_host_budgets",
+            "preparatory_execution_basis_sha256", "manifest_sha256",
+        }
+        preparatory_core = (allow_preparatory_core and
+                            set(manifest) == prep_core_fields)
+        exact(manifest, prep_core_fields if preparatory_core else prep_full_fields,
+              "Source5 preparatory execution manifest core" if preparatory_core else
+              "Source5 preparatory execution manifest")
+        manifest_scope = manifest["scope"]
+        require(manifest_scope == PREPARATORY_SCOPE and
+                manifest.get("host_id") == host_id and
+                manifest.get("phase_order") == ["exploration"] and
+                manifest.get("qualification_eligible") is False,
+                "Source5 preparatory execution manifest scope/host differs")
+        prepared_generation = exact(manifest["preparatory_capacity_generation"], {
+            "completion", "provenance",
+        }, "Source5 preparatory capacity generation")
+        capacity_registration = exact(
+            manifest["preparatory_capacity_registration"], {
+                "completion", "host_completion", "host_verification", "ledger",
+                "capacity_schedule_sha256", "registration_head",
+            }, "Source5 selected preparatory capacity registration",
+        )
+        if not preparatory_core:
+            require(is_sha(manifest["preparatory_execution_basis_sha256"]) and
+                    manifest["manifest_sha256"] == sha256(canonical_bytes({
+                        key: value for key, value in manifest.items()
+                        if key != "manifest_sha256"
+                    })),
+                    "Source5 preparatory manifest basis/self digest differs")
+        else:
+            require(manifest_raw_sha256 == "f" * 64,
+                    "preparatory core builder must use a non-authoritative fixed-width raw placeholder")
     else:
         raise Source5CampaignError("unsupported Source5 execution manifest version")
     require(
-            manifest["phase_order"] == list(PHASE_ORDER) and
+            (schema == PREPARATORY_EXECUTION_SCHEMA or
+             manifest["phase_order"] == list(PHASE_ORDER)) and
             manifest["qualification_eligible"] is False and
-            manifest["manifest_sha256"] == sha256(canonical_bytes({
-                key: value for key, value in manifest.items()
-                if key != "manifest_sha256"
-            })),
+            ((schema == PREPARATORY_EXECUTION_SCHEMA and
+              ((preparatory_core and "manifest_sha256" not in manifest) or
+               (not preparatory_core and
+                manifest["manifest_sha256"] == sha256(canonical_bytes({
+                    key: value for key, value in manifest.items()
+                    if key != "manifest_sha256"
+                })))) or
+             schema != PREPARATORY_EXECUTION_SCHEMA and
+             manifest["manifest_sha256"] == sha256(canonical_bytes({
+                 key: value for key, value in manifest.items()
+                 if key != "manifest_sha256"
+             })))),
             "Source5 execution manifest schema, phase order, eligibility, or digest is invalid")
     require(host_id in manifest["hosts"] and type(manifest["hosts"]) is list and
             len(manifest["hosts"]) == 3 and len(set(manifest["hosts"])) == 3,
@@ -367,9 +643,13 @@ def load_context(manifest_path: Path, host_id: str) -> CampaignContext:
         "source_root", "git_commit", "source_tree_sha256", "build_sha256",
     }, "Source5 selected execution source")
     source_root = Path(source_root_value["source_root"]).resolve(strict=True)
+    source_build_sha256 = sha256(canonical_bytes(source["build"]))
     require(source_root_value["git_commit"] == source["source"]["git_commit"] and
             source_root_value["source_tree_sha256"] == source["source"]["source_tree_sha256"] and
-            source_root_value["build_sha256"] == sha256(canonical_bytes(source["build"])),
+            source_root_value["build_sha256"] == source_build_sha256 and
+            source["resource_domain_calibration"]["build"] == source["build"] and
+            source["resource_domain_calibration"]["build_sha256"] ==
+                source_build_sha256,
             "Source5 selected source/build identity differs from SourceV5")
     artifact_root = Path(manifest["artifact_root"]).resolve(strict=True)
     output_root = Path(manifest["output_root"]).resolve(strict=True)
@@ -413,9 +693,31 @@ def load_context(manifest_path: Path, host_id: str) -> CampaignContext:
         "scripts/application-soak-recipe.py",
         "scripts/application-source5-soak.py",
         "scripts/application-source5-offline-dispatch.py",
+        "scripts/application-source5-evidence-transport-v3.py",
+        EVIDENCE_BUDGET_SOURCE_PATH,
+        EVIDENCE_CATALOGUE_SOURCE_PATH,
     }
-    if schema in (EXECUTION_SCHEMA_V2, EXECUTION_SCHEMA_V3):
-        execution_paths.add("scripts/application-source5-input-preparation.py")
+    preparatory_capacity_generation_value = None
+    preparatory_budget = None
+    preparatory_budget_raw = None
+    preparatory_budget_pin = None
+    preparatory_width_contract = None
+    preparatory_width_pin = None
+    if schema == EXECUTION_SCHEMA_V4:
+        execution_paths.update({
+            EVIDENCE_ARCHIVE_SOURCE_PATH,
+            EVIDENCE_TRANSFER_PACKET_SOURCE_PATH,
+        })
+    if schema == PREPARATORY_EXECUTION_SCHEMA:
+        execution_paths.update({
+            EVIDENCE_ARCHIVE_SOURCE_PATH,
+            EVIDENCE_TRANSFER_PACKET_SOURCE_PATH,
+            PREPARATORY_BUDGET_SOURCE_PATH,
+        })
+    if schema in (EXECUTION_SCHEMA_V2, EXECUTION_SCHEMA_V3,
+                  EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA):
+        execution_paths.add(SOURCE5_INPUT_PREPARATION_SOURCE_PATH)
+    execution_source_bytes: dict[str, bytes] = {}
     for relative in sorted(expected_script_paths):
         record = _inventory_record(source, relative)
         path = _safe_child(source_root, relative, relative)
@@ -426,10 +728,13 @@ def load_context(manifest_path: Path, host_id: str) -> CampaignContext:
                 modules[relative] == {"path": relative, "sha256": actual},
                 f"Source5 execution source {relative} differs from its typed inventory pin")
         if relative in execution_paths:
-            loaded[relative] = _load_module(raw, path, relative.replace("/", "_"))
+            module = _load_module(raw, path, relative.replace("/", "_"))
+            module.__source5_typed_pin__ = dict(modules[relative])
+            loaded[relative] = module
+            execution_source_bytes[relative] = raw
     require(execution_paths <= set(loaded),
             "Source5 execution module inventory is missing a transitive dependency")
-    if schema == EXECUTION_SCHEMA_V3:
+    if schema in BOUNDED_EXECUTION_SCHEMAS:
         composition = loaded["scripts/application-feedback-composition.py"]
         require(callable(getattr(composition, "capture_calibrated_probe_v2", None)) and
                 callable(getattr(composition, "compose_calibrated_policy_v5_offline", None)) and
@@ -450,12 +755,104 @@ def load_context(manifest_path: Path, host_id: str) -> CampaignContext:
             callable(getattr(chronology, "authorize_source5_job_locked", None)) and
             callable(getattr(chronology, "run_authorized_source5_job_locked", None)),
             "inventory-pinned chronology lacks the Source5 locked execution API")
+    if schema == EXECUTION_SCHEMA_V4:
+        require(callable(getattr(
+                    chronology, "refresh_source5_analysis_gate_locked", None,
+                )) and
+                callable(getattr(
+                    chronology,
+                    "replay_source5_phase_records_captured_locked", None,
+                )) and
+                callable(getattr(
+                    chronology,
+                    "source5_phase_analysis_events_held", None,
+                )) and
+                callable(getattr(
+                    globals().get("source5_completed_archive_read_provider"),
+                    "__call__", None,
+                )),
+                "Source5 v4 requires its pinned restart-safe captured-analysis refresh APIs")
     require(callable(getattr(soak_adapter, "prepare_source5_soak", None)) and
             callable(getattr(soak_adapter, "run_source5_soak", None)) and
             callable(getattr(soak_adapter, "verify_source5_soak_component", None)) and
             callable(getattr(soak_readback, "launch_soak_v2_application", None)),
             "inventory-pinned Source5 Soak/readback modules lack their captured V2 adapter API")
-    if schema in (EXECUTION_SCHEMA_V2, EXECUTION_SCHEMA_V3):
+    evidence_budget_module = loaded[EVIDENCE_BUDGET_SOURCE_PATH]
+    evidence_catalogue_module = loaded[EVIDENCE_CATALOGUE_SOURCE_PATH]
+    require(callable(getattr(
+                evidence_budget_module, "build_host_evidence_budget_plan", None,
+            )) and
+            callable(getattr(
+                evidence_catalogue_module, "inspect_owner_evidence_contracts", None,
+            )) and
+            callable(getattr(
+                evidence_catalogue_module, "bind_audit_budget_plan", None,
+            )),
+            "Source5 evidence budget/catalogue modules lack their pinned planning APIs")
+    if schema == PREPARATORY_EXECUTION_SCHEMA:
+        preparatory_budget_module = loaded[PREPARATORY_BUDGET_SOURCE_PATH]
+        require(callable(getattr(
+                    preparatory_budget_module, "build_execution_basis", None,
+                )) and
+                callable(getattr(
+                    preparatory_budget_module, "validate_execution_manifest", None,
+                )) and
+                callable(getattr(
+                    preparatory_budget_module, "validate_journal_width_contract", None,
+                )) and
+                callable(getattr(
+                    preparatory_budget_module, "validate_host_evidence_budget_v1", None,
+                )) and
+                callable(getattr(
+                    loaded[SOURCE5_INPUT_PREPARATION_SOURCE_PATH],
+                    "materialize_prepared_host_binding", None,
+                )) and
+                callable(getattr(
+                    loaded[SOURCE5_INPUT_PREPARATION_SOURCE_PATH],
+                    "verify_prepared_host_binding", None,
+                )) and
+                callable(getattr(
+                    loaded[SOURCE5_INPUT_PREPARATION_SOURCE_PATH],
+                    "capacity_pilot_maximum_bytes", None,
+                )),
+                "Source5 prep Source modules lack their exact profile and host-binding APIs")
+    if schema in {EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA}:
+        evidence_archive_module = loaded[EVIDENCE_ARCHIVE_SOURCE_PATH]
+        evidence_transfer_packet_module = loaded[EVIDENCE_TRANSFER_PACKET_SOURCE_PATH]
+        require(callable(getattr(
+                    evidence_archive_module, "build_checkpoint_request", None,
+                )) and
+                callable(getattr(
+                    evidence_archive_module,
+                    "verify_signed_ack_for_predecessor", None,
+                )) and
+                callable(getattr(
+                    evidence_archive_module, "verify_durable_ack", None,
+                )) and
+                callable(getattr(
+                    evidence_archive_module, "reclaim_acknowledged_local_paths", None,
+                )) and
+                callable(getattr(
+                    evidence_transfer_packet_module, "export_transfer_packet", None,
+                )) and
+                callable(getattr(
+                    evidence_transfer_packet_module, "publish_transfer_offer", None,
+                )) and
+                callable(getattr(
+                    evidence_transfer_packet_module, "read_ack_bundle", None,
+                )) and
+                callable(getattr(
+                    evidence_transfer_packet_module, "publish_ack_bundle", None,
+                )),
+                "Source5 v4 source inventory lacks the bounded archive handoff APIs")
+    owner_source_bytes = {
+        path: execution_source_bytes[path]
+        for path in evidence_catalogue_module.OWNER_PATHS.values()
+    }
+    owner_evidence_contract = evidence_catalogue_module.inspect_owner_evidence_contracts(
+        source, owner_source_bytes,
+    )
+    if schema in (EXECUTION_SCHEMA_V2, EXECUTION_SCHEMA_V3, EXECUTION_SCHEMA_V4):
         require(callable(getattr(
                     chronology, "register_source5_prepared_capacity_locked", None,
                 )),
@@ -473,7 +870,24 @@ def load_context(manifest_path: Path, host_id: str) -> CampaignContext:
             plan, source["runtime_readback_validator"]["sha256"],
             validation["campaign_inputs_module_sha256"],
         )
-        if spec["rates"] and spec["oracles"]:
+        if schema == PREPARATORY_EXECUTION_SCHEMA:
+            require(not spec["rates"] and not spec["oracles"],
+                    "preparatory Source5 manifest requires original empty rates and oracles")
+            scope = PREPARATORY_SCOPE
+            all_exploration = campaign.build_jobs(spec, "exploration")
+            selected_exploration = [
+                job for job in all_exploration
+                if job.get("host_id") == host_id
+            ]
+            selected_plan_exploration = [
+                job for job in plan["jobs"]["exploration"]
+                if job.get("host_id") == host_id
+            ]
+            require(plan["jobs"]["exploration"] == all_exploration and
+                    len(selected_exploration) == 360 and
+                    selected_plan_exploration == selected_exploration,
+                    "preparatory Source5 profile does not select exactly the original 360 host exploration jobs")
+        elif spec["rates"] and spec["oracles"]:
             scope = "final_frozen"
             require(callable(getattr(
                         chronology, "verify_source5_completed_fixed_phase_locked", None,
@@ -490,9 +904,10 @@ def load_context(manifest_path: Path, host_id: str) -> CampaignContext:
                     plan["jobs"]["pressure"] == [] and
                     plan["jobs"]["confirmation"] == [],
                     "prospective Source5 PlanV3 does not contain the exact exploration-only matrix")
-        if schema in (EXECUTION_SCHEMA_V2, EXECUTION_SCHEMA_V3):
+        if schema in (EXECUTION_SCHEMA_V2, EXECUTION_SCHEMA_V3, EXECUTION_SCHEMA_V4):
             expected_scope = ("final_prepared_bounded" if schema == EXECUTION_SCHEMA_V3
-                              else "final_prepared")
+                          else "final_prepared_bounded" if schema == EXECUTION_SCHEMA_V4
+                          else "final_prepared")
             require(scope == "final_frozen" and manifest_scope == expected_scope,
                     "prepared-input execution requires the complete frozen final SpecV3/PlanV3")
             preparation = loaded["scripts/application-source5-input-preparation.py"]
@@ -514,7 +929,7 @@ def load_context(manifest_path: Path, host_id: str) -> CampaignContext:
             require(type(prepared_completion) is dict and
                     prepared_completion.get("schema") ==
                     ("allocatbelt.application-source5-preparation-completion.v2"
-                     if schema == EXECUTION_SCHEMA_V3 else
+                     if schema in BOUNDED_EXECUTION_SCHEMAS else
                      "allocatbelt.application-source5-preparation-completion.v1") and
                     prepared_completion.get("complete") is True and
                     prepared_completion.get("qualification_eligible") is False and
@@ -565,7 +980,7 @@ def load_context(manifest_path: Path, host_id: str) -> CampaignContext:
                         selected_rows[0]["capacity_preparation_templates_sha256"] and
                     is_sha(capacity_registration["registration_head"]),
                     "prepared-capacity registration manifest differs from the selected verified 15-entry bridge row")
-            if schema == EXECUTION_SCHEMA_V3:
+            if schema in BOUNDED_EXECUTION_SCHEMAS:
                 selected_budget = selected_rows[0].get("resource_budget")
                 require(prepared_completion.get("resource_budgets", {}).get(host_id) == selected_budget and
                         type(selected_budget) is dict and
@@ -573,6 +988,72 @@ def load_context(manifest_path: Path, host_id: str) -> CampaignContext:
                             "allocatbelt.application-capacity-preparation-resource-monitor.v1" and
                         selected_rows[0]["resource_monitor"].get("report_count") == 30,
                         "bounded prepared-input generation does not bind the selected host budget and all monitor receipts")
+        elif schema == PREPARATORY_EXECUTION_SCHEMA:
+            preparation = loaded["scripts/application-source5-input-preparation.py"]
+            generation_completion = exact(
+                prepared_generation["completion"],
+                {"path", "raw_sha256", "semantic_sha256"},
+                "Source5 preparatory capacity-generation completion pin",
+            )
+            generation_provenance = exact(prepared_generation["provenance"], {
+                "schema", "preparation_pin", "initial_spec_pin", "initial_plan_pin",
+            }, "Source5 preparatory capacity-generation provenance")
+            require(generation_provenance["schema"] ==
+                    "allocatbelt.application-source5-preparatory-capacity-provenance.v1" and
+                    generation_provenance["initial_spec_pin"] == {
+                        "path": spec_raw_pin["path"],
+                        "raw_sha256": spec_raw_sha,
+                    } and
+                    generation_provenance["initial_plan_pin"] == {
+                        "path": plan_raw_pin["path"],
+                        "raw_sha256": plan_raw_sha,
+                    },
+                    "preparatory capacity generation changed its original SpecV3/PlanV3")
+            preparation_pin = raw_pin(
+                generation_provenance["preparation_pin"],
+                "Source5 preparatory preparation intent",
+            )
+            require(is_sha(generation_completion["raw_sha256"]) and
+                    is_sha(generation_completion["semantic_sha256"]),
+                    "preparatory capacity generation completion pin is malformed")
+            try:
+                preparatory_capacity_generation = \
+                    preparation.verify_prepared_capacity_generation_bounded(
+                        generation_completion, preparation_pin,
+                        source_root, input_root,
+                    )
+            except Exception as error:
+                raise Source5CampaignError(
+                    f"Source5 preparatory capacity generation replay failed: {error}",
+                ) from error
+            selected_rows = [row for row in
+                             preparatory_capacity_generation[
+                                 "capacity_preparations"]
+                             if row.get("host_id") == host_id]
+            require(preparatory_capacity_generation.get("schema") ==
+                    "allocatbelt.application-source5-prepared-capacity-generation.v1" and
+                    preparatory_capacity_generation.get("complete") is True and
+                    preparatory_capacity_generation.get("qualification_eligible") is False and
+                    preparatory_capacity_generation.get("generation_sha256") ==
+                        generation_completion["semantic_sha256"] and
+                    len(selected_rows) == 1,
+                    "Source5 preparatory generation did not replay its exact selected host row")
+            selected_capacity = selected_rows[0]
+            require(capacity_registration["completion"] == generation_completion and
+                    capacity_registration["host_completion"] == {
+                        **selected_capacity["completion"],
+                        "semantic_sha256": selected_capacity["completion_sha256"],
+                    } and
+                    capacity_registration["host_verification"] ==
+                        selected_capacity["host_verification"] and
+                    capacity_registration["ledger"] == selected_capacity["ledger"] and
+                    capacity_registration["capacity_schedule_sha256"] ==
+                        selected_capacity["capacity_preparation_templates_sha256"] and
+                    is_sha(capacity_registration["registration_head"]),
+                    "preparatory manifest registration differs from the real selected SourceA event")
+            context_preparatory_capacity_generation = preparatory_capacity_generation
+        else:
+            context_preparatory_capacity_generation = None
     except Exception as error:
         raise Source5CampaignError(f"pinned campaign verifier rejected original inputs: {error}") from error
     require(plan["execution_ready"] is False and plan["full_gate_ready"] is False,
@@ -580,6 +1061,143 @@ def load_context(manifest_path: Path, host_id: str) -> CampaignContext:
     observed = exact(manifest["observed_hosts"], set(manifest["hosts"]),
                      "Source5 observed host map")[host_id]
     observed_artifact = raw_pin(observed["artifact"], "Source5 observed host")
+    if schema == EXECUTION_SCHEMA_V4:
+        archive_signer_context, archive_signer_context_pin = \
+            _load_archive_signer_context(manifest, host_id)
+        journal_contract_map = exact(
+            manifest.get("journal_width_contracts"), set(manifest["hosts"]),
+            "Source5 per-host journal-width contract map",
+        )
+        journal_contract_ref = exact(
+            journal_contract_map[host_id], {"artifact", "semantic_sha256"},
+            f"{host_id} journal-width contract reference",
+        )
+        journal_contract_raw_pin = raw_pin(
+            journal_contract_ref["artifact"],
+            f"{host_id} journal-width contract artifact",
+        )
+        journal_contract_raw, journal_contract_raw_sha, journal_contract_info = \
+            read_stable(
+                Path(journal_contract_raw_pin["path"]),
+                f"{host_id} journal-width contract",
+                16 * 1024 * 1024,
+            )
+        try:
+            journal_width_contract = json.loads(journal_contract_raw)
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise Source5CampaignError(
+                f"{host_id} journal-width contract is malformed",
+            ) from error
+        require(type(journal_width_contract) is dict and
+                journal_contract_raw == canonical_bytes(journal_width_contract) and
+                journal_contract_raw_sha == journal_contract_raw_pin["raw_sha256"] and
+                stat.S_ISREG(journal_contract_info.st_mode) and
+                journal_contract_info.st_uid == os.getuid() and
+                stat.S_IMODE(journal_contract_info.st_mode) == 0o600 and
+                journal_width_contract.get("schema") ==
+                    SOURCE5_JOURNAL_WIDTH_CONTRACT_SCHEMA and
+                is_sha(journal_width_contract.get("contract_sha256")) and
+                journal_width_contract["contract_sha256"] ==
+                    journal_contract_ref["semantic_sha256"] ==
+                    sha256(canonical_bytes({
+                        key: item for key, item in journal_width_contract.items()
+                        if key != "contract_sha256"
+                    })),
+                f"{host_id} journal-width contract raw/semantic identity differs")
+        journal_width_contract_pin = {
+            "path": journal_contract_raw_pin["path"],
+            "raw_sha256": journal_contract_raw_sha,
+            "semantic_sha256": journal_width_contract["contract_sha256"],
+        }
+    elif schema == PREPARATORY_EXECUTION_SCHEMA:
+        archive_signer_context, archive_signer_context_pin = \
+            _load_archive_signer_context(manifest, host_id)
+        journal_width_contract = None
+        journal_width_contract_pin = None
+        preparatory_capacity_generation_value = \
+            context_preparatory_capacity_generation
+        if not preparatory_core:
+            prep_module = loaded[PREPARATORY_BUDGET_SOURCE_PATH]
+            prep_module.validate_execution_manifest(manifest)
+            width_refs = exact(
+                manifest["preparatory_journal_width_contracts"], {host_id},
+                "Source5 preparatory selected-host width map",
+            )
+            width_ref = exact(width_refs[host_id], {
+                "artifact", "semantic_sha256",
+            }, "Source5 preparatory width reference")
+            width_raw_pin = raw_pin(width_ref["artifact"],
+                                    "Source5 preparatory width artifact")
+            width_raw, width_raw_sha, width_info = read_stable(
+                Path(width_raw_pin["path"]),
+                "Source5 preparatory journal-width contract",
+                16 * 1024 * 1024,
+            )
+            try:
+                preparatory_width_contract = json.loads(width_raw)
+            except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+                raise Source5CampaignError(
+                    "Source5 preparatory width contract is malformed",
+                ) from error
+            require(type(preparatory_width_contract) is dict and
+                    width_raw == canonical_bytes(preparatory_width_contract) and
+                    width_raw_sha == width_raw_pin["raw_sha256"] and
+                    stat.S_ISREG(width_info.st_mode) and
+                    width_info.st_uid == os.getuid() and
+                    stat.S_IMODE(width_info.st_mode) == 0o600 and
+                    preparatory_width_contract.get("schema") ==
+                        PREPARATORY_WIDTH_SCHEMA and
+                    is_sha(preparatory_width_contract.get("contract_sha256")) and
+                    preparatory_width_contract["contract_sha256"] ==
+                        width_ref["semantic_sha256"] == sha256(canonical_bytes({
+                            key: value for key, value in preparatory_width_contract.items()
+                            if key != "contract_sha256"
+                        })),
+                    "Source5 preparatory width artifact raw/semantic identity differs")
+            preparatory_width_pin = {
+                "path": width_raw_pin["path"],
+                "raw_sha256": width_raw_sha,
+                "semantic_sha256": preparatory_width_contract["contract_sha256"],
+            }
+            budget_refs = exact(
+                manifest["preparatory_host_budgets"], {host_id},
+                "Source5 preparatory selected-host budget map",
+            )
+            budget_ref = exact(budget_refs[host_id], {
+                "artifact", "semantic_sha256",
+            }, "Source5 preparatory budget reference")
+            budget_raw_pin = raw_pin(budget_ref["artifact"],
+                                     "Source5 preparatory budget artifact")
+            preparatory_budget_raw, budget_raw_sha, budget_info = read_stable(
+                Path(budget_raw_pin["path"]),
+                "Source5 preparatory host budget",
+                prep_module.MAX_BUDGET_BYTES,
+            )
+            try:
+                preparatory_budget = json.loads(preparatory_budget_raw)
+            except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+                raise Source5CampaignError(
+                    "Source5 preparatory host budget is malformed",
+                ) from error
+            require(type(preparatory_budget) is dict and
+                    preparatory_budget_raw == canonical_bytes(preparatory_budget) and
+                    budget_raw_sha == budget_raw_pin["raw_sha256"] and
+                    stat.S_ISREG(budget_info.st_mode) and
+                    budget_info.st_uid == os.getuid() and
+                    stat.S_IMODE(budget_info.st_mode) == 0o600 and
+                    preparatory_budget.get("budget_sha256") ==
+                        budget_ref["semantic_sha256"],
+                    "Source5 preparatory budget raw/semantic identity differs")
+            preparatory_budget_pin = {
+                "path": budget_raw_pin["path"],
+                "raw_sha256": budget_raw_sha,
+                "semantic_sha256": preparatory_budget["budget_sha256"],
+            }
+    else:
+        archive_signer_context = None
+        archive_signer_context_pin = None
+        journal_width_contract = None
+        journal_width_contract_pin = None
     if schema == EXECUTION_SCHEMA:
         capacity_completion = exact(manifest["capacity_completions"],
                                     set(manifest["hosts"]),
@@ -598,12 +1216,15 @@ def load_context(manifest_path: Path, host_id: str) -> CampaignContext:
             "terminal_head": ledger["terminal_head"],
             "registration_head": capacity_registration["registration_head"],
         }
-    return CampaignContext(
+    manifest_path_string = str(
+        manifest_path.resolve(strict=False if preparatory_core else True),
+    )
+    result = CampaignContext(
         manifest=manifest,
-        manifest_pin={"path": str(manifest_path.resolve(strict=True)),
+        manifest_pin={"path": manifest_path_string,
                       "raw_sha256": manifest_sha},
         scope=scope,
-        host_id=host_id, spec=spec, plan=plan,
+        host_id=host_id, spec=spec, plan=plan, plan_raw=plan_raw,
         spec_pin={"path": spec_raw_pin["path"], "raw_sha256": spec_raw_sha},
         plan_pin={"path": plan_raw_pin["path"], "raw_sha256": plan_raw_sha},
         spec_semantic_sha256=spec_semantic, plan_semantic_sha256=plan_semantic,
@@ -617,7 +1238,88 @@ def load_context(manifest_path: Path, host_id: str) -> CampaignContext:
         prepared_input_completion=prepared_completion,
         campaign=campaign, chronology=chronology, fixed_pair=fixed_pair,
         pressure_pair=pressure_pair, modules=loaded,
+        owner_evidence_contract=owner_evidence_contract,
+        archive_signer_context=archive_signer_context,
+        archive_signer_context_pin=archive_signer_context_pin,
+        journal_width_contract=journal_width_contract,
+        journal_width_contract_pin=journal_width_contract_pin,
+        preparatory_capacity_generation=preparatory_capacity_generation_value,
+        preparatory_capacity_registration=(
+            capacity_registration if schema == PREPARATORY_EXECUTION_SCHEMA else None
+        ),
+        preparatory_execution_basis_sha256=(
+            manifest.get("preparatory_execution_basis_sha256")
+            if not preparatory_core and schema == PREPARATORY_EXECUTION_SCHEMA
+            else None
+        ),
+        preparatory_width_contract=preparatory_width_contract,
+        preparatory_width_pin=preparatory_width_pin,
+        preparatory_budget=preparatory_budget,
+        preparatory_budget_raw=preparatory_budget_raw,
+        preparatory_budget_pin=preparatory_budget_pin,
     )
+    if schema == PREPARATORY_EXECUTION_SCHEMA and not preparatory_core:
+        _source5_prepared_host_binding(result, materialize=False)
+    if schema == EXECUTION_SCHEMA_V4:
+        _validate_source5_journal_width_contract(
+            result, journal_width_contract,
+        )
+    if schema == PREPARATORY_EXECUTION_SCHEMA and not preparatory_core:
+        _validate_source5_preparatory_profile_artifacts(
+            result, preparatory_width_contract, preparatory_width_pin,
+            preparatory_budget, preparatory_budget_raw,
+            preparatory_budget_pin,
+        )
+    return result
+
+
+def _source5_prepared_host_binding(
+    context: CampaignContext, *, materialize: bool,
+) -> dict[str, Any]:
+    """Materialize or read-only verify the distinct Spec.host/source binding."""
+    require(context.manifest.get("schema") == PREPARATORY_EXECUTION_SCHEMA and
+            type(context.manifest.get("preparatory_capacity_generation")) is dict and
+            type(context.manifest["preparatory_capacity_generation"].get(
+                "provenance")) is dict,
+            "Source5 fixed Spec host binding requires the preparatory input generation")
+    module = context.modules.get(SOURCE5_INPUT_PREPARATION_SOURCE_PATH)
+    method_name = ("materialize_prepared_host_binding" if materialize else
+                   "verify_prepared_host_binding")
+    method = getattr(module, method_name, None)
+    require(callable(method),
+            f"pinned Source5 preparation module lacks {method_name}")
+    preparation_pin = exact(
+        context.manifest["preparatory_capacity_generation"]["provenance"].get(
+            "preparation_pin"),
+        {"path", "raw_sha256"}, "Source5 original preparation pin",
+    )
+    result = method(
+        {"path": preparation_pin["path"],
+         "sha256": preparation_pin["raw_sha256"]},
+        api_pin(context.spec_pin), context.source_root,
+        context.input_root, context.host_id,
+    )
+    result = exact(result, {"fixed_spec_host_pin", "prepared_host_binding"},
+                   "Source5 prepared fixed host binding result")
+    fixed_pin = exact(result["fixed_spec_host_pin"], {
+        "path", "raw_sha256",
+    }, "Source5 prepared fixed Spec host pin")
+    expected_path = (context.input_root / "fixed-spec-hosts" /
+                     f"{context.host_id}.json")
+    require(fixed_pin["path"] == str(expected_path) and
+            is_sha(fixed_pin["raw_sha256"]),
+            "Source5 prepared fixed Spec host pin differs from its exact input path")
+    validator = getattr(module, "_validate_prepared_fixed_host_binding", None)
+    require(callable(validator),
+            "pinned Source5 preparation module lacks its closed host-binding validator")
+    binding = validator(result["prepared_host_binding"])
+    require(binding["host_id"] == context.host_id and
+            binding["fixed_spec_host_pin"] == fixed_pin,
+            "Source5 prepared inline host adapter differs from the fixed Spec host pin")
+    context.fixed_spec_host_pin = dict(fixed_pin)
+    context.prepared_fixed_host_binding = dict(binding)
+    return {"fixed_spec_host_pin": dict(fixed_pin),
+            "prepared_host_binding": dict(binding)}
 
 
 def _validate_locked_context(context: CampaignContext, lock: Any) -> dict[str, Any]:
@@ -633,6 +1335,102 @@ def _validate_locked_context(context: CampaignContext, lock: Any) -> dict[str, A
         prepared,
         verify_selected_files=True,
     )
+    if context.manifest.get("schema") == PREPARATORY_EXECUTION_SCHEMA:
+        verifier = getattr(
+            chronology,
+            "validate_source5_preparatory_execution_manifest_locked",
+            None,
+        )
+        require(callable(verifier),
+                "pinned SourceA lacks sealed preparatory manifest/history verification")
+        verification = verifier(lock, api_pin(context.manifest_pin))
+        verification = exact(verification, {
+            "schema", "campaign_id", "host_id", "execution_manifest",
+            "execution_basis_sha256", "registration_head", "initial_spec_pin",
+            "initial_plan_pin", "capacity_generation_pin",
+            "journal_width_contract_pin", "host_evidence_budget_pin",
+            "job_count", "job_list_sha256", "journal_head",
+            "journal_record_count", "qualification_eligible", "launch_authorized",
+        }, "SourceA sealed preparatory execution verification")
+        registration = state.get("prepared_capacity_registration")
+        expected_registration = context.preparatory_capacity_registration
+        selected_jobs = _host_jobs(context, "exploration")
+        generation_pin = context.manifest["preparatory_capacity_generation"][
+            "completion"]
+        expected_manifest_pin = {
+            "path": context.manifest_pin["path"],
+            "raw_sha256": context.manifest_pin["raw_sha256"],
+            "semantic_sha256": context.manifest["manifest_sha256"],
+        }
+        expected_spec_pin = {
+            "path": context.spec_pin["path"],
+            "raw_sha256": context.spec_pin["raw_sha256"],
+            "semantic_sha256": context.spec_semantic_sha256,
+        }
+        expected_plan_pin = {
+            "path": context.plan_pin["path"],
+            "raw_sha256": context.plan_pin["raw_sha256"],
+            "semantic_sha256": context.plan_semantic_sha256,
+        }
+        require(type(expected_registration) is dict and
+                type(registration) is dict and
+                registration.get("completion") == expected_registration["completion"] and
+                registration.get("host_completion") ==
+                    expected_registration["host_completion"] and
+                registration.get("host_verification") ==
+                    expected_registration["host_verification"] and
+                registration.get("capacity_ledger") ==
+                    expected_registration["ledger"] and
+                registration.get("capacity_schedule_sha256") ==
+                    expected_registration["capacity_schedule_sha256"] and
+                verification["schema"] ==
+                    "allocatbelt.application-source5-preparatory-execution-verification.v1" and
+                verification["campaign_id"] == context.manifest["campaign_id"] and
+                verification["host_id"] == context.host_id and
+                verification["execution_manifest"] == expected_manifest_pin and
+                verification["execution_basis_sha256"] ==
+                    context.preparatory_execution_basis_sha256 and
+                verification["registration_head"] ==
+                    expected_registration["registration_head"] ==
+                    state.get("registration_head") and
+                verification["initial_spec_pin"] == expected_spec_pin and
+                verification["initial_plan_pin"] == expected_plan_pin and
+                verification["capacity_generation_pin"] == generation_pin and
+                verification["journal_width_contract_pin"] ==
+                    context.preparatory_width_pin and
+                verification["host_evidence_budget_pin"] ==
+                    context.preparatory_budget_pin and
+                verification["job_count"] == len(selected_jobs) == 360 and
+                verification["job_list_sha256"] ==
+                    sha256(canonical_bytes(selected_jobs)) and
+                verification["journal_head"] == state.get("head") and
+                verification["journal_record_count"] == state.get("record_count") and
+                state.get("registration") is None and
+                state.get("stage_completion") is None and
+                state.get("pending") is None and
+                state.get("source5_pending") is None and
+                state.get("cleanup_blocked") is False and
+                state.get("source5_cleanup_blocked") is False and
+                state.get("source5_failed_owner_window") is False and
+                verification["qualification_eligible"] is False and
+                verification["launch_authorized"] is False,
+                "SourceA preparatory sealed manifest/history differs from the selected 360-job context")
+        completion = context.manifest["preparatory_capacity_generation"]["completion"]
+        ledger = expected_registration["ledger"]
+        replay = {
+            "schema": "allocatbelt.application-source5-preparatory-capacity-registration.v1",
+            "registration_head": verification["registration_head"],
+            "capacity_completion_raw_sha256": completion["raw_sha256"],
+            "capacity_schedule_sha256":
+                expected_registration["capacity_schedule_sha256"],
+            "capacity_ledger_raw_sha256": ledger["raw_sha256"],
+            "capacity_ledger_terminal_head": ledger["terminal_head"],
+            "entry_count": 15, "pending_authorization": False,
+            "cleanup_blocked": False, "qualification_eligible": False,
+        }
+        return {"prepared": prepared, "state": state,
+                "capacity_replay": replay,
+                "preparatory_manifest_verification": verification}
     completion = context.capacity_completion
     completion_pin = raw_pin(completion["artifact"], "Source5 capacity completion")
     if context.prepared_input_completion is None:
@@ -727,6 +1525,474 @@ def _host_jobs(context: CampaignContext, phase: str) -> list[dict[str, Any]]:
     return jobs
 
 
+def _source5_disposition_byte_bound(
+    context: CampaignContext, phase: str,
+) -> int:
+    """Bound the complete original phase suffix from its exact PlanV3 jobs."""
+    jobs = _host_jobs(context, phase)
+    rows = [{
+        "job": job,
+        "reason": "x" * MAX_SOURCE5_DISPOSITION_REASON_BYTES,
+        "authorization_id": "x" * 96,
+        "job_terminal_head": "f" * 64,
+        "component_sha256": "f" * 64,
+        "error_sha256": "f" * 64,
+        "retained_failure": {
+            "path": "/" + ("x" * 4095),
+            "raw_sha256": "f" * 64,
+        },
+    } for job in jobs]
+    body = {
+        "schema": "allocatbelt.application-source5-not-run-dispositions.v1",
+        "campaign_id": context.manifest["campaign_id"],
+        "host_id": context.host_id, "phase": phase,
+        "reason": "x" * MAX_SOURCE5_DISPOSITION_REASON_BYTES,
+        "jobs": rows, "qualification_eligible": False,
+    }
+    body["disposition_sha256"] = "f" * 64
+    return len(canonical_bytes(body))
+
+
+def _source5_job_disposition_byte_bound(job: dict[str, Any]) -> int:
+    """Bound one failure disposition from the exact original job and schema."""
+    body = {
+        "schema": "allocatbelt.application-source5-job-disposition.v1",
+        "job": job, "state": "x" * 32,
+        "reason": "x" * MAX_SOURCE5_DISPOSITION_REASON_BYTES,
+        "authorization_id": "x" * 96,
+        "job_terminal_head": "f" * 64,
+        "component_sha256": "f" * 64, "error_sha256": "f" * 64,
+        "qualification_eligible": False, "disposition_sha256": "f" * 64,
+    }
+    return len(canonical_bytes(body))
+
+
+def _source5_runtime_snapshot_record_template(
+    context: CampaignContext, job: dict[str, Any], descriptor: dict[str, str],
+    comparison_family: str, report_nonce: str,
+) -> dict[str, Any]:
+    """Build the exact bounded numeric-snapshot shape from the pinned reader.
+
+    Values use the maximum widths accepted by the reader: u64 leaves, the
+    original token/hash widths, and finite IEEE-754 values in the outer metric
+    projection. No captured receipt or trace bytes are embedded here.
+    """
+    reader = context.campaign.runtime_readback_module(
+        context.source["runtime_readback_validator"]["sha256"],
+    )
+    policy = context.source["fixed_runtime_policy"]["policy"]["workloads"][
+        job["workload"]
+    ]
+    maximum = (1 << 64) - 1
+    dimensions = tuple(reader.DIMENSIONS)
+    app_dimensions = tuple(reader.APP_DIMENSIONS)
+    stages: dict[str, Any] = {}
+    for stage in reader.STAGES:
+        stage_value: dict[str, Any] = {}
+        for owner in reader.OWNERS:
+            stage_value[owner] = {
+                "ceiling": {name: maximum for name in dimensions},
+                "limit": {name: maximum for name in dimensions},
+                "used": {name: maximum for name in dimensions},
+                "live_tenants": maximum,
+            }
+        stage_value["scope"] = {
+            name: maximum for name in policy["scope_limits"]
+        }
+        stage_value["scope_used"] = {
+            name: maximum for name in (
+                "managed_memory", "disk_operations", "network_operations",
+            )
+        }
+        stage_value["io"] = {
+            direction: {
+                name: maximum for name in (
+                    "bytes_per_second", "ceiling_bytes_per_second",
+                    "burst_bytes", "ceiling_burst_bytes", "available_bytes",
+                    "reserved_bytes", "reservations", "max_reservations",
+                )
+            }
+            for direction in reader.DIRECTIONS
+        }
+        stages[stage] = stage_value
+    return {
+        "schema": "allocatbelt.application-runtime-numeric-snapshot.v2",
+        "identity": {
+            "report_nonce": report_nonce,
+            "run_id": job["run_id"],
+            "allocator": descriptor["allocator"],
+            "executor": ("allocatbelt" if descriptor["executor"] == "bounded"
+                         else "tokio-1.53.1"),
+            "comparison_family": comparison_family,
+            "resource_ceiling_sha256": job.get(
+                "resource_ceiling_sha256", "f" * 64,
+            ),
+            "policy_sha256": context.source["fixed_runtime_policy"][
+                "policy_sha256"
+            ],
+            "profile": job["profile"], "workload": job["workload"],
+        },
+        "configuration": {
+            name: maximum for name in (
+                "rate_per_second", "arrivals", "async_workers",
+                "logical_window", "trace_duration_ns",
+                "pulse_rate_per_second", "task_ceiling",
+                "fixed_global_control_baseline",
+            )
+        } | {
+            "mode": job["mode"],
+            "domain_ceiling": {name: maximum for name in dimensions},
+            "scope_limits": {
+                name: maximum for name in policy["scope_limits"]
+            },
+            "setup_global_control": maximum,
+        },
+        "stages": stages,
+        "after_release": {
+            "global_live_tenants": maximum,
+            "global_used_control": maximum,
+            "expected_global_control_baseline": maximum,
+            "global_used_application": {
+                name: maximum for name in app_dimensions
+            },
+        },
+    }
+
+
+def _source5_fixed_metric_record_template(
+    context: CampaignContext, job: dict[str, Any],
+    descriptor: dict[str, str], binding: dict[str, Any],
+) -> dict[str, Any]:
+    maximum = (1 << 64) - 1
+    max_float = sys.float_info.max
+    source = context.source
+    calibration = source["resource_domain_calibration"]
+    snapshot = _source5_runtime_snapshot_record_template(
+        context, job, descriptor, "fixed_policy", binding["report_nonce"],
+    )
+    runtime = {
+        "schema": "allocatbelt.application-runtime-readback-process.v1",
+        "pair": descriptor["pair"], "executor": descriptor["executor"],
+        "allocator": descriptor["allocator"],
+        "report_nonce": binding["report_nonce"],
+        "comparison_family": "fixed_policy",
+        "resource_ceiling_sha256": binding["resource_ceiling_sha256"],
+        "policy_sha256": binding["policy_sha256"],
+        "fixed_global_control_baseline": maximum,
+        "source_manifest_sha256": source["manifest_sha256"],
+        "calibration_binary_sha256": calibration["binary"]["sha256"],
+        "calibration_output_sha256": calibration["output"]["sha256"],
+        "validator_sha256": source["runtime_readback_validator"]["sha256"],
+        "runtime_readback_sha256": "f" * 64,
+        "output_sha256": "f" * 64,
+        "runtime_expectation_sha256": binding["expectation_sha256"],
+        "runtime_validation_sha256": "f" * 64,
+        "runtime_recipe_sha256": binding["recipe_sha256"],
+        "numeric_snapshot": snapshot,
+    }
+    metric: dict[str, Any] = {
+        "executor": descriptor["executor"], "allocator": descriptor["allocator"],
+        "mode": job["mode"], "completed": maximum,
+        "completed_on_time": maximum, "completed_late": maximum,
+        "capacity_per_second": max_float if job["mode"] == "capacity" else None,
+        "successful_throughput_per_second": max_float,
+        "response_p50_ns": maximum, "response_p95_ns": maximum,
+        "response_p99_ns": maximum, "cpu_ns_per_completion": maximum,
+        "production_cpu_started_ns": maximum,
+        "production_cpu_ended_ns": maximum, "production_cpu_ns": maximum,
+        "phase_sha256": "f" * 64, "runner_metadata_sha256": "f" * 64,
+        "execution_scope": "qualification",
+        "rss_after_drain_kib": maximum,
+        "retained_managed_bytes": maximum,
+        "max_observed_managed_bytes": maximum,
+        "managed_limit_bytes": maximum,
+        "ids_sha256": "f" * 64 if job["mode"] == "open_loop" else None,
+        "ids_path": "x" * 255 if job["mode"] == "open_loop" else None,
+        "family_successes": {family: maximum for family in context.campaign.STANDALONE},
+        "latency_p99_by_family_ns": {
+            family: maximum for family in context.campaign.STANDALONE
+        },
+        "runtime_readback": runtime,
+    }
+    if job["mode"] == "capacity" and job["workload"] == "mixed":
+        metric["capacity_throughput_by_family"] = {
+            family: max_float for family in context.campaign.STANDALONE
+        }
+        metric["capacity_family_sha256"] = "f" * 64
+    if job["mode"] == "open_loop":
+        metric["trace_duration_ns"] = maximum
+    return metric
+
+
+def _source5_pressure_metric_record_template(
+    context: CampaignContext, job: dict[str, Any],
+    descriptor: dict[str, str],
+) -> dict[str, Any]:
+    maximum = (1 << 64) - 1
+    maximum_128 = (1 << 128) - 1
+    max_float = sys.float_info.max
+    cell = next(item for item in context.spec["cells"]
+                if item["family"] == job["family"] and
+                item["profile"] == job["profile"])
+    policy = context.source["fixed_runtime_policy"]["policy"]["workloads"][
+        job["workload"]
+    ]
+    snapshot = _source5_runtime_snapshot_record_template(
+        context, job, descriptor, "external_pressure", "f" * 32,
+    )
+    snapshot["identity"]["resource_ceiling_sha256"] = cell[
+        "resource_ceiling_sha256"
+    ]
+    runtime = {
+        "schema": "allocatbelt.application-pressure-runtime-readback.v1",
+        "pair": descriptor["pair"], "executor": descriptor["executor"],
+        "allocator": descriptor["allocator"], "report_nonce": "f" * 32,
+        "comparison_family": "external_pressure",
+        "resource_ceiling_sha256": cell["resource_ceiling_sha256"],
+        "policy_sha256": context.source["fixed_runtime_policy"]["policy_sha256"],
+        "fixed_global_control_baseline": maximum,
+        "source_manifest_sha256": context.source["manifest_sha256"],
+        "runtime_readback_sha256": "f" * 64,
+        "numeric_snapshot_v2": snapshot,
+    }
+    return {
+        "pair": descriptor["pair"], "executor": descriptor["executor"],
+        "allocator": descriptor["allocator"], "mode": job["mode"],
+        "completed": maximum, "completed_on_time": maximum,
+        "completed_late": maximum,
+        "capacity_per_second": max_float if job["mode"] == "capacity" else None,
+        "capacity_throughput_by_family": {
+            family: max_float for family in context.campaign.STANDALONE
+        },
+        "successful_throughput_per_second": max_float,
+        "response_p50_ns": maximum_128, "response_p95_ns": maximum_128,
+        "response_p99_ns": maximum_128,
+        "cpu_ns_per_completion": maximum_128,
+        "production_cpu_started_ns": maximum_128,
+        "production_cpu_ended_ns": maximum_128,
+        "production_cpu_ns": maximum_128,
+        "phase_sha256": "f" * 64,
+        "ids_sha256": "f" * 64 if job["mode"] == "open_loop" else None,
+        "ids_path": "x" * 255 if job["mode"] == "open_loop" else None,
+        "family_successes": {
+            family: maximum for family in context.campaign.STANDALONE
+        },
+        "latency_p99_by_family_ns": {
+            family: maximum_128 for family in context.campaign.STANDALONE
+        },
+        "rss_after_drain_kib": maximum,
+        "retained_managed_bytes": maximum,
+        "max_observed_managed_bytes": maximum,
+        "managed_limit_bytes": maximum,
+        "pressure_sample_count": maximum,
+        "pressure_overlap_nanoseconds": maximum_128,
+        "runtime_numeric_snapshot_v2": snapshot,
+        "runtime_readback": runtime,
+        "execution_scope": "original_source_v5_pressure_job",
+        "p99_qualification": "not_applicable",
+        "qualification_eligible": False,
+    }
+
+
+def _source5_soak_metric_record_template(
+    context: CampaignContext, job: dict[str, Any],
+) -> dict[str, Any]:
+    maximum = (1 << 64) - 1
+    maximum_128 = (1 << 128) - 1
+    source = context.source
+    profile = job["profile"]
+    identity = {
+        "campaign_id": context.manifest["campaign_id"],
+        "host_id": context.host_id, "run_id": job["run_id"],
+        "nonce": "f" * 32, "allocator": "allocatbelt", "executor": "bounded",
+        "workload": "mixed", "profile": profile,
+        "comparison_family": "external_pressure",
+        "source_sha256": source["source"]["source_tree_sha256"],
+        "build_sha256": sha256(canonical_bytes(source["build"])),
+        "binary_sha256": source["artifacts"]["allocatbelt"]["sha256"],
+        "resource_ceiling_sha256": job.get("resource_ceiling_sha256", "f" * 64),
+    }
+    soak_readback = context.modules["scripts/application-soak-readback.py"]
+    endpoints = {
+        phase: [maximum_128, maximum_128]
+        for phase in soak_readback.SOAK_RECEIPT_CLOCK_PHASES
+    }
+    return {
+        "schema": soak_readback.RESULT_SCHEMA_V2,
+        "validated": True, "passed": True,
+        "qualification_eligible": False, "mode": "qualified",
+        "identity": identity,
+        "source_manifest_sha256": source["manifest_sha256"],
+        "source_tree_sha256": source["source"]["source_tree_sha256"],
+        "build_sha256": sha256(canonical_bytes(source["build"])),
+        "candidate_binary_sha256": source["artifacts"]["allocatbelt"]["sha256"],
+        "resource_ceiling_sha256": identity["resource_ceiling_sha256"],
+        "fixed_global_control_baseline": maximum,
+        "receipt_sha256": "f" * 64,
+        "validator_sha256": source["runtime_readback_validator"]["sha256"],
+        "monotonic_endpoints": endpoints,
+    }
+
+
+def _source5_job_record_byte_bound(
+    context: CampaignContext, phase: str, job: dict[str, Any],
+) -> int:
+    """Derive one successful record cap from pinned typed metric projections.
+
+    The fixed/pressure projections contain exactly two scalar rows. Their
+    numeric snapshot shape comes from the pinned runtime reader constants;
+    Soak has one fixed readback projection. Event and pin overhead is bounded
+    by the original absolute-path limit and the exact source event cardinality.
+    Failed jobs use their separate Plan-derived disposition envelope.
+    """
+    descriptors: list[dict[str, str]]
+    if phase in {"exploration", "aa", "confirmation"}:
+        descriptors = context.fixed_pair._member_descriptors(job, context.campaign)
+        member_count = 2
+        event_paths_per_member = 12
+    elif phase == "pressure":
+        descriptors = context.pressure_pair.pressure_process_descriptors(job)
+        member_count = 2
+        event_paths_per_member = 2
+    elif phase == "soak":
+        descriptors = [{
+            "role": "original_soak_app", "allocator": "allocatbelt",
+            "executor": "bounded",
+        }]
+        member_count = 1
+        event_paths_per_member = 10
+    else:
+        raise Source5CampaignError(
+            f"Source5 successful job record has unknown original phase {phase}",
+        )
+    metric_key = (
+        context.source["runtime_readback_validator"]["sha256"], phase,
+        job["workload"], job["profile"], (None if phase == "soak" else job["mode"]),
+        len(job["run_id"].encode("utf-8", "strict")),
+        len(context.manifest["campaign_id"]), len(context.host_id),
+        tuple((item.get("pair", item.get("role")), item["executor"],
+               item["allocator"]) for item in descriptors),
+    )
+    metric_bytes = _SOURCE5_JOB_METRIC_BOUND_CACHE.get(metric_key)
+    if metric_bytes is None:
+        # Run IDs are generated bounded ASCII tokens in PlanV3. A same-width
+        # token keeps the canonical template byte count exact while avoiding
+        # reconstruction of the same pinned metric schema for every ordinal.
+        template_job = dict(job)
+        template_job["run_id"] = "x" * metric_key[5]
+        if phase in {"exploration", "aa", "confirmation"}:
+            binding_map = {
+                (item["pair"], item["executor"], item["allocator"]): {
+                    "report_nonce": "f" * 32,
+                    "resource_ceiling_sha256": "f" * 64,
+                    "policy_sha256": "f" * 64,
+                    "expectation_sha256": "f" * 64,
+                    "recipe_sha256": "f" * 64,
+                } for item in descriptors
+            }
+            metrics = [
+                _source5_fixed_metric_record_template(
+                    context, template_job, descriptor,
+                    binding_map[(descriptor["pair"], descriptor["executor"],
+                                 descriptor["allocator"])],
+                ) for descriptor in descriptors
+            ]
+        elif phase == "pressure":
+            metrics = [_source5_pressure_metric_record_template(
+                context, template_job, descriptor,
+            ) for descriptor in descriptors]
+        else:
+            metrics = [_source5_soak_metric_record_template(
+                context, template_job,
+            )]
+        metric_bytes = sum(len(canonical_bytes(item)) for item in metrics)
+        _SOURCE5_JOB_METRIC_BOUND_CACHE[metric_key] = metric_bytes
+    max_path_width = 0
+    path_values = [
+        context.manifest_pin["path"], context.spec_pin["path"],
+        context.plan_pin["path"], context.observed_host_pin["path"],
+        str(context.source_root), str(context.input_root),
+        str(context.artifact_root), str(context.output_root),
+        str(context.artifact_root / context.manifest["campaign_id"] /
+            "source5" / context.host_id / "job-artifacts" / phase /
+            job["run_id"]),
+        str(context.artifact_root / context.manifest["campaign_id"] /
+            "source5" / context.host_id / "helper-inputs" /
+            f"{phase}-{job['run_id']}.json"),
+    ]
+    fixed_spec_pin = getattr(context, "fixed_spec_host_pin", None)
+    if type(fixed_spec_pin) is dict:
+        path_values.append(fixed_spec_pin["path"])
+    if context.manifest.get("schema") in {
+            EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA}:
+        path_values.append(str(_source5_fixed_host_receipt_path(
+            context, job,
+        )))
+    for path in path_values:
+        max_path_width = max(
+            max_path_width, len(path.encode("utf-8", "strict")) * 6 + 2,
+        )
+    # Exact source5 records have at most ten artifact pins and two callback
+    # rows per member. The bound permits every path-bearing event field at the
+    # catalogue's 4096-byte path ceiling, including ensure_ascii expansion.
+    path_envelope = (10 + member_count * event_paths_per_member) * max_path_width
+    callback_schema_envelope = 16 * 1024 * member_count
+    fixed_host_receipt_bytes = 0
+    if context.manifest.get("schema") in {
+            EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA} and phase in {
+            "exploration", "aa", "confirmation"}:
+        fixed_host_receipt_bytes = len(canonical_bytes({
+            "host_receipt": {
+                "path": str(_source5_fixed_host_receipt_path(context, job)),
+                "raw_sha256": "f" * 64,
+                "host_verification_sha256": "f" * 64,
+            },
+        })) - 1
+    if phase in {"exploration", "aa", "confirmation"}:
+        observed_pin = context.observed_host_pin
+        affinity_count = _SOURCE5_CPU_AFFINITY_COUNT_CACHE.get(
+            observed_pin["raw_sha256"],
+        )
+        if affinity_count is None:
+            observed, _observed_raw, _observed_sha = read_json(
+                Path(observed_pin["path"]), "Source5 observed-host record bound",
+                1 * 1024 * 1024, observed_pin["raw_sha256"],
+            )
+            affinity = observed.get("cpu_affinity")
+            require(type(affinity) is list and bool(affinity) and
+                    all(type(cpu) is int and 0 <= cpu <= 65535
+                        for cpu in affinity),
+                    "Source5 observed-host affinity cannot bound successful job records")
+            affinity_count = len(affinity)
+            _SOURCE5_CPU_AFFINITY_COUNT_CACHE[
+                observed_pin["raw_sha256"]
+            ] = affinity_count
+        callback_schema_envelope += 2 * len(canonical_bytes(
+            [65535] * affinity_count,
+        ))
+    result = (len(canonical_bytes(job)) + metric_bytes + path_envelope +
+              fixed_host_receipt_bytes +
+              callback_schema_envelope + 16 * 1024)
+    require(0 < result <= 4 * 1024 * 1024,
+            "Source5 successful-record schema projection exceeds its finite writer ceiling")
+    return result
+
+
+def _source5_phase_ledger_byte_bound(
+    context: CampaignContext, phase: str,
+    jobs: list[dict[str, Any]] | None = None,
+) -> int:
+    """Sum every original successful-record row cap for one phase ledger."""
+    selected_jobs = _host_jobs(context, phase) if jobs is None else jobs
+    total = sum(
+        _source5_job_record_byte_bound(context, phase, job)
+        for job in selected_jobs
+    )
+    require(type(total) is int and 0 < total <= (1 << 64) - 1,
+            f"Source5 {phase} phase-ledger source bound is outside u64")
+    return total
+
+
 def _phase_root(context: CampaignContext, phase: str) -> Path:
     root = context.output_root / context.manifest["campaign_id"] / "source5" / context.host_id / phase
     require(root.is_relative_to(context.output_root), "Source5 phase output escaped output_root")
@@ -757,8 +2023,12 @@ def _helper_prerequisites(
     return result
 
 
-def _phase_ledger_records(path: Path) -> list[dict[str, Any]]:
-    raw, _digest, _info = read_stable(path, "Source5 phase job ledger", MAX_LEDGER_BYTES)
+def _phase_ledger_records(
+    path: Path, maximum_bytes: int = MAX_LEDGER_BYTES,
+) -> list[dict[str, Any]]:
+    raw, _digest, _info = read_stable(
+        path, "Source5 phase job ledger", maximum_bytes,
+    )
     lines = raw.splitlines(keepends=True)
     require(all(line.endswith(b"\n") and b"\r" not in line for line in lines),
             "Source5 phase ledger framing differs")
@@ -787,10 +2057,13 @@ def _phase_ledger_records(path: Path) -> list[dict[str, Any]]:
     return result
 
 
-def _append_phase_record(ledger: Path, record: dict[str, Any]) -> None:
+def _append_phase_record(
+    ledger: Path, record: dict[str, Any], maximum_record_bytes: int,
+    maximum_ledger_bytes: int,
+) -> None:
     raw = canonical_bytes(record)
-    require(len(raw) <= 4 * 1024 * 1024,
-            "Source5 job record exceeds its finite line bound")
+    require(len(raw) <= maximum_record_bytes and len(raw) <= maximum_ledger_bytes,
+            "Source5 job ledger line exceeded its source-derived schema bound")
     fd = os.open(ledger, os.O_WRONLY | os.O_APPEND |
                  getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
     try:
@@ -798,6 +2071,8 @@ def _append_phase_record(ledger: Path, record: dict[str, Any]) -> None:
         require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
                 stat.S_IMODE(info.st_mode) == 0o600,
                 "Source5 job ledger is not an owned mode-0600 regular file")
+        require(info.st_size + len(raw) <= maximum_ledger_bytes,
+                "Source5 phase ledger exceeded the sum of its original per-job record bounds")
         offset = 0
         while offset < len(raw):
             offset += os.write(fd, raw[offset:])
@@ -808,7 +2083,12 @@ def _append_phase_record(ledger: Path, record: dict[str, Any]) -> None:
 
 def _write_dispositions(
     directory: Path, jobs: list[dict[str, Any]], reason: str,
+    *, maximum_bytes: int,
 ) -> dict[str, str]:
+    require(type(reason) is str and
+            len(reason.encode("utf-8", "strict")) <=
+                MAX_SOURCE5_DISPOSITION_REASON_BYTES,
+            "Source5 not-run disposition reason exceeds its source-pinned byte bound")
     material = {
         "schema": "allocatbelt.application-source5-not-run-dispositions.v1",
         "campaign_id": directory.parents[2].name,
@@ -821,13 +2101,16 @@ def _write_dispositions(
     material["disposition_sha256"] = sha256(canonical_bytes(material))
     path = directory / "not-run-dispositions.json"
     raw = canonical_bytes(material)
+    require(len(raw) <= maximum_bytes,
+            "Source5 not-run disposition suffix exceeds its exact PlanV3-derived byte bound")
     checksum = write_new(path, raw, "Source5 not-run dispositions")
     return {"path": str(path), "raw_sha256": checksum}
 
 
 def _write_job_disposition(
     phase_root: Path, job: dict[str, Any], state: str, reason: str,
-    *, authorization_id: str | None = None,
+    *, maximum_bytes: int,
+    authorization_id: str | None = None,
     terminal_head: str | None = None,
     component_sha256: str | None = None,
     error_sha256: str | None = None,
@@ -843,13 +2126,17 @@ def _write_job_disposition(
     }
     body["disposition_sha256"] = sha256(canonical_bytes(body))
     path = phase_root / "job-records" / f"{job['run_id']}.disposition.json"
-    checksum = write_new(path, canonical_bytes(body), "Source5 job disposition")
+    raw = canonical_bytes(body)
+    require(len(raw) <= maximum_bytes,
+            "Source5 job disposition exceeds its exact PlanV3/schema template bound")
+    checksum = write_new(path, raw, "Source5 job disposition")
     return {"path": str(path), "raw_sha256": checksum}
 
 
 def _seal_blocked_suffix(
     phase_root: Path, jobs: list[dict[str, Any]], index: int,
     error: BaseException, result: dict[str, Any] | None = None,
+    *, maximum_bytes: int,
 ) -> dict[str, str]:
     disposition: dict[str, Any] = {
         "job": jobs[index],
@@ -872,7 +2159,8 @@ def _seal_blocked_suffix(
     dispositions.extend({"job": pending, "reason": "not_run_after_blocked_job"}
                         for pending in jobs[index + 1:])
     return _write_dispositions(phase_root, dispositions,
-                               f"blocked original job {jobs[index]['run_id']}")
+                               f"blocked original job {jobs[index]['run_id']}",
+                               maximum_bytes=maximum_bytes)
 
 
 def _source5_fixed_original_pins(context: CampaignContext) -> dict[str, Any]:
@@ -912,7 +2200,8 @@ def _helper_input_value(
             f"Source5 {phase} has no original finite outer deadline")
     body = {
         "schema": HELPER_INPUT_SCHEMA,
-        "scope": context.scope,
+        "scope": ("prospective_exploration"
+                  if context.scope == PREPARATORY_SCOPE else context.scope),
         "campaign_id": context.manifest["campaign_id"],
         "host_id": context.host_id,
         "phase": phase,
@@ -933,6 +2222,1567 @@ def _helper_input_value(
     }
 
 
+def _source5_helper_input_byte_bound(
+    context: CampaignContext, phase: str, job: dict[str, Any],
+) -> int:
+    """Bound the canonical helper from its exact job and owner input schema.
+
+    Prerequisite analysis values are bounded by their source-pinned analysis
+    artifact role. The other fields use the accepted helper input schema and
+    maximum path/token widths, so we do not reserve the unrelated 256 MiB
+    Plan parser ceiling for every scheduled job.
+    """
+    maximum_path = "/" + ("x" * 4095)
+    maximum_pin = {"path": maximum_path, "raw_sha256": "f" * 64}
+    descriptors = [{
+        "pair": "x" * 96, "executor": "x" * 96,
+        "allocator": "x" * 96,
+    } for _ in range(2)]
+    capacity_bundle = {
+        name: dict(maximum_pin) for name in ("request", "artifact", "receipt")
+    }
+    probe_bundle = {
+        "schema": PROBE_CAPTURE_BUNDLE_SCHEMA,
+        "members": [{
+            "ordinal": index,
+            "construction_probe": {
+                "path": maximum_path, "raw_sha256": "f" * 64,
+                "allocator": "x" * 96, "binary_sha256": "f" * 64,
+            },
+            "capture_receipt": {
+                "path": maximum_path, "raw_sha256": "f" * 64,
+                "receipt_sha256": "f" * 64,
+            },
+            "capacity_bundle": capacity_bundle,
+        } for index in range(2)],
+    }
+    payloads = [
+        {"overlay_pin": maximum_pin},
+        {
+            "schema": PRESSURE_HELPER_PAYLOAD_SCHEMA_V2,
+            "recipe_pin": maximum_pin, "output_root": maximum_path,
+            "probe_capture_bundle": probe_bundle,
+            "host_receipt_path": maximum_path,
+        },
+        {
+            "materials_index": maximum_pin, "output_root": maximum_path,
+            "prepared_host_binding_sha256": "f" * 64,
+        },
+    ]
+    prerequisite_count = {
+        "exploration": 0, "aa": 1, "confirmation": 2,
+        "pressure": 1, "soak": 1,
+    }[phase]
+    prerequisites = [{
+        "phase": "x" * 96, "analysis": maximum_pin,
+        "analysis_sha256": "f" * 64, "event_head": "f" * 64,
+    } for _ in range(prerequisite_count)]
+    body = {
+        "schema": HELPER_INPUT_SCHEMA, "scope": "x" * 96,
+        "campaign_id": "x" * 96, "host_id": "x" * 96,
+        "phase": phase, "job_index": (1 << 64) - 1,
+        "job": job, "job_sha256": "f" * 64,
+        "members": descriptors,
+        "helper": {
+            "path": maximum_path, "sha256": "f" * 64,
+            "entrypoint": "x" * 128,
+        },
+        # Pressure has the largest nested payload and two-member bundle.
+        "payload": max(payloads, key=lambda item: len(canonical_bytes(item))),
+        "prerequisites": prerequisites,
+        "outer_deadline_seconds": (1 << 64) - 1,
+        "effective_timeout_seconds": (1 << 64) - 1,
+    }
+    value = {
+        **body, "input_snapshot_sha256": "f" * 64,
+        "qualification_eligible": False,
+    }
+    return len(canonical_bytes(value))
+
+
+def _source5_original_pins_for_context(
+    context: CampaignContext,
+) -> dict[str, Any]:
+    """Rebuild chronology's exact common pin body from the prepared context."""
+    if type(context.journal_width_original_pins) is dict:
+        return context.journal_width_original_pins
+    observed, _raw, observed_sha = read_json(
+        Path(context.observed_host_pin["path"]),
+        "Source5 journal-width observed-host input", MAX_ARTIFACT_BYTES,
+        context.observed_host_pin["raw_sha256"],
+    )
+    require(observed_sha == context.observed_host_pin["raw_sha256"] and
+            type(observed.get("controls")) is dict and
+            type(observed.get("cpu_affinity")) is list and
+            type(observed.get("network_namespace_inode")) is int,
+            "Source5 journal-width observed-host input is malformed")
+    source_manifests = []
+    for selected_host in context.manifest["hosts"]:
+        source = context.sources[selected_host]
+        pin = context.source_manifest_pins[selected_host]
+        source_manifests.append({
+            "host_id": selected_host, "path": pin["path"],
+            "raw_sha256": pin["raw_sha256"],
+            "semantic_sha256": source["manifest_sha256"],
+            "source_tree_sha256": source["source"]["source_tree_sha256"],
+        })
+    selected_modules = context.manifest["modules"][context.host_id]
+    chronology = context.chronology
+    captured = []
+    for role, relative in (
+        ("campaign_controller", "scripts/application-campaign.py"),
+        ("campaign_inputs", "scripts/application-campaign-inputs.py"),
+        ("feedback_reader", "scripts/application-feedback-readback.py"),
+        ("capacity_producer", "scripts/application-byte-capacity.py"),
+    ):
+        module_pin = exact(
+            selected_modules[relative], {"path", "sha256"},
+            f"Source5 journal-width {role} module pin",
+        )
+        captured.append({
+            "role": role, "path": relative, "sha256": module_pin["sha256"],
+        })
+    result = {
+        "schema": chronology.CHRONOLOGY_SCHEMA,
+        "campaign_id": context.manifest["campaign_id"],
+        "host_id": context.host_id,
+        "spec": {
+            "path": context.spec_pin["path"],
+            "raw_sha256": context.spec_pin["raw_sha256"],
+            "semantic_sha256": context.spec_semantic_sha256,
+        },
+        "plan": {
+            "path": context.plan_pin["path"],
+            "raw_sha256": context.plan_pin["raw_sha256"],
+            "semantic_sha256": context.plan_semantic_sha256,
+        },
+        "source_manifests": source_manifests,
+        "observed_host": {
+            "path": context.observed_host_pin["path"],
+            "raw_sha256": observed_sha,
+            "boot_id_sha256": observed["boot_id_sha256"],
+            "controls_sha256": observed["controls_sha256"],
+            "controls": observed["controls"],
+            "cpu_affinity": observed["cpu_affinity"],
+            "network_namespace_inode": observed["network_namespace_inode"],
+        },
+        "capacity_stage": {
+            "path": chronology.CAPACITY_STAGE_SOURCE_PATH,
+            "sha256": selected_modules[
+                chronology.CAPACITY_STAGE_SOURCE_PATH
+            ]["sha256"],
+        },
+        "chronology_module": {
+            "path": chronology.CHRONOLOGY_SOURCE_PATH,
+            "sha256": selected_modules[
+                chronology.CHRONOLOGY_SOURCE_PATH
+            ]["sha256"],
+        },
+        "pair_runner": {
+            "path": chronology.PAIR_RUNNER_SOURCE_PATH,
+            "sha256": selected_modules[
+                chronology.PAIR_RUNNER_SOURCE_PATH
+            ]["sha256"],
+        },
+        "captured_modules": captured,
+    }
+    validator = getattr(chronology, "_validate_chronology_original_pins", None)
+    require(callable(validator),
+            "pinned chronology lacks its exact original-pin validator")
+    try:
+        validator(result)
+    except Exception as error:
+        raise Source5CampaignError(
+            f"Source5 journal-width original pins differ from chronology: {error}",
+        ) from error
+    context.journal_width_original_pins = result
+    context.journal_width_observed_host = observed
+    return result
+
+
+def _source5_journal_sequence_base(
+    context: CampaignContext, phase: str,
+) -> int:
+    """Return the first sequence number for a phase's first original job."""
+    base = 2  # registration is event 1; the first job follows it
+    for prior_phase in ("exploration", "aa", "confirmation", "pressure", "soak"):
+        if prior_phase == phase:
+            return base
+        prior_jobs = _source5_journal_jobs(context, prior_phase)
+        base += len(prior_jobs) * (4 if prior_phase == "soak" else 6)
+        base += 1  # that phase's one source5_analysis event
+    raise Source5CampaignError(
+        f"Source5 journal-width phase is outside the original order: {phase}",
+    )
+
+
+def _source5_journal_jobs(
+    context: CampaignContext, phase: str,
+) -> list[dict[str, Any]]:
+    if type(context.journal_width_jobs) is not dict:
+        context.journal_width_jobs = {
+            name: _host_jobs(context, name)
+            for name in ("exploration", "aa", "confirmation", "pressure", "soak")
+        }
+    require(phase in context.journal_width_jobs,
+            "Source5 journal-width projection references an unknown original phase")
+    return context.journal_width_jobs[phase]
+
+
+def _source5_journal_event_line_bytes(
+    context: CampaignContext, original_pins: dict[str, Any],
+    event: str, details: dict[str, Any], sequence: int,
+) -> int:
+    maximum = (1 << 64) - 1
+    record = {
+        "schema": context.chronology.JOURNAL_SCHEMA,
+        "sequence": sequence,
+        "monotonic_ns": maximum,
+        "campaign_id": context.manifest["campaign_id"],
+        "host_id": context.host_id,
+        "boot_id_sha256": original_pins["observed_host"]["boot_id_sha256"],
+        "original_pins": original_pins,
+        "event": event,
+        "details": details,
+    }
+    envelope = {
+        "previous_sha256": "f" * 64,
+        "record": record,
+        "record_sha256": "f" * 64,
+    }
+    return len(canonical_bytes(envelope))
+
+
+def _source5_journal_prepared_tmpdir_budget(
+    context: CampaignContext,
+) -> dict[str, Any]:
+    if type(context.journal_width_tmpdir_budget) is dict:
+        return context.journal_width_tmpdir_budget
+    completion = (context.preparatory_capacity_generation
+                  if context.scope == PREPARATORY_SCOPE else
+                  context.prepared_input_completion)
+    require(type(completion) is dict and
+            type(completion.get("resource_budgets")) is dict,
+            "Source5 journal-width projection lacks the bounded TMP budget map")
+    pin = exact(
+        completion["resource_budgets"].get(context.host_id),
+        {"path", "raw_sha256", "semantic_sha256"},
+        "Source5 journal-width prepared TMP budget pin",
+    )
+    value, _raw, _sha = read_json(
+        Path(pin["path"]), "Source5 journal-width prepared TMP budget",
+        MAX_ARTIFACT_BYTES, pin["raw_sha256"],
+    )
+    require(value.get("resource_budget_sha256") == pin["semantic_sha256"] and
+            value["resource_budget_sha256"] == sha256(canonical_bytes({
+                key: item for key, item in value.items()
+                if key != "resource_budget_sha256"
+            })), "Source5 journal-width prepared TMP budget semantic pin differs")
+    ceilings = value.get("ceilings")
+    require(type(ceilings) is dict,
+            "Source5 journal-width prepared TMP budget omits exact ceilings")
+    result = {
+        "resource_budget_pin": pin,
+        "maximum_tmpdir_bytes": ceilings["maximum_tmpdir_bytes"],
+        "maximum_tmpdir_inodes": ceilings["maximum_tmpdir_inodes"],
+    }
+    context.journal_width_tmpdir_budget = result
+    return result
+
+
+def _source5_journal_fixed_members(
+    context: CampaignContext, phase: str, job: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Project the fixed owner's exact start-proof paths without launching or writing."""
+    descriptors = context.fixed_pair._member_descriptors(job, context.campaign)
+    bindings = context.plan["runtime_process_bindings"].get(job["run_id"])
+    require(type(bindings) is list and len(bindings) == 2,
+            "Source5 journal-width fixed job lost its two original runtime bindings")
+    binding_map = {
+        (item["pair"], item["executor"], item["allocator"]): item
+        for item in bindings
+    }
+    observed = context.journal_width_observed_host
+    if type(observed) is not dict:
+        _source5_original_pins_for_context(context)
+        observed = context.journal_width_observed_host
+    require(type(observed) is dict,
+            "Source5 journal-width fixed observed host is unavailable")
+    root = (context.artifact_root / context.manifest["campaign_id"] /
+            "source5" / context.host_id / "job-artifacts" / phase /
+            job["run_id"])
+    source_root = context.source_root
+    artifacts_root = Path(
+        context.manifest["original_inputs"]["campaign_artifacts_root"],
+    )
+    members = []
+    for index, descriptor in enumerate(descriptors):
+        binding = binding_map.get((descriptor["pair"], descriptor["executor"],
+                                   descriptor["allocator"]))
+        require(type(binding) is dict,
+                "Source5 journal-width fixed member lacks its exact Plan binding")
+        binary_pin = exact(
+            context.source["artifacts"][descriptor["allocator"]],
+            {"path", "sha256"}, "Source5 journal-width fixed binary pin",
+        )
+        binary_path = _safe_child(
+            source_root, binary_pin["path"], "Source5 journal-width fixed binary",
+        )
+        stem = f"{descriptor['pair']}-{descriptor['executor']}"
+        slug = (f"{index:02d}-{descriptor['pair']}-{descriptor['executor']}-"
+                f"{descriptor['allocator']}")
+        outputs = {
+            "root": str(root),
+            "stdout": str(root / f"{stem}.stdout.tsv"),
+            "stderr": str(root / f"{stem}.stderr.txt"),
+            "time_report": str(root / f"{stem}.direct-time.json"),
+            "ids": str(root / f"{stem}.ids.tsv"),
+            "shutdown": str(root / f"{stem}.shutdown.tsv"),
+            "capacity_families": str(root / f"{stem}.capacity-families.tsv"),
+            "runtime_readback": str(root / f"{stem}.runtime.tsv"),
+            "runtime_expectation": str(root / f"{stem}.runtime-expectation.json"),
+            "runtime_validation": str(root / f"{stem}.runtime-validation.json"),
+            "probe_stdout": str(root / "probes" / f"{slug}.stdout.json"),
+            "probe_stderr": str(root / "probes" / f"{slug}.stderr.txt"),
+            "probe_replay_stdout": str(root / "probes" /
+                                         f"{slug}.replay.stdout.json"),
+            "probe_replay_stderr": str(root / "probes" /
+                                        f"{slug}.replay.stderr.txt"),
+            "tmpdir": str(root / "tmp" / slug),
+            "probe_tmpdir": str(root / "probes" / "tmp" / slug),
+        }
+        oracle_entry = context.fixed_pair._member_oracle(
+            job, descriptor["allocator"],
+        )
+        oracle_path = None
+        oracle_sha = None
+        if oracle_entry is not None:
+            relative = PurePosixPath(oracle_entry["relative_path"])
+            require(not relative.is_absolute() and ".." not in relative.parts,
+                    "Source5 journal-width original oracle path is not portable")
+            oracle_path = artifacts_root.joinpath(*relative.parts)
+            oracle_sha = oracle_entry["sha256"]
+        environment = context.fixed_pair._derive_expected_environment(
+            job, descriptor, binding, context.source,
+            Path(outputs["tmpdir"]), outputs, oracle_path, oracle_sha,
+        )
+        argv = context.fixed_pair._member_argv(
+            job, descriptor, binary_path, context.spec["deadlines"],
+        )
+        members.append({
+            "ordinal": index,
+            "descriptor": descriptor,
+            "binary": {"path": str(binary_path),
+                       "sha256": binary_pin["sha256"]},
+            "argv": argv,
+            "environment": environment,
+            "cwd": str(source_root),
+            "tmpdir": {"path": outputs["tmpdir"]},
+            "affinity": {"cpus": observed["cpu_affinity"]},
+            "network_namespace_inode": observed["network_namespace_inode"],
+        })
+    return members
+
+
+def _source5_journal_authorization_details(
+    context: CampaignContext, phase: str, job_index: int,
+    job: dict[str, Any], original_pins: dict[str, Any],
+    fixed_members: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    modules = context.manifest["modules"][context.host_id]
+    if phase in {"exploration", "aa", "confirmation"}:
+        helper_path = "scripts/application-fixed-pair.py"
+        entrypoint = "run_fixed_pair_overlay"
+        projected_members = (
+            fixed_members if fixed_members is not None else
+            _source5_journal_fixed_members(context, phase, job)
+        )
+        members = [item["descriptor"] for item in projected_members]
+        output_root = (context.artifact_root / context.manifest["campaign_id"] /
+                       "source5" / context.host_id / "job-artifacts" /
+                       phase / job["run_id"])
+    elif phase == "pressure":
+        helper_path = "scripts/application-pressure-pair.py"
+        entrypoint = "run_pressure_pair_locked"
+        members = context.pressure_pair.pressure_process_descriptors(job)
+        output_root = (context.artifact_root / context.manifest["campaign_id"] /
+                       "source5" / context.host_id / "job-artifacts" /
+                       "pressure" / job["run_id"])
+    elif phase == "soak":
+        helper_path = "scripts/application-source5-soak.py"
+        entrypoint = "run_source5_soak"
+        members = [context.modules[helper_path].soak_descriptor(job)]
+        output_root = (context.artifact_root / context.manifest["campaign_id"] /
+                       "source5" / context.host_id / "job-artifacts" /
+                       "soak" / job["run_id"])
+    else:
+        raise Source5CampaignError(
+            f"Source5 journal-width authorization phase is unsupported: {phase}",
+        )
+    helper_record = _inventory_record(context.source, helper_path)
+    helper_input_path = (context.artifact_root / context.manifest["campaign_id"] /
+                         "source5" / context.host_id / "helper-inputs" /
+                         f"{phase}-{job['run_id']}.json")
+    capacity = context.capacity_completion
+    prerequisites = []
+    required = {
+        "exploration": (), "aa": ("exploration",),
+        "confirmation": ("exploration", "aa"),
+        "pressure": ("fixed_analysis",), "soak": ("pressure_analysis",),
+    }[phase]
+    for predecessor in required:
+        source_phase = {
+            "fixed_analysis": "confirmation",
+            "pressure_analysis": "pressure",
+        }.get(predecessor, predecessor)
+        analysis_path = (context.artifact_root /
+                         context.manifest["campaign_id"] / "source5" /
+                         context.host_id / "phase-analysis" /
+                         f"{predecessor}.json")
+        prerequisites.append({
+            "phase": predecessor,
+            "analysis": {"path": str(analysis_path),
+                         "raw_sha256": "f" * 64},
+            "analysis_sha256": "f" * 64,
+            "event_head": "f" * 64,
+        })
+    maximum = (1 << 64) - 1
+    host_budget = None
+    tmpdir_budget = None
+    if (context.manifest["schema"] in BOUNDED_EXECUTION_SCHEMAS and
+            (context.manifest["schema"] == EXECUTION_SCHEMA_V4 or
+             context.manifest["schema"] == PREPARATORY_EXECUTION_SCHEMA or
+             context.journal_width_budget_pin is not None or
+             context.host_evidence_budget_pin is not None)):
+        budget_path = (context.artifact_root / context.manifest["campaign_id"] /
+                       "source5" / context.host_id / "evidence-budget" /
+                       ("host-evidence-budget-preparatory-v1.json"
+                        if context.manifest["schema"] == PREPARATORY_EXECUTION_SCHEMA else
+                        "host-evidence-budget-v3.json"))
+        pinned = (context.journal_width_budget_pin or
+                  context.preparatory_budget_pin or
+                  context.host_evidence_budget_pin or {
+                      "path": str(budget_path), "raw_sha256": "f" * 64,
+                      "semantic_sha256": "f" * 64,
+                  })
+        host_budget = {
+            "path": pinned["path"], "raw_sha256": pinned["raw_sha256"],
+            "semantic_sha256": pinned["semantic_sha256"],
+        }
+        tmpdir_budget = _source5_journal_prepared_tmpdir_budget(context)
+    details_base = {
+        "campaign_id": context.manifest["campaign_id"],
+        "host_id": context.host_id,
+        "phase": phase,
+        "job_index": job_index,
+        "job": job,
+        "job_sha256": sha256(canonical_bytes(job)),
+        "members": members,
+        "members_sha256": sha256(canonical_bytes(members)),
+        "execution_manifest": {
+            "path": context.manifest_pin["path"],
+            "raw_sha256": context.manifest_pin["raw_sha256"],
+        },
+        "helper_input": {"path": str(helper_input_path),
+                         "raw_sha256": "f" * 64},
+        "capacity_registration_head": capacity["registration_head"],
+        "capacity_completion": capacity["artifact"],
+        "capacity_ledger_raw_sha256": capacity["ledger_raw_sha256"],
+        "capacity_terminal_head": capacity["terminal_head"],
+        "capacity_schedule_sha256": capacity["schedule_sha256"],
+        "prerequisites": prerequisites,
+        "outer_deadline_seconds": context.spec["deadlines"].get(
+            "soak_outer_seconds" if phase == "soak" else "outer_seconds",
+        ),
+        "effective_timeout_seconds": context.spec["deadlines"].get(
+            "soak_outer_seconds" if phase == "soak" else "outer_seconds",
+        ),
+        "input_snapshot_sha256": "f" * 64,
+        "output_root": str(output_root),
+        "qualification_eligible": False,
+    }
+    if host_budget is not None:
+        details_base["host_evidence_budget"] = host_budget
+        details_base["tmpdir_budget"] = tmpdir_budget
+    details = {
+        **details_base,
+        "helper_module": helper_record,
+        "authorization_id": "source5-" +
+            sha256(canonical_bytes(details_base))[:48],
+    }
+    return details, members
+
+
+def _source5_fixed_clean_cleanup_template() -> dict[str, Any]:
+    maximum_pid = (1 << 31) - 1
+    return {
+        "leader_info": {"si_code": 1, "si_status": 255,
+                        "si_pid": maximum_pid},
+        "child_return_code": 255,
+        "timed_out": False, "artifact_budget_exceeded": False,
+        "received_signal": None,
+        "term_grace_seconds": 3.0, "kill_reap_seconds": 1.0,
+        "signals": [],
+        "leader_unreaped_during_group_signals": True,
+        "group_signal_after_leader_reap_count": 0,
+        "leader_reaped": True,
+        "remaining_session_members": [], "cleanup_errors": [],
+        "cleanup_status": "verified",
+    }
+
+
+def _source5_fixed_cleanup_failure_summary(
+    context: CampaignContext, disposition: str,
+) -> dict[str, Any]:
+    value = {
+        "schema": "allocatbelt.application-source5-cleanup-summary.v1",
+        "disposition": disposition,
+        "cleanup_sha256": "f" * 64,
+        "cleanup_status": ("retention_refused_over_quota"
+                           if disposition == "refused_over_quota" else
+                           "retention_refused_source_shape"
+                           if disposition == "refused_source_shape" else
+                           "not_started"),
+        "timed_out": False,
+        "artifact_budget_exceeded": False,
+        "received_signal": None,
+        "leader_reaped": False,
+        "leader_unreaped_during_group_signals": False,
+        "group_signal_after_leader_reap_count": MAX_SOURCE5_CLEANUP_SIGNAL_SNAPSHOTS,
+        "signal_count": MAX_SOURCE5_CLEANUP_SIGNAL_SNAPSHOTS,
+        "remaining_session_member_count": context.fixed_pair.MAX_PROC_ENTRIES,
+        "cleanup_error_count": MAX_SOURCE5_CLEANUP_ERROR_ENTRIES,
+    }
+    if disposition in {"refused_over_quota", "refused_source_shape"}:
+        value.update({
+            "cleanup_byte_count": (1 << 64) - 1,
+            "cleanup_quota_bytes": 393_385_220,
+            "raw_cleanup_retained": False,
+            "cleanup_verified": False,
+            "owner_cleanup_status": "not_started",
+            "refusal_reason": (
+                "cleanup_source_shape_exceeded"
+                if disposition == "refused_source_shape" else
+                "cleanup_raw_bytes_exceeded"
+            ),
+        })
+        if disposition == "refused_source_shape":
+            value["cleanup_status"] = "retention_refused_source_shape"
+    return value
+
+
+def source5_cleanup_sidecar_source_byte_bound(
+    context: CampaignContext,
+) -> int:
+    """Derive the full raw fixed-cleanup object bound from owner constructors.
+
+    `_session_members` can retain the complete accepted `/proc` inventory in
+    each signal snapshot; no single-process assumption is made. The five signal
+    snapshots and bounded cleanup-error count follow the exact fixed-owner
+    control flow. Every diagnostic is limited by the v4 chronology admission
+    check to the declared 8192-byte UTF-8 bound. The admission quota is
+    deliberately a separate retention-policy value.
+    """
+    if type(context.journal_width_cleanup_source_bytes) is int:
+        return context.journal_width_cleanup_source_bytes
+    fixed = context.fixed_pair
+    poll_interval = 0.01  # exact `_wait_for_process_group` sleep literal
+    normal_polls = int((fixed.TERM_GRACE_SECONDS + fixed.KILL_REAP_SECONDS) /
+                       poll_interval) + 4
+    emergency_polls = int(fixed.KILL_REAP_SECONDS / poll_interval) + 4
+    error_count = 3 * normal_polls + emergency_polls + 32
+    max_u64 = (1 << 64) - 1
+    max_pid = (1 << 31) - 1
+    member_count = fixed.MAX_PROC_ENTRIES
+    session_member = {
+        "pid": max_pid, "state": "Z", "parent_pid": max_pid,
+        "process_group": max_pid, "session_id": max_pid,
+        "start_ticks": max_u64,
+    }
+    pidfd_signal = {
+        "pid": max_pid, "start_ticks": max_u64,
+        "signal": 255, "sent": False,
+    }
+    error_text = "\x01" * MAX_SOURCE5_CLEANUP_ERROR_TEXT_BYTES
+    array_width = lambda item_bytes, count: (
+        2 + item_bytes * count + max(0, count - 1)
+    )
+    signal_count = MAX_SOURCE5_CLEANUP_SIGNAL_SNAPSHOTS
+    signal_row = {
+        "group_signal": {
+            "signal": 255, "leader_pid": max_pid,
+            "leader_start_ticks": max_u64, "leader_unreaped": True,
+        },
+        "group_error": error_text,
+        "pidfd_signals": [],
+        "scan_error": error_text,
+        "members": [],
+    }
+    signal_row_bytes = len(canonical_bytes(signal_row)) - 1
+    signal_row_bytes += (
+        array_width(len(canonical_bytes(pidfd_signal)) - 1, member_count) - 2
+    )
+    signal_row_bytes += (
+        array_width(len(canonical_bytes(session_member)) - 1,
+                    member_count) - 2
+    )
+    signal_rows_bytes = array_width(signal_row_bytes, signal_count)
+    cleanup = {
+        "leader_info": {"si_code": 255, "si_status": 255,
+                        "si_pid": max_pid},
+        "child_return_code": -255,
+        "timed_out": False, "artifact_budget_exceeded": False,
+        "received_signal": None,
+        "term_grace_seconds": fixed.TERM_GRACE_SECONDS,
+        "kill_reap_seconds": fixed.KILL_REAP_SECONDS,
+        "signals": [],
+        "leader_unreaped_during_group_signals": False,
+        "group_signal_after_leader_reap_count": signal_count,
+        "leader_reaped": False,
+        "remaining_session_members": [],
+        "cleanup_errors": [],
+        "cleanup_status": "not_started",
+    }
+    result = len(canonical_bytes(cleanup)) - 1
+    result += signal_rows_bytes - 2
+    result += array_width(len(canonical_bytes(session_member)) - 1,
+                          member_count) - 2
+    result += array_width(len(canonical_bytes(error_text)) - 1,
+                          MAX_SOURCE5_CLEANUP_ERROR_ENTRIES) - 2
+    result += 1  # canonical newline
+    require(error_count == MAX_SOURCE5_CLEANUP_ERROR_ENTRIES and
+            result == 393_385_220,
+            "Source5 fixed cleanup raw-width derivation changed its pinned formula")
+    context.journal_width_cleanup_source_bytes = result
+    return result
+
+
+def _source5_journal_callback_member_events(
+    context: CampaignContext, phase: str, job: dict[str, Any],
+    job_index: int, member_index: int, descriptor: dict[str, str],
+    fixed_member: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any],
+           dict[str, Any], dict[str, Any]]:
+    """Build exact owner callback event shapes with maximum-width numeric leaves."""
+    max_u64 = (1 << 64) - 1
+    max_pid = (1 << 31) - 1
+    campaign_id = context.manifest["campaign_id"]
+    host_id = context.host_id
+    run_id = job["run_id"]
+    if fixed_member is not None:
+        fixed = context.fixed_pair
+        proof = {
+            "schema": fixed.APP_STARTED_SCHEMA,
+            "role": "fixed_application_member",
+            "pid": max_pid, "start_ticks": max_u64,
+            "executable_path": fixed_member["binary"]["path"],
+            "executable_sha256": fixed_member["binary"]["sha256"],
+            "executable_device": max_u64,
+            "executable_inode": max_u64,
+            "executable_size": max_u64,
+            "requested_argv": fixed_member["argv"],
+            "requested_argv_sha256": "f" * 64,
+            "executed_argv": fixed_member["argv"],
+            "executed_argv_sha256": "f" * 64,
+            "environment": fixed_member["environment"],
+            "environment_sha256": "f" * 64,
+            "cwd": fixed_member["cwd"],
+            "tmpdir": fixed_member["tmpdir"]["path"],
+            "cpu_affinity": fixed_member["affinity"]["cpus"],
+            "network_namespace_inode": max_u64,
+            "identity_sha256": "f" * 64,
+        }
+        start_event = {
+            "schema": fixed.APP_STARTED_SCHEMA,
+            "overlay_sha256": "f" * 64,
+            "campaign_id": campaign_id, "host_id": host_id,
+            "run_id": run_id, "member_ordinal": member_index,
+            "descriptor": descriptor,
+            "role": "fixed_application_member", "proof": proof,
+        }
+        success_cleanup = _source5_fixed_clean_cleanup_template()
+        success_terminal = {
+            "schema": fixed.APP_TERMINAL_SCHEMA,
+            "overlay_sha256": "f" * 64,
+            "campaign_id": campaign_id, "host_id": host_id,
+            "run_id": run_id, "member_ordinal": member_index,
+            "descriptor": descriptor, "pid": max_pid,
+            "status": 255, "child_return_code": -255, "signal": 255,
+            "cleanup": success_cleanup,
+            "cleanup_sidecar": None,
+            "terminal_monotonic_ns": max_u64,
+        }
+        sidecar_path = str(
+            context.output_root / campaign_id / "source5" / host_id /
+            phase / "cleanup-sidecars" /
+            f"{job['ordinal']:06d}-{sha256(canonical_bytes(job))}-"
+            f"member{member_index}.json",
+        )
+        failed_terminal = {
+            **success_terminal,
+            "cleanup": _source5_fixed_cleanup_failure_summary(
+                context, "sidecar",
+            ),
+            "cleanup_sidecar": {
+                "path": sidecar_path,
+                "raw_sha256": "f" * 64,
+                "byte_count":
+                    source5_cleanup_sidecar_source_byte_bound(context),
+            },
+        }
+        refusal_path = sidecar_path + ".refusal.json"
+        refusal_terminal = {
+            **success_terminal,
+            "cleanup": _source5_fixed_cleanup_failure_summary(
+                context, "refused_source_shape",
+            ),
+            "cleanup_sidecar": {
+                "path": refusal_path,
+                "raw_sha256": "f" * 64,
+                "byte_count": 65_536,
+            },
+        }
+        return (start_event, success_terminal, failed_terminal,
+                refusal_terminal, success_cleanup)
+    if phase == "pressure":
+        start_event = {
+            "schema": "allocatbelt.application-source5-pressure-app-start.v1",
+            "campaign_id": campaign_id, "host_id": host_id,
+            "run_id": run_id, "member_ordinal": member_index,
+            "descriptor": descriptor,
+            "proof": {"pid": max_pid, "start_ticks": max_u64,
+                      "attestation_sha256": "f" * 64},
+        }
+        cleanup = {
+            "schema": "allocatbelt.application-soak-process-cleanup.v1",
+            "status": "verified", "pid": max_pid,
+            "return_code": -255, "received_signal": None,
+            "cleanup_error": "\x01" * MAX_SOURCE5_CLEANUP_ERROR_TEXT_BYTES,
+        }
+        terminal = {
+            "schema": "allocatbelt.application-source5-pressure-app-terminal.v1",
+            "campaign_id": campaign_id, "host_id": host_id,
+            "run_id": run_id, "member_ordinal": member_index,
+            "descriptor": descriptor, "pid": max_pid, "status": 255,
+            "child_return_code": -255, "signal": 255,
+            "cleanup": cleanup, "cleanup_sidecar": None,
+            "terminal_monotonic_ns": max_u64,
+        }
+        return start_event, terminal, terminal, terminal, cleanup
+    soak = context.modules["scripts/application-source5-soak.py"]
+    soak_readback = context.modules["scripts/application-soak-readback.py"]
+    material = context.journal_width_soak_materials
+    recipe = material.get("parent_recipe_value") if type(material) is dict else None
+    resource_budget = (material.get("resource_budget_value")
+                       if type(material) is dict else None)
+    layout = (resource_budget.get("layout")
+              if type(resource_budget) is dict else None)
+    require(type(recipe) is dict and type(layout) is dict,
+            "Source5 Soak journal-width projection lacks its exact material/budget inputs")
+    output_path = layout["output_root"]
+    tmpdir_path = layout["application_tmpdir"]
+    identity = recipe["identity"]
+    ring_path = recipe["oracle"]["ring_path"]
+    ring_sha = recipe["oracle"]["ring_sha256"]
+    binary_ref = context.source["soak_artifacts"][job["allocator"]]
+    binary_path = str(_safe_child(context.source_root, binary_ref["path"],
+                                  "Source5 Soak journal-width binary"))
+    duration = str(recipe["runtime"]["duration_seconds"])
+    sample_interval = str(recipe["runtime"]["sample_interval_ms"])
+    argv = [
+        binary_path, "--executor", "bounded", "--workload", "mixed",
+        "--profile", job["profile"], "--duration-seconds", duration,
+        "--sample-interval-ms", sample_interval,
+        "--resource-ceiling-sha256", identity["resource_ceiling_sha256"],
+        "--reference-ring", ring_path,
+        "--reference-ring-sha256", ring_sha,
+        "--output-dir", output_path,
+    ]
+    launch_attestation = {
+        "schema": "allocatbelt.application-pressure-app-launch-attestation.v1",
+        "execution_kind": "timed_soak",
+        "process": {
+            "pid": max_pid, "start_ticks": max_u64,
+            "executable_path": binary_path,
+            "executable_sha256": binary_ref["sha256"],
+            "executable_device": max_u64, "executable_inode": max_u64,
+            "executable_size": max_u64,
+            "executable_fd_reference": "/proc/self/fd/" + "9" * 20,
+            "cwd": tmpdir_path, "argv": argv, "argv_sha256": "f" * 64,
+            "cmdline_raw_sha256": "f" * 64,
+            "environment_sha256": "f" * 64,
+            "environment_raw_sha256": "f" * 64,
+        },
+        "attestation_sha256": "f" * 64,
+    }
+    start_event = {
+        "campaign_id": campaign_id, "host_id": host_id,
+        "run_id": run_id, "descriptor": descriptor,
+        "member_ordinal": 0,
+        "proof": {"pid": max_pid, "start_ticks": max_u64,
+                  "launch_attestation": launch_attestation},
+    }
+    app_cleanup = {
+        "schema": "allocatbelt.application-soak-process-cleanup.v1",
+        "status": "verified", "pid": max_pid,
+        "return_code": -255, "received_signal": None,
+        "cleanup_error": "\x01" * MAX_SOURCE5_CLEANUP_ERROR_TEXT_BYTES,
+    }
+    terminal_cleanup = {
+        "status": "verified", "application_cleanup": app_cleanup,
+        "pressure_cleanup": "verified",
+    }
+    terminal_event = {
+        "campaign_id": campaign_id, "host_id": host_id,
+        "run_id": run_id, "descriptor": descriptor,
+        "member_ordinal": 0, "pid": max_pid, "status": 255,
+        "child_return_code": -255, "signal": 255,
+        "cleanup": terminal_cleanup, "cleanup_sidecar": None,
+        "terminal_monotonic_ns": max_u64,
+    }
+    require(soak is not None and soak_readback is not None,
+            "Source5 Soak journal-width modules are unavailable")
+    return (start_event, terminal_event, terminal_event, terminal_event,
+            terminal_cleanup)
+
+
+def source5_journal_width_projection(
+    context: CampaignContext, phase: str, job_index: int,
+    job: dict[str, Any],
+) -> dict[str, Any]:
+    """Return one source-pinned maximum callback-width row for an original job."""
+    require(context.manifest["schema"] in BOUNDED_EXECUTION_SCHEMAS and
+            (context.manifest["schema"] == EXECUTION_SCHEMA_V4 or
+             context.manifest["schema"] == PREPARATORY_EXECUTION_SCHEMA or
+             context.journal_width_budget_pin is not None) and
+            phase in {"exploration", "aa", "confirmation", "pressure", "soak"},
+            "Source5 journal-width projection requires one original prepared phase")
+    jobs = _source5_journal_jobs(context, phase)
+    require(type(job_index) is int and 0 <= job_index < len(jobs) and
+            jobs[job_index] == job,
+            "Source5 journal-width projection job/index differs from the original filtered Plan order")
+    original_pins = _source5_original_pins_for_context(context)
+    fixed_members = (
+        _source5_journal_fixed_members(context, phase, job)
+        if phase in {"exploration", "aa", "confirmation"} else None
+    )
+    authorization, descriptors = _source5_journal_authorization_details(
+        context, phase, job_index, job, original_pins, fixed_members,
+    )
+    member_count = len(descriptors)
+    require(member_count == (1 if phase == "soak" else 2),
+            "Source5 journal-width projection changed its original member count")
+    member_templates = []
+    member_sources = (fixed_members if fixed_members is not None else
+                      [None] * member_count)
+    for member_index, descriptor in enumerate(descriptors):
+        member_templates.append(_source5_journal_callback_member_events(
+            context, phase, job, job_index, member_index, descriptor,
+            member_sources[member_index],
+        ))
+    job_sha = sha256(canonical_bytes(job))
+    job_event_count = 4 if phase == "soak" else 6
+    phase_sequence_base = _source5_journal_sequence_base(context, phase)
+    first_sequence = phase_sequence_base + job_index * job_event_count
+    successful_widths: dict[str, int] = {}
+    failed_widths: dict[str, int] = {}
+    def width(event: str, details: dict[str, Any], offset: int) -> int:
+        return _source5_journal_event_line_bytes(
+            context, original_pins, event, details, first_sequence + offset,
+        )
+    auth_width = width("source5_authorized", authorization, 0)
+    member_start_widths = []
+    member_terminal_widths = []
+    member_failed_terminal_widths = []
+    for member_index, (start_event, terminal_event, failed_terminal,
+                       refusal_terminal, _cleanup) in enumerate(
+        member_templates,
+    ):
+        start_details = {
+            "authorization_id": authorization["authorization_id"],
+            "member_index": member_index,
+            "descriptor": descriptors[member_index],
+            "pid": (1 << 31) - 1,
+            "start_ticks": (1 << 64) - 1,
+            "proof_sha256": "f" * 64,
+            "proof": start_event,
+            "qualification_eligible": False,
+        }
+        start_offset = 1 + member_index
+        member_start_widths.append(width(
+            "source5_app_started", start_details, start_offset,
+        ))
+        terminal_details = {
+            "authorization_id": authorization["authorization_id"],
+            "member_index": member_index,
+            "descriptor": descriptors[member_index],
+            "pid": (1 << 31) - 1,
+            "status": 255,
+            "child_return_code": -255,
+            "signal": 255,
+            "cleanup": terminal_event["cleanup"],
+            "cleanup_sidecar": terminal_event["cleanup_sidecar"],
+            "terminal_monotonic_ns": (1 << 64) - 1,
+            "qualification_eligible": False,
+        }
+        terminal_offset = 1 + member_count + member_index
+        member_terminal_widths.append(width(
+            "source5_app_terminal", terminal_details, terminal_offset,
+        ))
+        failed_details = dict(terminal_details)
+        failed_details["cleanup"] = failed_terminal["cleanup"]
+        failed_details["cleanup_sidecar"] = failed_terminal["cleanup_sidecar"]
+        failed_details["status"] = 125
+        failed_details["child_return_code"] = None
+        failed_details["signal"] = None
+        sidecar_width = width(
+            "source5_app_terminal", failed_details, terminal_offset,
+        )
+        refusal_details = dict(terminal_details)
+        refusal_details["cleanup"] = refusal_terminal["cleanup"]
+        refusal_details["cleanup_sidecar"] = refusal_terminal["cleanup_sidecar"]
+        refusal_details["status"] = 125
+        refusal_details["child_return_code"] = None
+        refusal_details["signal"] = None
+        refusal_width = width(
+            "source5_app_terminal", refusal_details, terminal_offset,
+        )
+        member_failed_terminal_widths.append(max(sidecar_width, refusal_width))
+    successful_job_terminal = {
+        "authorization_id": authorization["authorization_id"],
+        "state": "valid_soak" if phase == "soak" else "valid_pair",
+        "blocked_reason": None,
+        "component_sha256": "f" * 64,
+        "process_metrics_sha256": "f" * 64,
+        "started_count": member_count, "terminal_count": member_count,
+        "qualification_eligible": False,
+    }
+    failed_job_terminal = {
+        **successful_job_terminal,
+        "state": "blocked",
+        "blocked_reason": "deadline_watchdog_unverified",
+    }
+    job_terminal_offset = job_event_count - 1
+    success_terminal_width = width(
+        "source5_job_terminal", successful_job_terminal, job_terminal_offset,
+    )
+    failed_terminal_width = width(
+        "source5_job_terminal", failed_job_terminal, job_terminal_offset,
+    )
+    successful_widths.update({
+        "source5_authorized": auth_width,
+        "source5_app_started": max(member_start_widths),
+        "source5_app_terminal": max(member_terminal_widths),
+        "source5_job_terminal": success_terminal_width,
+    })
+    failed_widths.update({
+        "source5_authorized": auth_width,
+        "source5_app_started": max(member_start_widths),
+        "source5_app_terminal": max(member_failed_terminal_widths),
+        "source5_job_terminal": failed_terminal_width,
+    })
+    event_counts = {
+        "source5_authorized": 1,
+        "source5_app_started": member_count,
+        "source5_app_terminal": member_count,
+        "source5_job_terminal": 1,
+    }
+    success_bytes = sum(
+        event_counts[name] * successful_widths[name]
+        for name in SOURCE5_JOURNAL_EVENT_KINDS
+    )
+    failed_window_bytes = sum(
+        event_counts[name] * failed_widths[name]
+        for name in SOURCE5_JOURNAL_EVENT_KINDS
+    )
+    return {
+        "phase": phase, "job_index": job_index,
+        "ordinal": job["ordinal"], "run_id": job["run_id"],
+        "job_sha256": job_sha,
+        "event_counts": event_counts,
+        "maximum_event_bytes_by_kind": successful_widths,
+        "failed_event_counts": dict(event_counts),
+        "failed_event_bytes_by_kind": failed_widths,
+        "success_job_bytes": success_bytes,
+        "failed_window_bytes": failed_window_bytes,
+        "failed_event_count": sum(event_counts.values()),
+        "failed_event_count_uplift": 0,
+        "byte_uplift": max(0, failed_window_bytes - success_bytes),
+    }
+
+
+def _source5_journal_fixed_event_widths(
+    context: CampaignContext, original_pins: dict[str, Any],
+) -> list[dict[str, Any]]:
+    chronology = context.chronology
+    registration = context.manifest["prepared_capacity_registration"]
+    generation = context.manifest["prepared_input_generation"]
+    selected_rows = [row for row in context.prepared_input_completion[
+        "capacity_preparations"] if row.get("host_id") == context.host_id]
+    require(len(selected_rows) == 1,
+            "Source5 journal-width registration lacks its selected host row")
+    details = {
+        "campaign_id": context.manifest["campaign_id"],
+        "host_id": context.host_id,
+        "completion": generation["completion"],
+        "provenance": generation["provenance"],
+        "host_completion": registration["host_completion"],
+        "host_verification": registration["host_verification"],
+        "capacity_ledger": registration["ledger"],
+        "capacity_schedule_sha256": registration["capacity_schedule_sha256"],
+        "entries": selected_rows[0]["entries"],
+        "qualification_eligible": False,
+        "controller_chronology_proven": False,
+    }
+    result = [{
+        "event": "source5_prepared_capacity_registered",
+        "phase": "registration", "count": 1,
+        "maximum_line_bytes": _source5_journal_event_line_bytes(
+            context, original_pins,
+            "source5_prepared_capacity_registered", details, 1,
+        ),
+    }]
+    analysis_to_source_phase = {
+        "exploration": "exploration", "aa": "aa",
+        "fixed_analysis": "confirmation", "pressure_analysis": "pressure",
+        "soak": "soak", "final_analysis": "soak",
+    }
+    sequence = 1
+    for phase in ("exploration", "aa", "confirmation", "pressure", "soak"):
+        sequence += len(_source5_journal_jobs(context, phase)) * (4 if phase == "soak" else 6)
+        analysis_phase = {
+            "exploration": "exploration", "aa": "aa",
+            "confirmation": "fixed_analysis", "pressure": "pressure_analysis",
+            "soak": "soak",
+        }[phase]
+        source_phase = analysis_to_source_phase[analysis_phase]
+        jobs = _source5_journal_jobs(context, source_phase)
+        analysis_path = (context.artifact_root /
+                         context.manifest["campaign_id"] / "source5" /
+                         context.host_id / "phase-analysis" /
+                         f"{analysis_phase}.json")
+        details = {
+            "phase": analysis_phase,
+            "analysis": {"path": str(analysis_path),
+                         "raw_sha256": "f" * 64},
+            "analysis_sha256": "f" * 64,
+            "job_count": len(jobs),
+            "job_set_sha256": sha256(canonical_bytes(
+                [job["run_id"] for job in jobs],
+            )),
+            "job_evidence_complete": False,
+            "numeric_gates_passed": False,
+            "phase_gate_passed": False,
+            "campaign_qualification_eligible": False,
+        }
+        sequence += 1
+        result.append({
+            "event": "source5_analysis", "phase": analysis_phase,
+            "count": 1,
+            "maximum_line_bytes": _source5_journal_event_line_bytes(
+                context, original_pins, "source5_analysis", details, sequence,
+            ),
+        })
+    analysis_phase = "final_analysis"
+    jobs = _source5_journal_jobs(context, "soak")
+    analysis_path = (context.artifact_root /
+                     context.manifest["campaign_id"] / "source5" /
+                     context.host_id / "phase-analysis" /
+                     f"{analysis_phase}.json")
+    details = {
+        "phase": analysis_phase,
+        "analysis": {"path": str(analysis_path),
+                     "raw_sha256": "f" * 64},
+        "analysis_sha256": "f" * 64,
+        "job_count": len(jobs),
+        "job_set_sha256": sha256(canonical_bytes(
+            [job["run_id"] for job in jobs],
+        )),
+        "job_evidence_complete": False,
+        "numeric_gates_passed": False,
+        "phase_gate_passed": False,
+        "campaign_qualification_eligible": False,
+    }
+    sequence += 1
+    result.append({
+        "event": "source5_analysis", "phase": analysis_phase,
+        "count": 1,
+        "maximum_line_bytes": _source5_journal_event_line_bytes(
+            context, original_pins, "source5_analysis", details, sequence,
+        ),
+    })
+    require(len(result) == 1 + len(SOURCE5_ANALYSIS_EVENT_PHASES) and
+            {row["phase"] for row in result[1:]} ==
+                set(SOURCE5_ANALYSIS_EVENT_PHASES),
+            "Source5 journal-width fixed event identities changed")
+    return result
+
+
+def _source5_journal_width_owner_pins(
+    context: CampaignContext,
+) -> dict[str, dict[str, Any]]:
+    catalogue_pins = context.owner_evidence_contract.get("owner_source_pins")
+    catalogue_roles = {
+        "fixed_pair", "pressure_pair", "source5_controller", "source5_soak",
+        "soak_reader", "offline_dispatcher", "chronology",
+        "evidence_transport",
+    }
+    require(type(catalogue_pins) is dict and
+            set(catalogue_pins) == catalogue_roles,
+            "Source5 journal-width catalogue owner profile differs from the exact eight-role source closure")
+    catalogue_module = context.modules[EVIDENCE_CATALOGUE_SOURCE_PATH]
+    catalogue_paths = catalogue_module.OWNER_PATHS
+    require(type(catalogue_paths) is dict and
+            set(catalogue_paths) == catalogue_roles,
+            "Source5 journal-width catalogue role/path map differs from its selected source")
+    profile_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    budget_pins = profile_module._owner_schema_pins(context.source)
+    budget_roles = {
+        "fixed_pair", "pressure_pair", "source5_controller", "source5_soak",
+        "soak_reader", "feedback_composer", "feedback_reader",
+        "pressure_reader", "evidence_transport",
+    }
+    require(type(budget_pins) is dict and set(budget_pins) == budget_roles,
+            "Source5 journal-width budget owner profile differs from its exact nine-role source closure")
+    result: dict[str, dict[str, Any]] = {}
+    for role, row_value in catalogue_pins.items():
+        row = exact(row_value, {"path", "raw_sha256", "byte_count"},
+                    f"Source5 journal-width catalogue owner pin {role}")
+        require(type(row["path"]) is str and row["path"] and
+                row["path"] == catalogue_paths[role] and
+                is_sha(row["raw_sha256"]) and
+                type(row["byte_count"]) is int and row["byte_count"] > 0,
+                f"Source5 journal-width catalogue owner pin {role} is malformed")
+        result[role] = dict(row)
+    for role, row_value in budget_pins.items():
+        row = exact(row_value, {"path", "mode", "sha256", "size"},
+                    f"Source5 journal-width budget owner pin {role}")
+        normalized = {
+            "path": row["path"], "raw_sha256": row["sha256"],
+            "byte_count": row["size"],
+        }
+        require(type(normalized["path"]) is str and normalized["path"] and
+                is_sha(normalized["raw_sha256"]) and
+                type(normalized["byte_count"]) is int and
+                normalized["byte_count"] > 0 and
+                row["mode"] in {"100644", "100755"},
+                f"Source5 journal-width budget owner pin {role} is malformed")
+        prior = result.get(role)
+        require(prior is None or prior == normalized,
+                f"Source5 journal-width source modules disagree for shared owner role {role}")
+        result[role] = normalized
+    expected_roles = catalogue_roles | budget_roles
+    require(set(result) == expected_roles and len(result) == 11,
+            "Source5 journal-width owner union does not close over its eleven exact source roles")
+    source_files = context.source.get("source", {}).get("files")
+    require(type(source_files) is list,
+            "Source5 journal-width owner union lacks the selected typed Source inventory")
+    typed_by_path = {}
+    for index, value in enumerate(source_files):
+        require(type(value) is dict,
+                f"Source5 journal-width typed source row[{index}] is not an object")
+        typed_kind = value.get("kind")
+        typed_fields = ({"path", "kind", "mode", "sha256", "size"}
+                        if typed_kind == "file" else
+                        {"path", "kind", "mode", "sha256", "size", "target"}
+                        if typed_kind == "symlink" else set())
+        typed = exact(value, typed_fields,
+                      f"Source5 journal-width typed source row[{index}]")
+        require(typed["path"] not in typed_by_path,
+                "Source5 journal-width typed Source inventory repeats a path")
+        if typed_kind == "symlink":
+            require(type(typed["target"]) is str and
+                    typed["size"] == len(typed["target"].encode("utf-8")) and
+                    typed["mode"] == "120000",
+                    f"Source5 journal-width unrelated typed symlink row[{index}] is malformed")
+        typed_by_path[typed["path"]] = typed
+    for role, pin in result.items():
+        typed = typed_by_path.get(pin["path"])
+        require(type(typed) is dict and typed["kind"] == "file" and
+                typed["mode"] in {"100644", "100755"} and
+                typed["sha256"] == pin["raw_sha256"] and
+                typed["size"] == pin["byte_count"],
+                f"Source5 journal-width owner pin {role} differs from its selected typed Source bytes")
+    return {role: result[role] for role in sorted(result)}
+
+
+def build_source5_journal_width_contract(
+    context: CampaignContext, pressure_material_index: Path,
+    soak_material_index: Path, host_evidence_budget_path: Path,
+    output_path: Path | None,
+) -> dict[str, Any]:
+    """Seal the exact per-job callback widths before v4 measurement begins."""
+    require(context.scope == "final_frozen" and
+            context.prepared_input_completion is not None,
+            "Source5 journal-width contract requires a final prepared original cohort")
+    require(host_evidence_budget_path.is_absolute() and
+            (output_path is None or
+             (output_path.is_absolute() and output_path.parent.is_dir())),
+            "Source5 journal-width contract paths are not prepared absolute locations")
+    budget_directory = (context.artifact_root /
+                        context.manifest["campaign_id"] / "source5" /
+                        context.host_id / "evidence-budget")
+    budget_paths = {
+        budget_directory / "host-evidence-budget-v2.json",
+        budget_directory / "host-evidence-budget-v3.json",
+    }
+    require(host_evidence_budget_path in budget_paths,
+            "Source5 journal-width contract budget path differs from its exact v2/v3 role")
+    budget_pin = context.host_evidence_budget_pin or {
+        "path": str(host_evidence_budget_path),
+        "raw_sha256": "f" * 64, "semantic_sha256": "f" * 64,
+    }
+    context.journal_width_budget_pin = dict(budget_pin)
+    pressure_materials_path = pressure_material_index.resolve(strict=True)
+    pressure_index, pressure_index_raw, pressure_index_sha = read_json(
+        pressure_materials_path,
+        "Source5 journal-width pressure materials index",
+        MAX_MANIFEST_BYTES,
+    )
+    exact(pressure_index, {
+        "schema", "campaign_id", "host_id", "jobs", "manifest_sha256",
+    }, "Source5 journal-width pressure materials index")
+    pressure_jobs = _source5_journal_jobs(context, "pressure")
+    pressure_refs = exact(
+        pressure_index["jobs"], {job["run_id"] for job in pressure_jobs},
+        "Source5 journal-width pressure job material pins",
+    )
+    require(pressure_index["schema"] == PRESSURE_MATERIAL_INDEX_SCHEMA_V2 and
+            pressure_index["campaign_id"] == context.manifest["campaign_id"] and
+            pressure_index["host_id"] == context.host_id and
+            pressure_index["manifest_sha256"] == sha256(canonical_bytes({
+                key: value for key, value in pressure_index.items()
+                if key != "manifest_sha256"
+            })) and
+            all(Path(raw_pin(value, "Source5 journal-width pressure material pin")[
+                "path"]).is_relative_to(context.artifact_root)
+                for value in pressure_refs.values()),
+            "Source5 journal-width pressure materials index changed its exact original job/path closure")
+    require(pressure_index_raw == canonical_bytes(pressure_index) and
+            pressure_index_sha == sha256(pressure_index_raw),
+            "Source5 journal-width pressure materials index changed during validation")
+    soak_materials_raw, soak_materials_sha, _soak_info = read_stable(
+        soak_material_index.resolve(strict=True),
+        "Source5 journal-width Soak materials index", MAX_ARTIFACT_BYTES,
+    )
+    try:
+        soak_materials = json.loads(soak_materials_raw)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            "Source5 journal-width Soak materials index is malformed",
+        ) from error
+    require(type(soak_materials) is dict and
+            soak_materials_raw == canonical_bytes(soak_materials) and
+            soak_materials.get("job") == _source5_journal_jobs(context, "soak")[0] and
+            soak_materials.get("job_sha256") == sha256(canonical_bytes(
+                _source5_journal_jobs(context, "soak")[0],
+            )), "Source5 journal-width Soak materials changed its original ordinal")
+    soak_helper = context.modules["scripts/application-source5-soak.py"]
+    binding = soak_helper._selected_prepared_host_binding(
+        context.prepared_input_completion, context.host_id,
+    )
+    soak_materials = soak_helper.validate_material_index(
+        soak_materials, context.manifest["campaign_id"], context.host_id,
+        _source5_journal_jobs(context, "soak")[0], binding["binding_sha256"],
+    )
+    soak_resource_budget, _soak_budget_pin = \
+        soak_helper._read_resource_budget_pin(soak_materials["resource_budget"])
+    parent_pin = raw_pin(soak_materials["parent_recipe"],
+                         "Source5 journal-width Soak parent recipe")
+    parent_recipe, _parent_raw, _parent_sha = read_json(
+        Path(parent_pin["path"]), "Source5 journal-width Soak parent recipe",
+        soak_helper.MAX_RECIPE_BYTES, parent_pin["raw_sha256"],
+    )
+    context.journal_width_soak_materials = {
+        "path": str(soak_material_index.resolve(strict=True)),
+        "raw_sha256": soak_materials_sha,
+        "value": soak_materials,
+        "parent_recipe_value": parent_recipe,
+        "resource_budget_value": soak_resource_budget,
+    }
+    original_pins = _source5_original_pins_for_context(context)
+    original_pins_sha = sha256(canonical_bytes(original_pins))
+    owner_pins = _source5_journal_width_owner_pins(context)
+    rows = []
+    phase_totals = []
+    success_total_event_count = 0
+    success_total_event_bytes = 0
+    failure_winner: dict[str, Any] | None = None
+    for phase in ("exploration", "aa", "confirmation", "pressure", "soak"):
+        jobs = _source5_journal_jobs(context, phase)
+        phase_event_count = 0
+        phase_event_bytes = 0
+        for job_index, job in enumerate(jobs):
+            row = source5_journal_width_projection(
+                context, phase, job_index, job,
+            )
+            phase_event_count += sum(row["event_counts"].values())
+            phase_event_bytes += row["success_job_bytes"]
+            candidate = {
+                "phase": row["phase"], "job_index": row["job_index"],
+                "ordinal": row["ordinal"], "run_id": row["run_id"],
+                "job_sha256": row["job_sha256"],
+                "failed_event_count": row["failed_event_count"],
+                "failed_event_count_uplift":
+                    row["failed_event_count_uplift"],
+                "failed_window_bytes": row["failed_window_bytes"],
+                "success_job_bytes": row["success_job_bytes"],
+                "byte_uplift": row["byte_uplift"],
+            }
+            if (failure_winner is None or
+                    (candidate["byte_uplift"],
+                     candidate["failed_event_count_uplift"]) >
+                    (failure_winner["byte_uplift"],
+                     failure_winner["failed_event_count_uplift"])):
+                failure_winner = candidate
+            rows.append({key: row[key] for key in (
+                "phase", "job_index", "ordinal", "run_id", "job_sha256",
+                "event_counts", "maximum_event_bytes_by_kind",
+                "failed_event_counts", "failed_event_bytes_by_kind",
+                "success_job_bytes", "failed_window_bytes",
+                "failed_event_count", "failed_event_count_uplift",
+                "byte_uplift",
+            )})
+        phase_totals.append({
+            "phase": phase, "job_count": len(jobs),
+            "event_count": phase_event_count,
+            "success_event_bytes": phase_event_bytes,
+        })
+        success_total_event_count += phase_event_count
+        success_total_event_bytes += phase_event_bytes
+    fixed_event_widths = _source5_journal_fixed_event_widths(
+        context, original_pins,
+    )
+    fixed_total_count = sum(row["count"] for row in fixed_event_widths)
+    fixed_total_bytes = sum(
+        row["count"] * row["maximum_line_bytes"]
+        for row in fixed_event_widths
+    )
+    require(failure_winner is not None,
+            "Source5 journal-width contract has no original job rows")
+    total_event_count = fixed_total_count + success_total_event_count
+    total_event_bytes = (
+        fixed_total_bytes + success_total_event_bytes +
+        max(0, failure_winner["byte_uplift"])
+    )
+    body = {
+        "schema": SOURCE5_JOURNAL_WIDTH_CONTRACT_SCHEMA,
+        "campaign_id": context.manifest["campaign_id"],
+        "host_id": context.host_id,
+        "original_pins_sha256": original_pins_sha,
+        "plan_pin": {
+            "path": context.plan_pin["path"],
+            "raw_sha256": context.plan_pin["raw_sha256"],
+            "semantic_sha256": context.plan_semantic_sha256,
+        },
+        "source_manifest_pin": {
+            "path": context.source_manifest_pins[context.host_id]["path"],
+            "raw_sha256": context.source_manifest_pins[context.host_id]["raw_sha256"],
+            "semantic_sha256": context.source["manifest_sha256"],
+        },
+        "owner_pins": owner_pins,
+        "job_rows": rows,
+        "phase_totals": phase_totals,
+        "fixed_event_widths": fixed_event_widths,
+        "total_event_count": total_event_count,
+        "total_event_bytes": total_event_bytes,
+        "failed_owner_window": failure_winner,
+    }
+    body["contract_sha256"] = sha256(canonical_bytes(body))
+    raw = canonical_bytes(body)
+    require(len(raw) <= 16 * 1024 * 1024,
+            "Source5 exact journal-width contract exceeds its finite canonical metadata allowance")
+    checksum = sha256(raw)
+    if output_path is not None:
+        checksum = write_new(output_path, raw,
+                             "Source5 original journal-width contract")
+    require(checksum == sha256(raw) and body["contract_sha256"] == sha256(
+        canonical_bytes({key: value for key, value in body.items()
+                         if key != "contract_sha256"}),
+    ), "Source5 journal-width contract changed during canonical publication")
+    result = {
+        "path": (None if output_path is None else str(output_path)),
+        "raw_sha256": checksum,
+        "semantic_sha256": body["contract_sha256"],
+        "contract": body,
+    }
+    return result
+
+
+def _validate_source5_journal_width_contract(
+    context: CampaignContext, value: object,
+) -> dict[str, Any]:
+    """Close a V4 width artifact against the immutable selected Plan/Source."""
+    contract = exact(value, {
+        "schema", "campaign_id", "host_id", "original_pins_sha256",
+        "plan_pin", "source_manifest_pin", "owner_pins", "job_rows",
+        "phase_totals", "fixed_event_widths", "total_event_count",
+        "total_event_bytes", "failed_owner_window", "contract_sha256",
+    }, "Source5 journal-width contract")
+    body = {key: item for key, item in contract.items()
+            if key != "contract_sha256"}
+    require(contract["schema"] == SOURCE5_JOURNAL_WIDTH_CONTRACT_SCHEMA and
+            contract["campaign_id"] == context.manifest["campaign_id"] and
+            contract["host_id"] == context.host_id and
+            is_sha(contract["contract_sha256"]) and
+            contract["contract_sha256"] == sha256(canonical_bytes(body)) and
+            contract["plan_pin"] == {
+                "path": context.plan_pin["path"],
+                "raw_sha256": context.plan_pin["raw_sha256"],
+                "semantic_sha256": context.plan_semantic_sha256,
+            } and
+            contract["source_manifest_pin"] == {
+                "path": context.source_manifest_pins[context.host_id]["path"],
+                "raw_sha256": context.source_manifest_pins[context.host_id]["raw_sha256"],
+                "semantic_sha256": context.source["manifest_sha256"],
+            } and
+            contract["owner_pins"] ==
+                _source5_journal_width_owner_pins(context) and
+            contract["original_pins_sha256"] == sha256(canonical_bytes(
+                _source5_original_pins_for_context(context),
+            )), "Source5 journal-width contract schema/source identity differs")
+    phase_order = ("exploration", "aa", "confirmation", "pressure", "soak")
+    expected_rows = []
+    expected_phase_totals = []
+    winner = None
+    total_success_count = 0
+    total_success_bytes = 0
+    require(type(contract["job_rows"]) is list and
+            type(contract["phase_totals"]) is list and
+            type(contract["fixed_event_widths"]) is list,
+            "Source5 journal-width rows/totals are not finite lists")
+    row_fields = {
+        "phase", "job_index", "ordinal", "run_id", "job_sha256",
+        "event_counts", "maximum_event_bytes_by_kind",
+        "failed_event_counts", "failed_event_bytes_by_kind",
+        "success_job_bytes", "failed_window_bytes", "failed_event_count",
+        "failed_event_count_uplift", "byte_uplift",
+    }
+    for phase in phase_order:
+        jobs = _source5_journal_jobs(context, phase)
+        phase_count = 0
+        phase_bytes = 0
+        for job_index, job in enumerate(jobs):
+            require(len(expected_rows) < len(contract["job_rows"]),
+                    "Source5 journal-width contract omits an original Plan row")
+            row = exact(contract["job_rows"][len(expected_rows)], row_fields,
+                        f"Source5 journal-width {phase} row[{job_index}]")
+            paired = phase != "soak"
+            member_count = 2 if paired else 1
+            expected_counts = {
+                "source5_authorized": 1,
+                "source5_app_started": member_count,
+                "source5_app_terminal": member_count,
+                "source5_job_terminal": 1,
+            }
+            require(type(row["job_index"]) is int and
+                    0 <= row["job_index"] <= (1 << 64) - 1 and
+                    type(row["ordinal"]) is int and row["ordinal"] > 0,
+                    "Source5 journal-width row index/ordinal is not a positive original integer")
+            require(row["phase"] == phase and
+                    row["job_index"] == job_index and
+                    row["ordinal"] == job["ordinal"] and
+                    row["run_id"] == job["run_id"] and
+                    row["job_sha256"] == sha256(canonical_bytes(job)) and
+                    row["event_counts"] == expected_counts and
+                    row["failed_event_counts"] == expected_counts,
+                    "Source5 journal-width row changed an original job identity/callback count")
+            for name in ("maximum_event_bytes_by_kind",
+                         "failed_event_bytes_by_kind"):
+                widths = exact(row[name], set(SOURCE5_JOURNAL_EVENT_KINDS),
+                               f"Source5 journal-width {name}")
+                for event, amount in widths.items():
+                    require(type(amount) is int and 0 < amount <=
+                            context.chronology.MAX_EVENT_BYTES,
+                            f"Source5 {event} canonical line width exceeds chronology's finite line bound")
+            success_bytes = sum(
+                expected_counts[name] *
+                row["maximum_event_bytes_by_kind"][name]
+                for name in SOURCE5_JOURNAL_EVENT_KINDS
+            )
+            failure_bytes = sum(
+                expected_counts[name] *
+                row["failed_event_bytes_by_kind"][name]
+                for name in SOURCE5_JOURNAL_EVENT_KINDS
+            )
+            require(type(row["success_job_bytes"]) is int and
+                    row["success_job_bytes"] == success_bytes and
+                    type(row["failed_window_bytes"]) is int and
+                    row["failed_window_bytes"] == failure_bytes and
+                    row["failed_event_count"] == sum(expected_counts.values()) and
+                    row["failed_event_count_uplift"] == 0 and
+                    row["byte_uplift"] == max(0, failure_bytes - success_bytes),
+                    "Source5 journal-width failed-owner bytes do not close over its event lines")
+            phase_count += sum(expected_counts.values())
+            phase_bytes += success_bytes
+            candidate = {
+                "phase": phase, "job_index": job_index,
+                "ordinal": job["ordinal"], "run_id": job["run_id"],
+                "job_sha256": sha256(canonical_bytes(job)),
+                "failed_event_count": row["failed_event_count"],
+                "failed_event_count_uplift": row["failed_event_count_uplift"],
+                "failed_window_bytes": failure_bytes,
+                "success_job_bytes": success_bytes,
+                "byte_uplift": row["byte_uplift"],
+            }
+            if (winner is None or
+                    (candidate["byte_uplift"],
+                     candidate["failed_event_count_uplift"]) >
+                    (winner["byte_uplift"],
+                     winner["failed_event_count_uplift"])):
+                winner = candidate
+            expected_rows.append(row)
+        expected_phase_totals.append({
+            "phase": phase, "job_count": len(jobs),
+            "event_count": phase_count,
+            "success_event_bytes": phase_bytes,
+        })
+        total_success_count += phase_count
+        total_success_bytes += phase_bytes
+    require(len(contract["job_rows"]) == len(expected_rows) and
+            contract["phase_totals"] == expected_phase_totals,
+            "Source5 journal-width contract does not close over all original phase rows")
+    fixed = contract["fixed_event_widths"]
+    expected_fixed = [
+        ("source5_prepared_capacity_registered", "registration"),
+        *(('source5_analysis', phase)
+          for phase in SOURCE5_ANALYSIS_EVENT_PHASES),
+    ]
+    require(len(fixed) == len(expected_fixed),
+            "Source5 journal-width fixed events omit a registration/analysis row")
+    fixed_bytes = 0
+    fixed_count = 0
+    for index, (row_value, identity) in enumerate(zip(
+        fixed, expected_fixed, strict=True,
+    )):
+        row = exact(row_value, {
+            "event", "phase", "count", "maximum_line_bytes",
+        }, f"Source5 journal-width fixed row[{index}]")
+        require((row["event"], row["phase"]) == identity and
+                row["count"] == 1 and
+                type(row["maximum_line_bytes"]) is int and
+                0 < row["maximum_line_bytes"] <=
+                    context.chronology.MAX_EVENT_BYTES,
+                "Source5 journal-width fixed event identity/count/width differs")
+        fixed_bytes += row["count"] * row["maximum_line_bytes"]
+        fixed_count += row["count"]
+    require(winner is not None and
+            contract["failed_owner_window"] == winner and
+            contract["total_event_count"] == fixed_count + total_success_count and
+            contract["total_event_bytes"] == fixed_bytes + total_success_bytes +
+                max(0, winner["byte_uplift"]),
+            "Source5 journal-width aggregate totals or stable failure winner differ")
+    projection = context.chronology._source5_plan_event_projection(
+        context.plan,
+        {"scope": "final_frozen", "host_id": context.host_id},
+        context.manifest,
+    )
+    require(contract["total_event_count"] ==
+            projection["maximum_callback_events"],
+            "Source5 journal-width contract count differs from the exact original plan projection")
+    return contract
+
+
 def _member_descriptors_from_overlay(overlay: dict[str, Any]) -> list[dict[str, str]]:
     members = overlay.get("members")
     require(type(members) is list and len(members) == 2,
@@ -945,6 +3795,28 @@ def _member_descriptors_from_overlay(overlay: dict[str, Any]) -> list[dict[str, 
                             f"fixed overlay member[{index}] descriptor")
         descriptors.append(descriptor)
     return descriptors
+
+
+def _source5_capacity_process_rows_from_overlay(
+    overlay: dict[str, Any], receipt: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Validate receipt row order against the exact fixed overlay members."""
+    descriptors = _member_descriptors_from_overlay(overlay)
+    expected_executors = [item["executor"] for item in descriptors]
+    require(len(expected_executors) == 2 and
+            set(expected_executors) == {"bounded", "tokio"},
+            "fixed capacity overlay does not select one bounded and one Tokio member")
+    rows = receipt.get("process_rows")
+    require(type(rows) is list and len(rows) == len(expected_executors) and
+            all(type(row) is dict and
+                (row.get("pair"), row.get("executor"), row.get("allocator")) ==
+                (descriptor["pair"], descriptor["executor"],
+                 descriptor["allocator"])
+                for row, descriptor in zip(
+                    rows, descriptors, strict=True,
+                )),
+            "fixed capacity receipt process rows differ from original overlay member order")
+    return rows
 
 
 def _build_fixed_helper_input(
@@ -961,8 +3833,16 @@ def _build_fixed_helper_input(
             f"Source5 ordinal output already exists and cannot be retried: {job['run_id']}")
     original = _source5_fixed_original_pins(context)
     execution = _source5_fixed_execution_pins(context)
+    observed_spec_pin = (
+        context.fixed_spec_host_pin
+        if context.manifest.get("schema") == PREPARATORY_EXECUTION_SCHEMA
+        else context.observed_host_pin
+    )
+    require(type(observed_spec_pin) is dict and
+            set(observed_spec_pin) == {"path", "raw_sha256"},
+            "Source5 fixed overlay lacks its exact original Spec host pin")
     overlay_pin = context.fixed_pair.build_fixed_pair_overlay(
-        original, execution, job, api_pin(context.observed_host_pin), job_root,
+        original, execution, job, api_pin(observed_spec_pin), job_root,
     )
     overlay, _overlay_raw, _overlay_sha, _fixed_context, _reconstructed = \
         context.fixed_pair._read_overlay(overlay_pin)
@@ -981,19 +3861,69 @@ def _build_fixed_helper_input(
     )
     helper_path = helper_dir / f"{phase}-{job['run_id']}.json"
     helper_raw = canonical_bytes(helper_value)
+    require(len(helper_raw) <= _source5_helper_input_byte_bound(
+        context, phase, job,
+    ), "Source5 fixed helper input exceeded its source-derived per-job template bound")
     helper_sha = write_new(helper_path, helper_raw, "Source5 fixed helper input")
     return helper_value, {"path": str(helper_path), "raw_sha256": helper_sha}, job_root
 
 
 def _write_record_file(
     phase_root: Path, ledger_path: Path, record: dict[str, Any],
+    maximum_bytes: int, maximum_ledger_bytes: int,
 ) -> dict[str, str]:
     record_dir = _private_directory(phase_root / "job-records")
     path = record_dir / f"{record['job']['run_id']}.json"
     raw = canonical_bytes(record)
+    require(len(raw) <= maximum_bytes,
+            "Source5 successful job record exceeded its source-derived schema bound")
     raw_sha = write_new(path, raw, "Source5 job record")
-    _append_phase_record(ledger_path, record)
+    _append_phase_record(
+        ledger_path, record, maximum_bytes, maximum_ledger_bytes,
+    )
     return {"path": str(path), "raw_sha256": raw_sha}
+
+
+def _source5_fixed_host_receipt_path(
+    context: CampaignContext, job: dict[str, Any],
+) -> Path:
+    require(type(job.get("ordinal")) is int and job["ordinal"] > 0 and
+            type(job.get("run_id")) is str and job["run_id"],
+            "Source5 fixed host receipt lost its original job identity")
+    job_sha = sha256(canonical_bytes(job))
+    return (context.output_root / context.manifest["campaign_id"] /
+            "source5" / context.host_id / job["phase"] /
+            "fixed-host-receipts" /
+            f"{job['ordinal']:06d}-{job_sha}.json")
+
+
+def _source5_fixed_host_receipt_pin(
+    context: CampaignContext, job: dict[str, Any],
+    overlay_ref: dict[str, Any], receipt_ref: dict[str, Any],
+    overlay_sha256: str, expected_status: str,
+) -> dict[str, str] | None:
+    if context.manifest.get("schema") not in {
+            EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA}:
+        return None
+    path = _source5_fixed_host_receipt_path(context, job)
+    _private_directory(path.parent)
+    result = context.fixed_pair.verify_fixed_pair_overlay_with_host_receipt(
+        api_pin(overlay_ref), api_pin(receipt_ref), path,
+    )
+    result = exact(result, {
+        "path", "raw_sha256", "host_verification_sha256", "status",
+        "overlay_sha256",
+    }, "Source5 strict fixed-pair host receipt result")
+    require(result["path"] == str(path) and
+            is_sha(result["raw_sha256"]) and
+            is_sha(result["host_verification_sha256"]) and
+            result["status"] == expected_status and
+            result["overlay_sha256"] == overlay_sha256,
+            "Source5 fixed-pair host receipt does not bind the exact original overlay and status")
+    return {
+        "path": str(path), "raw_sha256": result["raw_sha256"],
+        "host_verification_sha256": result["host_verification_sha256"],
+    }
 
 
 def _fixed_record_from_result(
@@ -1021,6 +3951,10 @@ def _fixed_record_from_result(
             receipt.get("inputs_unchanged") is True and
             receipt_raw == canonical_bytes(receipt),
             "Source5 fixed result did not freshly replay to its canonical receipt")
+    host_receipt_pin = _source5_fixed_host_receipt_pin(
+        context, result["job"], overlay_ref, receipt_ref, _overlay_sha,
+        component_status,
+    )
     metrics = receipt.get("process_metrics")
     require(type(metrics) is list,
             "Source5 fixed receipt metrics are malformed")
@@ -1093,6 +4027,8 @@ def _fixed_record_from_result(
             "runtime_bindings": {
                 "path": runtime_pin["path"], "raw_sha256": runtime_sha,
             },
+            **({"host_receipt": host_receipt_pin}
+               if host_receipt_pin is not None else {}),
             "source_snapshot": source_snapshot,
         },
         "chronology": record_chronology,
@@ -1105,17 +4041,35 @@ def _fixed_record_from_result(
 def _fresh_fixed_phase_records(
     context: CampaignContext, lock: Any, phase: str,
     phase_root: Path, ledger_path: Path,
+    archive_purpose: str | None = None,
 ) -> list[dict[str, Any]]:
-    records = _phase_ledger_records(ledger_path)
     expected = _host_jobs(context, phase)
+    records = _phase_ledger_records(
+        ledger_path, _source5_phase_ledger_byte_bound(context, phase, expected),
+    )
     context.campaign.validate_phase_ledger(records, expected, phase, context.host_id)
+    read_purpose = archive_purpose or {
+        "exploration": "exploration", "aa": "aa",
+        "confirmation": "fixed_analysis",
+    }[phase]
     for record in records:
         require(record.get("evidence", {}).get("kind") == "source5_fixed_pair",
                 f"{phase} contains a non-Source5 fixed component record")
         pin = _raw_record_pin(phase_root, record["job"]["run_id"])
-        checked = context.chronology.verify_source5_completed_fixed_phase_locked(
-            lock, api_pin(context.manifest_pin), pin,
-        )
+        if context.manifest["schema"] == EXECUTION_SCHEMA_V4:
+            with archived_job_read_view(
+                    context, record["job"], read_purpose) as captured_view:
+                checked = context.chronology.verify_source5_completed_fixed_phase_locked(
+                    lock, api_pin(context.manifest_pin), pin,
+                    captured_evidence=captured_view,
+                )
+                _source5_capture_fixed_capacity_projection(
+                    context, record, captured_view,
+                )
+        else:
+            checked = context.chronology.verify_source5_completed_fixed_phase_locked(
+                lock, api_pin(context.manifest_pin), pin,
+            )
         require(checked["process_metrics"] == record["process_metrics"],
                 "Source5 fixed journal replay and stored metrics differ")
     return records
@@ -1125,6 +4079,131 @@ def _raw_record_pin(phase_root: Path, run_id: str) -> dict[str, str]:
     path = phase_root / "job-records" / f"{run_id}.json"
     raw, raw_sha, _info = read_stable(path, "Source5 per-job record", 4 * 1024 * 1024)
     return {"path": str(path), "raw_sha256": raw_sha}
+
+
+def _source5_replay_phase_records_captured(
+    context: CampaignContext, lock: Any, phase: str,
+    expected_records: list[dict[str, Any]], provider: Any,
+) -> list[dict[str, Any]]:
+    replay = getattr(
+        context.chronology,
+        "replay_source5_phase_records_captured_locked", None,
+    )
+    require(context.manifest["schema"] == EXECUTION_SCHEMA_V4 and
+            callable(replay) and type(expected_records) is list and
+            callable(getattr(provider, "open_view", None)),
+            "Source5 captured phase replay lacks its exact v4 held-owner API")
+    replayed = replay(
+        lock, api_pin(context.manifest_pin), phase,
+        captured_read_context=provider,
+    )
+    require(type(replayed) is list and replayed == expected_records and
+            all(type(record) is dict for record in replayed),
+            f"Source5 captured {phase} replay differs from the exact local journal rows")
+    return replayed
+
+
+def _source5_archive_read_reference_bytes(
+    context: CampaignContext, view: dict[str, Any],
+    pin_value: object, label: str, expected_role: str | None = None,
+) -> tuple[bytes, dict[str, Any]]:
+    pin = exact(pin_value, {"path", "raw_sha256"}, f"{label} origin pin")
+    reference = view["objects"].get(pin["path"])
+    require(type(reference) is dict and
+            reference.get("origin_path") == pin["path"] and
+            reference.get("host_id") == context.host_id and
+            reference.get("raw_sha256") == pin["raw_sha256"] and
+            (expected_role is None or reference.get("role") == expected_role),
+            f"{label} is absent from the authenticated archived read view")
+    path = Path(reference["path"])
+    raw, digest, info = read_stable(
+        path, f"captured Source5 {label}", reference["byte_count"],
+    )
+    require(digest == pin["raw_sha256"] and len(raw) ==
+            reference["byte_count"] and stat.S_ISREG(info.st_mode) and
+            info.st_uid == os.getuid() and
+            stat.S_IMODE(info.st_mode) == 0o400 and info.st_nlink == 1,
+            f"captured Source5 {label} bytes differ from the original raw pin")
+    return raw, reference
+
+
+def _source5_capture_fixed_capacity_projection(
+    context: CampaignContext, record: dict[str, Any],
+    view: dict[str, Any],
+) -> None:
+    if record["job"]["phase"] != "exploration":
+        return
+    evidence = record["evidence"]
+    overlay_pin = raw_pin(evidence.get("overlay"),
+                          "Source5 archived capacity overlay")
+    receipt_pin = raw_pin(evidence.get("receipt"),
+                          "Source5 archived capacity execution receipt")
+    host_pin = exact(evidence.get("host_receipt"), {
+        "path", "raw_sha256", "host_verification_sha256",
+    }, "Source5 archived strict fixed host receipt")
+    overlay_raw, overlay_ref = _source5_archive_read_reference_bytes(
+        context, view, overlay_pin, "fixed execution overlay",
+        "fixed_pair_artifact",
+    )
+    receipt_raw, receipt_ref = _source5_archive_read_reference_bytes(
+        context, view, receipt_pin, "fixed execution receipt",
+        "component_receipt",
+    )
+    host_raw, host_ref = _source5_archive_read_reference_bytes(
+        context, view, {"path": host_pin["path"],
+                        "raw_sha256": host_pin["raw_sha256"]},
+        "strict fixed host receipt", "fixed_pair_host_receipt",
+    )
+    try:
+        overlay = json.loads(overlay_raw.decode("ascii"))
+        receipt = json.loads(receipt_raw.decode("ascii"))
+        host_receipt = json.loads(host_raw.decode("ascii"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            "Source5 archived fixed capacity evidence is malformed",
+        ) from error
+    require(all(raw == canonical_bytes(value) for raw, value in (
+                (overlay_raw, overlay), (receipt_raw, receipt),
+                (host_raw, host_receipt))) and
+            receipt.get("schema") ==
+                "allocatbelt.application-fixed-pair-execution-receipt.v1" and
+            receipt.get("status") == "valid_pair" and
+            receipt.get("run_id") == record["job"]["run_id"] and
+            receipt.get("host_id") == context.host_id and
+            receipt.get("receipt_sha256") ==
+                sha256(canonical_bytes({
+                    key: value for key, value in receipt.items()
+                    if key != "receipt_sha256"
+                })) and
+            receipt_ref["semantic_sha256"] == receipt["receipt_sha256"] and
+            overlay.get("overlay_sha256") ==
+                sha256(canonical_bytes({
+                    key: value for key, value in overlay.items()
+                    if key != "overlay_sha256"
+                })) and
+            overlay_ref["raw_sha256"] == overlay_pin["raw_sha256"] and
+            host_ref["raw_sha256"] == host_pin["raw_sha256"] and
+            host_ref["semantic_sha256"] ==
+                host_pin["host_verification_sha256"],
+            "Source5 archived fixed capacity receipts differ from their original self/raw pins")
+    context.fixed_pair._validate_host_verification_receipt(
+        host_receipt, host_pin, overlay, overlay_pin["raw_sha256"],
+        receipt_pin["raw_sha256"], receipt,
+    )
+    process_rows = _source5_capacity_process_rows_from_overlay(
+        overlay, receipt,
+    )
+    if context.source5_fixed_capacity_projections is None:
+        context.source5_fixed_capacity_projections = {}
+    context.source5_fixed_capacity_projections[
+        ("exploration", record["job"]["run_id"])
+    ] = {
+        "process_rows": process_rows,
+        "overlay_raw_sha256": overlay_pin["raw_sha256"],
+        "receipt_raw_sha256": receipt_pin["raw_sha256"],
+        "verified_receipt_sha256": host_pin["host_verification_sha256"],
+        "run_id": record["job"]["run_id"],
+    }
 
 
 def _capacity_pilot(
@@ -1146,13 +4225,56 @@ def _capacity_pilot(
             pairs = []
             for ordinal in range(1, context.spec["protocol"]["exploration_pairs"] + 1):
                 record = by_key[(cell["family"], cell["profile"], allocator, ordinal)]
-                receipt, _raw, _sha = read_json(
-                    Path(record["evidence"]["receipt"]["path"]),
-                    "Source5 exploration receipt",
-                    context.fixed_pair.MAX_RECEIPT_BYTES,
-                    record["evidence"]["receipt"]["raw_sha256"],
-                )
-                rows = receipt.get("process_rows")
+                if context.manifest["schema"] == EXECUTION_SCHEMA_V4:
+                    projection = (None if context.source5_fixed_capacity_projections is None
+                                  else context.source5_fixed_capacity_projections.get(
+                                      ("exploration", record["job"]["run_id"]),
+                                  ))
+                    require(type(projection) is dict and
+                            projection.get("run_id") == record["job"]["run_id"],
+                            "Source5 exploration lacks the exact captured receipt projection")
+                    rows = projection["process_rows"]
+                    overlay_sha = projection["overlay_raw_sha256"]
+                    receipt_sha = projection["receipt_raw_sha256"]
+                    verified_receipt_sha256 = projection[
+                        "verified_receipt_sha256"]
+                else:
+                    receipt, _raw, _sha = read_json(
+                        Path(record["evidence"]["receipt"]["path"]),
+                        "Source5 exploration receipt",
+                        context.fixed_pair.MAX_RECEIPT_BYTES,
+                        record["evidence"]["receipt"]["raw_sha256"],
+                    )
+                    rows = receipt.get("process_rows")
+                    overlay_ref = raw_pin(record["evidence"]["overlay"],
+                                          "Source5 capacity overlay")
+                    receipt_ref = raw_pin(record["evidence"]["receipt"],
+                                          "Source5 capacity receipt")
+                    overlay_raw, overlay_sha, _overlay_info = read_stable(
+                        Path(overlay_ref["path"]), "Source5 capacity overlay",
+                        context.fixed_pair.MAX_PLAN_BYTES,
+                    )
+                    receipt_raw, receipt_sha, _receipt_info = read_stable(
+                        Path(receipt_ref["path"]), "Source5 capacity receipt",
+                        context.fixed_pair.MAX_RECEIPT_BYTES,
+                    )
+                    require(overlay_sha == overlay_ref["raw_sha256"] and
+                            receipt_sha == receipt_ref["raw_sha256"],
+                            "Source5 capacity pair changed after independent receipt replay")
+                    receipt_value = json.loads(receipt_raw)
+                    require(receipt_raw == canonical_bytes(receipt_value) and
+                            receipt_value.get("run_id") == record["job"]["run_id"] and
+                            receipt_value.get("host_id") == context.host_id and
+                            receipt_value.get("status") == "valid_pair",
+                            "Source5 pilot receipt identity/status differs from its original job")
+                    verified = context.fixed_pair.verify_fixed_pair_overlay(
+                        api_pin(overlay_ref), api_pin(receipt_ref),
+                    )
+                    require(verified.get("verified") is True and
+                            verified.get("status") == "valid_pair" and
+                            verified.get("receipt_sha256") == receipt_sha,
+                            "Source5 pilot pair failed its final raw-pinned fixed receipt replay")
+                    verified_receipt_sha256 = verified["receipt_sha256"]
                 require(type(rows) is list and len(rows) == 2,
                         "Source5 exploration receipt does not retain its two original process rows")
                 by_executor = {row["executor"]: row for row in rows}
@@ -1164,34 +4286,6 @@ def _capacity_pilot(
                             f"Source5 exploration {key} is not a canonical process-row count")
                     return int(value)
                 bounded, tokio = by_executor["bounded"], by_executor["tokio"]
-                overlay_ref = raw_pin(record["evidence"]["overlay"],
-                                      "Source5 capacity overlay")
-                receipt_ref = raw_pin(record["evidence"]["receipt"],
-                                      "Source5 capacity receipt")
-                overlay_raw, overlay_sha, _overlay_info = read_stable(
-                    Path(overlay_ref["path"]), "Source5 capacity overlay",
-                    context.fixed_pair.MAX_PLAN_BYTES,
-                )
-                receipt_raw, receipt_sha, _receipt_info = read_stable(
-                    Path(receipt_ref["path"]), "Source5 capacity receipt",
-                    context.fixed_pair.MAX_RECEIPT_BYTES,
-                )
-                require(overlay_sha == overlay_ref["raw_sha256"] and
-                        receipt_sha == receipt_ref["raw_sha256"],
-                        "Source5 capacity pair changed after independent receipt replay")
-                receipt_value = json.loads(receipt_raw)
-                require(receipt_raw == canonical_bytes(receipt_value) and
-                        receipt_value.get("run_id") == record["job"]["run_id"] and
-                        receipt_value.get("host_id") == context.host_id and
-                        receipt_value.get("status") == "valid_pair",
-                        "Source5 pilot receipt identity/status differs from its original job")
-                verified = context.fixed_pair.verify_fixed_pair_overlay(
-                    api_pin(overlay_ref), api_pin(receipt_ref),
-                )
-                require(verified.get("verified") is True and
-                        verified.get("status") == "valid_pair" and
-                        verified.get("receipt_sha256") == receipt_sha,
-                        "Source5 pilot pair failed its final raw-pinned fixed receipt replay")
                 pairs.append({
                     "ordinal": ordinal,
                     "bounded_status": "valid", "tokio_status": "valid",
@@ -1210,7 +4304,7 @@ def _capacity_pilot(
                     "raw_pair_sha256": sha256(canonical_bytes({
                         "overlay_raw_sha256": overlay_sha,
                         "receipt_raw_sha256": receipt_sha,
-                        "verified_receipt_sha256": verified["receipt_sha256"],
+                        "verified_receipt_sha256": verified_receipt_sha256,
                         "run_id": record["job"]["run_id"],
                     })),
                 })
@@ -1286,7 +4380,7 @@ def _validate_probe_capture_contract(
 def _pressure_materials_index(
     context: CampaignContext, index_path: Path,
 ) -> dict[str, dict[str, Any]]:
-    bounded = context.manifest["schema"] == EXECUTION_SCHEMA_V3
+    bounded = context.manifest["schema"] in BOUNDED_EXECUTION_SCHEMAS
     index_schema = (PRESSURE_MATERIAL_INDEX_SCHEMA_V2 if bounded
                     else PRESSURE_MATERIAL_INDEX_SCHEMA)
     material_schema = (PRESSURE_MATERIALS_SCHEMA_V2 if bounded
@@ -1799,9 +4893,17 @@ def _capture_source5_probe_bundle(
     bundle_members: list[dict[str, Any]] = []
     for index, (request, request_sha, refs, probe) in enumerate(prepared):
         output_base = _private_directory(capture_parent / f"member-{index:02d}")
+        capture_identity = {
+            "campaign_id": context.manifest["campaign_id"],
+            "host_id": context.host_id,
+            "run_id": job["run_id"],
+            "member_index": index,
+            "request_sha256": request_sha,
+        }
+        capture_id = sha256(canonical_bytes(capture_identity))[:32]
         result = composition.capture_calibrated_probe_v2(
             request, request_sha, context.observed_host_pin,
-            output_root=output_base, capture_id=secrets.token_hex(16),
+            output_root=output_base, capture_id=capture_id,
             capture_timeout_ns=probe_capture["capture_timeout_ns"],
             storage_budget=probe_capture["storage_budget"],
         )
@@ -1952,10 +5054,28 @@ def _build_pressure_recipe(
             fixed_record.get("state") == "valid_pair" and
             fixed_record.get("job", {}).get("run_id") == fixed_run_id[0],
             "Source5 pressure predecessor is absent or not a successful exact fixed record")
-    context.chronology.verify_source5_completed_job_locked(
-        lock, api_pin(context.manifest_pin), None,
-        {"path": str(fixed_record_path), "raw_sha256": fixed_record_sha},
-    )
+    fixed_record_pin = {
+        "path": str(fixed_record_path), "raw_sha256": fixed_record_sha,
+    }
+    pressure_predecessor_certificate = None
+    if context.manifest["schema"] == EXECUTION_SCHEMA_V4:
+        fixed_jobs = [row for row in _host_jobs(context, "confirmation")
+                      if row["run_id"] == fixed_run_id[0]]
+        require(len(fixed_jobs) == 1 and
+                fixed_jobs[0] == fixed_record.get("job"),
+                "Source5 pressure predecessor record differs from its exact original Plan row")
+        with archived_job_read_view(
+                context, fixed_jobs[0], "pressure_analysis") as captured_view:
+            pressure_predecessor_certificate = (
+                context.chronology.build_source5_pressure_predecessor_replay_locked(
+                    lock, api_pin(context.manifest_pin), job, fixed_record_pin,
+                    captured_evidence=captured_view,
+                )
+            )
+    else:
+        context.chronology.verify_source5_completed_job_locked(
+            lock, api_pin(context.manifest_pin), None, fixed_record_pin,
+        )
     deadlines = exact(material["deadlines"], {
         "trace_seconds", "drain_seconds", "shutdown_seconds", "process_seconds",
         "outer_seconds", "application_wall_timeout_seconds",
@@ -1968,7 +5088,7 @@ def _build_pressure_recipe(
     require(deadlines["application_wall_timeout_seconds"] ==
             context.spec["deadlines"]["process_seconds"],
             "Source5 pressure material changed the original APP process bound")
-    bounded_pressure = context.manifest["schema"] == EXECUTION_SCHEMA_V3
+    bounded_pressure = context.manifest["schema"] in BOUNDED_EXECUTION_SCHEMAS
     probe_capture_bundle = None
     recipe_schema = pressure.RECIPE_SCHEMA
     if bounded_pressure:
@@ -2032,7 +5152,7 @@ def _build_pressure_recipe(
     recipe_path = recipe_root / "source5-pressure-recipe.json"
     recipe_raw = canonical_bytes(recipe)
     recipe_sha = write_new(recipe_path, recipe_raw, "Source5 pressure job recipe")
-    return recipe, {"path": str(recipe_path), "raw_sha256": recipe_sha}, recipe_root, {
+    details = {
         "fixed_record": fixed_record,
         "fixed_record_pin": {"path": str(fixed_record_path), "raw_sha256": fixed_record_sha},
         "shared_policy": shared_policy_value,
@@ -2040,6 +5160,11 @@ def _build_pressure_recipe(
         "prerequisites": phase_prerequisites,
         "probe_capture_bundle": probe_capture_bundle,
     }
+    if context.manifest["schema"] == EXECUTION_SCHEMA_V4:
+        require(pressure_predecessor_certificate is not None,
+                "Source5 v4 pressure predecessor replay did not produce its process-local certificate")
+        details["pressure_predecessor_certificate"] = pressure_predecessor_certificate
+    return recipe, {"path": str(recipe_path), "raw_sha256": recipe_sha}, recipe_root, details
 
 
 def _analysis_record(
@@ -2077,6 +5202,111 @@ def _source5_analysis_matches_replay(
                 for name in ("analyzer_wall_seconds", "resident_peak_bytes",
                              "output_sha256"):
                     bootstrap.pop(name, None)
+                if "input_transport" in bootstrap:
+                    raw_transport = bootstrap["input_transport"]
+                    transport_schema = (
+                        raw_transport.get("schema")
+                        if type(raw_transport) is dict else None
+                    )
+                    if transport_schema == \
+                            "allocatbelt.application-rust-analyzer-input-transport.v1":
+                        transport = exact(raw_transport, {
+                            "schema", "kind", "input_sha256", "input_bytes",
+                            "decoder_consumed_bytes", "process",
+                        }, "legacy Source5 Rust analyzer input transport")
+                    elif transport_schema == \
+                            "allocatbelt.application-rust-analyzer-input-transport.v2":
+                        transport = exact(raw_transport, {
+                            "schema", "kind", "input_sha256", "input_bytes",
+                            "decoder_consumed_bytes", "launch_transition",
+                            "process",
+                        }, "Source5 Rust analyzer input transport v2")
+                    else:
+                        raise Source5CampaignError(
+                            "Source5 Rust analyzer input transport version is unsupported",
+                        )
+                    require(transport["schema"] ==
+                            transport_schema and
+                            transport["kind"] == "owned_stdin_pipe" and
+                            is_sha(transport["input_sha256"]) and
+                            type(transport["input_bytes"]) is int and
+                            0 < transport["input_bytes"] < (1 << 64) and
+                            is_sha(bootstrap.get("input_sha256")) and
+                            type(bootstrap.get("input_bytes")) is int and
+                            transport["decoder_consumed_bytes"] ==
+                                transport["input_bytes"] and
+                            transport["input_sha256"] == bootstrap.get(
+                                "input_sha256") and
+                            transport["input_bytes"] == bootstrap.get(
+                                "input_bytes"),
+                            "Source5 Rust analyzer input transport differs from its exact logical input")
+                    launch_transition = None
+                    if transport_schema == \
+                            "allocatbelt.application-rust-analyzer-input-transport.v2":
+                        launch_transition = exact(
+                            transport["launch_transition"], {
+                                "schema", "kind", "status", "launcher_sha256",
+                                "binary_sha256", "executable_identity",
+                            }, "Source5 Rust analyzer launch transition",
+                        )
+                        require(
+                            launch_transition["schema"] ==
+                                "allocatbelt.application-rust-analyzer-launch-transition.v1" and
+                            launch_transition["kind"] ==
+                                "pinned_binary_fd_gate_exec" and
+                            launch_transition["status"] ==
+                                "exec_confirmed_close_on_exec_pipe" and
+                            launch_transition["executable_identity"] ==
+                                "elf_proc_inode_matched" and
+                            is_sha(launch_transition["launcher_sha256"]) and
+                            is_sha(launch_transition["binary_sha256"]) and
+                            launch_transition["binary_sha256"] ==
+                                bootstrap.get("analyzer_binary_sha256"),
+                            "Source5 Rust analyzer launch did not prove the pinned binary transition",
+                        )
+                    process = exact(transport["process"], {
+                        "parent_pid", "child_pid", "start_ticks", "pipe",
+                    }, "Source5 Rust analyzer process identity")
+                    require(all(type(process[name]) is int and
+                                0 < process[name] < (1 << 32) for name in (
+                                    "parent_pid", "child_pid")) and
+                            type(process["start_ticks"]) is int and
+                            0 < process["start_ticks"] < (1 << 64) and
+                            process["parent_pid"] != process["child_pid"],
+                            "Source5 Rust analyzer process identity is malformed")
+                    pipe = exact(process["pipe"], {
+                        "file_type", "parent_fd", "child_fd", "device",
+                        "inode", "mode",
+                    }, "Source5 Rust analyzer pipe identity")
+                    require(pipe["file_type"] == "fifo" and
+                            type(pipe["parent_fd"]) is int and
+                            pipe["parent_fd"] >= 0 and
+                            type(pipe["child_fd"]) is int and
+                            pipe["child_fd"] == 0 and
+                            type(pipe["device"]) is int and
+                            0 <= pipe["device"] < (1 << 64) and
+                            type(pipe["inode"]) is int and
+                            0 < pipe["inode"] < (1 << 64) and
+                            type(pipe["mode"]) is int and
+                            0 <= pipe["mode"] <= 0o777,
+                            "Source5 Rust analyzer pipe identity is malformed")
+                    # Process IDs, starts, FDs and pipe inodes differ on each
+                    # run. Keep stable pipe type/device/mode and all input pins.
+                    normalized_transport = {
+                        **{key: transport[key] for key in (
+                            "schema", "kind", "input_sha256", "input_bytes",
+                            "decoder_consumed_bytes",
+                        )},
+                        "pipe": {
+                            "file_type": pipe["file_type"],
+                            "device": pipe["device"],
+                            "mode": pipe["mode"],
+                        },
+                    }
+                    if launch_transition is not None:
+                        normalized_transport["launch_transition"] = \
+                            launch_transition
+                    bootstrap["input_transport"] = normalized_transport
     return actual_value == expected_value
 
 
@@ -2097,10 +5327,18 @@ def _persist_analysis(
     )
     raw = canonical_bytes(record)
     raw_sha = write_new(path, raw, "Source5 phase analysis")
-    registered = context.chronology.record_source5_analysis_locked(
-        lock, api_pin(context.manifest_pin),
-        {"path": str(path), "raw_sha256": raw_sha},
-    )
+    analysis_pin = {"path": str(path), "raw_sha256": raw_sha}
+    if context.manifest.get("schema") == EXECUTION_SCHEMA_V4:
+        registered = context.chronology.record_source5_analysis_locked(
+            lock, api_pin(context.manifest_pin), analysis_pin,
+            captured_read_context=source5_completed_archive_read_provider(
+                context,
+            ),
+        )
+    else:
+        registered = context.chronology.record_source5_analysis_locked(
+            lock, api_pin(context.manifest_pin), analysis_pin,
+        )
     return {"record": record, "pin": {"path": str(path), "raw_sha256": raw_sha},
             "chronology": registered}
 
@@ -2121,8 +5359,11 @@ def analyze_phase(context: CampaignContext, phase: str) -> dict[str, Any]:
     }.get(phase, phase)
     phase_root = _phase_root(context, source_phase)
     ledger_path = phase_root / "controller-ledger.jsonl"
-    records = _phase_ledger_records(ledger_path)
     expected_jobs = _host_jobs(context, source_phase)
+    records = _phase_ledger_records(
+        ledger_path,
+        _source5_phase_ledger_byte_bound(context, source_phase, expected_jobs),
+    )
     if source_phase == "soak":
         require(len(records) == len(expected_jobs) == 1 and
                 records[0]["state"] in {"valid_soak", "invalid_soak"},
@@ -2138,17 +5379,22 @@ def analyze_phase(context: CampaignContext, phase: str) -> dict[str, Any]:
     ) as lock:
         verified = _validate_locked_context(context, lock)
         state = verified["state"]
-        if source_phase in {"exploration", "aa", "confirmation"}:
+        if phase == "final_analysis":
+            records = []  # The exact final replay below owns the Soak read too.
+        elif source_phase in {"exploration", "aa", "confirmation"}:
             records = _fresh_fixed_phase_records(
                 context, lock, source_phase, phase_root, ledger_path,
+                archive_purpose=phase,
             )
         elif source_phase == "pressure":
             records = _fresh_pressure_phase_records(
                 context, lock, phase_root, ledger_path,
+                archive_purpose=phase,
             )
         else:
             records = _fresh_soak_phase_records(
                 context, lock, phase_root, ledger_path,
+                archive_purpose=phase,
             )
         if phase == "exploration":
             pilot = _capacity_pilot(context, records)
@@ -2227,38 +5473,121 @@ def analyze_phase(context: CampaignContext, phase: str) -> dict[str, Any]:
         return result
 
 
+
+def _source5_refresh_phase_prerequisite_gates_locked(
+    context: CampaignContext, lock: Any, phase: str,
+) -> None:
+    """Issue held-lock freshness for exact prior gates before a new v4 grant."""
+    if context.manifest.get("schema") != EXECUTION_SCHEMA_V4:
+        return
+    required = {
+        "exploration": (),
+        "aa": ("exploration",),
+        "confirmation": ("exploration", "aa"),
+        "pressure": ("fixed_analysis",),
+        "soak": ("pressure_analysis",),
+    }.get(phase)
+    require(required is not None,
+            "Source5 phase-entry freshness received an unsupported original phase")
+    refresh = getattr(
+        context.chronology, "refresh_source5_analysis_gate_locked", None,
+    )
+    require(callable(refresh),
+            "Source5 v4 cannot grant a new phase without captured freshness replay")
+    for analysis_phase in required:
+        provider = source5_completed_archive_read_provider(context)
+        require(callable(getattr(provider, "open_view", None)),
+                "Source5 completed archive provider is not IO-only/readable")
+        # The chronology owns the lock/epoch freshness marker. Its return value
+        # is deliberately not used as a separate gate or caller authority.
+        refresh(
+            lock, api_pin(context.manifest_pin), analysis_phase,
+            captured_read_context=provider,
+        )
+
+
 def run_fixed_phase(context: CampaignContext, phase: str) -> dict[str, Any]:
     require(phase in {"exploration", "aa", "confirmation"},
             "fixed component runner only accepts original fixed-policy phases")
     require(context.scope == "final_frozen" or phase == "exploration",
             "prospective Source5 scope is closed to exploration-only execution")
     jobs = _host_jobs(context, phase)
+    disposition_byte_bound = _source5_disposition_byte_bound(context, phase)
+    ledger_byte_bound = _source5_phase_ledger_byte_bound(context, phase, jobs)
     phase_root = _phase_root(context, phase)
-    require(not phase_root.exists() and not phase_root.is_symlink(),
+    phase_root_preexisting = phase_root.exists() or phase_root.is_symlink()
+    require(not phase_root_preexisting or
+            context.manifest.get("schema") in {EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA},
             f"Source5 phase output already exists and its ordinals cannot be replaced: {phase_root}")
     with context.chronology.campaign_host_lock(
         context.output_root, context.manifest["campaign_id"], context.host_id,
     ) as lock:
         verified = _validate_locked_context(context, lock)
         state = verified["state"]
+        if context.manifest["schema"] in {EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA}:
+            _source5_require_uncompleted_catalogue_paths_absent(
+                context, lock, verified,
+            )
+            if phase_root_preexisting:
+                start_index, _resume_records = _source5_validate_resume_prefix_locked(
+                    context, lock, phase, jobs,
+                )
+            else:
+                start_index, _resume_records = (
+                    _source5_validate_fresh_phase_start_locked(
+                        context, lock, phase, jobs, verified,
+                    )
+                )
+        else:
+            require(not phase_root_preexisting,
+                    f"Source5 phase output already exists and its ordinals cannot be replaced: {phase_root}")
+            start_index = 0
+        _source5_refresh_phase_prerequisite_gates_locked(context, lock, phase)
         prerequisites = _helper_prerequisites(state, phase)
         _private_directory(phase_root)
         job_records = _private_directory(phase_root / "job-records")
         del job_records
         ledger_path = phase_root / "controller-ledger.jsonl"
-        ledger_fd = os.open(ledger_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
-                            getattr(os, "O_CLOEXEC", 0) |
-                            getattr(os, "O_NOFOLLOW", 0), 0o600)
-        os.close(ledger_fd)
-        for index, job in enumerate(jobs):
+        ledger_flags = (os.O_WRONLY | os.O_APPEND |
+                        getattr(os, "O_CLOEXEC", 0) |
+                        getattr(os, "O_NOFOLLOW", 0))
+        if ledger_path.exists() or ledger_path.is_symlink():
+            ledger_info = ledger_path.lstat()
+            require(stat.S_ISREG(ledger_info.st_mode) and
+                    ledger_info.st_uid == os.getuid() and
+                    stat.S_IMODE(ledger_info.st_mode) == 0o600 and
+                    ledger_info.st_nlink == 1 and
+                    ledger_info.st_size <= ledger_byte_bound,
+                    "Source5 resumed phase ledger is not one bounded private file")
+        else:
+            ledger_flags |= os.O_CREAT | os.O_EXCL
+        ledger_fd = os.open(ledger_path, ledger_flags, 0o600)
+        try:
+            os.fsync(ledger_fd)
+        finally:
+            os.close(ledger_fd)
+        for index in range(start_index, len(jobs)):
+            job = jobs[index]
             result = None
             try:
+                if context.manifest["schema"] == PREPARATORY_EXECUTION_SCHEMA:
+                    remaining_bytes, remaining_inodes = (
+                        _source5_preparatory_dispatch_storage_requirements(
+                            context, lock, index,
+                        )
+                    )
+                    _validate_live_storage_reservation(
+                        context, Path(context.preparatory_budget["storage_reservation"]["pin"]["path"]),
+                        required_bytes_by_root=remaining_bytes,
+                        required_inodes_by_root=remaining_inodes,
+                    )
                 helper_value, helper_ref, _job_root = _build_fixed_helper_input(
                     context, phase, index, job, prerequisites,
                 )
                 del helper_value
                 authorization = context.chronology.authorize_source5_job_locked(
                     lock, api_pin(context.manifest_pin), job, helper_ref,
+                    host_evidence_budget_pin=context.host_evidence_budget_pin,
                 )
                 result = context.chronology.run_authorized_source5_job_locked(
                     lock, authorization,
@@ -2272,7 +5601,8 @@ def run_fixed_phase(context: CampaignContext, phase: str) -> dict[str, Any]:
                     dispositions.extend({"job": pending, "reason": "not_run_after_blocked_job"}
                                         for pending in jobs[index + 1:])
                     _write_dispositions(phase_root, dispositions,
-                                        f"blocked original job {job['run_id']}")
+                                        f"blocked original job {job['run_id']}",
+                                        maximum_bytes=disposition_byte_bound)
                     return {"phase": phase, "blocked": True,
                             "job_run_id": job["run_id"],
                             "dispositions": str(phase_root / "not-run-dispositions.json")}
@@ -2280,19 +5610,55 @@ def run_fixed_phase(context: CampaignContext, phase: str) -> dict[str, Any]:
                     _write_job_disposition(
                         phase_root, job, "invalid_pair",
                         "complete_invalid_fixed_component_consumes_original_ordinal",
+                        maximum_bytes=_source5_job_disposition_byte_bound(job),
                         authorization_id=result["chronology"]["authorization_id"],
                         terminal_head=result["chronology"]["job_terminal_head"],
                         component_sha256=result["component_sha256"],
                         error_sha256=result["error_sha256"],
                     )
-                    continue
+                    dispositions = [{
+                        "job": job,
+                        "reason": "failed_owner_stops_new_authorizations",
+                        "authorization_id": result["chronology"]["authorization_id"],
+                        "job_terminal_head": result["chronology"]["job_terminal_head"],
+                        "component_sha256": result["component_sha256"],
+                        "error_sha256": result["error_sha256"],
+                    }]
+                    dispositions.extend({
+                        "job": pending,
+                        "reason": "not_run_after_failed_original_ordinal",
+                    } for pending in jobs[index + 1:])
+                    _write_dispositions(
+                        phase_root, dispositions,
+                        f"failed original job {job['run_id']}",
+                        maximum_bytes=disposition_byte_bound,
+                    )
+                    return {"phase": phase, "blocked": True,
+                            "job_run_id": job["run_id"],
+                            "dispositions": str(phase_root / "not-run-dispositions.json")}
                 record = _fixed_record_from_result(context, result, phase)
-                _write_record_file(phase_root, ledger_path, record)
+                job_record_pin = _write_record_file(
+                    phase_root, ledger_path, record,
+                    _source5_job_record_byte_bound(context, phase, job),
+                    ledger_byte_bound,
+                )
+                if context.manifest["schema"] in {EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA}:
+                    handoff = _source5_create_transfer_offer(
+                        context, phase, index, job, job_record_pin,
+                        canonical_bytes(record), None,
+                    )
+                    _source5_wait_verify_and_reclaim_archive_job(
+                        context, handoff, None, phase, job["run_id"],
+                    )
             except BaseException as error:
-                _seal_blocked_suffix(phase_root, jobs, index, error, result)
+                _seal_blocked_suffix(
+                    phase_root, jobs, index, error, result,
+                    maximum_bytes=disposition_byte_bound,
+                )
                 raise
         return {"phase": phase, "job_count": len(jobs),
                 "ledger": str(ledger_path), "blocked": False}
+
 
 
 def _pressure_record_from_result(
@@ -2312,6 +5678,16 @@ def _pressure_record_from_result(
     readback = raw_pin(component["readback"], "Source5 pressure readback")
     processes = raw_pin(component["processes"], "Source5 pressure process ledger")
     overlay = raw_pin(component["overlay"], "Source5 pressure execution overlay")
+    host_receipt_value = result["evidence"].get("pressure_host_receipt")
+    if context.manifest["schema"] in BOUNDED_EXECUTION_SCHEMAS:
+        host_receipt = exact(host_receipt_value, {
+            "path", "raw_sha256", "receipt_sha256",
+        }, "Source5 strict pressure origin receipt pin")
+        require(is_sha(host_receipt["raw_sha256"]) and
+                is_sha(host_receipt["receipt_sha256"]),
+                "Source5 strict pressure origin receipt digest is malformed")
+    else:
+        host_receipt = None
     fixed_predecessor_path = recipe_root / "preflight" / "fixed-pressure-predecessor.json"
     _fixed_raw, fixed_sha, _fixed_info = read_stable(
         fixed_predecessor_path, "Source5 fixed-pressure predecessor receipt",
@@ -2361,6 +5737,8 @@ def _pressure_record_from_result(
             "overlay": overlay,
             "readback": readback,
             "processes": processes,
+            **({"host_receipt": host_receipt}
+               if host_receipt is not None else {}),
             "fixed_predecessor": {
                 "path": str(fixed_predecessor_path), "raw_sha256": fixed_sha,
             },
@@ -2373,62 +5751,153 @@ def _pressure_record_from_result(
     return body
 
 
-def _fresh_pressure_phase_records(
-    context: CampaignContext, lock: Any, phase_root: Path,
-    ledger_path: Path,
-) -> list[dict[str, Any]]:
-    records = _phase_ledger_records(ledger_path)
-    expected = _host_jobs(context, "pressure")
-    context.campaign.validate_phase_ledger(records, expected, "pressure", context.host_id)
-    for record in records:
-        require(record.get("evidence", {}).get("kind") == "source5_pressure_pair",
-                "pressure phase contains a non-Source5 pressure record")
-        record_pin = _raw_record_pin(phase_root, record["job"]["run_id"])
+def _source5_fresh_pressure_record(
+    context: CampaignContext, lock: Any, record: dict[str, Any],
+    record_pin: dict[str, str], captured_view: dict[str, Any] | None,
+) -> None:
+    if captured_view is None:
         checked_chain = context.chronology.verify_source5_completed_job_locked(
             lock, api_pin(context.manifest_pin), None, record_pin,
         )
-        require(checked_chain["process_metrics"] == record["process_metrics"],
-                "Source5 pressure journal replay and stored metrics differ")
-        authorization_context = context.chronology.source5_authorization_context_locked(
-            lock, api_pin(context.manifest_pin),
-            record["chronology"]["authorization_id"],
+    else:
+        checked_chain = context.chronology.verify_source5_completed_job_locked(
+            lock, api_pin(context.manifest_pin), None, record_pin,
+            captured_evidence=captured_view,
         )
-        recipe_ref = raw_pin(record["evidence"]["recipe"],
-                             "Source5 pressure recipe")
+    require(checked_chain["process_metrics"] == record["process_metrics"],
+            "Source5 pressure journal replay and stored metrics differ")
+    authorization_context = context.chronology.source5_authorization_context_locked(
+        lock, api_pin(context.manifest_pin),
+        record["chronology"]["authorization_id"],
+    )
+    recipe_ref = raw_pin(record["evidence"]["recipe"],
+                         "Source5 pressure recipe")
+    if captured_view is None:
         recipe, _recipe_raw, _recipe_sha = read_json(
             Path(recipe_ref["path"]), "Source5 pressure recipe",
             MAX_ARTIFACT_BYTES, recipe_ref["raw_sha256"],
         )
-        validation = context.pressure_pair.validate_pressure_pair_artifacts(
-            recipe, Path(record["pair_directory"]),
-            Path(record["evidence"]["readback"]["path"]),
-            record["evidence"]["readback"]["raw_sha256"],
-            chronology_module=context.chronology,
-            lock=lock,
-            authorization_context=authorization_context,
+    else:
+        recipe_raw, _recipe_row = _source5_archive_read_reference_bytes(
+            context, captured_view, recipe_ref, "pressure recipe",
+            "pressure_pair_artifact",
         )
-        require(validation["validated"] is True and
-                validation["qualification_eligible"] is False and
-                validation["pressure_metrics"] == record["process_metrics"],
-                "Source5 pressure artifacts failed a fresh component replay")
+        try:
+            recipe = json.loads(recipe_raw.decode("ascii"))
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise Source5CampaignError(
+                "Source5 captured pressure recipe is malformed",
+            ) from error
+        require(recipe_raw == canonical_bytes(recipe),
+                "Source5 captured pressure recipe is not canonical")
+    kwargs = {
+        "chronology_module": context.chronology,
+        "lock": lock,
+        "authorization_context": authorization_context,
+    }
+    if captured_view is not None:
+        kwargs["captured_evidence"] = captured_view
+    validation = context.pressure_pair.validate_pressure_pair_artifacts(
+        recipe, Path(record["pair_directory"]),
+        Path(record["evidence"]["readback"]["path"]),
+        record["evidence"]["readback"]["raw_sha256"],
+        **kwargs,
+    )
+    require(validation["validated"] is True and
+            validation["qualification_eligible"] is False and
+            validation["pressure_metrics"] == record["process_metrics"],
+            "Source5 pressure artifacts failed a fresh component replay")
+    if context.manifest["schema"] in BOUNDED_EXECUTION_SCHEMAS:
+        receipt_pin = exact(record["evidence"].get("host_receipt"), {
+            "path", "raw_sha256", "receipt_sha256",
+        }, "Source5 strict pressure host receipt")
+        if captured_view is None:
+            receipt, receipt_raw, receipt_sha = read_json(
+                Path(receipt_pin["path"]), "Source5 strict pressure host receipt",
+                context.chronology.MAX_COMPLETION_BYTES,
+                receipt_pin["raw_sha256"],
+            )
+        else:
+            receipt_raw, receipt_row = _source5_archive_read_reference_bytes(
+                context, captured_view,
+                {"path": receipt_pin["path"],
+                 "raw_sha256": receipt_pin["raw_sha256"]},
+                "strict pressure host receipt", "component_receipt",
+            )
+            receipt_sha = receipt_row["raw_sha256"]
+            try:
+                receipt = json.loads(receipt_raw.decode("ascii"))
+            except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+                raise Source5CampaignError(
+                    "Source5 captured strict pressure receipt is malformed",
+                ) from error
+        receipt_body = {key: value for key, value in receipt.items()
+                        if key != "receipt_sha256"}
+        require(receipt["schema"] ==
+                context.pressure_pair.HOST_VERIFICATION_SCHEMA and
+                receipt["campaign_id"] == context.manifest["campaign_id"] and
+                receipt["host_id"] == context.host_id and
+                receipt["job"]["run_id"] == record["job"]["run_id"] and
+                receipt["authorization_id"] ==
+                    record["chronology"]["authorization_id"] and
+                receipt["receipt_sha256"] == receipt_pin["receipt_sha256"] ==
+                    sha256(canonical_bytes(receipt_body)) and
+                receipt_raw == canonical_bytes(receipt) and
+                receipt_sha == receipt_pin["raw_sha256"],
+                "Source5 strict pressure receipt differs from the exact authorized original job")
+
+
+def _fresh_pressure_phase_records(
+    context: CampaignContext, lock: Any, phase_root: Path,
+    ledger_path: Path, archive_purpose: str = "pressure_analysis",
+) -> list[dict[str, Any]]:
+    expected = _host_jobs(context, "pressure")
+    records = _phase_ledger_records(
+        ledger_path,
+        _source5_phase_ledger_byte_bound(context, "pressure", expected),
+    )
+    context.campaign.validate_phase_ledger(records, expected, "pressure", context.host_id)
+    for record in records:
+        require(record.get("evidence", {}).get("kind") == "source5_pressure_pair",
+                "pressure phase contains a non-Source5 pressure record")
+    if context.manifest["schema"] == EXECUTION_SCHEMA_V4:
+        require(archive_purpose == "pressure_analysis",
+                "Source5 v4 final pressure owners require the all-phase held replay")
+        provider = source5_completed_archive_read_provider(context)
+        return _source5_replay_phase_records_captured(
+            context, lock, "pressure", records, provider,
+        )
+    for record in records:
+        record_pin = _raw_record_pin(phase_root, record["job"]["run_id"])
+        _source5_fresh_pressure_record(context, lock, record, record_pin, None)
     return records
 
 
 def _fresh_soak_phase_records(
     context: CampaignContext, lock: Any, phase_root: Path,
-    ledger_path: Path,
+    ledger_path: Path, archive_purpose: str = "soak",
 ) -> list[dict[str, Any]]:
-    records = _phase_ledger_records(ledger_path)
     expected = _host_jobs(context, "soak")
+    records = _phase_ledger_records(
+        ledger_path, _source5_phase_ledger_byte_bound(context, "soak", expected),
+    )
     require(len(expected) == len(records) == 1 and
             records[0]["job"] == expected[0] and
             records[0]["state"] in {"valid_soak", "invalid_soak"} and
             records[0]["evidence"].get("kind") == "source5_timed_soak",
             "Source5 Soak ledger does not preserve its one original completed ordinal")
     record_pin = _raw_record_pin(phase_root, expected[0]["run_id"])
-    checked = context.chronology.verify_source5_completed_soak_job_locked(
-        lock, api_pin(context.manifest_pin), record_pin,
-    )
+    if context.manifest["schema"] == EXECUTION_SCHEMA_V4:
+        with archived_job_read_view(
+                context, expected[0], archive_purpose) as captured_view:
+            checked = context.chronology.verify_source5_completed_soak_job_locked(
+                lock, api_pin(context.manifest_pin), record_pin,
+                captured_evidence=captured_view,
+            )
+    else:
+        checked = context.chronology.verify_source5_completed_soak_job_locked(
+            lock, api_pin(context.manifest_pin), record_pin,
+        )
     require(checked["verified"] is True and
             checked["status"] == records[0]["state"] and
             checked["run_id"] == expected[0]["run_id"] and
@@ -2440,6 +5909,8 @@ def _fresh_soak_phase_records(
 
 def _source5_numeric_for_pairs(
     context: CampaignContext, phase: str, records: list[dict[str, Any]],
+    archive_purpose: str | None = None, *,
+    captured_read_provider: Any | None = None,
 ) -> dict[str, Any]:
     analyzer = context.source.get("analysis_artifact")
     require(type(analyzer) is dict and set(analyzer) == {"path", "sha256"} and
@@ -2452,11 +5923,218 @@ def _source5_numeric_for_pairs(
     )
     require(analysis_sha == analyzer["sha256"] and analysis_info.st_mode & 0o111 != 0,
             "Source5 paired analysis binary differs from SourceV5")
-    result = context.campaign.analyze_confirmation_host_numeric(
-        context.spec, context.host_id, records,
-        context.artifact_root, analysis_path, analysis_sha,
-        phase="confirmation" if phase == "fixed_analysis" else "pressure",
-    )
+    analyzer_scratch = context.source5_analyzer_scratch_root
+    analyzer_projection = context.source5_analyzer_scratch_projection
+    if context.manifest["schema"] == EXECUTION_SCHEMA_V4:
+        require(context.journal_width_contract is not None and
+                isinstance(analyzer_scratch, Path) and
+                type(analyzer_projection) is dict and
+                analyzer_projection.get("schema") ==
+                    "allocatbelt.application-rust-analyzer-scratch-projection.v1" and
+                analyzer_scratch.is_absolute() and
+                _source5_analyzer_scratch_is_empty(analyzer_scratch),
+                "Source5 v4 analyzer has no exact empty source-derived scratch reservation")
+    trace_view_factory = None
+    if context.manifest["schema"] == EXECUTION_SCHEMA_V4:
+        read_purpose = archive_purpose or phase
+
+        def trace_view_factory(
+            job: dict[str, Any], cancel_event: threading.Event | None,
+        ):
+            @contextmanager
+            def one_job_view():
+                require(cancel_event is None or not cancel_event.is_set(),
+                        "Source5 analyzer input serialization was cancelled")
+                if captured_read_provider is None:
+                    read_view = archived_job_read_view(
+                        context, job, read_purpose,
+                        cancel_event=cancel_event,
+                    )
+                else:
+                    open_view = getattr(captured_read_provider, "open_view", None)
+                    require(callable(open_view),
+                            "Source5 captured replay provider has no exact open_view API")
+                    read_use = ("final_analyzer_trace"
+                                if read_purpose == "final_analysis" else
+                                "phase_analyzer_trace")
+                    read_view = open_view(job, read_purpose, use=read_use)
+                with read_view as captured_view:
+                    require(type(captured_view) is dict and
+                            captured_view.get("schema") ==
+                                "allocatbelt.application-source5-archived-job-read-view.v1" and
+                            captured_view.get("campaign_id") ==
+                                context.manifest["campaign_id"] and
+                            captured_view.get("host_id") == context.host_id and
+                            captured_view.get("phase") == job["phase"] and
+                            captured_view.get("ordinal") == job["ordinal"] and
+                            captured_view.get("run_id") == job["run_id"] and
+                            captured_view.get("job_sha256") ==
+                                sha256(canonical_bytes(job)) and
+                            captured_view.get("qualification_eligible") is False and
+                            captured_view.get("may_reclaim") is False,
+                            "Source5 analyzer captured view differs from the exact original job")
+                    references = captured_view["objects"]
+                    stage_root = Path(captured_view["stage_root"])
+
+                    class ArtifactView:
+                        @contextmanager
+                        def open_snapshot(
+                            self, origin_path: Path, label: str,
+                            maximum: int,
+                        ):
+                            origin = str(origin_path)
+                            reference = references.get(origin)
+                            require(type(reference) is dict and
+                                    reference.get("origin_path") == origin,
+                                    "Source5 analyzer trace is outside its archived job closure")
+                            reference = exact(reference, {
+                                "origin_path", "path", "role", "host_id",
+                                "raw_sha256", "semantic_sha256", "byte_count",
+                                "maximum_bytes",
+                            }, "Source5 archived analyzer trace reference")
+                            staged_path = Path(reference["path"])
+                            expected_role = (
+                                "normal_app_output"
+                                if job["phase"] == "confirmation" else
+                                "opaque_trace"
+                                if job["phase"] == "pressure" else None
+                            )
+                            require(staged_path.is_absolute() and
+                                    staged_path.parent == stage_root and
+                                    expected_role is not None and
+                                    reference["role"] == expected_role and
+                                    reference["host_id"] == context.host_id and
+                                    is_sha(reference["raw_sha256"]) and
+                                    reference["semantic_sha256"] is None and
+                                    type(reference["byte_count"]) is int and
+                                    0 < reference["byte_count"] <= maximum and
+                                    reference["maximum_bytes"] ==
+                                        reference["byte_count"],
+                                    "Source5 analyzer trace reference exceeds its authenticated bound")
+                            stage_fd = os.open(
+                                stage_root, os.O_RDONLY |
+                                getattr(os, "O_DIRECTORY", 0) |
+                                getattr(os, "O_CLOEXEC", 0) |
+                                getattr(os, "O_NOFOLLOW", 0),
+                            )
+                            snapshot = None
+                            object_fd = None
+                            try:
+                                snapshot = tempfile.SpooledTemporaryFile(
+                                    max_size=context.campaign.ANALYZER_TRACE_SNAPSHOT_MEMORY_BYTES,
+                                    mode="w+b",
+                                    dir=(analyzer_scratch if analyzer_scratch is not None
+                                         else None),
+                                )
+                                stage_before = os.fstat(stage_fd)
+                                stage_path_before = stage_root.lstat()
+                                require(stat.S_ISDIR(stage_before.st_mode) and
+                                        stage_before.st_uid == os.getuid() and
+                                        stat.S_IMODE(stage_before.st_mode) == 0o700 and
+                                        _source5_same_file_identity(
+                                            stage_before, stage_path_before,
+                                        ),
+                                        "Source5 analyzer trace root is not its owned captured directory")
+                                before_path = os.stat(
+                                    staged_path.name, dir_fd=stage_fd,
+                                    follow_symlinks=False,
+                                )
+                                object_fd = os.open(
+                                    staged_path.name, os.O_RDONLY |
+                                    getattr(os, "O_CLOEXEC", 0) |
+                                    getattr(os, "O_NOFOLLOW", 0) |
+                                    getattr(os, "O_NONBLOCK", 0),
+                                    dir_fd=stage_fd,
+                                )
+                                before = os.fstat(object_fd)
+                                require(stat.S_ISREG(before.st_mode) and
+                                        before.st_uid == os.getuid() and
+                                        stat.S_IMODE(before.st_mode) == 0o400 and
+                                        before.st_nlink == 1 and
+                                        before.st_size == reference["byte_count"] and
+                                        _source5_same_file_identity(
+                                            before_path, before,
+                                        ),
+                                        "Source5 analyzer trace stage is not one exact private object")
+                                digest = hashlib.sha256()
+                                size = 0
+                                while size < reference["byte_count"]:
+                                    require(cancel_event is None or
+                                            not cancel_event.is_set(),
+                                            "Source5 analyzer trace read was cancelled")
+                                    block = os.read(object_fd, min(
+                                        SOURCE5_ARCHIVE_READ_COPY_BYTES,
+                                        reference["byte_count"] - size,
+                                    ))
+                                    require(bool(block),
+                                            "Source5 analyzer trace stage shortened")
+                                    size += len(block)
+                                    require(size <= maximum,
+                                            "Source5 analyzer trace stage exceeded its owner cap")
+                                    digest.update(block)
+                                    snapshot.write(block)
+                                after = os.fstat(object_fd)
+                                after_path = os.stat(
+                                    staged_path.name, dir_fd=stage_fd,
+                                    follow_symlinks=False,
+                                )
+                                stage_after = os.fstat(stage_fd)
+                                stage_path_after = stage_root.lstat()
+                                digest_hex = digest.hexdigest()
+                                require(os.read(object_fd, 1) == b"" and
+                                        size == reference["byte_count"] and
+                                        digest_hex == reference["raw_sha256"] and
+                                        _source5_same_file_identity(before, after) and
+                                        _source5_same_file_identity(before, after_path) and
+                                        _source5_same_file_identity(
+                                            stage_before, stage_after,
+                                        ) and
+                                        _source5_same_file_identity(
+                                            stage_before, stage_path_after,
+                                        ),
+                                        "Source5 analyzer trace bytes or captured identities changed")
+                                require(cancel_event is None or
+                                        not cancel_event.is_set(),
+                                        "Source5 analyzer trace read was cancelled before release")
+                                snapshot.seek(0)
+                                yield snapshot, digest_hex, size
+                            except OSError as error:
+                                raise Source5CampaignError(
+                                    f"cannot read {label} from its captured stage: {error}",
+                                ) from error
+                            finally:
+                                try:
+                                    if object_fd is not None:
+                                        os.close(object_fd)
+                                finally:
+                                    try:
+                                        if snapshot is not None:
+                                            snapshot.close()
+                                    finally:
+                                        os.close(stage_fd)
+
+                    yield ArtifactView()
+            return one_job_view()
+
+    try:
+        result = context.campaign.analyze_confirmation_host_numeric(
+            context.spec, context.host_id, records,
+            context.artifact_root, analysis_path, analysis_sha,
+            phase="confirmation" if phase == "fixed_analysis" else "pressure",
+            trace_view_factory=trace_view_factory,
+            analyzer_require_elf=(
+                context.manifest["schema"] == EXECUTION_SCHEMA_V4
+            ),
+            analyzer_scratch_directory=analyzer_scratch,
+            analyzer_maximum_group_frame_bytes=(
+                None if analyzer_projection is None else
+                analyzer_projection["maximum_group_frame_bytes"]
+            ),
+        )
+    finally:
+        if analyzer_scratch is not None:
+            require(_source5_analyzer_scratch_is_empty(analyzer_scratch),
+                    "Source5 analyzer left unaccounted scratch bytes after its read window")
     _after_raw, after_sha, _after_info = read_stable(
         analysis_path, "Source5 paired analysis binary after run",
         1024 * 1024 * 1024,
@@ -2464,6 +6142,675 @@ def _source5_numeric_for_pairs(
     require(after_sha == analysis_sha,
             "Source5 paired-analysis binary changed during a fresh final replay")
     return result
+
+
+def _source5_replay_exploration_analysis_value(
+    context: CampaignContext, records: list[dict[str, Any]],
+    prior_analysis: object, provider: Any, view_purpose: str,
+) -> tuple[dict[str, Any], bool]:
+    """Rebuild the original capacity pilot from held records and pinned receipts."""
+    jobs = _host_jobs(context, "exploration")
+    require(len(records) == len(jobs),
+            "Source5 exploration replay differs from the exact original job count")
+    require(view_purpose in {"exploration", "final_analysis"},
+            "Source5 exploration receipt view has an unsupported refresh purpose")
+    read_use = ("phase_analysis" if view_purpose == "exploration" else
+                "final_replay")
+    for index, (record, job) in enumerate(zip(records, jobs, strict=True)):
+        with provider.open_view(job, view_purpose, use=read_use) as view:
+            require(type(view) is dict and
+                    view.get("schema") ==
+                        "allocatbelt.application-source5-archived-job-read-view.v1" and
+                    view.get("campaign_id") == context.manifest["campaign_id"] and
+                    view.get("host_id") == context.host_id and
+                    view.get("phase") == "exploration" and
+                    view.get("job_index") == index and
+                    view.get("ordinal") == job["ordinal"] and
+                    view.get("run_id") == job["run_id"] and
+                    view.get("job_sha256") == sha256(canonical_bytes(job)) and
+                    view.get("qualification_eligible") is False and
+                    view.get("may_reclaim") is False,
+                    "Source5 exploration receipt view differs from its exact original job")
+            _source5_capture_fixed_capacity_projection(context, record, view)
+    rebuilt_pilot = _capacity_pilot(context, records)
+    analysis_value = exact(prior_analysis, {
+        "schema", "scope", "pilot", "rate_candidate", "rate_status",
+    }, "Source5 immutable exploration analysis projection")
+    pilot_pin = exact(analysis_value["pilot"], {
+        "path", "raw_sha256",
+    }, "Source5 immutable exploration pilot pin")
+    phase_root = _phase_root(context, "exploration")
+    pilot_path = phase_root / "capacity-pilot.json"
+    require(pilot_pin["path"] == str(pilot_path) and
+            is_sha(pilot_pin["raw_sha256"]),
+            "Source5 exploration pilot pin differs from its deterministic original path")
+    pilot, pilot_raw, pilot_sha = read_json(
+        pilot_path, "Source5 immutable exploration capacity pilot",
+        MAX_ARTIFACT_BYTES, pilot_pin["raw_sha256"],
+    )
+    require(pilot_raw == canonical_bytes(pilot) and
+            pilot_sha == pilot_pin["raw_sha256"] and
+            pilot == rebuilt_pilot,
+            "Source5 immutable exploration pilot differs from fresh original-record reconstruction")
+    frozen = context.campaign.freeze_rates(context.spec, rebuilt_pilot, pilot_sha)
+    expected_rates = _frozen_rate_rows(context.host_id, frozen, pilot_sha)
+    existing_rates = [row for row in context.spec["rates"]
+                      if row["host_id"] == context.host_id]
+    if context.scope == "final_frozen":
+        require(existing_rates == expected_rates,
+                "retained exploration pairs do not reproduce the already frozen original SpecV3 rates")
+        rate_status = "verified_against_final_frozen_spec"
+    else:
+        require(existing_rates == [],
+                "prospective exploration must retain an unfrozen SpecV3 rate table")
+        rate_status = "candidate_for_separate_final_freeze"
+    candidate_pin = exact(analysis_value["rate_candidate"], {
+        "path", "raw_sha256",
+    }, "Source5 immutable exploration rate-candidate pin")
+    candidate_path = phase_root / "capacity-rate-candidate.json"
+    require(candidate_pin["path"] == str(candidate_path) and
+            is_sha(candidate_pin["raw_sha256"]),
+            "Source5 exploration rate candidate differs from its deterministic original path")
+    candidate = {
+        "schema": "allocatbelt.application-source5-rate-candidate.v1",
+        "scope": context.scope,
+        "pilot": pilot_pin,
+        "candidate_rates": expected_rates,
+        "original_spec_rates": existing_rates,
+        "status": rate_status,
+        "qualification_eligible": False,
+    }
+    captured_candidate, candidate_raw, candidate_sha = read_json(
+        candidate_path, "Source5 immutable exploration rate candidate",
+        MAX_ARTIFACT_BYTES, candidate_pin["raw_sha256"],
+    )
+    expected_analysis = {
+        "schema": "allocatbelt.application-source5-exploration-analysis.v1",
+        "scope": context.scope,
+        "pilot": pilot_pin,
+        "rate_candidate": {
+            "path": str(candidate_path), "raw_sha256": candidate_sha,
+        },
+        "rate_status": rate_status,
+    }
+    require(candidate_raw == canonical_bytes(captured_candidate) and
+            candidate_sha == candidate_pin["raw_sha256"] and
+            captured_candidate == candidate and
+            analysis_value == expected_analysis,
+            "Source5 immutable exploration candidate differs from fresh original-record reconstruction")
+    return expected_analysis, existing_rates == expected_rates
+
+
+def _source5_phase_records_replay_sha256(
+    context: CampaignContext, phase: str, records: list[dict[str, Any]],
+) -> str:
+    """Rebuild chronology's phase-ledger/raw-record digest without owner maps."""
+    jobs = _host_jobs(context, phase)
+    maximum = _source5_phase_ledger_byte_bound(context, phase, jobs)
+    phase_root = _phase_root(context, phase)
+    ledger_path = phase_root / "controller-ledger.jsonl"
+    ledger_raw, ledger_sha, _ledger_info = read_stable(
+        ledger_path, f"Source5 {phase} captured-replay phase ledger", maximum,
+    )
+    lines = ledger_raw.splitlines(keepends=True)
+    require(ledger_raw.endswith(b"\n") and b"\r" not in ledger_raw and
+            len(lines) == len(jobs) == len(records),
+            f"Source5 {phase} replay ledger does not close the exact original Plan rows")
+    record_raw_hashes = []
+    for index, (line, record, job) in enumerate(zip(
+        lines, records, jobs, strict=True,
+    )):
+        try:
+            line_value = json.loads(line)
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise Source5CampaignError(
+                f"Source5 {phase} replay ledger row[{index}] is malformed",
+            ) from error
+        require(type(record) is dict and record == line_value and
+                line == canonical_bytes(line_value) and
+                record.get("job") == job and
+                record.get("qualification_eligible") is False and
+                record.get("record_sha256") == sha256(canonical_bytes({
+                    key: value for key, value in record.items()
+                    if key != "record_sha256"
+                })),
+                f"Source5 {phase} held record differs from its exact local canonical ledger row")
+        record_path = phase_root / "job-records" / f"{job['run_id']}.json"
+        record_raw, record_sha, record_info = read_stable(
+            record_path, f"Source5 {phase} replay job record",
+            _source5_job_record_byte_bound(context, phase, job),
+        )
+        require(record_raw == line and record_sha == sha256(record_raw) and
+                stat.S_ISREG(record_info.st_mode) and
+                record_info.st_uid == os.getuid() and
+                stat.S_IMODE(record_info.st_mode) == 0o600 and
+                record_info.st_nlink == 1,
+                f"Source5 {phase} replay job record differs from its raw local pin")
+        record_raw_hashes.append(record_sha)
+    return sha256(canonical_bytes({
+        "ledger_raw_sha256": ledger_sha,
+        "record_raw_sha256": record_raw_hashes,
+    }))
+
+
+def _source5_read_original_phase_analysis(
+    context: CampaignContext, phase: str,
+) -> dict[str, Any]:
+    """Read a prior immutable phase analysis whose digest is inside final analysis."""
+    source_phase = {
+        "fixed_analysis": "confirmation",
+        "pressure_analysis": "pressure",
+        "final_analysis": "soak",
+    }.get(phase, phase)
+    jobs = _host_jobs(context, source_phase)
+    path = (context.artifact_root / context.manifest["campaign_id"] /
+            "source5" / context.host_id / "phase-analysis" / f"{phase}.json")
+    value, raw, raw_sha = read_json(
+        path, f"Source5 immutable original {phase} analysis",
+        MAX_ARTIFACT_BYTES,
+    )
+    value = exact(value, {
+        "schema", "campaign_id", "host_id", "phase", "job_count",
+        "job_set_sha256", "job_evidence_complete", "numeric_gates_passed",
+        "phase_gate_passed", "campaign_qualification_eligible", "analysis",
+        "analysis_sha256",
+    }, f"Source5 immutable original {phase} analysis")
+    body = {key: item for key, item in value.items()
+            if key != "analysis_sha256"}
+    job_ids = [job["run_id"] for job in jobs]
+    require(raw == canonical_bytes(value) and raw_sha == sha256(raw) and
+            value["schema"] == ANALYSIS_SCHEMA and
+            value["campaign_id"] == context.manifest["campaign_id"] and
+            value["host_id"] == context.host_id and
+            value["phase"] == phase and
+            value["job_count"] == len(jobs) and
+            value["job_set_sha256"] == sha256(canonical_bytes(job_ids)) and
+            value["job_evidence_complete"] is True and
+            type(value["numeric_gates_passed"]) is bool and
+            value["phase_gate_passed"] == value["numeric_gates_passed"] and
+            value["campaign_qualification_eligible"] is False and
+            type(value["analysis"]) is dict and
+            value["analysis_sha256"] == sha256(canonical_bytes(body)),
+            f"Source5 immutable original {phase} analysis identity or self digest differs")
+    value["_artifact_raw_sha256"] = raw_sha
+    return value
+
+
+def _source5_replay_final_analysis_value(
+    context: CampaignContext, lock: Any, manifest_pin: dict[str, str],
+    prior_analysis: object, provider: Any, held_replay: Any,
+    phase_analysis_events: object,
+) -> dict[str, Any]:
+    """Rebuild the final decision from every exact original captured phase."""
+    required = ("exploration", "aa", "fixed_analysis", "pressure_analysis", "soak")
+    owner_phase = {
+        "exploration": "exploration", "aa": "aa",
+        "fixed_analysis": "confirmation", "pressure_analysis": "pressure",
+        "soak": "soak",
+    }
+    final_value = exact(prior_analysis, {
+        "schema", "campaign_id", "host_id", "original_spec", "original_plan",
+        "prepared_input_completion", "source_manifest",
+        "prepared_host_binding_sha256", "phase_results",
+        "numeric_gates_passed", "failed_phases", "cohort_status",
+        "cohort_blockers", "campaign_qualification_eligible",
+    }, "Source5 immutable final decision analysis")
+    stored_results = final_value["phase_results"]
+    require(type(stored_results) is list and len(stored_results) == len(required),
+            "Source5 final decision omits an original phase result")
+    require(type(phase_analysis_events) is list and
+            len(phase_analysis_events) == len(required),
+            "Source5 final replay lacks the exact chronology phase-event projection")
+    event_by_phase: dict[str, dict[str, Any]] = {}
+    for index, (phase, event_value) in enumerate(zip(
+        required, phase_analysis_events, strict=True,
+    )):
+        event = exact(event_value, {
+            "phase", "analysis", "analysis_sha256", "event_head",
+        }, f"Source5 chronology phase event[{index}]")
+        artifact = exact(event["analysis"], {
+            "path", "raw_sha256",
+        }, f"Source5 chronology phase event[{index}] analysis pin")
+        expected_path = (
+            context.artifact_root / context.manifest["campaign_id"] /
+            "source5" / context.host_id / "phase-analysis" / f"{phase}.json"
+        )
+        require(event["phase"] == phase and
+                artifact["path"] == str(expected_path) and
+                is_sha(artifact["raw_sha256"]) and
+                event["analysis_sha256"] == artifact["raw_sha256"] and
+                is_sha(event["event_head"]),
+                f"Source5 chronology phase event[{index}] pin or head differs")
+        event_by_phase[phase] = event
+    for index, (phase, stored) in enumerate(zip(
+        required, stored_results, strict=True,
+    )):
+        row = exact(stored, {
+            "phase", "numeric_gates_passed", "analysis_sha256", "event_head",
+            "records_sha256",
+        }, f"Source5 final immutable phase result[{index}]")
+        event = event_by_phase[phase]
+        require(row["phase"] == phase and
+                row["analysis_sha256"] == event["analysis_sha256"] and
+                row["event_head"] == event["event_head"] and
+                is_sha(row["records_sha256"]),
+                f"Source5 final {phase} metadata differs from its chronology event")
+    old_phase_records = {
+        phase: _source5_read_original_phase_analysis(context, phase)
+        for phase in required
+    }
+    for phase in required:
+        prior = old_phase_records[phase]
+        event = event_by_phase[phase]
+        require(prior["_artifact_raw_sha256"] ==
+                    event["analysis"]["raw_sha256"] and
+                event["analysis_sha256"] == prior["_artifact_raw_sha256"],
+                f"Source5 {phase} analysis artifact raw pin differs from its chronology event")
+    records_by_phase: dict[str, list[dict[str, Any]]] = {}
+    record_digests: dict[str, str] = {}
+    for phase in required:
+        records = held_replay(
+            lock, {"path": manifest_pin["path"],
+                   "sha256": manifest_pin["raw_sha256"]},
+            owner_phase[phase], captured_read_context=provider,
+            analysis_phase="final_analysis",
+        )
+        jobs = _host_jobs(context, owner_phase[phase])
+        require(type(records) is list and len(records) == len(jobs) and
+                all(type(record) is dict and record.get("job") == job
+                    for record, job in zip(records, jobs, strict=True)),
+                f"Source5 final held replay does not close every original {phase} job")
+        if phase == "soak":
+            require(len(records) == len(jobs) == 1 and
+                    records[0].get("state") in {"valid_soak", "invalid_soak"} and
+                    records[0].get("evidence", {}).get("kind") ==
+                        "source5_timed_soak" and
+                    type(records[0].get("process_metrics")) is list and
+                    len(records[0]["process_metrics"]) == 1,
+                    "Source5 final Soak replay differs from its one original ordinal")
+        else:
+            context.campaign.validate_phase_ledger(
+                records, jobs, owner_phase[phase], context.host_id,
+            )
+            require(all(record.get("state") == "valid_pair"
+                        for record in records),
+                    f"Source5 final {phase} replay contains an invalid original pair")
+        records_by_phase[phase] = records
+        record_digests[phase] = _source5_phase_records_replay_sha256(
+            context, owner_phase[phase], records,
+        )
+
+    exploration_analysis, _exploration_rate_gate = \
+        _source5_replay_exploration_analysis_value(
+            context, records_by_phase["exploration"],
+            old_phase_records["exploration"]["analysis"],
+            provider, "final_analysis",
+        )
+    require(exploration_analysis == old_phase_records["exploration"]["analysis"],
+            "Source5 final exploration replay differs from its immutable phase analysis")
+    aa_analysis = context.campaign.validate_aa_records(
+        records_by_phase["aa"], _host_jobs(context, "aa"), context.host_id,
+        context.spec["protocol"]["bootstrap_draws"],
+        context.spec["protocol"]["bootstrap_seed"],
+    )
+    require(aa_analysis == old_phase_records["aa"]["analysis"],
+            "Source5 final A/A replay differs from its immutable phase analysis")
+    fixed_analysis = _source5_numeric_for_pairs(
+        context, "fixed_analysis", records_by_phase["fixed_analysis"],
+        archive_purpose="final_analysis", captured_read_provider=provider,
+    )
+    require(_source5_analysis_matches_replay(
+                "fixed_analysis", fixed_analysis,
+                old_phase_records["fixed_analysis"]["analysis"],
+            ),
+            "Source5 final fixed analysis differs from its immutable fresh replay")
+    pressure_analysis = _source5_numeric_for_pairs(
+        context, "pressure_analysis", records_by_phase["pressure_analysis"],
+        archive_purpose="final_analysis", captured_read_provider=provider,
+    )
+    require(_source5_analysis_matches_replay(
+                "pressure_analysis", pressure_analysis,
+                old_phase_records["pressure_analysis"]["analysis"],
+            ),
+            "Source5 final pressure analysis differs from its immutable fresh replay")
+    soak_record = records_by_phase["soak"][0]
+    soak_analysis = {
+        "schema": "allocatbelt.application-source5-soak-analysis.v1",
+        "component": raw_pin(soak_record["evidence"].get("soak_component"),
+                              "Source5 final Soak component"),
+        "readback": soak_record["process_metrics"][0],
+        "record_sha256": soak_record["record_sha256"],
+    }
+    require(soak_analysis == old_phase_records["soak"]["analysis"],
+            "Source5 final Soak replay differs from its immutable phase analysis")
+
+    gates = [
+        _exploration_rate_gate,
+        aa_analysis.get("passed") is True,
+        fixed_analysis.get("numeric_gates_passed") is True,
+        pressure_analysis.get("numeric_gates_passed") is True,
+        soak_analysis["readback"].get("passed") is True,
+    ]
+    for phase, gate in zip(required, gates, strict=True):
+        prior = old_phase_records[phase]
+        require(prior["numeric_gates_passed"] is gate and
+                prior["phase_gate_passed"] is gate,
+                f"Source5 {phase} document gate differs from fresh original replay")
+    phase_results = []
+    for index, (phase, gate, stored) in enumerate(zip(
+        required, gates, stored_results, strict=True,
+    )):
+        row = exact(stored, {
+            "phase", "numeric_gates_passed", "analysis_sha256", "event_head",
+            "records_sha256",
+        }, f"Source5 final immutable phase result[{index}]")
+        event = event_by_phase[phase]
+        require(row["phase"] == phase and
+                row["numeric_gates_passed"] is gate and
+                row["analysis_sha256"] == event["analysis_sha256"] and
+                row["event_head"] == event["event_head"] and
+                row["records_sha256"] == record_digests[phase] and
+                is_sha(row["event_head"]),
+                f"Source5 final {phase} result differs from its immutable phase/read digests")
+        phase_results.append({
+            "phase": phase, "numeric_gates_passed": gate,
+            "analysis_sha256": event["analysis_sha256"],
+            "event_head": event["event_head"],
+            "records_sha256": record_digests[phase],
+        })
+    fresh_analysis = _source5_final_decision_value(context, phase_results)
+    require(fresh_analysis == final_value,
+            "Source5 final decision differs from fresh exact original phase replay")
+    return fresh_analysis
+
+
+def _source5_validate_captured_host_budget(
+    context: CampaignContext, value: object, budget_module: Any,
+) -> dict[str, Any]:
+    """Dispatch exact v2/v3 bodies without widening legacy validator calls."""
+    require(type(value) is dict,
+            "Source5 captured phase replay host budget is not an object")
+    schema_v2 = getattr(
+        budget_module, "HOST_BUDGET_SCHEMA_V2",
+        "allocatbelt.application-source5-host-evidence-budget.v2",
+    )
+    schema_v3 = getattr(
+        budget_module, "HOST_BUDGET_SCHEMA_V3",
+        "allocatbelt.application-source5-host-evidence-budget.v3",
+    )
+    schema = value.get("schema")
+    if schema == schema_v2:
+        validate_v2 = getattr(
+            budget_module, "validate_host_evidence_budget_v2", None,
+        )
+        require(callable(validate_v2),
+                "selected Source lacks its exact v2 host-budget validator")
+        if "journal_width_contract_pin" not in value:
+            # The closed legacy 13-field body has no captured-width binding.
+            return validate_v2(value)
+        # The additive 15-field v2 body uses its source-owned width-aware
+        # validator form; legacy 13-field modules keep the positional call.
+        require(value.get("execution_manifest_schema") == EXECUTION_SCHEMA_V4 and
+                type(context.journal_width_contract) is dict,
+                "selected Source cannot validate a width-bound v2 budget")
+        return validate_v2(
+            value,
+            journal_width_contract_raw=canonical_bytes(
+                context.journal_width_contract,
+            ),
+        )
+    if schema == schema_v3:
+        validate_v3 = getattr(
+            budget_module, "validate_host_evidence_budget_v3", None,
+        )
+        require(callable(validate_v3) and
+                type(context.journal_width_contract) is dict,
+                "selected Source lacks its exact v3 width-bound budget validator")
+        return validate_v3(
+            value,
+            journal_width_contract_raw=canonical_bytes(
+                context.journal_width_contract,
+            ),
+        )
+    raise Source5CampaignError(
+        "Source5 analysis freshness host budget has an unsupported exact schema",
+    )
+
+
+def replay_source5_phase_analysis_captured_locked(
+    hook_context: Any, lock: Any, phase: str, *,
+    chronology_module: Any, expected_analysis_pin: object,
+) -> dict[str, Any]:
+    """Recompute one prior v4 phase analysis through captured read views.
+
+    The chronology supplies only its validated prepared/manifest values and a
+    raw-view provider. A fresh Source5 CampaignContext is rebuilt from the
+    original manifest and Source pins; owner records come from the chronology's
+    held-lock replay API, and captured owner/trace bytes come only from
+    provider.open_view. Exploration and A/A rebuild their deterministic
+    projections from the exact replayed original records and immutable local
+    analysis artifacts; neither branch writes replacement artifacts. This
+    function never publishes a journal event or analysis artifact.
+    """
+    require(phase in {"exploration", "aa", "fixed_analysis",
+                      "pressure_analysis", "soak", "final_analysis"} and
+            type(getattr(hook_context, "prepared", None)) is dict and
+            type(getattr(hook_context, "manifest", None)) is dict,
+            "Source5 analysis freshness context is malformed")
+    prepared = hook_context.prepared
+    manifest_value = hook_context.manifest
+    provider = getattr(hook_context, "captured_read_provider", None)
+    require(callable(getattr(provider, "open_view", None)),
+            "Source5 analysis freshness has no exact captured read-view provider")
+    manifest_pin = exact(prepared.get("source5_execution_manifest_pin"), {
+        "path", "raw_sha256",
+    }, "Source5 analysis freshness execution-manifest pin")
+    require(type(manifest_pin["path"]) is str and
+            type(manifest_pin["raw_sha256"]) is str and
+            is_sha(manifest_pin["raw_sha256"]) and
+            type(prepared.get("host_id")) is str and
+            type(prepared.get("campaign_id")) is str and
+            manifest_value.get("schema") == EXECUTION_SCHEMA_V4,
+            "Source5 analysis freshness requires the exact original v4 context")
+    context = load_context(Path(manifest_pin["path"]), prepared["host_id"])
+    require(context.manifest == manifest_value and
+            context.manifest_pin["raw_sha256"] == manifest_pin["raw_sha256"] and
+            context.manifest["campaign_id"] == prepared["campaign_id"] and
+            context.host_id == prepared["host_id"] and
+            context.journal_width_contract is not None,
+            "Source5 analysis freshness rebuilt a different pinned Source context")
+    require(getattr(lock, "campaign_id", None) == context.manifest["campaign_id"] and
+            getattr(lock, "host_id", None) == context.host_id and
+            getattr(lock, "output_root", None) == context.output_root,
+            "Source5 analysis freshness lock differs from its original host context")
+
+    chronology_relative = "scripts/application-campaign-chronology.py"
+    selected_modules = context.manifest["modules"][context.host_id]
+    chronology_pin = exact(selected_modules.get(chronology_relative), {
+        "path", "sha256",
+    }, "Source5 analysis freshness chronology module pin")
+    chronology_path = context.source_root / chronology_relative
+    chronology_raw, chronology_sha, _chronology_info = read_stable(
+        chronology_path, "Source5 pinned held-lock chronology helper",
+        MAX_SCRIPT_BYTES,
+    )
+    del chronology_raw
+    require(chronology_pin["path"] == chronology_relative and
+            chronology_pin["sha256"] == chronology_sha and
+            getattr(chronology_module, "__file__", None) ==
+                str(chronology_path) and
+            getattr(context.chronology, "__file__", None) ==
+                str(chronology_path),
+            "Source5 held-lock replay helper is not the exact selected Source module")
+    held_replay = getattr(
+        chronology_module,
+        "replay_source5_phase_records_captured_held", None,
+    )
+    require(callable(held_replay),
+            "Source5 held-lock captured phase-record replay API is unavailable")
+
+    budget_pin = exact(prepared.get("source5_host_evidence_budget_pin"), {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "Source5 analysis freshness host-budget pin")
+    require(is_sha(budget_pin["raw_sha256"]) and
+            is_sha(budget_pin["semantic_sha256"]),
+            "Source5 analysis freshness host-budget pin is malformed")
+    budget_value, budget_raw, budget_sha = read_json(
+        Path(budget_pin["path"]), "Source5 analysis freshness host budget",
+        MAX_ARTIFACT_BYTES, budget_pin["raw_sha256"],
+    )
+    budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    budget = _source5_validate_captured_host_budget(
+        context, budget_value, budget_module,
+    )
+    require(budget_raw == canonical_bytes(budget) and
+            budget_sha == budget_pin["raw_sha256"] and
+            budget["budget_sha256"] == budget_pin["semantic_sha256"] and
+            budget["campaign_id"] == context.manifest["campaign_id"] and
+            budget["host_id"] == context.host_id,
+            "Source5 analysis freshness host budget differs from its exact raw/semantic pin")
+    context.host_evidence_budget_pin = dict(budget_pin)
+    context.host_evidence_budget_raw = budget_raw
+    context.job_path_catalogue_pins = _source5_job_catalogue_pins(
+        context, budget, budget_module,
+    )
+    _source5_restore_archive_readback_context(
+        context, budget, budget_module,
+    )
+
+    phase_jobs = {
+        "exploration": "exploration",
+        "aa": "aa",
+        "soak": "soak",
+        "final_analysis": "soak",
+        "fixed_analysis": ("confirmation",),
+        "pressure_analysis": ("pressure",),
+    }[phase]
+    source_phase = phase_jobs[0] if type(phase_jobs) is tuple else phase_jobs
+    jobs = _host_jobs(context, source_phase)
+    expected_pin = exact(expected_analysis_pin, {
+        "path", "raw_sha256",
+    }, "Source5 original phase-analysis pin")
+    expected_analysis_path = (
+        context.artifact_root / context.manifest["campaign_id"] /
+        "source5" / context.host_id / "phase-analysis" / f"{phase}.json"
+    )
+    require(expected_pin["path"] == str(expected_analysis_path) and
+            is_sha(expected_pin["raw_sha256"]),
+            "Source5 prior phase-analysis pin differs from its exact deterministic path")
+    old_record, old_raw, old_sha = read_json(
+        expected_analysis_path, "Source5 immutable prior phase analysis",
+        MAX_ARTIFACT_BYTES, expected_pin["raw_sha256"],
+    )
+    old_record = exact(old_record, {
+        "schema", "campaign_id", "host_id", "phase", "job_count",
+        "job_set_sha256", "job_evidence_complete", "numeric_gates_passed",
+        "phase_gate_passed", "campaign_qualification_eligible", "analysis",
+        "analysis_sha256",
+    }, "Source5 immutable prior phase analysis")
+    old_body = {key: value for key, value in old_record.items()
+                if key != "analysis_sha256"}
+    job_ids = [job["run_id"] for job in jobs]
+    expected_job_set = sha256(canonical_bytes(job_ids))
+    require(old_sha == expected_pin["raw_sha256"] and
+            old_record["schema"] == ANALYSIS_SCHEMA and
+            old_record["campaign_id"] == context.manifest["campaign_id"] and
+            old_record["host_id"] == context.host_id and
+            old_record["phase"] == phase and
+            old_record["job_count"] == len(jobs) and
+            old_record["job_set_sha256"] == expected_job_set and
+            type(old_record["job_evidence_complete"]) is bool and
+            type(old_record["numeric_gates_passed"]) is bool and
+            old_record["phase_gate_passed"] ==
+                (old_record["job_evidence_complete"] and
+                 old_record["numeric_gates_passed"]) and
+            old_record["campaign_qualification_eligible"] is False and
+            type(old_record["analysis"]) is dict and
+            old_record["analysis_sha256"] ==
+                sha256(canonical_bytes(old_body)),
+            "Source5 prior phase-analysis bytes/pins are not a complete immutable record")
+
+    manifest_pin_for_chronology = {
+        "path": manifest_pin["path"],
+        "sha256": manifest_pin["raw_sha256"],
+    }
+    if phase == "final_analysis":
+        phase_event_reader = getattr(
+            chronology_module, "source5_phase_analysis_events_held", None,
+        )
+        require(callable(phase_event_reader),
+                "Source5 held chronology lacks the exact phase-event metadata API")
+        phase_analysis_events = phase_event_reader(
+            lock, manifest_pin_for_chronology,
+        )
+        fresh_analysis = _source5_replay_final_analysis_value(
+            context, lock, manifest_pin, old_record["analysis"],
+            provider, held_replay, phase_analysis_events,
+        )
+        require(len(jobs) == 1,
+                "Source5 final analysis does not bind the one original Soak job set")
+        return _analysis_record(
+            context, phase, len(jobs), job_ids, True,
+            fresh_analysis.get("numeric_gates_passed") is True,
+            fresh_analysis,
+        )
+
+    records = held_replay(
+        lock, manifest_pin_for_chronology, source_phase,
+        captured_read_context=provider, analysis_phase=phase,
+    )
+    require(type(records) is list and len(records) == len(jobs) and
+            all(type(record) is dict and record.get("job") == job
+                for record, job in zip(records, jobs, strict=True)),
+            "Source5 held-lock job replay does not close the exact original Plan phase")
+    if phase == "soak":
+        require(len(records) == len(jobs) == 1 and
+                records[0].get("state") in {"valid_soak", "invalid_soak"} and
+                records[0].get("evidence", {}).get("kind") ==
+                    "source5_timed_soak" and
+                type(records[0].get("process_metrics")) is list and
+                len(records[0]["process_metrics"]) == 1,
+                "Source5 captured Soak replay does not retain its one original completed ordinal")
+        component_pin = raw_pin(
+            records[0]["evidence"].get("soak_component"),
+            "Source5 captured Soak component",
+        )
+        fresh_analysis = {
+            "schema": "allocatbelt.application-source5-soak-analysis.v1",
+            "component": component_pin,
+            "readback": records[0]["process_metrics"][0],
+            "record_sha256": records[0]["record_sha256"],
+        }
+        require(old_record["analysis"] == fresh_analysis,
+                "Source5 immutable Soak analysis differs from fresh original component replay")
+        numeric_passed = fresh_analysis["readback"].get("passed") is True
+    elif phase == "exploration":
+        fresh_analysis, _rate_gate = \
+            _source5_replay_exploration_analysis_value(
+                context, records, old_record["analysis"], provider, phase,
+            )
+        numeric_passed = True
+    elif phase == "aa":
+        fresh_analysis = context.campaign.validate_aa_records(
+            records, jobs, context.host_id,
+            context.spec["protocol"]["bootstrap_draws"],
+            context.spec["protocol"]["bootstrap_seed"],
+        )
+        require(old_record["analysis"] == fresh_analysis,
+                "Source5 immutable A/A analysis differs from fresh original-record bootstrap replay")
+        numeric_passed = fresh_analysis.get("passed") is True
+    else:
+        require(all(record.get("state") == "valid_pair" for record in records),
+                "Source5 numeric phase replay contains a failed original fixed/pressure pair")
+        fresh_analysis = _source5_numeric_for_pairs(
+            context, phase, records, archive_purpose=phase,
+            captured_read_provider=provider,
+        )
+        numeric_passed = fresh_analysis.get("numeric_gates_passed") is True
+    return _analysis_record(
+        context, phase, len(jobs), job_ids, True, numeric_passed,
+        fresh_analysis,
+    )
 
 
 def _source5_final_decision_value(
@@ -2544,36 +6891,95 @@ def _fresh_source5_final_phase_results(
                 f"Source5 final analysis lacks the durable {phase} analysis event")
         stored.append(event)
     checked_records: dict[str, tuple[list[dict[str, Any]], str]] = {}
-    checked_records["exploration"] = (
-        _fresh_fixed_phase_records(
-            context, lock, "exploration", _phase_root(context, "exploration"),
-            _phase_root(context, "exploration") / "controller-ledger.jsonl",
-        ), "",
-    )
-    checked_records["aa"] = (
-        _fresh_fixed_phase_records(
-            context, lock, "aa", _phase_root(context, "aa"),
-            _phase_root(context, "aa") / "controller-ledger.jsonl",
-        ), "",
-    )
-    checked_records["confirmation"] = (
-        _fresh_fixed_phase_records(
-            context, lock, "confirmation", _phase_root(context, "confirmation"),
-            _phase_root(context, "confirmation") / "controller-ledger.jsonl",
-        ), "",
-    )
-    checked_records["pressure"] = (
-        _fresh_pressure_phase_records(
-            context, lock, _phase_root(context, "pressure"),
-            _phase_root(context, "pressure") / "controller-ledger.jsonl",
-        ), "",
-    )
-    soak_root = _phase_root(context, "soak")
-    checked_records["soak"] = (
-        _fresh_soak_phase_records(
-            context, lock, soak_root, soak_root / "controller-ledger.jsonl",
-        ), "",
-    )
+    final_read_provider = None
+    if context.manifest["schema"] == EXECUTION_SCHEMA_V4:
+        owner_phases = ("exploration", "aa", "confirmation", "pressure", "soak")
+        local_records: dict[str, list[dict[str, Any]]] = {}
+        for owner_phase in owner_phases:
+            phase_root = _phase_root(context, owner_phase)
+            expected_jobs = _host_jobs(context, owner_phase)
+            ledger_path = phase_root / "controller-ledger.jsonl"
+            phase_records = _phase_ledger_records(
+                ledger_path,
+                _source5_phase_ledger_byte_bound(
+                    context, owner_phase, expected_jobs,
+                ),
+            )
+            if owner_phase == "soak":
+                require(len(expected_jobs) == len(phase_records) == 1 and
+                        phase_records[0]["job"] == expected_jobs[0] and
+                        phase_records[0]["state"] == "valid_soak" and
+                        phase_records[0]["evidence"].get("kind") ==
+                            "source5_timed_soak",
+                        "Source5 final replay lacks the one successful original Soak row")
+            else:
+                context.campaign.validate_phase_ledger(
+                    phase_records, expected_jobs, owner_phase, context.host_id,
+                )
+                expected_kind = (
+                    "source5_pressure_pair"
+                    if owner_phase == "pressure" else "source5_fixed_pair"
+                )
+                require(all(record.get("state") == "valid_pair" and
+                            record.get("evidence", {}).get("kind") == expected_kind
+                            for record in phase_records),
+                        f"Source5 final replay contains an invalid {owner_phase} owner row")
+            local_records[owner_phase] = phase_records
+        final_read_provider = _Source5ScheduledArchiveReadProvider(context)
+        replay_final = getattr(
+            context.chronology,
+            "replay_source5_final_records_captured_locked", None,
+        )
+        require(callable(replay_final),
+                "Source5 v4 final analysis lacks the one-operation captured owner replay API")
+        replayed_records = replay_final(
+            lock, api_pin(context.manifest_pin),
+            captured_read_context=final_read_provider,
+        )
+        require(type(replayed_records) is dict and
+                set(replayed_records) == set(owner_phases) and
+                replayed_records == local_records,
+                "Source5 captured final owners differ from all exact local journal rows")
+        checked_records = {
+            owner_phase: (local_records[owner_phase], "")
+            for owner_phase in owner_phases
+        }
+    else:
+        checked_records["exploration"] = (
+            _fresh_fixed_phase_records(
+                context, lock, "exploration", _phase_root(context, "exploration"),
+                _phase_root(context, "exploration") / "controller-ledger.jsonl",
+                archive_purpose="final_analysis",
+            ), "",
+        )
+        checked_records["aa"] = (
+            _fresh_fixed_phase_records(
+                context, lock, "aa", _phase_root(context, "aa"),
+                _phase_root(context, "aa") / "controller-ledger.jsonl",
+                archive_purpose="final_analysis",
+            ), "",
+        )
+        checked_records["confirmation"] = (
+            _fresh_fixed_phase_records(
+                context, lock, "confirmation", _phase_root(context, "confirmation"),
+                _phase_root(context, "confirmation") / "controller-ledger.jsonl",
+                archive_purpose="final_analysis",
+            ), "",
+        )
+        checked_records["pressure"] = (
+            _fresh_pressure_phase_records(
+                context, lock, _phase_root(context, "pressure"),
+                _phase_root(context, "pressure") / "controller-ledger.jsonl",
+                archive_purpose="final_analysis",
+            ), "",
+        )
+        soak_root = _phase_root(context, "soak")
+        checked_records["soak"] = (
+            _fresh_soak_phase_records(
+                context, lock, soak_root, soak_root / "controller-ledger.jsonl",
+                archive_purpose="final_analysis",
+            ), "",
+        )
     records_by_key = {key: value[0] for key, value in checked_records.items()}
     exploration_pilot = _capacity_pilot(context, records_by_key["exploration"])
     exploration_analysis, _exploration_analysis_raw, _exploration_analysis_sha = read_json(
@@ -2600,9 +7006,13 @@ def _fresh_source5_final_phase_results(
     )
     fixed_result = _source5_numeric_for_pairs(
         context, "fixed_analysis", records_by_key["confirmation"],
+        archive_purpose="final_analysis",
+        captured_read_provider=final_read_provider,
     )
     pressure_result = _source5_numeric_for_pairs(
         context, "pressure_analysis", records_by_key["pressure"],
+        archive_purpose="final_analysis",
+        captured_read_provider=final_read_provider,
     )
     soak_component = records_by_key["soak"][0]["process_metrics"][0]
     gates = [exploration_passed, aa_result.get("passed") is True,
@@ -2648,8 +7058,13 @@ def _build_soak_helper_input(
         materials = json.loads(materials_raw)
     except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
         raise Source5CampaignError("Source5 Soak materials index is malformed") from error
+    expected_material_schema = (
+        soak.MATERIALS_INDEX_SCHEMA_V2
+        if context.manifest["schema"] in BOUNDED_EXECUTION_SCHEMAS else
+        soak.MATERIALS_INDEX_SCHEMA
+    )
     require(type(materials) is dict and materials_raw == canonical_bytes(materials) and
-            materials.get("schema") == soak.MATERIALS_INDEX_SCHEMA and
+            materials.get("schema") == expected_material_schema and
             materials.get("campaign_id") == context.manifest["campaign_id"] and
             materials.get("host_id") == context.host_id and
             materials.get("job") == job and
@@ -2692,7 +7107,11 @@ def _build_soak_helper_input(
         context.host_id / "helper-inputs",
     )
     helper_path = helper_dir / f"soak-{job['run_id']}.json"
-    helper_sha = write_new(helper_path, canonical_bytes(helper_value),
+    helper_raw = canonical_bytes(helper_value)
+    require(len(helper_raw) <= _source5_helper_input_byte_bound(
+        context, "soak", job,
+    ), "Source5 Soak helper input exceeded its source-derived per-job template bound")
+    helper_sha = write_new(helper_path, helper_raw,
                            "Source5 Soak helper input")
     return helper_value, {"path": str(helper_path), "raw_sha256": helper_sha}, helper_root
 
@@ -2702,14 +7121,20 @@ def _soak_record_from_result(
 ) -> dict[str, Any]:
     require(result["state"] in {"valid_soak", "invalid_soak"},
             "Source5 Soak result is not a complete one-APP disposition")
-    component = exact(result["component"], {
+    component_fields = {
         "schema", "campaign_id", "host_id", "run_id", "validated", "passed",
         "qualification_eligible", "launch_enabled", "prepared_host_binding_sha256",
         "pins", "application_attestation", "application_cleanup", "pressure_cleanup",
         "terminal_event", "readback", "supervisor_sha256",
-    }, "Source5 Soak component result")
-    require(component["schema"] == context.modules[
-                "scripts/application-source5-soak.py"].COMPONENT_SCHEMA and
+    }
+    soak_module = context.modules["scripts/application-source5-soak.py"]
+    component_schemas = {soak_module.COMPONENT_SCHEMA}
+    if context.manifest["schema"] in BOUNDED_EXECUTION_SCHEMAS:
+        component_fields |= {"resource_budget", "probe_capture", "resource_monitor"}
+        component_schemas.add(soak_module.COMPONENT_SCHEMA_V2)
+    component = exact(result["component"], component_fields,
+                      "Source5 Soak component result")
+    require(component["schema"] in component_schemas and
             component["validated"] is True and
             component["qualification_eligible"] is False and
             component["passed"] is (result["state"] == "valid_soak"),
@@ -2717,6 +7142,22 @@ def _soak_record_from_result(
     evidence = result["evidence"]
     component_pin = raw_pin(evidence.get("soak_component"),
                             "Source5 Soak component artifact")
+    host_receipt_pin = None
+    if context.manifest["schema"] in BOUNDED_EXECUTION_SCHEMAS:
+        host_receipt_pin = exact(evidence.get("soak_host_receipt"), {
+            "path", "raw_sha256", "receipt_sha256",
+        }, "Source5 Soak strict host receipt")
+        budget_value, budget_pin = soak_module._read_resource_budget_pin(
+            component["resource_budget"],
+        )
+        require(host_receipt_pin["path"] ==
+                budget_value["layout"]["host_receipt_path"] and
+                budget_pin == soak_module.resource_budget_pin(
+                    component["resource_budget"],
+                ) and
+                is_sha(host_receipt_pin["raw_sha256"]) and
+                is_sha(host_receipt_pin["receipt_sha256"]),
+                "Source5 Soak host receipt differs from the component resource budget")
     readback = component["readback"]
     require(type(readback) is dict and readback.get("validated") is True and
             readback.get("qualification_eligible") is True and
@@ -2759,6 +7200,8 @@ def _soak_record_from_result(
             "helper_input": evidence["helper_input"],
             "helper_module": evidence["helper_module"],
             "soak_component": component_pin,
+            **({"host_receipt": host_receipt_pin}
+               if host_receipt_pin is not None else {}),
         },
         "chronology": chronology,
         "qualification_eligible": False,
@@ -2773,31 +7216,81 @@ def run_pressure_phase(
     require(context.scope == "final_frozen",
             "external pressure requires the separately frozen final SpecV3/PlanV3/oracle scope")
     jobs = _host_jobs(context, "pressure")
+    disposition_byte_bound = _source5_disposition_byte_bound(context, "pressure")
+    ledger_byte_bound = _source5_phase_ledger_byte_bound(
+        context, "pressure", jobs,
+    )
     materials = _pressure_materials_index(context, materials_index)
     phase_root = _phase_root(context, "pressure")
-    require(not phase_root.exists() and not phase_root.is_symlink(),
+    phase_root_preexisting = phase_root.exists() or phase_root.is_symlink()
+    require(not phase_root_preexisting or
+            context.manifest.get("schema") == EXECUTION_SCHEMA_V4,
             f"Source5 pressure output already exists and its ordinals cannot be replaced: {phase_root}")
     with context.chronology.campaign_host_lock(
         context.output_root, context.manifest["campaign_id"], context.host_id,
     ) as lock:
         verified = _validate_locked_context(context, lock)
+        if context.manifest["schema"] == EXECUTION_SCHEMA_V4:
+            _source5_require_uncompleted_catalogue_paths_absent(
+                context, lock, verified,
+            )
+            if phase_root_preexisting:
+                start_index, _resume_records = _source5_validate_resume_prefix_locked(
+                    context, lock, "pressure", jobs,
+                )
+            else:
+                start_index, _resume_records = (
+                    _source5_validate_fresh_phase_start_locked(
+                        context, lock, "pressure", jobs, verified,
+                    )
+                )
+        else:
+            require(not phase_root_preexisting,
+                    f"Source5 pressure output already exists and its ordinals cannot be replaced: {phase_root}")
+            start_index = 0
+        _source5_refresh_phase_prerequisite_gates_locked(
+            context, lock, "pressure",
+        )
         prerequisites = _helper_prerequisites(verified["state"], "pressure")
         _private_directory(phase_root)
         _private_directory(phase_root / "job-records")
         ledger_path = phase_root / "controller-ledger.jsonl"
-        fd = os.open(ledger_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
-                     getattr(os, "O_CLOEXEC", 0) |
-                     getattr(os, "O_NOFOLLOW", 0), 0o600)
-        os.fsync(fd)
-        os.close(fd)
-        for index, job in enumerate(jobs):
+        ledger_flags = (os.O_WRONLY | os.O_APPEND |
+                        getattr(os, "O_CLOEXEC", 0) |
+                        getattr(os, "O_NOFOLLOW", 0))
+        if ledger_path.exists() or ledger_path.is_symlink():
+            ledger_info = ledger_path.lstat()
+            require(stat.S_ISREG(ledger_info.st_mode) and
+                    ledger_info.st_uid == os.getuid() and
+                    stat.S_IMODE(ledger_info.st_mode) == 0o600 and
+                    ledger_info.st_nlink == 1 and
+                    ledger_info.st_size <= ledger_byte_bound,
+                    "Source5 resumed pressure ledger is not one bounded private file")
+        else:
+            ledger_flags |= os.O_CREAT | os.O_EXCL
+        fd = os.open(ledger_path, ledger_flags, 0o600)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        for index in range(start_index, len(jobs)):
+            job = jobs[index]
+            predecessor_ack_pin = (
+                _source5_predecessor_archive_ack_pin(context, job)
+                if context.manifest["schema"] == EXECUTION_SCHEMA_V4 else None
+            )
             recipe, recipe_pin, recipe_root, details = _build_pressure_recipe(
                 context, lock, job, index, materials[job["run_id"]],
                 prerequisites,
             )
             pressure_payload = {"recipe_pin": recipe_pin,
                                 "output_root": str(recipe_root)}
-            if context.manifest["schema"] == EXECUTION_SCHEMA_V3:
+            if context.manifest["schema"] in BOUNDED_EXECUTION_SCHEMAS:
+                receipt_dir = _private_directory(
+                    context.artifact_root / context.manifest["campaign_id"] /
+                    "source5" / context.host_id / "pressure-host-receipts",
+                )
+                host_receipt_path = receipt_dir / f"{job['run_id']}.json"
                 bundle = exact(details["probe_capture_bundle"], {"schema", "members"},
                                "Source5 bounded pressure ProbeV2 bundle")
                 require(bundle["schema"] == PROBE_CAPTURE_BUNDLE_SCHEMA and
@@ -2809,6 +7302,7 @@ def run_pressure_phase(
                     "recipe_pin": recipe_pin,
                     "output_root": str(recipe_root),
                     "probe_capture_bundle": bundle,
+                    "host_receipt_path": str(host_receipt_path),
                 }
             helper_value = _helper_input_value(
                 context, "pressure", index, job,
@@ -2826,13 +7320,27 @@ def run_pressure_phase(
             )
             helper_path = helper_dir / f"pressure-{job['run_id']}.json"
             helper_raw = canonical_bytes(helper_value)
+            require(len(helper_raw) <= _source5_helper_input_byte_bound(
+                context, "pressure", job,
+            ), "Source5 pressure helper input exceeded its source-derived per-job template bound")
             helper_sha = write_new(helper_path, helper_raw,
                                    "Source5 pressure helper input")
             try:
-                authorization = context.chronology.authorize_source5_job_locked(
-                    lock, api_pin(context.manifest_pin), job,
-                    {"path": str(helper_path), "raw_sha256": helper_sha},
-                )
+                if context.manifest["schema"] == EXECUTION_SCHEMA_V4:
+                    authorization = context.chronology.authorize_source5_job_locked(
+                        lock, api_pin(context.manifest_pin), job,
+                        {"path": str(helper_path), "raw_sha256": helper_sha},
+                        host_evidence_budget_pin=context.host_evidence_budget_pin,
+                        pressure_predecessor_certificate=(
+                            details["pressure_predecessor_certificate"]
+                        ),
+                    )
+                else:
+                    authorization = context.chronology.authorize_source5_job_locked(
+                        lock, api_pin(context.manifest_pin), job,
+                        {"path": str(helper_path), "raw_sha256": helper_sha},
+                        host_evidence_budget_pin=context.host_evidence_budget_pin,
+                    )
                 result = context.chronology.run_authorized_source5_job_locked(
                     lock, authorization,
                 )
@@ -2842,7 +7350,8 @@ def run_pressure_phase(
                 dispositions.extend({"job": pending, "reason": "not_run_after_blocked_job"}
                                     for pending in jobs[index + 1:])
                 _write_dispositions(phase_root, dispositions,
-                                    f"blocked job {job['run_id']}: {type(error).__name__}")
+                                    f"blocked job {job['run_id']}: {type(error).__name__}",
+                                    maximum_bytes=disposition_byte_bound)
                 raise
             if result["state"] == "blocked":
                 dispositions = [{"job": job,
@@ -2853,7 +7362,8 @@ def run_pressure_phase(
                 dispositions.extend({"job": pending, "reason": "not_run_after_blocked_job"}
                                     for pending in jobs[index + 1:])
                 _write_dispositions(phase_root, dispositions,
-                                    f"blocked original pressure job {job['run_id']}")
+                                    f"blocked original pressure job {job['run_id']}",
+                                    maximum_bytes=disposition_byte_bound)
                 return {"phase": "pressure", "blocked": True,
                         "job_run_id": job["run_id"],
                         "dispositions": str(phase_root / "not-run-dispositions.json")}
@@ -2864,15 +7374,58 @@ def run_pressure_phase(
                 _write_job_disposition(
                     phase_root, job, "invalid_pair",
                     "complete_invalid_pressure_component_consumes_original_ordinal",
+                    maximum_bytes=_source5_job_disposition_byte_bound(job),
                     authorization_id=result["chronology"]["authorization_id"],
                     terminal_head=result["chronology"]["job_terminal_head"],
                     component_sha256=result["component_sha256"],
                     error_sha256=result["error_sha256"],
                 )
-                continue
-            _write_record_file(phase_root, ledger_path, record)
+                dispositions = [{
+                    "job": job,
+                    "reason": "failed_owner_stops_new_authorizations",
+                    "authorization_id": result["chronology"]["authorization_id"],
+                    "job_terminal_head": result["chronology"]["job_terminal_head"],
+                    "component_sha256": result["component_sha256"],
+                    "error_sha256": result["error_sha256"],
+                }]
+                dispositions.extend({
+                    "job": pending,
+                    "reason": "not_run_after_failed_original_ordinal",
+                } for pending in jobs[index + 1:])
+                _write_dispositions(
+                    phase_root, dispositions,
+                    f"failed original pressure job {job['run_id']}",
+                    maximum_bytes=disposition_byte_bound,
+                )
+                return {"phase": "pressure", "blocked": True,
+                        "job_run_id": job["run_id"],
+                        "dispositions": str(phase_root / "not-run-dispositions.json")}
+            job_record_pin = _write_record_file(
+                phase_root, ledger_path, record,
+                _source5_job_record_byte_bound(context, "pressure", job),
+                ledger_byte_bound,
+            )
+            if context.manifest["schema"] == EXECUTION_SCHEMA_V4:
+                handoff = _source5_create_transfer_offer(
+                    context, "pressure", index, job, job_record_pin,
+                    canonical_bytes(record), predecessor_ack_pin,
+                )
+                _source5_wait_verify_and_reclaim_archive_job(
+                    context, handoff, predecessor_ack_pin,
+                    "pressure", job["run_id"],
+                )
+                with archived_job_read_view(
+                        context, job, "pressure_analysis") as captured_view:
+                    context.chronology.verify_source5_completed_pressure_job_captured_locked(
+                        lock, api_pin(context.manifest_pin), job_record_pin,
+                        captured_evidence=captured_view,
+                        pressure_predecessor_certificate=(
+                            details["pressure_predecessor_certificate"]
+                        ),
+                    )
         return {"phase": "pressure", "job_count": len(jobs),
                 "ledger": str(ledger_path), "blocked": False}
+
 
 
 def run_soak_phase(
@@ -2882,27 +7435,64 @@ def run_soak_phase(
             context.prepared_input_completion is not None,
             "Source5 continuous Soak requires the final prepared original cohort")
     jobs = _host_jobs(context, "soak")
+    disposition_byte_bound = _source5_disposition_byte_bound(context, "soak")
+    ledger_byte_bound = _source5_phase_ledger_byte_bound(context, "soak", jobs)
     require(len(jobs) == 1,
             "Source5 host Soak must contain exactly its one original scheduled APP job")
     phase_root = _phase_root(context, "soak")
-    require(not phase_root.exists() and not phase_root.is_symlink(),
+    phase_root_preexisting = phase_root.exists() or phase_root.is_symlink()
+    require(not phase_root_preexisting or
+            context.manifest.get("schema") == EXECUTION_SCHEMA_V4,
             f"Source5 Soak output already exists and its original ordinal cannot be replaced: {phase_root}")
     with context.chronology.campaign_host_lock(
         context.output_root, context.manifest["campaign_id"], context.host_id,
     ) as lock:
         verified = _validate_locked_context(context, lock)
+        if context.manifest["schema"] == EXECUTION_SCHEMA_V4:
+            _source5_require_uncompleted_catalogue_paths_absent(
+                context, lock, verified,
+            )
+            if phase_root_preexisting:
+                start_index, _resume_records = _source5_validate_resume_prefix_locked(
+                    context, lock, "soak", jobs,
+                )
+            else:
+                start_index, _resume_records = (
+                    _source5_validate_fresh_phase_start_locked(
+                        context, lock, "soak", jobs, verified,
+                    )
+                )
+        else:
+            require(not phase_root_preexisting,
+                    f"Source5 Soak output already exists and its original ordinal cannot be replaced: {phase_root}")
+            start_index = 0
+        _source5_refresh_phase_prerequisite_gates_locked(
+            context, lock, "soak",
+        )
         prerequisites = _helper_prerequisites(verified["state"], "soak")
         _private_directory(phase_root)
         _private_directory(phase_root / "job-records")
         ledger_path = phase_root / "controller-ledger.jsonl"
-        fd = os.open(ledger_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
-                     getattr(os, "O_CLOEXEC", 0) |
-                     getattr(os, "O_NOFOLLOW", 0), 0o600)
+        ledger_flags = (os.O_WRONLY | os.O_APPEND |
+                        getattr(os, "O_CLOEXEC", 0) |
+                        getattr(os, "O_NOFOLLOW", 0))
+        if ledger_path.exists() or ledger_path.is_symlink():
+            ledger_info = ledger_path.lstat()
+            require(stat.S_ISREG(ledger_info.st_mode) and
+                    ledger_info.st_uid == os.getuid() and
+                    stat.S_IMODE(ledger_info.st_mode) == 0o600 and
+                    ledger_info.st_nlink == 1 and
+                    ledger_info.st_size <= ledger_byte_bound,
+                    "Source5 resumed Soak ledger is not one bounded private file")
+        else:
+            ledger_flags |= os.O_CREAT | os.O_EXCL
+        fd = os.open(ledger_path, ledger_flags, 0o600)
         try:
             os.fsync(fd)
         finally:
             os.close(fd)
-        for index, job in enumerate(jobs):
+        for index in range(start_index, len(jobs)):
+            job = jobs[index]
             result = None
             try:
                 _helper_value, helper_ref, _job_root = _build_soak_helper_input(
@@ -2910,6 +7500,7 @@ def run_soak_phase(
                 )
                 authorization = context.chronology.authorize_source5_job_locked(
                     lock, api_pin(context.manifest_pin), job, helper_ref,
+                    host_evidence_budget_pin=context.host_evidence_budget_pin,
                 )
                 result = context.chronology.run_authorized_source5_job_locked(
                     lock, authorization,
@@ -2927,24 +7518,47 @@ def run_soak_phase(
                     _write_dispositions(
                         phase_root, dispositions,
                         f"blocked original Soak job {job['run_id']}",
+                        maximum_bytes=disposition_byte_bound,
                     )
                     return {"phase": "soak", "blocked": True,
                             "job_run_id": job["run_id"],
                             "dispositions": str(phase_root / "not-run-dispositions.json"),
                             "qualification_eligible": False}
                 record = _soak_record_from_result(context, result)
-                _write_record_file(phase_root, ledger_path, record)
+                job_record_pin = _write_record_file(
+                    phase_root, ledger_path, record,
+                    _source5_job_record_byte_bound(context, "soak", job),
+                    ledger_byte_bound,
+                )
+                if record["state"] != "valid_soak":
+                    return {"phase": "soak", "blocked": True,
+                            "job_run_id": job["run_id"],
+                            "reason": "failed_original_soak_is_retained_without_archive_reclaim",
+                            "qualification_eligible": False}
+                if context.manifest["schema"] == EXECUTION_SCHEMA_V4:
+                    handoff = _source5_create_transfer_offer(
+                        context, "soak", index, job, job_record_pin,
+                        canonical_bytes(record), None,
+                    )
+                    _source5_wait_verify_and_reclaim_archive_job(
+                        context, handoff, None, "soak", job["run_id"],
+                    )
             except BaseException as error:
-                _seal_blocked_suffix(phase_root, jobs, index, error, result)
+                _seal_blocked_suffix(
+                    phase_root, jobs, index, error, result,
+                    maximum_bytes=disposition_byte_bound,
+                )
                 raise
         return {"phase": "soak", "job_count": len(jobs),
                 "ledger": str(ledger_path), "blocked": False,
                 "qualification_eligible": False}
 
 
+
 def create_soak_material_index(
     context: CampaignContext, parent_recipe_path: Path,
     build_receipt_path: Path, output_path: Path,
+    resource_budget_path: Path | None = None,
 ) -> dict[str, Any]:
     """Bind one real externally built V2 recipe and receipt to the original Soak job."""
     require(context.scope == "final_frozen" and
@@ -2969,11 +7583,41 @@ def create_soak_material_index(
             receipt_raw == canonical_bytes(json.loads(receipt_raw)),
             "Source5 Soak parent recipe or build receipt is not canonical JSON")
     helper = context.modules["scripts/application-source5-soak.py"]
+    resource_budget_pin = None
+    if context.manifest["schema"] in BOUNDED_EXECUTION_SCHEMAS:
+        require(resource_budget_path is not None,
+                "bounded Source5 Soak materials require the caller-frozen resource-budget file")
+        budget_path = resource_budget_path.resolve(strict=True)
+        require(budget_path.is_relative_to(context.artifact_root),
+                "Source5 Soak resource budget is outside the private artifact root")
+        budget_raw, budget_raw_sha, _budget_info = read_stable(
+            budget_path, "Source5 caller-frozen Soak resource budget",
+            helper.MAX_RESOURCE_BUDGET_BYTES,
+        )
+        try:
+            budget_value = json.loads(budget_raw)
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise Source5CampaignError(
+                "Source5 caller-frozen Soak resource budget is malformed",
+            ) from error
+        require(type(budget_value) is dict and
+                budget_raw == canonical_bytes(budget_value),
+                "Source5 caller-frozen Soak resource budget is not canonical")
+        resource_budget_pin = {
+            "path": str(budget_path), "raw_sha256": budget_raw_sha,
+            "semantic_sha256": budget_value.get("resource_budget_sha256"),
+        }
+        helper._read_resource_budget_pin(resource_budget_pin)
+        resource_budget_pin = helper.resource_budget_pin(resource_budget_pin)
+    else:
+        require(resource_budget_path is None,
+                "legacy Source5 Soak index cannot accept a v2 resource budget")
     index = helper.make_material_index(
         context.manifest["campaign_id"], context.host_id, jobs[0],
         {"path": str(recipe_path), "raw_sha256": recipe_sha},
         {"path": str(receipt_path), "raw_sha256": receipt_sha},
         binding["binding_sha256"],
+        resource_budget_pin=resource_budget_pin,
     )
     prep_context = {
         "campaign_id": context.manifest["campaign_id"],
@@ -3019,13 +7663,6249 @@ def create_soak_material_index(
             "materials_sha256": index["materials_sha256"]}
 
 
+def _source5_analyzer_scratch_is_empty(path: Path) -> bool:
+    """Check one owned directory through a stable no-follow descriptor."""
+    descriptor = None
+    try:
+        descriptor = os.open(
+            path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+            getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        before = os.fstat(descriptor)
+        before_path = path.lstat()
+        require(stat.S_ISDIR(before.st_mode) and before.st_uid == os.getuid() and
+                stat.S_IMODE(before.st_mode) == 0o700 and
+                _source5_same_mutable_file_object(before, before_path),
+                "Source5 analyzer scratch root changed type, owner, or identity")
+        names_before = os.listdir(descriptor)
+        after = os.fstat(descriptor)
+        after_path = path.lstat()
+        names_after = os.listdir(descriptor)
+        require(_source5_same_mutable_file_object(before, after) and
+                _source5_same_mutable_file_object(before, after_path),
+                "Source5 analyzer scratch root changed while checking its contents")
+        return not names_before and not names_after
+    except OSError as error:
+        raise Source5CampaignError(
+            f"cannot verify Source5 analyzer scratch directory: {error}",
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _source5_analyzer_scratch_projection(
+    context: CampaignContext, rows: Any,
+) -> dict[str, Any] | None:
+    """Recompute the v4 analyzer scratch bound from original open-loop ID rows."""
+    if context.journal_width_contract is None:
+        return None
+    expected: dict[tuple[str, str], dict[int, str]] = {}
+    for phase in ("confirmation", "pressure"):
+        for job in _host_jobs(context, phase):
+            if job.get("mode") != "open_loop":
+                continue
+            descriptors = (
+                context.fixed_pair._member_descriptors(job, context.campaign)
+                if phase == "confirmation" else
+                context.pressure_pair.pressure_process_descriptors(job)
+            )
+            require(type(descriptors) is list and bool(descriptors),
+                    f"Source5 {phase} open-loop job has no exact analyzer trace members")
+            key = (phase, job["run_id"])
+            require(key not in expected,
+                    f"Source5 analyzer trace plan repeats an original job {key}")
+            expected_paths = {}
+            job_root = (
+                context.artifact_root / context.manifest["campaign_id"] /
+                "source5" / context.host_id / "job-artifacts" / phase /
+                job["run_id"]
+            )
+            for member_index, descriptor in enumerate(descriptors):
+                if phase == "confirmation":
+                    path = job_root / (
+                        f"{descriptor['pair']}-{descriptor['executor']}.ids.tsv"
+                    )
+                else:
+                    member_root = job_root / (
+                        f"{member_index:02d}-{descriptor['pair']}-"
+                        f"{descriptor['executor']}-{descriptor['allocator']}"
+                    )
+                    path = Path(_pressure_member_outputs(member_root)["ids"])
+                expected_paths[member_index] = str(path)
+            expected[key] = expected_paths
+    require(expected,
+            "Source5 v4 analyzer scratch projection has no original open-loop jobs")
+    expected_id_paths = {
+        path for member_paths in expected.values()
+        for path in member_paths.values()
+    }
+    observed: dict[tuple[str, str], set[int]] = {key: set() for key in expected}
+    trace_caps: list[int] = []
+    for row in rows:
+        if (type(row) is not dict or
+                (row.get("phase"), row.get("run_id")) not in expected or
+                type(row.get("path")) is not str):
+            continue
+        key = (row["phase"], row["run_id"])
+        filename = PurePosixPath(row["path"]).name
+        if (row["path"] not in expected_id_paths and
+                filename != "ids.tsv" and ".ids.tsv" not in filename):
+            continue
+        expected_role = ("normal_app_output" if key[0] == "confirmation"
+                         else "opaque_trace")
+        member_index = row.get("member_index")
+        require(row.get("kind") == "file" and
+                row.get("role") == expected_role and
+                row.get("host_id") == context.host_id and
+                row.get("owner") == ("fixed_pair" if key[0] == "confirmation"
+                                      else "pressure_pair") and
+                row.get("storage_root") == str(context.artifact_root) and
+                type(member_index) is int and
+                member_index in expected[key] and
+                row["path"] == expected[key][member_index] and
+                member_index not in observed[key] and
+                type(row.get("max_file_bytes")) is int and
+                row.get("max_bytes") == row["max_file_bytes"] and
+                0 < row["max_file_bytes"] <=
+                    context.campaign.MAX_TRACE_ARTIFACT_BYTES,
+                f"Source5 {key} analyzer ID row differs from its exact owner role")
+        observed[key].add(member_index)
+        trace_caps.append(row["max_file_bytes"])
+    require(all(observed[key] == set(expected[key])
+                for key in expected) and
+            len(trace_caps) == sum(len(value) for value in expected.values()),
+            "Source5 analyzer ID rows do not close over every original open-loop member")
+    projection = context.campaign.analyzer_scratch_projection(
+        context.spec, max(trace_caps),
+    )
+    require(type(projection) is dict and
+            projection.get("schema") ==
+                "allocatbelt.application-rust-analyzer-scratch-projection.v1" and
+            projection.get("maximum_trace_file_bytes") == max(trace_caps),
+            "Source5 campaign controller returned a malformed analyzer scratch projection")
+    return projection
+
+
+def _source5_path_catalogue_records(
+    context: CampaignContext, pressure_material_index: Path,
+    soak_material_index: Path, storage_reservation: dict[str, Any],
+    storage_reservation_pin: dict[str, Any],
+) -> tuple[Any, dict[str, Any]]:
+    """Derive named Source5 paths and owner ceilings before any scheduled job."""
+    contract = context.owner_evidence_contract
+    fixed_limits = contract["fixed_pair"]["limits"]
+    pressure_limits = contract["pressure_pair"]["limits"]
+    pressure_roles = contract["pressure_pair"]["role_byte_limits"]
+    chronology_roles = contract["pressure_pair"]["chronology_role_byte_limits"]
+    source = context.source
+    host_id = context.host_id
+    campaign_id = context.manifest["campaign_id"]
+    artifact_root = context.artifact_root
+    output_root = context.output_root
+    budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    directory_specs: dict[str, dict[str, Any]] = {}
+    reservation_roots = storage_reservation.get("roots")
+    require(type(reservation_roots) is list,
+            "Source5 path catalogue requires the caller-pinned writable-root map")
+    writable_roots = [Path(item["path"]) for item in reservation_roots
+                      if type(item) is dict and item.get("role") != "evidence_store"]
+    scratch_values = [item for item in reservation_roots
+                      if type(item) is dict and item.get("role") == "scratch"]
+    require(len(scratch_values) == 1,
+            "Source5 catalogue requires one caller-reserved scratch domain")
+    scratch_reservation = scratch_values[0]
+    scratch_root = Path(scratch_reservation["path"])
+    require(scratch_root.resolve(strict=True) == scratch_root and
+            scratch_root.is_dir() and scratch_root.stat().st_uid == os.getuid() and
+            stat.S_IMODE(scratch_root.stat().st_mode) == 0o700,
+            "Source5 catalogue requires one owned private scratch directory")
+    roots = (context.source_root, context.input_root, artifact_root, output_root,
+             scratch_root,
+             Path(context.manifest["original_inputs"]["campaign_artifacts_root"]))
+    record_spool = tempfile.TemporaryFile(mode="w+b", dir=scratch_root)
+    record_spool_count = 0
+
+    def storage_domain(path: Path) -> str:
+        matches = [root for root in writable_roots if path.is_relative_to(root)]
+        require(matches,
+                f"Source5 output path has no caller-pinned writable domain: {path}")
+        selected = max(matches, key=lambda root: len(root.parts))
+        return str(selected)
+
+    def directory(path_value: Path, owner: str, *, storage_root: str | None,
+                  phase: str | None = None, run_id: str | None = None) -> None:
+        path = path_value.absolute()
+        if storage_root == "auto":
+            storage_root = storage_domain(path)
+        key = str(path)
+        if key not in directory_specs:
+            directory_specs[key] = {
+                "path": key, "kind": "tree", "role": "directory_node",
+                "host_id": host_id, "max_bytes": 0, "max_file_bytes": 0,
+                "max_inodes": 1, "storage_root": storage_root,
+                "owner": owner, "phase": phase, "run_id": run_id,
+                "member_index": None, "aggregate_id": None,
+                "aggregate_max_bytes": None, "origin_pin": None,
+            }
+
+    def parents(path: Path, owner: str, storage_root: str | None,
+                phase: str | None = None, run_id: str | None = None) -> None:
+        parent = path.parent
+        boundary = next((root for root in roots if path.is_relative_to(root)), None)
+        while parent != parent.parent:
+            directory(parent, owner, storage_root=storage_root,
+                      phase=phase, run_id=run_id)
+            if boundary is not None and parent == boundary:
+                break
+            parent = parent.parent
+
+    def add_file(
+        path_value: Path | str, role: str, maximum: int, owner: str, *,
+        storage_root: str | None, phase: str | None = None,
+        run_id: str | None = None, member_index: int | None = None,
+        aggregate_id: str | None = None,
+        aggregate_maximum: int | None = None,
+        exact_size: int | None = None, raw_sha256: str | None = None,
+        semantic_sha256: str | None = None, file_label: str | None = None,
+        host: str | None = None,
+    ) -> None:
+        nonlocal record_spool_count
+        path = Path(path_value).absolute()
+        if storage_root == "auto":
+            storage_root = storage_domain(path)
+        maximum = int(maximum)
+        require(0 <= maximum <= (1 << 64) - 1,
+                f"Source5 catalogue {role} ceiling is outside u64")
+        byte_count = maximum if exact_size is None else exact_size
+        require(type(byte_count) is int and 0 <= byte_count <= maximum,
+                f"Source5 catalogue {path} exact size exceeds its pinned owner ceiling")
+        pin = None
+        if raw_sha256 is not None:
+            require(is_sha(raw_sha256),
+                    f"Source5 catalogue {path} raw pin is malformed")
+            pin = {"raw_sha256": raw_sha256,
+                   "semantic_sha256": semantic_sha256}
+        record = {
+            "path": str(path), "kind": "file", "role": role,
+            "host_id": host, "max_bytes": byte_count,
+            "max_file_bytes": byte_count, "max_inodes": 1,
+            "storage_root": storage_root, "owner": owner,
+            "phase": phase, "run_id": run_id,
+            "member_index": member_index, "aggregate_id": aggregate_id,
+            "aggregate_max_bytes": aggregate_maximum,
+            "origin_pin": pin,
+        }
+        encoded = canonical_bytes(record)
+        require(record_spool.tell() + len(encoded) <=
+                scratch_reservation["reserved_bytes"],
+                "Source5 producer path spool exceeded the caller-reserved scratch bytes")
+        record_spool.write(encoded)
+        record_spool_count += 1
+        parents(path, owner, storage_root, phase, run_id)
+
+    def add_tree(
+        path_value: Path | str, role: str, maximum: int, maximum_file: int,
+        inodes: int, owner: str, *, storage_root: str | None,
+        phase: str | None = None, run_id: str | None = None,
+        member_index: int | None = None,
+        aggregate_id: str | None = None,
+        aggregate_maximum: int | None = None,
+    ) -> None:
+        path = Path(path_value).absolute()
+        if storage_root == "auto":
+            storage_root = storage_domain(path)
+        key = str(path)
+        prior = directory_specs.get(key)
+        if prior is not None:
+            require(prior["role"] == "directory_node" and prior["max_inodes"] == 1,
+                    f"Source5 dynamic tree aliases another declared root: {path}")
+        directory_specs[key] = {
+            "path": key, "kind": "tree", "role": role,
+            "host_id": host_id, "max_bytes": maximum,
+            "max_file_bytes": maximum_file, "max_inodes": inodes,
+            "storage_root": storage_root, "owner": owner,
+            "phase": phase, "run_id": run_id,
+            "member_index": member_index, "aggregate_id": aggregate_id,
+            "aggregate_max_bytes": aggregate_maximum, "origin_pin": None,
+        }
+        parents(path, owner, storage_root, phase, run_id)
+
+    def add_pin(
+        pin_value: object, role: str, maximum: int, owner: str,
+        label: str, *, semantic_sha256: str | None = None,
+        host: str | None = None,
+    ) -> dict[str, str]:
+        pin = raw_pin(pin_value, label)
+        path = Path(pin["path"])
+        actual = context.fixed_pair._hash_regular_file(
+            path, maximum, label,
+        )
+        info = path.stat(follow_symlinks=False)
+        require(actual == pin["raw_sha256"] and
+                (semantic_sha256 is None or is_sha(semantic_sha256)),
+                f"Source5 catalogue input pin changed: {path}")
+        add_file(path, role, int(info.st_size), owner, storage_root=None,
+                 exact_size=int(info.st_size), raw_sha256=actual,
+                 semantic_sha256=semantic_sha256, file_label=label, host=host)
+        return pin
+
+    # Original source closure: exact Source.files rows, including literal links.
+    for row in source["source"]["files"]:
+        path = context.source_root / PurePosixPath(row["path"])
+        role = ("typed_source_file" if row["kind"] == "file" else
+                "typed_source_symlink")
+        add_file(path, role, row["size"], "source", storage_root=None,
+                 exact_size=row["size"], raw_sha256=row["sha256"], host=host_id)
+    for host, pin in context.source_manifest_pins.items():
+        semantic = context.sources[host]["manifest_sha256"]
+        add_pin({"path": pin["path"], "raw_sha256": pin["raw_sha256"]},
+                "source_manifest", 16 * 1024 * 1024, "source",
+                f"Source5 {host} manifest", semantic_sha256=semantic,
+                host=host)
+    for owner_host, owner_source in context.sources.items():
+        artifact_refs: list[tuple[dict[str, Any], str, int]] = []
+        artifact_refs.extend((item, "normal_app_output",
+                              context.fixed_pair.MAX_BINARY_BYTES)
+                             for item in owner_source["artifacts"].values())
+        artifact_refs.extend((item, "source5_soak_artifact",
+                              context.fixed_pair.MAX_BINARY_BYTES)
+                             for item in owner_source["soak_artifacts"].values())
+        artifact_refs.append((owner_source["analysis_artifact"],
+                              "analysis_artifact",
+                              chronology_roles["analysis_artifact"]))
+        calibration = owner_source["resource_domain_calibration"]
+        artifact_refs.extend((calibration[name], "capacity_artifact",
+                              chronology_roles["capacity_artifact"])
+                             for name in ("binary", "output"))
+        for artifact, role, maximum in artifact_refs:
+            path = context.source_root / PurePosixPath(artifact["path"])
+            actual = context.fixed_pair._hash_regular_file(
+                path, maximum, f"Source5 {role} artifact {artifact['path']}",
+            )
+            info = path.stat(follow_symlinks=False)
+            require(actual == artifact["sha256"],
+                    f"Source5 {role} artifact raw pin changed: {path}")
+            add_file(path, role, int(info.st_size), "source_artifact",
+                     storage_root=None, exact_size=int(info.st_size),
+                     raw_sha256=actual, host=host_id)
+
+    # Original SpecV3, PlanV3, execution manifest, host and prepared pins.
+    add_pin(context.spec_pin, "spec_v3", 32 * 1024 * 1024, "inputs",
+            "original SpecV3", semantic_sha256=context.spec_semantic_sha256,
+            host=host_id)
+    add_pin(context.plan_pin, "plan_v3", 256 * 1024 * 1024, "inputs",
+            "original PlanV3", semantic_sha256=context.plan_semantic_sha256,
+            host=host_id)
+    add_pin(context.manifest_pin, "execution_manifest", MAX_MANIFEST_BYTES,
+            "inputs", "Source5 execution manifest",
+            semantic_sha256=context.manifest["manifest_sha256"], host=host_id)
+    require(context.journal_width_contract is not None and
+            context.journal_width_contract_pin is not None,
+            "bounded Source5 manifest lacks its source-derived journal-width contract")
+    add_pin({
+        "path": context.journal_width_contract_pin["path"],
+        "raw_sha256": context.journal_width_contract_pin["raw_sha256"],
+    }, "journal_width_contract",
+        context.modules[EVIDENCE_BUDGET_SOURCE_PATH].MAX_JOURNAL_WIDTH_CONTRACT_BYTES,
+        "source5_controller", "Source5 per-job journal-width contract",
+        semantic_sha256=context.journal_width_contract_pin["semantic_sha256"],
+        host=host_id)
+    require(context.archive_signer_context is not None and
+            context.archive_signer_context_pin is not None,
+            "bounded Source5 manifest lacks its prospectively pinned private archive signer context")
+    add_pin({
+        "path": context.archive_signer_context_pin["path"],
+        "raw_sha256": context.archive_signer_context_pin["raw_sha256"],
+    }, "source5_archive_signer_context", MAX_ARCHIVE_SIGNER_CONTEXT_BYTES,
+        "source5_controller", "Source5 private archive signer context",
+        semantic_sha256=context.archive_signer_context_pin["semantic_sha256"],
+        host=host_id)
+    add_pin(context.archive_signer_context["keyring_pin"],
+            "source5_archive_signer_keyring", MAX_ARCHIVE_KEYRING_BYTES,
+            "source5_controller", "Source5 archive verifier public keyring",
+            host=host_id)
+    add_pin(context.archive_signer_context["gpgv_pin"],
+            "source5_archive_signer_gpgv", MAX_ARCHIVE_GPGV_BYTES,
+            "source5_controller", "Source5 archive verifier gpgv",
+            host=host_id)
+    for host, pin in context.manifest["observed_hosts"].items():
+        add_pin(pin["artifact"], "observed_host", 16 * 1024 * 1024, "inputs",
+                f"Source5 {host} observed host", host=host)
+    if type(context.capacity_completion) is dict:
+        capacity_artifact = context.capacity_completion.get("artifact")
+        if type(capacity_artifact) is dict:
+            add_pin(capacity_artifact, "capacity_completion", 16 * 1024 * 1024,
+                    "capacity_stage", "Source5 capacity completion", host=host_id)
+    prepared_registration = context.manifest.get("prepared_capacity_registration")
+    if type(prepared_registration) is dict:
+        for key, role in (("completion", "capacity_completion"),
+                          ("host_completion", "capacity_completion"),
+                          ("host_verification", "capacity_host_receipt"),
+                          ("ledger", "capacity_ledger")):
+            pin = prepared_registration.get(key)
+            if type(pin) is dict and type(pin.get("path")) is str:
+                pin_fields = {"path": pin["path"],
+                              "raw_sha256": pin.get("raw_sha256")}
+                semantic = pin.get("semantic_sha256", pin.get("receipt_sha256"))
+                add_pin(pin_fields, role, chronology_roles.get(role, MAX_ARTIFACT_BYTES),
+                        "capacity_stage", f"Source5 prepared capacity {key}",
+                        semantic_sha256=semantic, host=host_id)
+    prepared_generation = context.manifest.get("prepared_input_generation")
+    if type(prepared_generation) is dict:
+        completion_pin = exact(prepared_generation["completion"], {
+            "path", "raw_sha256", "semantic_sha256",
+        }, "Source5 prepared-input completion pin")
+        add_pin({"path": completion_pin["path"],
+                 "raw_sha256": completion_pin["raw_sha256"]},
+                "prepared_completion", MAX_ARTIFACT_BYTES, "inputs",
+                "Source5 prepared-input completion",
+                semantic_sha256=completion_pin["semantic_sha256"], host=host_id)
+        provenance = exact(prepared_generation["provenance"], {
+            "schema", "preparation_pin", "final_spec_pin", "final_plan_pin",
+        }, "Source5 prepared-input provenance")
+        prep_pin = exact(provenance["preparation_pin"], {
+            "path", "raw_sha256",
+        }, "Source5 preparation pin")
+        add_pin(prep_pin, "preparation", MAX_ARTIFACT_BYTES, "inputs",
+                "Source5 preparation", host=host_id)
+    if type(context.prepared_input_completion) is dict:
+        for other_host, pin in context.prepared_input_completion.get(
+                "resource_budgets", {}).items():
+            add_pin(pin, "preparation", MAX_ARTIFACT_BYTES, "inputs",
+                    f"Source5 {other_host} preparation resource budget",
+                    semantic_sha256=pin["semantic_sha256"], host=other_host)
+    add_file(storage_reservation_pin["path"], "storage_reservation",
+             storage_reservation_pin["byte_count"], "source5_controller",
+             storage_root="auto", exact_size=storage_reservation_pin["byte_count"],
+             raw_sha256=storage_reservation_pin["raw_sha256"],
+             semantic_sha256=storage_reservation_pin["semantic_sha256"],
+             file_label="Source5 caller storage reservation", host=host_id)
+    host_budget_path = (artifact_root / campaign_id / "source5" / host_id /
+                        "evidence-budget" / "host-evidence-budget-v3.json")
+    add_file(host_budget_path, "host_evidence_budget",
+             context.chronology.MAX_SOURCE5_HOST_EVIDENCE_BUDGET_BYTES,
+             "source5_controller", storage_root=str(artifact_root), host=host_id)
+
+    # Fixed-pair named outputs and both retained member TMPDIR trees.
+    fixed_jobs = [job for phase in ("exploration", "aa", "confirmation")
+                  for job in _host_jobs(context, phase)]
+    for job in fixed_jobs:
+        phase, run_id = job["phase"], job["run_id"]
+        job_root = (artifact_root / campaign_id / "source5" / host_id /
+                    "job-artifacts" / phase / run_id)
+        helper_path = (artifact_root / campaign_id / "source5" / host_id /
+                       "helper-inputs" / f"{phase}-{run_id}.json")
+        add_file(helper_path, "source5_helper_input",
+                 _source5_helper_input_byte_bound(context, phase, job),
+                 "source5_controller", storage_root=str(artifact_root),
+                 phase=phase, run_id=run_id)
+        pair_group = f"fixed-output-{sha256(canonical_bytes(job))}"
+        pair_limit = fixed_limits["MAX_PAIR_OUTPUT_BYTES"]
+        for name, maximum in (
+            ("fixed-pair-execution-overlay.json", 256 * 1024 * 1024),
+            (".fixed-pair-runtime-bindings.json", fixed_limits["MAX_RUNTIME_BYTES"]),
+            ("processes.tsv", fixed_limits["MAX_RUNTIME_BYTES"]),
+            ("metadata.tsv", fixed_limits["MAX_RUNTIME_BYTES"]),
+            ("app-events.jsonl", pair_limit),
+        ):
+            add_file(job_root / name,
+                     "fixed_pair_artifact" if name in {
+                         "fixed-pair-execution-overlay.json",
+                     } else "normal_app_output",
+                     maximum, "fixed_pair", storage_root=str(artifact_root),
+                     phase=phase, run_id=run_id, aggregate_id=pair_group,
+                     aggregate_maximum=pair_limit)
+        add_file(job_root / "fixed-pair-execution-receipt.json",
+                 "component_receipt", fixed_limits["MAX_RECEIPT_BYTES"],
+                 "fixed_pair", storage_root=str(artifact_root),
+                 phase=phase, run_id=run_id)
+        if context.manifest["schema"] == EXECUTION_SCHEMA_V4:
+            add_file(
+                _source5_fixed_host_receipt_path(context, job),
+                "fixed_pair_host_receipt",
+                fixed_limits["MAX_RECEIPT_BYTES"],
+                "fixed_pair", storage_root=str(output_root),
+                phase=phase, run_id=run_id, host=host_id,
+            )
+        descriptors = context.fixed_pair._member_descriptors(
+            job, context.campaign,
+        )
+        for index, descriptor in enumerate(descriptors):
+            slug = (f"{index:02d}-{descriptor['pair']}-{descriptor['executor']}-"
+                    f"{descriptor['allocator']}")
+            stem = f"{descriptor['pair']}-{descriptor['executor']}"
+            member_files = {
+                f"{stem}.stdout.tsv": fixed_limits["MAX_STDOUT_BYTES"],
+                f"{stem}.stderr.txt": fixed_limits["MAX_STDERR_BYTES"],
+                f"{stem}.direct-time.json": fixed_limits["MAX_TIME_BYTES"],
+                f"{stem}.ids.tsv": fixed_limits["MAX_ID_BYTES"],
+                f"{stem}.shutdown.tsv": fixed_limits["MAX_RUNTIME_BYTES"],
+                f"{stem}.capacity-families.tsv": fixed_limits["MAX_RUNTIME_BYTES"],
+                f"{stem}.runtime.tsv": fixed_limits["MAX_RUNTIME_BYTES"],
+                f"{stem}.runtime-expectation.json": fixed_limits["MAX_RUNTIME_BYTES"],
+                f"{stem}.runtime-validation.json": fixed_limits["MAX_RUNTIME_BYTES"],
+                f"probes/{slug}.stdout.json": fixed_limits["MAX_PROBE_STDOUT_BYTES"],
+                f"probes/{slug}.stderr.txt": fixed_limits["MAX_PROBE_STDERR_BYTES"],
+                f"probes/{slug}.replay.stdout.json": fixed_limits["MAX_PROBE_STDOUT_BYTES"],
+                f"probes/{slug}.replay.stderr.txt": fixed_limits["MAX_PROBE_STDERR_BYTES"],
+            }
+            for relative, maximum in member_files.items():
+                add_file(job_root / relative, "normal_app_output", maximum,
+                         "fixed_pair", storage_root=str(artifact_root),
+                         phase=phase, run_id=run_id, member_index=index,
+                         aggregate_id=pair_group,
+                         aggregate_maximum=pair_limit)
+            add_tree(job_root / "tmp" / slug, "normal_app_output",
+                     fixed_limits["MAX_TMPDIR_BYTES"],
+                     fixed_limits["MAX_TMPDIR_BYTES"],
+                     fixed_limits["MAX_TMPDIR_INODES"] + 1, "fixed_pair",
+                     storage_root=str(artifact_root), phase=phase,
+                     run_id=run_id, member_index=index)
+            add_tree(job_root / "probes" / "tmp" / slug,
+                     "normal_app_output", fixed_limits["MAX_TMPDIR_BYTES"],
+                     fixed_limits["MAX_TMPDIR_BYTES"],
+                     fixed_limits["MAX_TMPDIR_INODES"] + 1, "fixed_pair",
+                     storage_root=str(artifact_root), phase=phase,
+                     run_id=run_id, member_index=index)
+        cleanup_root = (output_root / campaign_id / "source5" / host_id /
+                        phase / "cleanup-sidecars")
+        job_sha = sha256(canonical_bytes(job))
+        for member_index in range(2):
+            cleanup_path = (cleanup_root /
+                            f"{job['ordinal']:06d}-{job_sha}-"
+                            f"member{member_index}.json")
+            add_file(cleanup_path, budget_module.SOURCE5_CLEANUP_SIDECAR_ROLE,
+                     source5_cleanup_sidecar_source_byte_bound(context),
+                     "chronology", storage_root=str(output_root),
+                     phase=phase, run_id=run_id, member_index=member_index)
+            add_file(str(cleanup_path) + ".refusal.json",
+                     budget_module.SOURCE5_CLEANUP_SIDECAR_REFUSAL_ROLE,
+                     budget_module.SOURCE5_CLEANUP_REFUSAL_BYTES,
+                     "chronology", storage_root=str(output_root),
+                     phase=phase, run_id=run_id, member_index=member_index)
+
+    # Pressure recipes, two member outputs, ProbeV2 capture files and roots.
+    pressure_materials = _pressure_materials_index(context, pressure_material_index)
+    pressure_index_value, _pressure_index_raw, pressure_index_sha = read_json(
+        pressure_material_index.resolve(strict=True),
+        "Source5 pressure material index", MAX_MANIFEST_BYTES,
+    )
+    add_file(pressure_material_index.resolve(strict=True),
+             "pressure_pair_artifact", MAX_MANIFEST_BYTES,
+             "source5_controller", storage_root=str(artifact_root),
+             exact_size=len(canonical_bytes(pressure_index_value)),
+             raw_sha256=pressure_index_sha, host=host_id)
+    pressure_material_refs = exact(
+        pressure_index_value["jobs"],
+        {job["run_id"] for job in _host_jobs(context, "pressure")},
+        "Source5 pressure material path catalogue pins",
+    )
+    for job in _host_jobs(context, "pressure"):
+        material_pin = raw_pin(pressure_material_refs[job["run_id"]],
+                               f"Source5 pressure material {job['run_id']}")
+        material_path = Path(material_pin["path"])
+        material_sha = context.fixed_pair._hash_regular_file(
+            material_path, MAX_ARTIFACT_BYTES,
+            f"Source5 pressure material {job['run_id']}",
+        )
+        material_info = material_path.stat(follow_symlinks=False)
+        require(material_sha == material_pin["raw_sha256"],
+                f"Source5 pressure material raw pin changed: {material_path}")
+        add_file(material_path, "pressure_pair_artifact", int(material_info.st_size),
+                 "source5_controller", storage_root="auto", phase="pressure",
+                 run_id=job["run_id"], exact_size=int(material_info.st_size),
+                 raw_sha256=material_sha, host=host_id)
+        material = pressure_materials[job["run_id"]]
+        add_pin(material["shared_policy"], "pressure_pair_artifact",
+                MAX_ARTIFACT_BYTES, "feedback_composer",
+                f"Source5 {job['run_id']} shared policy", host=host_id)
+        for member_index, member in enumerate(material["members"]):
+            for name, role, maximum in (
+                ("application_binary", "normal_app_output",
+                 context.fixed_pair.MAX_BINARY_BYTES),
+                ("construction_probe", "opaque_trace",
+                 context.modules["scripts/application-feedback-composition.py"].MAX_PROBE_BYTES),
+            ):
+                reference_value = member[name]
+                reference = raw_pin({
+                    "path": reference_value["path"],
+                    "raw_sha256": reference_value.get(
+                        "raw_sha256", reference_value.get("sha256"),
+                    ),
+                },
+                                    f"Source5 {job['run_id']} member[{member_index}] {name}")
+                add_pin(reference, role, maximum, "pressure_pair",
+                        f"Source5 {job['run_id']} member[{member_index}] {name}",
+                        host=host_id)
+            composition_pins = exact(member["composition"],
+                                     {"request", "policy", "receipt"},
+                                     f"Source5 {job['run_id']} composition pins[{member_index}]")
+            for name, reference_value in composition_pins.items():
+                add_pin(reference_value, "pressure_pair_artifact",
+                        MAX_ARTIFACT_BYTES, "feedback_composer",
+                        f"Source5 {job['run_id']} composition {name}[{member_index}]",
+                        host=host_id)
+            oracle_value = member.get("oracle")
+            if type(oracle_value) is dict and type(oracle_value.get("artifact")) is dict:
+                add_pin(oracle_value["artifact"], "normal_app_output",
+                        context.fixed_pair.MAX_ORACLE_BYTES, "pressure_pair",
+                        f"Source5 {job['run_id']} member[{member_index}] oracle",
+                        host=host_id)
+    for job in _host_jobs(context, "pressure"):
+        run_id = job["run_id"]
+        material = pressure_materials[run_id]
+        recipe_root = (artifact_root / campaign_id / "source5" / host_id /
+                       "job-artifacts" / "pressure" / run_id)
+        helper_path = (artifact_root / campaign_id / "source5" / host_id /
+                       "helper-inputs" / f"pressure-{run_id}.json")
+        add_file(helper_path, "source5_helper_input",
+                 _source5_helper_input_byte_bound(context, "pressure", job),
+                 "source5_controller", storage_root=str(artifact_root),
+                 phase="pressure", run_id=run_id)
+        for filename, role, maximum in (
+            ("source5-execution-overlay.json", "pressure_pair_artifact", 256 * 1024 * 1024),
+            ("source5-pressure-recipe.json", "pressure_pair_artifact", 16 * 1024 * 1024),
+            ("processes.tsv", "pressure_pair_artifact", material["artifact_budgets"]["pair_sidecar_bytes"]),
+            ("pressure-readback.json", "pressure_pair_artifact", material["artifact_budgets"]["pair_sidecar_bytes"]),
+            ("pressure-driver.stdout.log", "pressure_pair_artifact", material["artifact_budgets"]["supervision_bytes"]),
+            ("pressure-driver.stderr.log", "pressure_pair_artifact", material["artifact_budgets"]["supervision_bytes"]),
+        ):
+            add_file(recipe_root / filename, role, maximum, "pressure_pair",
+                     storage_root=str(artifact_root), phase="pressure",
+                     run_id=run_id)
+        pressure_receipt = (
+            artifact_root / campaign_id / "source5" / host_id /
+            "pressure-host-receipts" / f"{run_id}.json"
+        )
+        add_file(pressure_receipt, "component_receipt",
+                 chronology_roles["component_receipt"], "pressure_pair",
+                 storage_root=str(artifact_root), phase="pressure", run_id=run_id)
+        predecessor = job["predecessor_run_ids"][0]
+        fixed_record = (output_root / campaign_id / "source5" / host_id /
+                        "confirmation" / "job-records" / f"{predecessor}.json")
+        add_file(recipe_root / "preflight" / "fixed-pressure-predecessor.json",
+                 "pressure_predecessor_record", 16 * 1024 * 1024,
+                 "source5_controller",
+                 storage_root=str(artifact_root), phase="pressure", run_id=run_id)
+        pressure_members = context.pressure_pair.pressure_process_descriptors(job)
+        member_budget = material["artifact_budgets"]
+        member_caps = {
+            "stdout": member_budget["stdout_bytes"],
+            "stderr": member_budget["supervision_bytes"],
+            "timing": member_budget["member_sidecar_bytes"],
+            "ids": member_budget["ids_bytes"],
+            "shutdown": member_budget["shutdown_bytes"],
+            "capacity_families": member_budget["shutdown_bytes"],
+            "runtime_binding": member_budget["runtime_binding_bytes"],
+            "feedback_manifest": member_budget["feedback_manifest_bytes"],
+            "feedback_events": member_budget["feedback_events_bytes"],
+            "feedback_samples": member_budget["feedback_samples_bytes"],
+            "feedback_validation": member_budget["feedback_validation_bytes"],
+            "pressure_readback": member_budget["pressure_proof_bytes"],
+            "app_launch_attestation": member_budget["member_sidecar_bytes"],
+            "supervision_receipt": member_budget["supervision_bytes"],
+            "cleanup_receipt": member_budget["supervision_bytes"],
+            "runtime_expectation": member_budget["member_sidecar_bytes"],
+            "finalization_request": member_budget["member_sidecar_bytes"],
+            "finalization_receipt": member_budget["member_sidecar_bytes"],
+        }
+        for index, descriptor in enumerate(pressure_members):
+            member_root = (recipe_root /
+                           f"{index:02d}-{descriptor['pair']}-{descriptor['executor']}-{descriptor['allocator']}")
+            outputs = _pressure_member_outputs(member_root)
+            for name, path in outputs.items():
+                if name in {"root", "trace_directory"}:
+                    continue
+                relative_name = name
+                cap = member_caps[name]
+                relpath = Path(path).relative_to(recipe_root)
+                role = ("opaque_trace" if name in {
+                    "feedback_events", "feedback_samples", "ids",
+                } else "pressure_pair_artifact")
+                add_file(recipe_root / relpath, role, cap, "pressure_pair",
+                         storage_root=str(artifact_root), phase="pressure",
+                         run_id=run_id, member_index=index,
+                         aggregate_id=("pressure-output-" +
+                                       sha256(canonical_bytes(job))),
+                         aggregate_maximum=pressure_limits["MAX_TOTAL_ARTIFACT_BYTES"])
+            directory(member_root / "feedback-trace", "pressure_pair",
+                      storage_root=str(artifact_root), phase="pressure",
+                      run_id=run_id)
+            tmpdir_path = Path(material["members"][index]["tmpdir_path"])
+            tmp_ceilings = context.prepared_input_completion["resource_budgets"][host_id]
+            tmp_budget_value, _tmp_raw, _tmp_sha = read_json(
+                Path(tmp_ceilings["path"]),
+                "Source5 prepared per-host TMPDIR budget", MAX_ARTIFACT_BYTES,
+                tmp_ceilings["raw_sha256"],
+            )
+            ceilings = tmp_budget_value["ceilings"]
+            add_tree(tmpdir_path, "normal_app_output",
+                     ceilings["maximum_tmpdir_bytes"],
+                     ceilings["maximum_tmpdir_bytes"],
+                     ceilings["maximum_tmpdir_inodes"] + 1, "pressure_pair",
+                     storage_root="auto", phase="pressure",
+                     run_id=run_id, member_index=index)
+            if context.manifest["schema"] in BOUNDED_EXECUTION_SCHEMAS:
+                probe_budget = material["probe_capture"]["storage_budget"]
+                capture_id = sha256(canonical_bytes({
+                    "campaign_id": campaign_id, "host_id": host_id,
+                    "run_id": run_id, "member_index": index,
+                    "request_sha256": material["members"][index]["composition"]["request"]["raw_sha256"],
+                }))[:32]
+                capture_dir = (recipe_root / "probe-v2-captures" /
+                               f"member-{index:02d}" / capture_id)
+                caps = {
+                    "stdout.bin": probe_budget["stdout_bytes"],
+                    "stderr.bin": probe_budget["stderr_bytes"],
+                    "capture-receipt.json": probe_budget["receipt_bytes"],
+                    "owner-result.json": probe_budget["owner_result_bytes"],
+                    "tmpdir-inventory.json": probe_budget["inventory_bytes"],
+                    "capture-failure.json": probe_budget["failure_bytes"],
+                }
+                for filename, maximum in caps.items():
+                    role = (f"probe_capture_receipt_member{index}"
+                            if filename == "capture-receipt.json" else
+                            f"probe_capture_inventory_member{index}"
+                            if filename == "tmpdir-inventory.json" else
+                            "pressure_pair_artifact")
+                    add_file(capture_dir / filename, role,
+                             maximum, "feedback_composer",
+                             storage_root=str(artifact_root), phase="pressure",
+                             run_id=run_id, member_index=index)
+                add_tree(capture_dir / "tmp", "opaque_trace",
+                         probe_budget["tmpdir_bytes"], probe_budget["tmpdir_bytes"],
+                         probe_budget["tmpdir_inodes"] + 1, "feedback_composer",
+                         storage_root=str(artifact_root), phase="pressure",
+                         run_id=run_id, member_index=index)
+
+    # One original Soak material, its separately caller-pinned budget, and all
+    # schema-declared output/TMP roots. The dynamic roots carry their own caps.
+    soak_jobs = _host_jobs(context, "soak")
+    require(len(soak_jobs) == 1,
+            "Source5 path catalogue requires the one original host Soak ordinal")
+    soak_job = soak_jobs[0]
+    soak_materials_raw, soak_materials_sha, _soak_materials_info = read_stable(
+        soak_material_index.resolve(strict=True), "Source5 Soak materials index",
+        MAX_ARTIFACT_BYTES,
+    )
+    try:
+        soak_materials = json.loads(soak_materials_raw)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError("Source5 Soak materials index is malformed") from error
+    require(type(soak_materials) is dict and
+            soak_materials_raw == canonical_bytes(soak_materials),
+            "Source5 Soak materials index is not canonical")
+    soak_helper = context.modules["scripts/application-source5-soak.py"]
+    binding = soak_helper._selected_prepared_host_binding(
+        context.prepared_input_completion, host_id,
+    )
+    soak_materials = soak_helper.validate_material_index(
+        soak_materials, campaign_id, host_id, soak_job,
+        binding["binding_sha256"],
+    )
+    soak_index_path = soak_material_index.resolve(strict=True)
+    add_file(soak_index_path, "source5_soak_artifact", MAX_ARTIFACT_BYTES,
+             "source5_controller", storage_root="auto", phase="soak",
+             run_id=soak_job["run_id"], exact_size=len(soak_materials_raw),
+             raw_sha256=soak_materials_sha, host=host_id)
+    add_pin(soak_materials["parent_recipe"], "source5_soak_artifact",
+            soak_helper.MAX_RECIPE_BYTES, "source5_soak",
+            "Source5 original Soak parent recipe", host=host_id)
+    add_pin(soak_materials["build_receipt"], "source5_soak_artifact",
+            soak_helper.MAX_RECEIPT_BYTES, "source5_soak",
+            "Source5 Soak recipe build receipt", host=host_id)
+    require(soak_materials.get("schema") == soak_helper.MATERIALS_INDEX_SCHEMA_V2 and
+            type(soak_materials.get("resource_budget")) is dict,
+            "bounded Source5 Soak material index lacks its original resource budget")
+    resource_budget_value, resource_budget_pin = \
+        soak_helper._read_resource_budget_pin(soak_materials["resource_budget"])
+    add_pin({"path": resource_budget_pin["path"],
+             "raw_sha256": resource_budget_pin["raw_sha256"]},
+            "host_evidence_budget",
+            soak_helper.MAX_RESOURCE_BUDGET_BYTES, "source5_soak",
+            "Source5 Soak resource budget",
+            semantic_sha256=resource_budget_pin["semantic_sha256"], host=host_id)
+    soak_layout = resource_budget_value["layout"]
+    soak_ceilings = resource_budget_value["ceilings"]
+    soak_limits = resource_budget_value["artifact_limits"]
+    soak_output = Path(soak_layout["output_root"])
+    soak_helper_root = (artifact_root / campaign_id / "source5" / host_id /
+                        "job-artifacts" / "soak" / soak_job["run_id"])
+    helper_input_path = (artifact_root / campaign_id / "source5" / host_id /
+                         "helper-inputs" / f"soak-{soak_job['run_id']}.json")
+    add_file(helper_input_path, "source5_helper_input",
+             _source5_helper_input_byte_bound(context, "soak", soak_job),
+             "source5_controller", storage_root=str(artifact_root), phase="soak",
+             run_id=soak_job["run_id"])
+    soak_file_limits = {
+        "soak-preflight.json": soak_limits["preflight_receipt_bytes"],
+        "soak-postflight.json": soak_limits["postflight_receipt_bytes"],
+        "soak-launch.json": soak_limits["launch_receipt_bytes"],
+        "soak-readback.json": soak_limits["readback_receipt_bytes"],
+        "source5-soak-launch-authorization.json": soak_limits["launch_receipt_bytes"],
+        "source5-soak-postflight.json": soak_limits["postflight_receipt_bytes"],
+        "source5-soak-supervisor.json": soak_limits["source5_supervisor_bytes"],
+        "soak-receipt.json": soak_limits["soak_receipt_bytes"],
+        "pressure-readback.json": soak_limits["pressure_run_receipt_bytes"],
+        "stdout.log": soak_limits["application_stdout_bytes"],
+        "stderr.log": soak_limits["application_stderr_bytes"],
+        "time.txt": soak_limits["application_timing_bytes"],
+        "terminal-records.tsv": soak_limits["terminal_stream_bytes"],
+        "resource-samples.tsv": soak_limits["resource_samples_bytes"],
+        "pressure-driver.stdout.log": soak_limits["pressure_driver_stdout_bytes"],
+        "pressure-driver.stderr.log": soak_limits["pressure_driver_stderr_bytes"],
+        "source5-soak-resource-monitor.jsonl": soak_limits["resource_monitor_stream_bytes"],
+        "source5-soak-application-owner-return.json": soak_limits["owner_return_receipt_bytes"],
+        "source5-soak-pressure-owner-return.json": soak_limits["owner_return_receipt_bytes"],
+    }
+    soak_output_group = (
+        "soak-output-" + sha256(canonical_bytes(soak_job))
+    )
+    for filename, maximum in soak_file_limits.items():
+        role = ("opaque_trace" if filename in {
+            "terminal-records.tsv", "resource-samples.tsv",
+            "source5-soak-resource-monitor.jsonl",
+        } else "source5_soak_artifact")
+        add_file(soak_output / filename, role, maximum, "source5_soak",
+                 storage_root="auto", phase="soak", run_id=soak_job["run_id"],
+                 aggregate_id=soak_output_group,
+                 aggregate_maximum=soak_ceilings["maximum_output_bytes"])
+    pressure_output = soak_output / "pressure"
+    for filename, budget_name in (
+        ("run.json", "pressure_run_receipt_bytes"),
+        ("events.jsonl", "pressure_events_bytes"),
+        ("launch-record.json", "pressure_launch_bytes"),
+        ("process-binding.json", "pressure_binding_bytes"),
+        ("pressure-ready.json", "pressure_ready_bytes"),
+    ):
+        add_file(pressure_output / filename, "source5_soak_artifact",
+                 soak_limits[budget_name], "source5_soak",
+                 storage_root="auto", phase="soak", run_id=soak_job["run_id"],
+                 aggregate_id=soak_output_group,
+                 aggregate_maximum=soak_ceilings["maximum_output_bytes"])
+    host_receipt_path = Path(soak_layout["host_receipt_path"])
+    add_file(host_receipt_path, "component_receipt",
+             soak_limits["host_receipt_bytes"], "source5_soak",
+             storage_root="auto", phase="soak", run_id=soak_job["run_id"])
+    add_file(soak_helper_root / "source5-soak-component.json",
+             "source5_soak_artifact",
+             soak_limits["component_receipt_bytes"],
+             "source5_soak", storage_root=str(artifact_root), phase="soak",
+             run_id=soak_job["run_id"])
+    add_file(soak_helper_root / "source5-soak-failure.json",
+             "source5_soak_artifact", soak_limits["failure_receipt_bytes"],
+             "source5_soak", storage_root=str(artifact_root), phase="soak",
+             run_id=soak_job["run_id"])
+    for field, bytes_field, inodes_field, role in (
+        ("application_tmpdir", "maximum_application_tmpdir_bytes",
+         "maximum_application_tmpdir_inodes", "normal_app_output"),
+        ("probe_tmpdir", "maximum_probe_tmpdir_bytes",
+         "maximum_probe_tmpdir_inodes", "opaque_trace"),
+    ):
+        add_tree(soak_layout[field], role, soak_ceilings[bytes_field],
+                 soak_ceilings[bytes_field], soak_ceilings[inodes_field] + 1,
+                 "source5_soak", storage_root="auto", phase="soak",
+                 run_id=soak_job["run_id"])
+    probe_root = Path(soak_layout["probe_capture_root"])
+    directory(probe_root, "source5_soak", storage_root="auto",
+              phase="soak", run_id=soak_job["run_id"])
+    probe_files = {
+        "stdout.bin": soak_limits["probe_stdout_bytes"],
+        "stderr.bin": soak_limits["probe_stderr_bytes"],
+        "owner-result.json": soak_limits["probe_owner_receipt_bytes"],
+        "tmpdir-inventory.json": soak_limits["probe_inventory_bytes"],
+        "capture-receipt.json": soak_limits["probe_capture_receipt_bytes"],
+        "capture-failure.json": soak_limits["probe_failure_bytes"],
+    }
+    for filename, maximum in probe_files.items():
+        role = ("probe_capture_receipt"
+                if filename == "capture-receipt.json" else
+                "probe_capture_inventory"
+                if filename == "tmpdir-inventory.json" else
+                "source5_soak_artifact")
+        add_file(probe_root / filename, role, maximum,
+                 "source5_soak", storage_root="auto", phase="soak",
+                 run_id=soak_job["run_id"],
+                 aggregate_id=("soak-probe-output-" +
+                               sha256(canonical_bytes(soak_job))),
+                 aggregate_maximum=soak_ceilings["maximum_probe_output_bytes"])
+    require(len(probe_files) + 1 <= soak_ceilings["maximum_probe_output_inodes"],
+            "Source5 Soak probe output roles exceed their prospectively reserved inode count")
+    add_tree(probe_root / "tmp", "opaque_trace",
+             soak_ceilings["maximum_probe_tmpdir_bytes"],
+             soak_ceilings["maximum_probe_tmpdir_bytes"],
+             soak_ceilings["maximum_probe_tmpdir_inodes"] + 1, "source5_soak",
+             storage_root="auto", phase="soak", run_id=soak_job["run_id"])
+    parent_recipe_value, _parent_recipe_raw, _parent_recipe_sha = read_json(
+        Path(soak_materials["parent_recipe"]["path"]),
+        "Source5 Soak parent recipe", soak_helper.MAX_RECIPE_BYTES,
+        soak_materials["parent_recipe"]["raw_sha256"],
+    )
+    pressure_recipe_pin = parent_recipe_value["pressure"]["recipe"]
+    pressure_recipe_value, _pressure_recipe_raw, _pressure_recipe_sha = read_json(
+        Path(pressure_recipe_pin["path"]), "Source5 Soak pressure recipe",
+        context.pressure_pair.MAX_RECIPE_BYTES,
+        pressure_recipe_pin["raw_sha256"],
+    )
+    scratch_path = Path(pressure_recipe_value["storage"]["pressure_scratch_path"])
+    scratch_size = pressure_recipe_value["schedule"]["scratch_file_bytes"]
+    require(str(scratch_path) == soak_layout["pressure_scratch"] and
+            type(scratch_size) is int and
+            0 < scratch_size <= soak_ceilings["maximum_pressure_scratch_bytes"],
+            "Source5 Soak scratch reservation differs from its original pressure recipe")
+    add_file(scratch_path, "pressure_pair_artifact", scratch_size,
+             "pressure_driver", storage_root="auto", phase="soak",
+             run_id=soak_job["run_id"], exact_size=scratch_size)
+
+    # The ordered phase journal, terminal records, analyses and original Soak inputs.
+    for phase in ("exploration", "aa", "confirmation", "pressure", "soak"):
+        phase_root = output_root / campaign_id / "source5" / host_id / phase
+        add_file(phase_root / "controller-ledger.jsonl", "source5_phase_ledger",
+                 _source5_phase_ledger_byte_bound(
+                     context, phase, _host_jobs(context, phase),
+                 ),
+                 "source5_controller", storage_root=str(output_root),
+                 phase=phase)
+        for job in _host_jobs(context, phase):
+            run_id = job["run_id"]
+            record_root = phase_root / "job-records"
+            record_limit = _source5_job_record_byte_bound(context, phase, job)
+            disposition_limit = _source5_job_disposition_byte_bound(job)
+            add_file(record_root / f"{run_id}.json", "source5_job_record",
+                     record_limit, "source5_controller",
+                     storage_root=str(output_root), phase=phase, run_id=run_id)
+            add_file(record_root / f"{run_id}.disposition.json",
+                     "source5_job_disposition", disposition_limit,
+                     "source5_controller", storage_root=str(output_root),
+                     phase=phase, run_id=run_id)
+    phase_names = {
+        "exploration": "exploration", "aa": "aa",
+        "fixed_analysis": "confirmation", "pressure_analysis": "pressure",
+        "soak": "soak", "final_analysis": "soak",
+    }
+    for analysis, source_phase in phase_names.items():
+        phase_root = output_root / campaign_id / "source5" / host_id / source_phase
+        analysis_root = artifact_root / campaign_id / "source5" / host_id / "phase-analysis"
+        add_file(analysis_root / f"{analysis}.json", "analysis_artifact",
+                 chronology_roles["analysis_artifact"], "source5_controller",
+                 storage_root=str(artifact_root), phase=source_phase)
+        add_file(phase_root / "not-run-dispositions.json",
+                 "source5_job_disposition",
+                 min(chronology_roles["source5_helper_input"],
+                     _source5_disposition_byte_bound(context, source_phase)),
+                 "source5_controller",
+                 storage_root=str(output_root), phase=source_phase)
+
+    chronology_root = output_root / campaign_id / "chronology" / host_id
+    callback_events = context.chronology._source5_plan_event_projection(
+        context.plan, {"host_id": host_id, "campaign_id": campaign_id},
+        context.manifest,
+    )["maximum_callback_events"]
+    add_file(chronology_root / "dispatch-journal.jsonl", "journal",
+             context.chronology._source5_plan_journal_byte_ceiling(callback_events),
+             "chronology", storage_root=str(output_root), host=host_id)
+    add_file(chronology_root / "source5-origin-journal-receipt-v3.json",
+             "origin_receipt", 0,
+             "chronology", storage_root=str(output_root), host=host_id)
+    add_file(chronology_root / "source5-host-journal-request-v3.json",
+             "source5_helper_input", chronology_roles["source5_helper_input"],
+             "chronology", storage_root=str(output_root), host=host_id)
+
+    # SourceV5 source directories and all explicit private output roots are
+    # directory identities in the component maps; TMP trees carry their own
+    # independent byte/inode ceilings above.
+    for name, root in (("source", context.source_root),
+                       ("input", context.input_root),
+                       ("artifact", artifact_root),
+                       ("output", output_root),
+                       ("scratch", scratch_root),
+                       ("campaign_artifacts", Path(
+                           context.manifest["original_inputs"]["campaign_artifacts_root"]
+                       ))):
+        directory(root, "source5_controller",
+                  storage_root=(str(root) if root in {artifact_root, output_root}
+                                else None))
+    # Build an immutable per-job row lookup with a bounded external sort. The
+    # archive handshake runs between timed jobs; this file avoids rereading
+    # every host catalogue chunk for every original job while keeping the
+    # request's entries tied to the exact catalogue rows.
+    job_catalogue_root = (artifact_root / campaign_id / "source5" / host_id /
+                          "job-path-catalogues")
+    _private_directory(job_catalogue_root)
+    for phase in ("exploration", "aa", "confirmation", "pressure", "soak"):
+        _private_directory(job_catalogue_root / phase)
+    directory(job_catalogue_root, "source5_controller",
+              storage_root=str(artifact_root))
+    record_spool.flush()
+    current_spool_bytes = record_spool.seek(0, os.SEEK_END)
+    current_directory_bytes = sum(
+        len(canonical_bytes(row)) for row in directory_specs.values()
+    )
+    current_row_count = record_spool_count + len(directory_specs)
+    current_run_count = max(
+        1, (current_row_count + budget_module.PATH_CATALOGUE_RUN_ROWS - 1) //
+        budget_module.PATH_CATALOGUE_RUN_ROWS,
+    )
+    current_merge_overlap = (
+        (current_run_count + budget_module.PATH_CATALOGUE_MERGE_FANOUT - 1) //
+        budget_module.PATH_CATALOGUE_MERGE_FANOUT
+        if current_run_count > budget_module.PATH_CATALOGUE_MERGE_FANOUT else 0
+    )
+    require(
+        scratch_reservation["reserved_bytes"] >=
+            3 * (current_spool_bytes + current_directory_bytes) and
+        scratch_reservation["reserved_inodes"] >=
+            2 + current_run_count + current_merge_overlap,
+        "Source5 job-path external sort exceeds the caller-reserved scratch peak before writing runs",
+    )
+    original_jobs = {
+        (phase, job["run_id"]): job
+        for phase in ("exploration", "aa", "confirmation", "pressure", "soak")
+        for job in _host_jobs(context, phase)
+    }
+    job_sort_root = Path(tempfile.mkdtemp(
+        prefix=".source5-job-path-sort-", dir=scratch_root,
+    ))
+    os.chmod(job_sort_root, 0o700)
+    job_runs: list[Path] = []
+
+    def row_sort_key(row: dict[str, Any]) -> tuple[str, str, str]:
+        return (row["phase"], row["run_id"], row["path"])
+
+    def flush_job_run(batch: list[dict[str, Any]]) -> None:
+        if not batch:
+            return
+        batch.sort(key=row_sort_key)
+        run_path = job_sort_root / f"run-{len(job_runs):08d}.jsonl"
+        fd = os.open(run_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                     getattr(os, "O_CLOEXEC", 0) |
+                     getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            for row in batch:
+                raw = canonical_bytes(row)
+                require(len(raw) <= budget_module.PATH_CATALOGUE_ROW_BYTES,
+                        "Source5 job-path sort row exceeds its pinned width")
+                offset = 0
+                while offset < len(raw):
+                    count = os.write(fd, raw[offset:])
+                    require(count > 0,
+                            "short write to bounded Source5 job-path sort run")
+                    offset += count
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        job_runs.append(run_path)
+        batch.clear()
+
+    def iter_job_run(path: Path):
+        before_path = path.lstat()
+        require(stat.S_ISREG(before_path.st_mode) and
+                before_path.st_uid == os.getuid() and
+                stat.S_IMODE(before_path.st_mode) == 0o600 and
+                before_path.st_nlink == 1,
+                "Source5 job-path sort run is not an owned private regular file")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+                     getattr(os, "O_NOFOLLOW", 0) |
+                     getattr(os, "O_NONBLOCK", 0))
+        opened = os.fstat(fd)
+        identity = lambda info: (
+            info.st_dev, info.st_ino, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns,
+        )
+        require(stat.S_ISREG(opened.st_mode) and identity(opened) ==
+                identity(before_path),
+                "Source5 job-path sort run changed while opening")
+        with os.fdopen(fd, "rb") as stream:
+            previous_key: tuple[str, str, str] | None = None
+            while True:
+                line = stream.readline(budget_module.PATH_CATALOGUE_ROW_BYTES + 1)
+                if not line:
+                    return
+                require(len(line) <= budget_module.PATH_CATALOGUE_ROW_BYTES and
+                        line.endswith(b"\n") and b"\r" not in line,
+                        "Source5 job-path sort run framing or row width differs")
+                try:
+                    row = json.loads(line.decode("ascii"))
+                except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+                    raise Source5CampaignError(
+                        "Source5 job-path sort row is malformed",
+                    ) from error
+                require(type(row) is dict and line == canonical_bytes(row),
+                        "Source5 job-path sort row is not canonical")
+                key = row_sort_key(row)
+                require(previous_key is None or key > previous_key,
+                        "Source5 job-path sort run is not strictly ordered")
+                previous_key = key
+                yield row
+            after_fd = os.fstat(stream.fileno())
+            after_path = path.lstat()
+            require(identity(opened) == identity(after_fd) == identity(after_path),
+                    "Source5 job-path sort run changed during bounded reading")
+
+    def write_merged_job_run(
+        rows: Any, round_index: int, output_index: int,
+    ) -> Path:
+        run_path = job_sort_root / f"merge-{round_index:04d}-{output_index:08d}.jsonl"
+        fd = os.open(run_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                     getattr(os, "O_CLOEXEC", 0) |
+                     getattr(os, "O_NOFOLLOW", 0), 0o600)
+        previous_key: tuple[str, str, str] | None = None
+        try:
+            for row in rows:
+                key = row_sort_key(row)
+                require(previous_key is None or key > previous_key,
+                        "Source5 merged job-path sort run repeats or reorders a row")
+                previous_key = key
+                raw = canonical_bytes(row)
+                require(len(raw) <= budget_module.PATH_CATALOGUE_ROW_BYTES,
+                        "Source5 merged job-path sort row exceeds its pinned width")
+                offset = 0
+                while offset < len(raw):
+                    count = os.write(fd, raw[offset:])
+                    require(count > 0,
+                            "short write to bounded Source5 merged job-path sort run")
+                    offset += count
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return run_path
+
+    def close_job_catalogue(
+        key: tuple[str, str], fd: int, path: Path, hasher: Any,
+        byte_count: int, row_count: int,
+    ) -> None:
+        require(byte_count > 0 and row_count > 0,
+                f"Source5 {key} has an empty exact job-path catalogue")
+        os.fsync(fd)
+        os.close(fd)
+        parent_fd = os.open(
+            path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+            getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        job = original_jobs.get(key)
+        require(type(job) is dict,
+                f"Source5 job-path catalogue has no original Plan row: {key}")
+        job_sha = sha256(canonical_bytes(job))
+        expected_path = (job_catalogue_root / key[0] /
+                         f"{job['ordinal']:06d}-{job_sha}.jsonl")
+        require(path == expected_path,
+                "Source5 job-path catalogue path differs from original Plan identity")
+        add_file(
+            path, "source5_job_row_catalogue", byte_count,
+            "source5_controller", storage_root=str(artifact_root),
+            phase=key[0], run_id=key[1],
+            exact_size=byte_count, raw_sha256=hasher.hexdigest(), host=host_id,
+        )
+
+    batch: list[dict[str, Any]] = []
+    record_spool.flush()
+    record_spool.seek(0)
+    while True:
+        line = record_spool.readline()
+        if not line:
+            break
+        require(line.endswith(b"\n") and b"\r" not in line,
+                "Source5 producer spool framing differs during job-path indexing")
+        try:
+            row = json.loads(line.decode("ascii"))
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise Source5CampaignError(
+                "Source5 producer spool is malformed during job-path indexing",
+            ) from error
+        require(type(row) is dict and line == canonical_bytes(row),
+                "Source5 producer spool row is not canonical during job-path indexing")
+        if row["phase"] is None or row["run_id"] is None:
+            continue
+        batch.append(row)
+        if len(batch) >= budget_module.PATH_CATALOGUE_RUN_ROWS:
+            flush_job_run(batch)
+    for row in directory_specs.values():
+        if (row["kind"] == "tree" and row["phase"] is not None and
+                row["run_id"] is not None):
+            batch.append(row)
+            if len(batch) >= budget_module.PATH_CATALOGUE_RUN_ROWS:
+                flush_job_run(batch)
+    flush_job_run(batch)
+    record_spool.seek(0)
+    merge_round = 0
+    while len(job_runs) > budget_module.PATH_CATALOGUE_MERGE_FANOUT:
+        next_runs: list[Path] = []
+        for output_index, offset in enumerate(range(
+                0, len(job_runs), budget_module.PATH_CATALOGUE_MERGE_FANOUT)):
+            group = job_runs[offset:offset +
+                             budget_module.PATH_CATALOGUE_MERGE_FANOUT]
+            if len(group) == 1:
+                next_runs.append(group[0])
+                continue
+            merged = heapq.merge(
+                *(iter_job_run(path) for path in group), key=row_sort_key,
+            )
+            output = write_merged_job_run(merged, merge_round, output_index)
+            next_runs.append(output)
+            for old_run in group:
+                old_run.unlink()
+        job_runs = next_runs
+        merge_round += 1
+    grouped_rows = heapq.merge(
+        *(iter_job_run(path) for path in job_runs), key=row_sort_key,
+    ) if job_runs else iter(())
+    active_key: tuple[str, str] | None = None
+    active_fd: int | None = None
+    active_path: Path | None = None
+    active_hash: Any = None
+    active_bytes = 0
+    active_rows = 0
+    observed_job_keys: set[tuple[str, str]] = set()
+    try:
+        for row in grouped_rows:
+            key = (row["phase"], row["run_id"])
+            if key != active_key:
+                if active_key is not None:
+                    close_job_catalogue(
+                        active_key, active_fd, active_path, active_hash,
+                        active_bytes, active_rows,
+                    )
+                    active_fd = None
+                job = original_jobs.get(key)
+                require(type(job) is dict and key not in observed_job_keys,
+                        f"Source5 job-path rows repeat or escape original Plan jobs: {key}")
+                observed_job_keys.add(key)
+                job_sha = sha256(canonical_bytes(job))
+                active_path = (job_catalogue_root / key[0] /
+                               f"{job['ordinal']:06d}-{job_sha}.jsonl")
+                active_fd = os.open(
+                    active_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                    getattr(os, "O_CLOEXEC", 0) |
+                    getattr(os, "O_NOFOLLOW", 0), 0o600,
+                )
+                active_key = key
+                active_hash = hashlib.sha256()
+                active_bytes = 0
+                active_rows = 0
+            raw = canonical_bytes(row)
+            offset = 0
+            while offset < len(raw):
+                count = os.write(active_fd, raw[offset:])
+                require(count > 0,
+                        "short write to exact Source5 per-job path catalogue")
+                offset += count
+            active_hash.update(raw)
+            active_bytes += len(raw)
+            active_rows += 1
+        if active_key is not None:
+            close_job_catalogue(
+                active_key, active_fd, active_path, active_hash,
+                active_bytes, active_rows,
+            )
+            active_fd = None
+    finally:
+        if active_fd is not None:
+            try:
+                os.close(active_fd)
+            except OSError:
+                pass
+        shutil.rmtree(job_sort_root, ignore_errors=True)
+    require(observed_job_keys == set(original_jobs),
+            "Source5 per-job path catalogue does not cover every original Plan job")
+
+    def base_catalogue_rows():
+        record_spool.flush()
+        record_spool.seek(0)
+        while True:
+            line = record_spool.readline()
+            if not line:
+                break
+            require(line.endswith(b"\n") and b"\r" not in line,
+                    "Source5 catalogue spool framing differs during archive-cap projection")
+            try:
+                value = json.loads(line.decode("ascii"))
+            except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+                raise Source5CampaignError(
+                    "Source5 catalogue spool is malformed during archive-cap projection",
+                ) from error
+            require(type(value) is dict and line == canonical_bytes(value),
+                    "Source5 catalogue spool row is not canonical during archive-cap projection")
+            yield value
+        yield from directory_specs.values()
+
+    # Derive each transfer request/packet/ACK cap from this exact original
+    # job's canonical file-role rows before adding the corresponding transport
+    # paths to the catalogue. Metadata paths are cumulative; the raw packet is
+    # one transient scratch inode and is reclaimed only after signed ACK.
+    archive_caps = budget_module.project_archive_job_caps(base_catalogue_rows())
+    readback_caps_by_job = budget_module.project_archive_readback_caps(
+        base_catalogue_rows(),
+    )
+    expected_job_groups = set(original_jobs)
+    require(set(archive_caps) == expected_job_groups and
+            set(readback_caps_by_job) == expected_job_groups,
+            "Source5 archive/readback path projections do not close over every original job")
+    readback_cap_fields = (
+        "maximum_request_bytes", "maximum_response_bytes",
+        "maximum_bundle_bytes", "maximum_stage_bytes",
+        "maximum_stage_inodes", "maximum_object_count",
+        "maximum_object_bytes", "maximum_live_window_bytes",
+        "maximum_live_window_inodes",
+    )
+    readback_caps = {
+        name: max(value[name] for value in readback_caps_by_job.values())
+        for name in readback_cap_fields
+    }
+    metadata_root = (output_root / campaign_id / "chronology" / host_id /
+                     "evidence-checkpoints")
+    packet_root = (scratch_root / campaign_id / host_id / "evidence-packets")
+    readback_root = (scratch_root / campaign_id / host_id /
+                     "archive-readback")
+    read_slot_paths = {
+        "source5_archive_read_request_slot": str(readback_root / "request.json"),
+        "source5_archive_read_response_slot": str(readback_root / "response.json"),
+        "source5_archive_read_response_incoming":
+            str(readback_root / "response.json.incoming"),
+        "source5_archive_read_bundle": str(readback_root / "response.tar"),
+        "source5_archive_read_bundle_incoming":
+            str(readback_root / "response.tar.incoming"),
+        "source5_archive_read_stage": str(readback_root / "stage"),
+        budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE: str(
+            output_root / campaign_id / "source5" / host_id /
+            "archive-read-control.jsonl",
+        ),
+    }
+    readback_schedule = _source5_archive_read_schedule(
+        context, readback_caps_by_job,
+    )
+    read_control_projection = _source5_archive_read_control_ledger_byte_bound(
+        context, readback_schedule, read_slot_paths,
+    )
+    require(readback_caps["maximum_request_bytes"] <=
+                MAX_SOURCE5_ARCHIVE_READ_METADATA_BYTES and
+            readback_caps["maximum_response_bytes"] <=
+                MAX_SOURCE5_ARCHIVE_READ_METADATA_BYTES and
+            readback_caps["maximum_stage_bytes"] > 0 and
+            readback_caps["maximum_stage_inodes"] > 1 and
+            readback_caps["maximum_object_bytes"] > 0 and
+            read_control_projection["maximum_bytes"] > 0 and
+            read_control_projection["maximum_line_bytes"] > 0 and
+            read_control_projection["maximum_event_count"] ==
+                2 * len(readback_schedule),
+            "Source5 readback slots or Plan-derived control ledger exceed their finite owner projection")
+    context.source5_archive_read_slot_paths = dict(read_slot_paths)
+    context.source5_archive_read_caps = {
+        **readback_caps,
+        "control_ledger_bytes": read_control_projection["maximum_bytes"],
+        "control_ledger_line_bytes": read_control_projection[
+            "maximum_line_bytes"],
+        "control_ledger_event_count": read_control_projection[
+            "maximum_event_count"],
+    }
+    context.source5_archive_read_schedule = readback_schedule
+    analyzer_projection = _source5_analyzer_scratch_projection(
+        context, base_catalogue_rows(),
+    )
+    if analyzer_projection is not None:
+        analyzer_root = (scratch_root / campaign_id / host_id /
+                         "analyzer-spool")
+        _private_directory(analyzer_root)
+        require(_source5_analyzer_scratch_is_empty(analyzer_root),
+                "Source5 analyzer scratch root is not empty before prospective execution")
+        add_tree(
+            analyzer_root, budget_module.SOURCE5_ANALYZER_SPOOL_ROLE,
+            analyzer_projection["maximum_bytes"],
+            analyzer_projection["maximum_file_bytes"],
+            analyzer_projection["maximum_inodes"],
+            "source5_controller", storage_root=str(scratch_root),
+        )
+        context.source5_analyzer_scratch_root = analyzer_root
+        context.source5_analyzer_scratch_projection = analyzer_projection
+    else:
+        context.source5_analyzer_scratch_root = None
+        context.source5_analyzer_scratch_projection = None
+    add_file(
+        read_slot_paths["source5_archive_read_control_ledger"],
+        budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE,
+        read_control_projection["maximum_bytes"], "source5_controller",
+        storage_root=str(output_root), host=host_id,
+    )
+    add_file(
+        read_slot_paths["source5_archive_read_request_slot"],
+        "source5_archive_read_request_slot",
+        readback_caps["maximum_request_bytes"], "source5_controller",
+        storage_root=str(scratch_root), host=host_id,
+    )
+    add_file(
+        read_slot_paths["source5_archive_read_response_slot"],
+        "source5_archive_read_response_slot",
+        readback_caps["maximum_response_bytes"], "source5_controller",
+        storage_root=str(scratch_root), host=host_id,
+    )
+    add_file(
+        read_slot_paths["source5_archive_read_response_incoming"],
+        "source5_archive_read_response_incoming",
+        readback_caps["maximum_response_bytes"], "source5_controller",
+        storage_root=str(scratch_root), host=host_id,
+    )
+    add_file(
+        read_slot_paths["source5_archive_read_bundle"],
+        "source5_archive_read_bundle",
+        readback_caps["maximum_bundle_bytes"], "source5_controller",
+        storage_root=str(scratch_root), host=host_id,
+    )
+    add_file(
+        read_slot_paths["source5_archive_read_bundle_incoming"],
+        "source5_archive_read_bundle_incoming",
+        readback_caps["maximum_bundle_bytes"], "source5_controller",
+        storage_root=str(scratch_root), host=host_id,
+    )
+    add_tree(
+        read_slot_paths["source5_archive_read_stage"],
+        "source5_archive_read_stage",
+        readback_caps["maximum_stage_bytes"],
+        readback_caps["maximum_object_bytes"],
+        readback_caps["maximum_stage_inodes"],
+        "source5_controller", storage_root=str(scratch_root),
+    )
+    for phase in ("exploration", "aa", "confirmation", "pressure", "soak"):
+        for job in _host_jobs(context, phase):
+            run_id = job["run_id"]
+            ordinal = job.get("ordinal")
+            require(type(ordinal) is int and ordinal > 0 and
+                    type(run_id) is str and run_id,
+                    f"Source5 {phase} archive path lost its original ordinal or run ID")
+            caps = archive_caps.get((phase, run_id))
+            require(type(caps) is dict and set(caps) == {
+                "checkpoint_request_bytes", "transfer_packet_bytes",
+                "checkpoint_bytes", "object_manifest_bytes",
+                "archive_ack_bytes", "signature_bytes", "ack_bundle_bytes",
+                "stage_map_bytes", "transfer_offer_bytes",
+            }, f"Source5 {phase}/{run_id} has no exact per-job archive closure bound")
+            job_sha = sha256(canonical_bytes(job))
+            leaf = f"{ordinal:06d}-{job_sha}"
+            outbox = metadata_root / phase
+            packet = packet_root / phase / f"{leaf}.tar"
+            add_file(outbox / f"{leaf}.request.json",
+                     "source5_checkpoint_request",
+                     caps["checkpoint_request_bytes"], "source5_controller",
+                     storage_root=str(output_root), phase=phase, run_id=run_id)
+            add_file(outbox / f"{leaf}.offer.json",
+                     "source5_transfer_offer",
+                     caps["transfer_offer_bytes"], "source5_controller",
+                     storage_root=str(output_root), phase=phase, run_id=run_id)
+            add_file(packet, "source5_transfer_packet",
+                     caps["transfer_packet_bytes"], "source5_controller",
+                     storage_root=str(scratch_root), phase=phase, run_id=run_id)
+            add_file(outbox / f"{leaf}.ack.tar", "source5_ack_bundle",
+                     caps["ack_bundle_bytes"], "source5_controller",
+                     storage_root=str(output_root), phase=phase, run_id=run_id)
+            add_file(outbox / f"{leaf}.ack.tar.incoming",
+                     "source5_ack_bundle_incoming", caps["ack_bundle_bytes"],
+                     "source5_controller", storage_root=str(output_root),
+                     phase=phase, run_id=run_id)
+            add_file(outbox / f"{leaf}.checkpoint.json", "source5_checkpoint",
+                     caps["checkpoint_bytes"], "source5_controller",
+                     storage_root=str(output_root), phase=phase, run_id=run_id)
+            add_file(outbox / f"{leaf}.object-manifest.json",
+                     "source5_object_manifest", caps["object_manifest_bytes"],
+                     "source5_controller", storage_root=str(output_root),
+                     phase=phase, run_id=run_id)
+            add_file(outbox / f"{leaf}.ack.json", "source5_archive_ack",
+                     caps["archive_ack_bytes"], "source5_controller",
+                     storage_root=str(output_root), phase=phase, run_id=run_id)
+            add_file(outbox / f"{leaf}.ack.sig", "source5_archive_signature",
+                     caps["signature_bytes"], "source5_controller",
+                     storage_root=str(output_root), phase=phase, run_id=run_id)
+            add_file(outbox / f"{leaf}.stage-map.json", "source5_stage_map",
+                     caps["stage_map_bytes"], "source5_controller",
+                     storage_root=str(output_root), phase=phase, run_id=run_id)
+
+    def row_stream():
+        try:
+            record_spool.flush()
+            spool_bytes = record_spool.seek(0, os.SEEK_END)
+            directory_rows = directory_specs.values()
+            directory_bytes = sum(len(canonical_bytes(row))
+                                  for row in directory_rows)
+            input_bytes = spool_bytes + directory_bytes
+            input_count = record_spool_count + len(directory_specs)
+            run_count = max(1, (input_count +
+                               budget_module.PATH_CATALOGUE_RUN_ROWS - 1) //
+                            budget_module.PATH_CATALOGUE_RUN_ROWS)
+            merge_overlap = ((run_count + budget_module.PATH_CATALOGUE_MERGE_FANOUT - 1) //
+                             budget_module.PATH_CATALOGUE_MERGE_FANOUT
+                             if run_count > budget_module.PATH_CATALOGUE_MERGE_FANOUT
+                             else 0)
+            required_scratch_bytes = input_bytes * 3
+            required_scratch_inodes = 2 + run_count + merge_overlap
+            require(scratch_reservation["reserved_bytes"] >= required_scratch_bytes and
+                    scratch_reservation["reserved_inodes"] >= required_scratch_inodes,
+                    "Source5 caller scratch reservation cannot hold the bounded external sort peak")
+            record_spool.seek(0)
+            while True:
+                line = record_spool.readline()
+                if not line:
+                    break
+                require(line.endswith(b"\n") and b"\r" not in line,
+                        "Source5 catalogue row spool framing differs")
+                try:
+                    value = json.loads(line.decode("ascii"))
+                except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+                    raise Source5CampaignError(
+                        "Source5 catalogue row spool is malformed",
+                    ) from error
+                yield value
+            yield from directory_rows
+        finally:
+            record_spool.close()
+
+    return row_stream(), pressure_materials
+
+
+def _validate_live_storage_reservation(
+    context: CampaignContext, reservation_path_value: Path,
+    *, required_bytes_by_root: dict[str, int] | None = None,
+    required_inodes_by_root: dict[str, int] | None = None,
+    check_space: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate pinned roots and compare current space with future writes.
+
+    With no per-root override, this is the one-time full-horizon admission
+    before the first Source5 owner.  Once a v3 budget exists, the caller passes
+    requirements derived from the verified chronology/catalogue frontier;
+    immutable bytes already present are not charged as future writes again.
+    """
+    budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    path = reservation_path_value.resolve(strict=True)
+    require(path.is_relative_to(context.artifact_root),
+            "Source5 storage reservation must be frozen inside the private artifact root")
+    raw, raw_sha, info = read_stable(
+        path, "Source5 caller storage reservation", 16 * 1024 * 1024,
+    )
+    require(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600,
+            "Source5 caller storage reservation must be an owned mode-0600 file")
+    try:
+        value = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError("Source5 storage reservation is malformed") from error
+    require(type(value) is dict and raw == canonical_bytes(value),
+            "Source5 storage reservation is not canonical JSON")
+    expected = budget_module.build_storage_reservation_value(
+        context.manifest["campaign_id"], context.host_id, value.get("roots"),
+    )
+    require(value == expected,
+            "Source5 storage reservation differs from its exact raw/semantic fields")
+    roots = value["roots"]
+    role_paths = {
+        role: Path(row["path"]) for row in roots for role in (row["role"],)
+        if role in {"artifact", "output", "evidence_store"}
+    }
+    require(role_paths.get("artifact") == context.artifact_root and
+            role_paths.get("output") == context.output_root,
+            "Source5 caller reservation changes the immutable artifact/output roots")
+    protected_roots = (context.source_root, context.input_root,
+                       Path(context.manifest["original_inputs"][
+                           "campaign_artifacts_root"]),)
+    root_ids = {item["path"] for item in roots}
+    root_paths = [Path(item["path"]) for item in roots]
+    for index, root_path in enumerate(root_paths):
+        require(not any(
+            root_path.is_relative_to(other) or other.is_relative_to(root_path)
+            for other in root_paths[index + 1:]
+        ), "Source5 caller-reserved writable domains must be disjoint")
+    require(type(check_space) is bool,
+            "Source5 storage-space check selector is malformed")
+    if required_bytes_by_root is None and required_inodes_by_root is None:
+        byte_requirements = {
+            row["path"]: (row["reserved_bytes"] if check_space else 0)
+            for row in roots
+        }
+        inode_requirements = {
+            row["path"]: (row["reserved_inodes"] if check_space else 0)
+            for row in roots
+        }
+    else:
+        require(type(required_bytes_by_root) is dict and
+                type(required_inodes_by_root) is dict and
+                set(required_bytes_by_root) == root_ids and
+                set(required_inodes_by_root) == root_ids,
+                "Source5 remaining reservation does not close over exact caller roots")
+        byte_requirements = required_bytes_by_root
+        inode_requirements = required_inodes_by_root
+        for root in roots:
+            path_value = root["path"]
+            require(type(byte_requirements[path_value]) is int and
+                    0 <= byte_requirements[path_value] <= root["reserved_bytes"] and
+                    type(inode_requirements[path_value]) is int and
+                    0 <= inode_requirements[path_value] <= root["reserved_inodes"],
+                    f"Source5 remaining reservation exceeds its sealed caller cap: {path_value}")
+    by_device: dict[str, dict[str, int]] = {}
+    observed: dict[str, dict[str, int]] = {}
+    for root in roots:
+        root_path = Path(root["path"])
+        try:
+            require(root_path.resolve(strict=True) == root_path,
+                    "Source5 reserved storage root traverses a symlink or alias")
+            root_info = root_path.lstat()
+            stats = os.statvfs(root_path)
+        except OSError as error:
+            raise Source5CampaignError(
+                f"Source5 reserved storage root is unavailable: {root_path}: {error}",
+            ) from error
+        require(stat.S_ISDIR(root_info.st_mode) and
+                root_info.st_uid == os.getuid() and
+                stat.S_IMODE(root_info.st_mode) == 0o700 and
+                str(root_info.st_dev) == root["filesystem_id"],
+                f"Source5 reserved root identity/mode differs: {root_path}")
+        if root["role"] not in {"artifact", "output"}:
+            require(not any(root_path == protected or
+                            root_path.is_relative_to(protected) or
+                            protected.is_relative_to(root_path)
+                            for protected in protected_roots),
+                    f"Source5 external reserved root overlaps immutable inputs: {root_path}")
+        device = root["filesystem_id"]
+        values = by_device.setdefault(device, {"bytes": 0, "inodes": 0})
+        values["bytes"] += byte_requirements[root["path"]]
+        values["inodes"] += inode_requirements[root["path"]]
+        available = observed.setdefault(device, {
+            "bytes": stats.f_bavail * stats.f_frsize,
+            "inodes": stats.f_favail,
+        })
+        available["bytes"] = min(available["bytes"],
+                                  stats.f_bavail * stats.f_frsize)
+        available["inodes"] = min(available["inodes"], stats.f_favail)
+    if check_space:
+        for device, required in by_device.items():
+            available = observed[device]
+            require(available["bytes"] >= required["bytes"] and
+                    available["inodes"] >= required["inodes"],
+                    f"Source5 filesystem {device} cannot reserve its source-derived remaining bytes/inodes")
+    pin = {
+        "path": str(path), "raw_sha256": raw_sha,
+        "semantic_sha256": value["reservation_sha256"],
+        "byte_count": len(raw),
+    }
+    return value, pin
+
+
+def _source5_match_finished_record(
+    phase: str, job: dict[str, Any], record: dict[str, Any],
+    finished: dict[str, Any],
+) -> None:
+    """Bind one persistent record to the replayed original callback chain."""
+    expected_state = "valid_soak" if phase == "soak" else "valid_pair"
+    require(record.get("job") == job and record.get("state") == expected_state and
+            finished.get("state") == expected_state and
+            finished.get("details", {}).get("job") == job,
+            f"Source5 stored {phase}/{job['run_id']} record is not one successful original ordinal")
+    chronology = exact(record.get("chronology"), {
+        "authorization_id", "authorization_head", "app_started_heads",
+        "app_terminal_heads", "job_terminal_head", "component_sha256",
+        "process_metrics_sha256", "app_start_events", "app_terminal_events",
+        "member_processes",
+    }, f"Source5 {phase}/{job['run_id']} record chronology")
+    starts = finished.get("starts")
+    terminals = finished.get("terminals")
+    terminal = finished.get("terminal")
+    member_count = 1 if phase == "soak" else 2
+    require(type(starts) is list and len(starts) == member_count and
+            type(terminals) is list and len(terminals) == member_count and
+            type(terminal) is dict and
+            chronology["authorization_id"] == finished.get("authorization_id") and
+            chronology["authorization_head"] == finished.get("authorization_head") and
+            chronology["app_started_heads"] ==
+                [item.get("event_head") for item in starts] and
+            chronology["app_terminal_heads"] ==
+                [item.get("event_head") for item in terminals] and
+            chronology["job_terminal_head"] == finished.get("record_sha256") and
+            chronology["component_sha256"] == terminal.get("component_sha256") and
+            chronology["process_metrics_sha256"] ==
+                terminal.get("process_metrics_sha256") ==
+                sha256(canonical_bytes(record.get("process_metrics"))) and
+            chronology["app_start_events"] ==
+                [item.get("proof") for item in starts] and
+            type(chronology["app_terminal_events"]) is list and
+            len(chronology["app_terminal_events"]) == member_count and
+            [item.get("cleanup") for item in terminals] ==
+                [item.get("cleanup") for item in chronology["app_terminal_events"]] and
+            chronology["member_processes"] == [
+                {"descriptor": item["descriptor"],
+                 "pid": item["proof"]["pid"],
+                 "start_ticks": item["proof"]["start_ticks"],
+                 "member_index": index}
+                for index, item in enumerate(starts)
+            ],
+            f"Source5 stored {phase}/{job['run_id']} record differs from its exact callback chain")
+
+
+def _source5_storage_finished_prefix(
+    context: CampaignContext, lock: Any, budget_module: Any,
+) -> tuple[set[tuple[str, str]], dict[str, list[dict[str, Any]]],
+           dict[str, Any]]:
+    """Revalidate the only job prefix whose persistent caps may be spent."""
+    phases = ("exploration", "aa", "confirmation", "pressure", "soak")
+    verified = _validate_locked_context(context, lock)
+    state = verified["state"]
+    require(state.get("pending") is None and
+            state.get("source5_pending") is None and
+            state.get("cleanup_blocked") is False and
+            state.get("source5_cleanup_blocked") is False,
+            "Source5 storage reuse refuses a pending, failed, or cleanup-blocked owner")
+    finished_map = state.get("source5_finished")
+    require(type(finished_map) is dict,
+            "Source5 storage reuse lacks the replayed successful-job map")
+    expected_by_phase = {phase: _host_jobs(context, phase) for phase in phases}
+    expected_keys = {
+        (phase, job["run_id"])
+        for phase, jobs in expected_by_phase.items() for job in jobs
+    }
+    require(set(finished_map) <= expected_keys,
+            "Source5 journal contains a non-Plan completed owner during storage reuse")
+    finished_keys: set[tuple[str, str]] = set()
+    phase_records: dict[str, list[dict[str, Any]]] = {}
+    incomplete_phase_seen = False
+    for phase in phases:
+        jobs = expected_by_phase[phase]
+        count = 0
+        while count < len(jobs) and (phase, jobs[count]["run_id"]) in finished_map:
+            finished = finished_map[(phase, jobs[count]["run_id"])]
+            require(type(finished) is dict and
+                    finished.get("state") ==
+                        ("valid_soak" if phase == "soak" else "valid_pair"),
+                    "Source5 storage reuse cannot pass a failed original owner")
+            count += 1
+        require(all((phase, job["run_id"]) not in finished_map
+                    for job in jobs[count:]),
+                f"Source5 {phase} finished owners are not an exact original Plan prefix")
+        require(not incomplete_phase_seen or count == 0,
+                "Source5 storage reuse found a later phase beyond an incomplete predecessor")
+        if count < len(jobs):
+            incomplete_phase_seen = True
+        phase_records[phase] = []
+        phase_root = _phase_root(context, phase)
+        ledger_path = phase_root / "controller-ledger.jsonl"
+        if ledger_path.exists() or ledger_path.is_symlink():
+            records = _phase_ledger_records(
+                ledger_path,
+                _source5_phase_ledger_byte_bound(context, phase, jobs),
+            )
+            require(len(records) == count and
+                    all(record.get("job") == jobs[index]
+                        for index, record in enumerate(records)),
+                    f"Source5 {phase} ledger does not close its completed original prefix")
+        else:
+            require(count == 0,
+                    f"Source5 {phase} completed owners have no persistent phase ledger")
+            records = []
+        for job, record in zip(jobs[:count], records, strict=True):
+            finished = finished_map[(phase, job["run_id"])]
+            _source5_match_finished_record(phase, job, record, finished)
+            phase_records[phase].append(record)
+            finished_keys.add((phase, job["run_id"]))
+    require(finished_keys == set(finished_map),
+            "Source5 storage reuse lost a completed ordinal while checking phase prefixes")
+    cursor, _head, _event_count, pending = \
+        _source5_archive_read_control_ledger_state(context, force_reload=True)
+    require(pending is None and
+            all((row["owner_phase"], row["job"]["run_id"]) in finished_keys
+                for row in context.source5_archive_read_schedule[:cursor]),
+            "Source5 read-control frontier consumes an unfinished or unknown owner")
+    return finished_keys, phase_records, state
+
+
+
+def _source5_credit_catalogue_file(
+    row: dict[str, Any], label: str,
+) -> tuple[int, int] | None:
+    """Return exact current bytes/inode only for an origin-raw-pinned file."""
+    path = Path(row["path"])
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        require(row.get("origin_pin") is None,
+                f"Source5 required pinned storage input disappeared: {path}")
+        return None
+    pin = row.get("origin_pin")
+    require(type(pin) is dict and set(pin) == {
+        "raw_sha256", "semantic_sha256",
+    } and is_sha(pin["raw_sha256"]),
+            f"Source5 storage credit has no immutable raw pin: {path}")
+    if stat.S_ISLNK(before.st_mode):
+        require(path.parent.resolve(strict=True) == path.parent,
+                f"Source5 literal-link parent traverses an alias: {path}")
+        target = os.readlink(path).encode("utf-8", "strict")
+        after = path.lstat()
+        require((before.st_dev, before.st_ino, before.st_mode,
+                 before.st_mtime_ns, before.st_ctime_ns) ==
+                (after.st_dev, after.st_ino, after.st_mode,
+                 after.st_mtime_ns, after.st_ctime_ns) and
+                sha256(target) == pin["raw_sha256"] and
+                len(target) <= row["max_file_bytes"],
+                f"Source5 literal-link storage input changed: {path}")
+        return len(target), 1
+    raw, digest, info = read_stable(path, label, row["max_file_bytes"])
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+            stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+            digest == pin["raw_sha256"] and len(raw) <= row["max_file_bytes"],
+            f"Source5 pinned storage input changed: {path}")
+    return len(raw), 1
+
+
+def _source5_verified_control_ledger_credit(
+    context: CampaignContext, path: Path, maximum_bytes: int,
+) -> int:
+    """Credit only the exact raw/stat snapshot just replayed as a chain."""
+    expected_identity = context.source5_archive_read_ledger_file_identity
+    expected_bytes = context.source5_archive_read_ledger_byte_count
+    expected_sha = context.source5_archive_read_ledger_raw_sha256
+    require(type(expected_identity) is tuple and len(expected_identity) == 8 and
+            type(expected_bytes) is int and expected_bytes >= 0 and
+            is_sha(expected_sha),
+            "Source5 read-control credit lacks the just-validated raw prefix identity")
+    raw, digest, info = read_stable(
+        path, "Source5 verified archive read-control ledger", maximum_bytes,
+    )
+    current = path.lstat()
+    actual_identity = (
+        info.st_dev, info.st_ino, info.st_mode, info.st_size,
+        info.st_mtime_ns, info.st_ctime_ns, info.st_nlink, info.st_uid,
+    )
+    current_identity = (
+        current.st_dev, current.st_ino, current.st_mode, current.st_size,
+        current.st_mtime_ns, current.st_ctime_ns,
+        current.st_nlink, current.st_uid,
+    )
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+            stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+            digest == expected_sha and len(raw) == expected_bytes and
+            actual_identity == current_identity == expected_identity,
+            "Source5 read-control ledger changed between authenticated replay and storage credit")
+    return len(raw)
+
+
+def _source5_verify_completed_archive_metadata(
+    context: CampaignContext, phase: str, job: dict[str, Any],
+    closure: dict[str, Any], budget_module: Any,
+) -> list[dict[str, Any]]:
+    """Close all retained per-job metadata before crediting its storage cap."""
+    declarations = _source5_job_path_declarations(context, phase, job)
+    roles = {row["role"]: row for row in declarations}
+    persistent = set(budget_module.ARCHIVE_LOCAL_METADATA_ROLES) | {
+        "source5_job_record",
+    }
+    require(persistent <= set(roles),
+            f"Source5 {phase}/{job['run_id']} lacks a persistent metadata catalogue role")
+    archive = context.modules[EVIDENCE_ARCHIVE_SOURCE_PATH]
+    packet = context.modules[EVIDENCE_TRANSFER_PACKET_SOURCE_PATH]
+    for role in persistent:
+        row = roles[role]
+        raw, digest, info = read_stable(
+            Path(row["path"]), f"Source5 completed persistent {role}",
+            row["max_file_bytes"],
+        )
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+                0 < len(raw) <= row["max_file_bytes"],
+                f"Source5 completed persistent {role} is not one exact private file")
+        if role == "source5_job_record":
+            require(raw == closure["job_record_raw"] and
+                    digest == closure["job_record_pin"]["raw_sha256"],
+                    "Source5 local completed job record differs from its signed archive closure")
+        elif role == "source5_checkpoint_request":
+            require(raw == closure["request_raw"] and
+                    digest == closure["request_pin"]["raw_sha256"],
+                    "Source5 persistent checkpoint request differs from its signed archive closure")
+        elif role == "source5_checkpoint":
+            require(raw == closure["checkpoint_raw"] and
+                    digest == closure["checkpoint_pin"]["raw_sha256"],
+                    "Source5 persistent checkpoint differs from its signed archive closure")
+        elif role == "source5_object_manifest":
+            require(raw == closure["manifest_raw"] and
+                    digest == closure["manifest_pin"]["raw_sha256"],
+                    "Source5 persistent object manifest differs from its signed archive closure")
+        elif role == "source5_archive_ack":
+            require(raw == closure["ack_raw"] and
+                    digest == closure["ack_pin"]["raw_sha256"],
+                    "Source5 persistent ACK differs from its signed archive closure")
+        elif role == "source5_archive_signature":
+            require(raw == closure["signature_raw"] and
+                    digest == closure["signature_pin"]["raw_sha256"],
+                    "Source5 persistent signature differs from its signed archive closure")
+        elif role == "source5_transfer_offer":
+            offer_pin = {"path": row["path"], "raw_sha256": digest,
+                         "semantic_sha256": _source5_file_semantic_digest(
+                             context, Path(row["path"]), role, digest, len(raw), None,
+                         )}
+            offer, checked_pin, _limits = packet.validate_transfer_offer(
+                raw, offer_pin, context.host_evidence_budget_raw,
+                context.host_evidence_budget_pin,
+            )
+            require(checked_pin == offer_pin and
+                    offer["checkpoint_request_pin"] == {
+                        key: closure["request_pin"][key]
+                        for key in ("path", "raw_sha256", "semantic_sha256")
+                    },
+                    "Source5 persistent transfer offer differs from its exact checkpoint request")
+        elif role == "source5_stage_map":
+            try:
+                stage_map = json.loads(raw.decode("ascii"))
+            except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+                raise Source5CampaignError(
+                    "Source5 persistent stage map is malformed",
+                ) from error
+            require(raw == canonical_bytes(stage_map),
+                    "Source5 persistent stage map is not canonical JSON")
+            archive._validate_stage_map(
+                stage_map, closure["checkpoint"], closure["manifest"],
+            )
+            require(stage_map["checkpoint_pin"] == closure["checkpoint_pin"] and
+                    stage_map["object_manifest_pin"] == closure["manifest_pin"],
+                    "Source5 persistent stage map differs from its signed checkpoint/manifest")
+    transient = set(budget_module.TRANSIENT_JOB_EVIDENCE_ROLES)
+    for role in transient | set(budget_module.FAILURE_WINDOW_ONLY_ROLES):
+        row = roles.get(role)
+        if row is not None:
+            require(not Path(row["path"]).exists() and
+                    not Path(row["path"]).is_symlink(),
+                    f"Source5 completed ordinal retains transient/failure path {row['path']}")
+    return declarations
+
+
+def _source5_remaining_storage_requirements(
+    context: CampaignContext, budget: dict[str, Any], budget_module: Any,
+    lock: Any,
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Subtract only exact already-written base allocations from the full cap.
+
+    The archive read/analyzer/failure window stays fully reserved.  Per-job
+    persistent credits require both the replayed original terminal and a
+    freshly verified signed ACK closure; growing ledgers credit only their
+    current verified prefix.
+    """
+    finished_keys, phase_records, state = _source5_storage_finished_prefix(
+        context, lock, budget_module,
+    )
+    job_indices = {
+        phase: {job["run_id"]: index
+                for index, job in enumerate(_host_jobs(context, phase))}
+        for phase in ("exploration", "aa", "confirmation", "pressure", "soak")
+    }
+    roots = budget["storage_reservation"]["roots"]
+    remaining_bytes = dict(budget["storage_reservation"]["required_bytes_by_root"])
+    remaining_inodes = dict(budget["storage_reservation"]["required_inodes_by_root"])
+    caller_roots = budget["storage_reservation"]["roots"]
+    for root, row in caller_roots.items():
+        # Preserve any caller-declared reserve above the source-derived whole-
+        # horizon bound while crediting only verified already-written bytes.
+        remaining_bytes[root] += (
+            row["reserved_bytes"] -
+            budget["storage_reservation"]["required_bytes_by_root"][root]
+        )
+        remaining_inodes[root] += (
+            row["reserved_inodes"] -
+            budget["storage_reservation"]["required_inodes_by_root"][root]
+        )
+    credit_bytes = {root: 0 for root in roots}
+    credit_inodes = {root: 0 for root in roots}
+    catalogue = budget_module.verify_path_catalogue_chunks(
+        budget["path_catalogue"],
+    )
+    always_local = (set(budget_module.ALWAYS_LOCAL_EVIDENCE_ROLES) |
+                    {"journal_width_contract",
+                     budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE})
+    # A row stream is bounded by the pinned catalogue, but avoid retaining all
+    # finished object bodies: closure data is consumed one original job at a time.
+    for phase in ("exploration", "aa", "confirmation", "pressure", "soak"):
+        for job in _host_jobs(context, phase):
+            key = (phase, job["run_id"])
+            if key not in finished_keys:
+                continue
+            job_index = job_indices[phase][job["run_id"]]
+            local_record = phase_records[phase][job_index]
+            closure = _source5_verify_persisted_archive_read_closure(
+                context, phase, job,
+            )
+            require(closure["job_record"] == local_record and
+                    closure["job_record_raw"] == canonical_bytes(local_record),
+                    f"Source5 {phase}/{job['run_id']} archive record differs from the replayed ledger")
+            _source5_match_finished_record(
+                phase, job, closure["job_record"],
+                state["source5_finished"][key],
+            )
+            declarations = _source5_verify_completed_archive_metadata(
+                context, phase, job, closure, budget_module,
+            )
+            for row in declarations:
+                if (row["role"] not in set(budget_module.ARCHIVE_LOCAL_METADATA_ROLES) |
+                        {"source5_job_record"} or
+                        row["storage_root"] not in roots):
+                    continue
+                credit_bytes[row["storage_root"]] += row["max_bytes"]
+                credit_inodes[row["storage_root"]] += row["max_inodes"]
+    # Verify and credit immutable catalogue-pinned files, exact directories,
+    # and the source-validated growing control/journal prefixes.
+    phase_ledger_paths = {
+        str(_phase_root(context, phase) / "controller-ledger.jsonl"):
+            (phase, phase_records[phase])
+        for phase in ("exploration", "aa", "confirmation", "pressure", "soak")
+    }
+    control_path = context.source5_archive_read_slot_paths[
+        budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE
+    ]
+    # The authoritative journal path is returned by the live lock state and is
+    # also closed by the execution manifest's chronology-origin catalogue row.
+    for row in budget_module.iter_path_catalogue_rows(catalogue):
+        root = row["storage_root"]
+        if root is None or root not in roots:
+            continue
+        if row["role"] in budget_module.FAILURE_WINDOW_ONLY_ROLES:
+            failure_path = Path(row["path"])
+            require(not failure_path.exists() and not failure_path.is_symlink(),
+                    f"Source5 successful storage frontier retains a failure-only path: {failure_path}")
+        if row["phase"] is not None and row["run_id"] is not None and \
+                (row["phase"], row["run_id"]) not in finished_keys and \
+                row["role"] != "directory_node" and \
+                row.get("origin_pin") is None:
+            future_path = Path(row["path"])
+            require(not future_path.exists() and not future_path.is_symlink(),
+                    f"Source5 uncompleted ordinal has an unexplained output path: {future_path}")
+        if (row["role"] in budget_module.TRANSIENT_JOB_EVIDENCE_ROLES or
+                row["role"] in budget_module.FAILURE_WINDOW_ONLY_ROLES or
+                row["role"] == budget_module.SOURCE5_ANALYZER_SPOOL_ROLE):
+            continue
+        grouped = (row["phase"] is not None and row["run_id"] is not None and
+                   row["role"] not in always_local)
+        if grouped:
+            continue
+        path = Path(row["path"])
+        role = row["role"]
+        if row["kind"] == "tree":
+            if role != "directory_node":
+                continue
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and
+                    stat.S_IMODE(info.st_mode) == 0o700 and
+                    path.resolve(strict=True) == path,
+                    f"Source5 persistent directory identity/mode changed: {path}")
+            credit_inodes[root] += 1
+            continue
+        key = (row["phase"], row["run_id"])
+        if row.get("origin_pin") is not None:
+            credited = _source5_credit_catalogue_file(
+                row, f"Source5 pinned persistent {role}",
+            )
+            if credited is not None:
+                size, inodes = credited
+                credit_bytes[root] += size
+                credit_inodes[root] += inodes
+            continue
+        if role == "source5_job_record":
+            continue  # credited only after the signed per-job closure above
+        if role in budget_module.ARCHIVE_LOCAL_METADATA_ROLES:
+            continue  # credited only after the signed per-job closure above
+        if role == "journal":
+            file_stat = state.get("file_stat")
+            require(type(file_stat) is tuple and len(file_stat) == 6,
+                    "Source5 chronology replay did not retain its exact journal stat")
+            raw, _raw_sha, info = read_stable(path, "Source5 live chronology journal",
+                                               row["max_file_bytes"])
+            current = path.lstat()
+            require((info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                     info.st_mtime_ns, info.st_ctime_ns) == file_stat and
+                    (current.st_dev, current.st_ino, current.st_mode,
+                     current.st_size, current.st_mtime_ns, current.st_ctime_ns) ==
+                    file_stat and len(raw) == info.st_size,
+                    "Source5 live chronology journal changed after exact replay")
+            credit_bytes[root] += len(raw)
+            credit_inodes[root] += 1
+            continue
+        if role == "source5_phase_ledger":
+            phase, records = phase_ledger_paths[str(path)]
+            if path.exists() or path.is_symlink():
+                raw, _digest, info = read_stable(
+                    path, f"Source5 {phase} persistent phase ledger",
+                    row["max_file_bytes"],
+                )
+                require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                        stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+                        len(raw) <= row["max_file_bytes"] and
+                        len(raw.splitlines()) == len(records) and
+                        raw == b"".join(canonical_bytes(record)
+                                         for record in records),
+                        f"Source5 {phase} ledger is not one exact private file")
+                credit_bytes[root] += len(raw)
+                credit_inodes[root] += 1
+            continue
+        if role == budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE:
+            require(str(path) == control_path,
+                    "Source5 control ledger path changed after readback setup")
+            credit_bytes[root] += _source5_verified_control_ledger_credit(
+                context, path, row["max_file_bytes"],
+            )
+            credit_inodes[root] += 1
+            continue
+        if role == "host_evidence_budget":
+            require(context.host_evidence_budget_raw is not None and
+                    context.host_evidence_budget_pin is not None and
+                    path == Path(context.host_evidence_budget_pin["path"]),
+                    "Source5 v3 budget self-row changed its pinned path")
+            raw, digest, info = read_stable(
+                path, "Source5 ready host budget self-row", row["max_file_bytes"],
+            )
+            require(raw == context.host_evidence_budget_raw and
+                    digest == context.host_evidence_budget_pin["raw_sha256"] and
+                    stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                    stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1,
+                    "Source5 ready budget self-row differs from its verified exact bytes")
+            credit_bytes[root] += len(raw)
+            credit_inodes[root] += 1
+            continue
+        if role == "journal_width_contract":
+            raw, digest, info = read_stable(
+                path, "Source5 journal-width contract self-row",
+                row["max_file_bytes"],
+            )
+            expected = canonical_bytes(context.journal_width_contract)
+            require(raw == expected and digest ==
+                    context.journal_width_contract_pin["raw_sha256"] and
+                    stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                    stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1,
+                    "Source5 width-contract self-row differs from its exact source projection")
+            credit_bytes[root] += len(raw)
+            credit_inodes[root] += 1
+            continue
+        if role == "analysis_artifact":
+            analysis = state.get("source5_analyses", {}).get(row["phase"])
+            if analysis is None:
+                continue
+            pin = analysis.get("analysis")
+            require(type(pin) is dict and pin.get("path") == str(path) and
+                    pin.get("raw_sha256") == analysis.get("analysis_sha256"),
+                    "Source5 analysis catalogue row differs from its immutable chronology event")
+            raw, digest, info = read_stable(
+                path, "Source5 pinned phase analysis", row["max_file_bytes"],
+            )
+            require(digest == pin["raw_sha256"] and stat.S_ISREG(info.st_mode) and
+                    info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600 and
+                    info.st_nlink == 1,
+                    "Source5 phase analysis raw bytes differ from chronology")
+            credit_bytes[root] += len(raw)
+            credit_inodes[root] += 1
+            continue
+        # Unpinned future/base rows remain fully reserved. Their presence is
+        # never converted into a credit by an ambient directory scan.
+    artifact_root = str(context.artifact_root)
+    catalogue_directory = (
+        context.artifact_root / context.manifest["campaign_id"] / "source5" /
+        context.host_id / "evidence-budget" / "path-catalogue-v2"
+    )
+    catalogue_directory_info = catalogue_directory.lstat()
+    require(stat.S_ISDIR(catalogue_directory_info.st_mode) and
+            catalogue_directory_info.st_uid == os.getuid() and
+            stat.S_IMODE(catalogue_directory_info.st_mode) == 0o700,
+            "Source5 pinned path-catalogue chunk directory changed identity or mode")
+    credit_inodes[artifact_root] += 1
+    for chunk in catalogue["chunks"]:
+        chunk_path = Path(chunk["path"])
+        require(chunk_path.parent == catalogue_directory and
+                chunk_path.name.startswith("path-catalogue-") and
+                chunk_path.name.endswith(".jsonl"),
+                "Source5 path-catalogue chunk escaped its exact producer directory")
+        raw, digest, info = read_stable(
+            chunk_path, "Source5 verified persistent path-catalogue chunk",
+            chunk["byte_count"],
+        )
+        require(digest == chunk["raw_sha256"] and len(raw) == chunk["byte_count"] and
+                stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1,
+                "Source5 persistent path-catalogue chunk differs from its raw pin")
+        credit_bytes[artifact_root] += len(raw)
+        credit_inodes[artifact_root] += 1
+    for root in roots:
+        require(credit_bytes[root] <= remaining_bytes[root] and
+                credit_inodes[root] <= remaining_inodes[root],
+                f"Source5 verified allocations exceed the sealed storage bound: {root}")
+        remaining_bytes[root] -= credit_bytes[root]
+        remaining_inodes[root] -= credit_inodes[root]
+    for role in budget_module.SOURCE5_ARCHIVE_READ_TRANSIENT_ROLES:
+        row = context.source5_archive_read_slot_paths.get(role)
+        if row is not None:
+            path = Path(row)
+            require(not path.exists() and not path.is_symlink(),
+                    f"Source5 reusable archive read slot is not empty at phase admission: {path}")
+    if context.source5_analyzer_scratch_root is not None:
+        require(_source5_analyzer_scratch_is_empty(
+                    context.source5_analyzer_scratch_root),
+                "Source5 analyzer scratch is not empty at phase admission")
+    scratch_roots = [
+        Path(value["path"]) for value in budget["storage_reservation"]["roots"].values()
+        if value["role"] == "scratch"
+    ]
+    require(len(scratch_roots) == 1,
+            "Source5 remaining reservation has no unique scratch root")
+    scratch_campaign = scratch_roots[0] / context.manifest["campaign_id"]
+    scratch_host = scratch_campaign / context.host_id
+    for directory, allowed_children in (
+        (scratch_roots[0], {context.manifest["campaign_id"]}),
+        (scratch_campaign, {context.host_id}),
+        (scratch_host, {"archive-readback", "analyzer-spool"}),
+    ):
+        if not directory.exists() and not directory.is_symlink():
+            continue
+        info = directory.lstat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o700 and
+                directory.resolve(strict=True) == directory and
+                set(os.listdir(directory)) <= allowed_children,
+                f"Source5 scratch root has an unexpected or aliased child: {directory}")
+    archive_read_root = scratch_host / "archive-readback"
+    if archive_read_root.exists() or archive_read_root.is_symlink():
+        info = archive_read_root.lstat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o700 and
+                not any(archive_read_root.iterdir()),
+                "Source5 archive-readback scratch root retains an unexpected child")
+    return remaining_bytes, remaining_inodes
+
+
+def activate_source5_host_evidence_budget_v3(
+    context: CampaignContext, pressure_material_index: Path,
+    soak_material_index: Path, storage_reservation_path: Path,
+) -> dict[str, str]:
+    """Admit v3 only after all original preparation provenance is replayable."""
+    require(context.manifest["schema"] == EXECUTION_SCHEMA_V4 and
+            context.prepared_input_completion is not None and
+            type(context.journal_width_contract) is dict and
+            type(context.journal_width_contract_pin) is dict,
+            "Source5 ready v3 activation requires the final bounded prepared generation")
+    # This freeze has no verified original prepared-exploration bridge API.
+    # Do not emit an execution-ready budget that could launch a second pilot.
+    raise Source5CampaignError(
+        "Source5 v3 execution admission is refused until the selected Source epoch verifies the original prepared-exploration bridge"
+    )
+    budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    pins = {
+        "spec": {
+            "path": context.spec_pin["path"],
+            "raw_sha256": context.spec_pin["raw_sha256"],
+            "semantic_sha256": context.spec_semantic_sha256,
+        },
+        "plan": {
+            "path": context.plan_pin["path"],
+            "raw_sha256": context.plan_pin["raw_sha256"],
+            "semantic_sha256": context.plan_semantic_sha256,
+        },
+        "execution_manifest": {
+            "path": context.manifest_pin["path"],
+            "raw_sha256": context.manifest_pin["raw_sha256"],
+            "semantic_sha256": context.manifest["manifest_sha256"],
+        },
+        "source_manifests": {
+            host: {
+                "path": context.source_manifest_pins[host]["path"],
+                "raw_sha256": context.source_manifest_pins[host]["raw_sha256"],
+                "semantic_sha256": context.sources[host]["manifest_sha256"],
+            }
+            for host in context.manifest["hosts"]
+        },
+    }
+    budget_dir = _private_directory(
+        context.artifact_root / context.manifest["campaign_id"] /
+        "source5" / context.host_id / "evidence-budget",
+    )
+    path = budget_dir / "host-evidence-budget-v3.json"
+    projected_widths = build_source5_journal_width_contract(
+        context, pressure_material_index, soak_material_index, path, None,
+    )
+    _require_source5_journal_width_projection(context, projected_widths)
+    existing_budget = path.exists() or path.is_symlink()
+    reservation, reservation_pin = _validate_live_storage_reservation(
+        context, storage_reservation_path, check_space=not existing_budget,
+    )
+    if existing_budget:
+        existing, existing_sha, _info = read_stable(
+            path, "Source5 original host evidence budget v3", MAX_ARTIFACT_BYTES,
+        )
+        try:
+            budget = json.loads(existing)
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise Source5CampaignError("persisted Source5 budget v3 is malformed") from error
+        budget = budget_module.validate_host_evidence_budget_v3(
+            budget,
+            journal_width_contract_raw=canonical_bytes(
+                context.journal_width_contract,
+            ),
+        )
+        context.host_evidence_budget_raw = existing
+        require(existing == canonical_bytes(budget) and
+                budget["campaign_id"] == context.manifest["campaign_id"] and
+                budget["host_id"] == context.host_id and
+                budget["original_pins"]["spec"] == pins["spec"] and
+                budget["original_pins"]["plan"] == pins["plan"] and
+                budget["original_pins"]["execution_manifest"] == pins["execution_manifest"] and
+                budget["journal_width_contract_pin"] ==
+                    context.journal_width_contract_pin and
+                budget["storage_reservation"]["pin"] == reservation_pin,
+                "Source5 v3 budget changed after its first immutable preflight")
+        catalogue = budget_module.verify_path_catalogue_chunks(
+            budget["path_catalogue"],
+        )
+        expected_input_paths = {
+            str(storage_reservation_path.resolve(strict=True)):
+                ("storage_reservation", reservation_pin["raw_sha256"],
+                 reservation_pin["semantic_sha256"]),
+            context.journal_width_contract_pin["path"]:
+                ("journal_width_contract",
+                 context.journal_width_contract_pin["raw_sha256"],
+                 context.journal_width_contract_pin["semantic_sha256"]),
+            str(pressure_material_index.resolve(strict=True)):
+                ("pressure_pair_artifact", None, None),
+            str(soak_material_index.resolve(strict=True)):
+                ("source5_soak_artifact", None, None),
+        }
+        seen_inputs: dict[str, dict[str, Any]] = {}
+        for row in budget_module.iter_path_catalogue_rows(catalogue):
+            if row["path"] in expected_input_paths:
+                seen_inputs[row["path"]] = row
+        require(set(seen_inputs) == set(expected_input_paths),
+                "Source5 persisted path catalogue omits a current producer input path")
+        for input_path, (role, raw_sha, semantic_sha) in expected_input_paths.items():
+            row = seen_inputs[input_path]
+            require(row["kind"] == "file" and row["role"] == role and
+                    (raw_sha is None or row["origin_pin"]["raw_sha256"] == raw_sha) and
+                    (semantic_sha is None or
+                     row["origin_pin"]["semantic_sha256"] == semantic_sha),
+                    f"Source5 persisted catalogue changed producer input identity: {input_path}")
+        for input_path in (
+                pressure_material_index.resolve(strict=True),
+                soak_material_index.resolve(strict=True)):
+            _raw, actual, _info = read_stable(
+                input_path, "Source5 persisted material index", MAX_ARTIFACT_BYTES,
+            )
+            require(seen_inputs[str(input_path)]["origin_pin"]["raw_sha256"] == actual,
+                    f"Source5 producer material index changed after budget freeze: {input_path}")
+        context.host_evidence_budget_pin = {
+            "path": str(path), "raw_sha256": existing_sha,
+            "semantic_sha256": budget["budget_sha256"],
+        }
+        context.job_path_catalogue_pins = _source5_job_catalogue_pins(
+            context, budget, budget_module,
+        )
+        _source5_restore_archive_readback_context(
+            context, budget, budget_module,
+        )
+        with context.chronology.campaign_host_lock(
+                context.output_root, context.manifest["campaign_id"],
+                context.host_id) as lock:
+            remaining_bytes, remaining_inodes = \
+                _source5_remaining_storage_requirements(
+                    context, budget, budget_module, lock,
+                )
+            _validate_live_storage_reservation(
+                context, storage_reservation_path,
+                required_bytes_by_root=remaining_bytes,
+                required_inodes_by_root=remaining_inodes,
+            )
+        return {"path": str(path), "raw_sha256": existing_sha,
+                "semantic_sha256": budget["budget_sha256"]}
+
+    # Initial admission above charges the caller's full reserved bytes/inodes
+    # before any Source5 owner or catalogue generation consumes the filesystem.
+    catalogue_directory = _private_directory(budget_dir / "path-catalogue-v2")
+    records, _pressure_materials = _source5_path_catalogue_records(
+        context, pressure_material_index, soak_material_index, reservation,
+        reservation_pin,
+    )
+    scratch_root = next(Path(item["path"]) for item in reservation["roots"]
+                        if item["role"] == "scratch")
+    catalogue = budget_module.write_path_catalogue_chunks(
+        records, catalogue_directory,
+        scratch_directory_value=scratch_root,
+    )
+    audit = budget_module.build_host_evidence_budget_plan(
+        context.spec, context.plan, context.sources, context.manifest,
+        context.host_id, pins_value=pins,
+    )
+    budget = budget_module.build_host_evidence_budget_v3(
+        audit, context.owner_evidence_contract, catalogue,
+        reservation, reservation_pin,
+        journal_width_contract_value=context.journal_width_contract,
+        journal_width_contract_pin_value=context.journal_width_contract_pin,
+        journal_width_contract_raw=canonical_bytes(
+            context.journal_width_contract,
+        ),
+    )
+    budget = budget_module.validate_host_evidence_budget_v3(
+        budget,
+        journal_width_contract_raw=canonical_bytes(
+            context.journal_width_contract,
+        ),
+    )
+    raw = canonical_bytes(budget)
+    raw_sha = write_new(path, raw, "Source5 original host evidence budget v3")
+    require(raw_sha == sha256(raw),
+            "Source5 host evidence budget v3 raw digest differs after persistence")
+    context.host_evidence_budget_raw = raw
+    context.host_evidence_budget_pin = {
+        "path": str(path), "raw_sha256": raw_sha,
+        "semantic_sha256": budget["budget_sha256"],
+    }
+    context.job_path_catalogue_pins = _source5_job_catalogue_pins(
+        context, budget, budget_module,
+    )
+    _source5_restore_archive_readback_context(
+        context, budget, budget_module,
+    )
+    with context.chronology.campaign_host_lock(
+            context.output_root, context.manifest["campaign_id"],
+            context.host_id) as lock:
+        remaining_bytes, remaining_inodes = \
+            _source5_remaining_storage_requirements(
+                context, budget, budget_module, lock,
+            )
+        _validate_live_storage_reservation(
+            context, storage_reservation_path,
+            required_bytes_by_root=remaining_bytes,
+            required_inodes_by_root=remaining_inodes,
+        )
+    return {"path": str(path), "raw_sha256": raw_sha,
+            "semantic_sha256": budget["budget_sha256"]}
+
+
+def _require_source5_journal_width_projection(
+    context: CampaignContext, projected_widths: object,
+) -> None:
+    """Require the pinned v4 callback contract to equal fresh source projection."""
+    require(type(projected_widths) is dict and
+            set(projected_widths) == {
+                "path", "raw_sha256", "semantic_sha256", "contract",
+            } and
+            type(context.journal_width_contract_pin) is dict and
+            type(context.journal_width_contract) is dict and
+            projected_widths["contract"] == context.journal_width_contract and
+            projected_widths["semantic_sha256"] ==
+                context.journal_width_contract_pin["semantic_sha256"] and
+            projected_widths["raw_sha256"] ==
+                context.journal_width_contract_pin["raw_sha256"],
+            "Source5 v4 journal-width contract differs from deterministic source-side preflight recomputation")
+
+
+def _source5_restore_archive_readback_context(
+    context: CampaignContext, budget: dict[str, Any], budget_module: Any,
+) -> None:
+    """Reconstruct reusable read slots and their exact Plan schedule from the pinned catalogue."""
+    catalogue = budget_module.validate_path_catalogue_manifest(
+        budget["path_catalogue"],
+    )
+    catalogue = budget_module.verify_path_catalogue_chunks(catalogue)
+    readback_caps_by_job = budget_module.project_archive_readback_caps(
+        budget_module.iter_path_catalogue_rows(catalogue),
+    )
+    original_jobs = {
+        (phase, job["run_id"])
+        for phase in ("exploration", "aa", "confirmation", "pressure", "soak")
+        for job in _host_jobs(context, phase)
+    }
+    require(set(readback_caps_by_job) == original_jobs,
+            "Source5 archive readback catalogue does not close over every original Plan job")
+    readback_roles = (
+        set(budget_module.SOURCE5_ARCHIVE_READ_TRANSIENT_ROLES) |
+        {budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE}
+    )
+    slot_rows: dict[str, dict[str, Any]] = {}
+    for row in budget_module.iter_path_catalogue_rows(catalogue):
+        if row["role"] in readback_roles:
+            require(row["role"] not in slot_rows,
+                    "Source5 archive readback catalogue repeats a reusable slot role")
+            slot_rows[row["role"]] = row
+    require(set(slot_rows) == readback_roles,
+            "Source5 archive readback catalogue omits a fixed slot or control ledger")
+    readback_cap_fields = (
+        "maximum_request_bytes", "maximum_response_bytes",
+        "maximum_bundle_bytes", "maximum_stage_bytes",
+        "maximum_stage_inodes", "maximum_object_count",
+        "maximum_object_bytes", "maximum_live_window_bytes",
+        "maximum_live_window_inodes",
+    )
+    readback_caps = {
+        name: max(value[name] for value in readback_caps_by_job.values())
+        for name in readback_cap_fields
+    }
+    expected_caps = {
+        "source5_archive_read_request_slot": (
+            "file", readback_caps["maximum_request_bytes"],
+            readback_caps["maximum_request_bytes"], 1,
+        ),
+        "source5_archive_read_response_slot": (
+            "file", readback_caps["maximum_response_bytes"],
+            readback_caps["maximum_response_bytes"], 1,
+        ),
+        "source5_archive_read_response_incoming": (
+            "file", readback_caps["maximum_response_bytes"],
+            readback_caps["maximum_response_bytes"], 1,
+        ),
+        "source5_archive_read_bundle": (
+            "file", readback_caps["maximum_bundle_bytes"],
+            readback_caps["maximum_bundle_bytes"], 1,
+        ),
+        "source5_archive_read_bundle_incoming": (
+            "file", readback_caps["maximum_bundle_bytes"],
+            readback_caps["maximum_bundle_bytes"], 1,
+        ),
+        "source5_archive_read_stage": (
+            "tree", readback_caps["maximum_stage_bytes"],
+            readback_caps["maximum_object_bytes"],
+            readback_caps["maximum_stage_inodes"],
+        ),
+    }
+    slot_paths: dict[str, str] = {}
+    scratch_roots = set()
+    for role, (kind, maximum, maximum_file, inodes) in expected_caps.items():
+        row = slot_rows[role]
+        require(row["kind"] == kind and row["max_bytes"] == maximum and
+                row["max_file_bytes"] == maximum_file and
+                row["max_inodes"] == inodes and row["phase"] is None and
+                row["run_id"] is None and row["member_index"] is None and
+                row["aggregate_id"] is None and row["owner"] ==
+                    "source5_controller" and row["storage_root"] is not None,
+                f"Source5 archive readback slot {role} differs from its exact catalogue cap")
+        slot_paths[role] = row["path"]
+        scratch_roots.add(row["storage_root"])
+    require(len(scratch_roots) == 1,
+            "Source5 archive readback fixed slots span more than one scratch root")
+    scratch_root = Path(next(iter(scratch_roots)))
+    expected_readback_root = (scratch_root / context.manifest["campaign_id"] /
+                              context.host_id / "archive-readback")
+    require(Path(slot_rows["source5_archive_read_request_slot"]["path"]).parent ==
+                expected_readback_root and
+            all(Path(slot_rows[role]["path"]) == expected_readback_root / name
+                for role, name in (
+                    ("source5_archive_read_request_slot", "request.json"),
+                    ("source5_archive_read_response_slot", "response.json"),
+                    ("source5_archive_read_response_incoming",
+                     "response.json.incoming"),
+                    ("source5_archive_read_bundle", "response.tar"),
+                    ("source5_archive_read_bundle_incoming",
+                     "response.tar.incoming"),
+                    ("source5_archive_read_stage", "stage"),
+                )),
+            "Source5 archive readback slots changed their exact campaign scratch layout")
+    analyzer_projection = _source5_analyzer_scratch_projection(
+        context, budget_module.iter_path_catalogue_rows(catalogue),
+    )
+    analyzer_row = None
+    for row in budget_module.iter_path_catalogue_rows(catalogue):
+        if row["role"] == budget_module.SOURCE5_ANALYZER_SPOOL_ROLE:
+            require(analyzer_row is None,
+                    "Source5 analyzer scratch catalogue repeats its global tree")
+            analyzer_row = row
+    require((analyzer_projection is None) == (analyzer_row is None),
+            "Source5 analyzer scratch role does not match the width-bound v4 contract")
+    if analyzer_projection is not None:
+        analyzer_root = (scratch_root / context.manifest["campaign_id"] /
+                         context.host_id / "analyzer-spool")
+        require(type(analyzer_row) is dict and
+                analyzer_row["path"] == str(analyzer_root) and
+                analyzer_row["kind"] == "tree" and
+                analyzer_row["role"] == budget_module.SOURCE5_ANALYZER_SPOOL_ROLE and
+                analyzer_row["host_id"] == context.host_id and
+                analyzer_row["owner"] == "source5_controller" and
+                analyzer_row["max_bytes"] ==
+                    analyzer_projection["maximum_bytes"] and
+                analyzer_row["max_file_bytes"] ==
+                    analyzer_projection["maximum_file_bytes"] and
+                analyzer_row["max_inodes"] ==
+                    analyzer_projection["maximum_inodes"] and
+                analyzer_row["storage_root"] == str(scratch_root) and
+                analyzer_row["phase"] is None and
+                analyzer_row["run_id"] is None and
+                analyzer_row["member_index"] is None and
+                analyzer_row["aggregate_id"] is None,
+                "Source5 analyzer scratch catalogue row differs from its deterministic source projection")
+        _private_directory(analyzer_root)
+        require(_source5_analyzer_scratch_is_empty(analyzer_root),
+                "Source5 analyzer scratch root contains an unaccounted prior spool")
+        context.source5_analyzer_scratch_root = analyzer_root
+        context.source5_analyzer_scratch_projection = analyzer_projection
+    else:
+        context.source5_analyzer_scratch_root = None
+        context.source5_analyzer_scratch_projection = None
+    ledger_row = slot_rows[budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE]
+    require(ledger_row["kind"] == "file" and ledger_row["max_inodes"] == 1 and
+            ledger_row["owner"] == "source5_controller" and
+            ledger_row["storage_root"] == str(context.output_root) and
+            ledger_row["phase"] is None and ledger_row["run_id"] is None and
+            ledger_row["member_index"] is None,
+            "Source5 archive read-control ledger differs from its persistent output role")
+    slot_paths[budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE] = ledger_row["path"]
+    expected_ledger_path = (context.output_root /
+                            context.manifest["campaign_id"] / "source5" /
+                            context.host_id / "archive-read-control.jsonl")
+    require(Path(ledger_row["path"]) == expected_ledger_path,
+            "Source5 archive read-control ledger changed its fixed persistent host path")
+    schedule = _source5_archive_read_schedule(context, readback_caps_by_job)
+    control_projection = _source5_archive_read_control_ledger_byte_bound(
+        context, schedule, slot_paths,
+    )
+    require(ledger_row["max_bytes"] == control_projection["maximum_bytes"],
+            "Source5 archive read-control ledger ceiling differs from the full Plan event projection")
+    context.source5_archive_read_slot_paths = slot_paths
+    context.source5_archive_read_caps = {
+        **readback_caps,
+        "control_ledger_bytes": control_projection["maximum_bytes"],
+        "control_ledger_line_bytes": control_projection[
+            "maximum_line_bytes"],
+        "control_ledger_event_count": control_projection[
+            "maximum_event_count"],
+    }
+    context.source5_archive_read_schedule = schedule
+    _source5_archive_read_control_ledger_state(context)
+
+
+def _source5_job_catalogue_pins(
+    context: CampaignContext, budget: dict[str, Any], budget_module: Any,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Bind one immutable path-row catalogue to every original job identity."""
+    expected_jobs = {
+        (phase, job["run_id"]): job
+        for phase in ("exploration", "aa", "confirmation", "pressure", "soak")
+        for job in _host_jobs(context, phase)
+    }
+    root = (context.artifact_root / context.manifest["campaign_id"] /
+            "source5" / context.host_id / "job-path-catalogues")
+    result: dict[tuple[str, str], dict[str, Any]] = {}
+    catalogue = budget_module.verify_path_catalogue_chunks(
+        budget["path_catalogue"],
+    )
+    for row in budget_module.iter_path_catalogue_rows(catalogue):
+        if row["role"] != "source5_job_row_catalogue":
+            continue
+        key = (row["phase"], row["run_id"])
+        job = expected_jobs.get(key)
+        require(type(job) is dict and key not in result and
+                row["kind"] == "file" and
+                row["host_id"] == context.host_id and
+                row["storage_root"] == str(context.artifact_root) and
+                row["max_bytes"] == row["max_file_bytes"] > 0 and
+                type(row["origin_pin"]) is dict and
+                is_sha(row["origin_pin"].get("raw_sha256")) and
+                row["origin_pin"].get("semantic_sha256") is None,
+                "Source5 job path catalogue row has an unknown or duplicate original job identity")
+        job_sha = sha256(canonical_bytes(job))
+        expected_path = (root / key[0] /
+                         f"{job['ordinal']:06d}-{job_sha}.jsonl")
+        require(row["path"] == str(expected_path),
+                "Source5 job path catalogue row differs from its exact Plan ordinal/job digest")
+        result[key] = {
+            "path": row["path"],
+            "raw_sha256": row["origin_pin"]["raw_sha256"],
+            "byte_count": row["max_file_bytes"],
+        }
+    require(set(result) == set(expected_jobs),
+            "Source5 job path catalogues do not cover every original Plan job exactly once")
+    return result
+
+
+def _source5_job_path_declarations(
+    context: CampaignContext, phase: str, job: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Read one exact, bounded per-job catalogue and preserve all path roles."""
+    pins = context.job_path_catalogue_pins
+    key = (phase, job["run_id"])
+    require(type(pins) is dict and key in pins and
+            context.host_evidence_budget_pin is not None,
+            "Source5 per-job path lookup is not bound to the validated host budget")
+    pin = pins[key]
+    raw, actual, info = read_stable(
+        Path(pin["path"]), f"Source5 {phase}/{job['run_id']} job path catalogue",
+        pin["byte_count"],
+    )
+    require(actual == pin["raw_sha256"] and len(raw) == pin["byte_count"] and
+            info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600,
+            "Source5 per-job path catalogue changed its frozen raw identity")
+    budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    declarations: list[dict[str, Any]] = []
+    previous_path = ""
+    for position, line in enumerate(raw.splitlines(keepends=True)):
+        require(line.endswith(b"\n") and b"\r" not in line and
+                len(line) <= budget_module.PATH_CATALOGUE_ROW_BYTES,
+                f"Source5 per-job catalogue row[{position}] framing or width differs")
+        try:
+            value = json.loads(line.decode("ascii"))
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise Source5CampaignError(
+                f"Source5 per-job catalogue row[{position}] is malformed",
+            ) from error
+        row = budget_module._catalogue_row(
+            value, f"Source5 per-job catalogue row[{position}]",
+        )
+        require(line == canonical_bytes(row) and
+                row["path"] > previous_path and
+                row["phase"] == phase and row["run_id"] == job["run_id"],
+                f"Source5 per-job catalogue row[{position}] escaped its original sorted job group")
+        previous_path = row["path"]
+        declarations.append(row)
+    require(bool(declarations),
+            "Source5 per-job path catalogue contains no exact producer rows")
+    return declarations
+
+
+def _source5_probe_tree_inventory(
+    context: CampaignContext, job: dict[str, Any],
+    declaration: dict[str, Any], typed_entries: list[dict[str, Any]],
+    tree_rows: list[dict[str, Any]],
+    captured_entries: dict[str, dict[str, Any]],
+    owner_receipt_bytes: dict[str, bytes],
+) -> dict[str, Any]:
+    """Bind one dynamic ProbeV2 TMP tree to its exact owner inventory and bytes."""
+    root = Path(declaration["path"])
+    capture_receipt_path = root.parent / "capture-receipt.json"
+    inventory_path = root.parent / "tmpdir-inventory.json"
+    capture_entry = captured_entries.get(str(capture_receipt_path))
+    inventory_entry = captured_entries.get(str(inventory_path))
+    require(type(capture_entry) is dict and
+            capture_entry["role"].startswith("probe_capture_receipt") and
+            type(inventory_entry) is dict and
+            inventory_entry["role"].startswith("probe_capture_inventory") and
+            str(capture_receipt_path) in owner_receipt_bytes,
+            "Source5 dynamic ProbeV2 tree lacks its exact capture/inventory sidecars")
+    capture_raw = owner_receipt_bytes[str(capture_receipt_path)]
+    try:
+        capture = json.loads(capture_raw.decode("ascii"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            "Source5 ProbeV2 capture receipt is not bounded canonical JSON",
+        ) from error
+    require(capture_raw == canonical_bytes(capture) and
+            capture.get("schema") == PROBE_CAPTURE_RECEIPT_SCHEMA and
+            is_sha(capture.get("receipt_sha256")) and
+            capture["receipt_sha256"] == sha256(canonical_bytes({
+                key: value for key, value in capture.items()
+                if key != "receipt_sha256"
+            })),
+            "Source5 dynamic ProbeV2 capture receipt semantic digest differs")
+    initial = exact(capture.get("tmpdir_initial"), {
+        "path", "device", "inode", "mode", "mount", "available_bytes",
+        "available_inodes", "bytes_limit", "inode_limit",
+    }, "Source5 ProbeV2 initial TMPDIR fact")
+    final = exact(capture.get("tmpdir_final"), {
+        "path", "device", "inode", "mode", "mount", "bytes_used",
+        "file_count", "directory_count", "bytes_limit", "inode_limit",
+        "available_bytes", "available_inodes",
+    }, "Source5 ProbeV2 final TMPDIR fact")
+    inventory_pin = exact(capture.get("tmpdir_inventory_pin"), {
+        "path", "raw_sha256", "inventory_sha256",
+    }, "Source5 ProbeV2 inventory pin")
+    require(initial["path"] == final["path"] == str(root) and
+            inventory_pin["path"] == str(inventory_path) and
+            inventory_pin["raw_sha256"] == inventory_entry["raw_sha256"] and
+            inventory_pin["inventory_sha256"] ==
+                inventory_entry["semantic_sha256"] and
+            capture_entry["raw_sha256"] == sha256(capture_raw) and
+            capture_entry["semantic_sha256"] == capture["receipt_sha256"],
+            "Source5 ProbeV2 owner receipt pins a different tree or inventory")
+    inventory_raw, inventory_raw_sha, _info = read_stable(
+        inventory_path, "Source5 ProbeV2 TMPDIR inventory",
+        inventory_entry["maximum_bytes"],
+    )
+    require(inventory_raw_sha == inventory_pin["raw_sha256"] and
+            inventory_entry["byte_count"] == len(inventory_raw),
+            "Source5 ProbeV2 inventory raw bytes differ from its catalogue row")
+    try:
+        inventory = json.loads(inventory_raw.decode("ascii"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            "Source5 ProbeV2 inventory is not bounded canonical JSON",
+        ) from error
+    require(type(inventory) is dict and
+            set(inventory) == {"schema", "entries", "inventory_sha256"} and
+            inventory_raw == canonical_bytes(inventory) and
+            inventory["schema"] ==
+                "allocatbelt.application-feedback-probe-tmpdir-inventory.v1" and
+            type(inventory["entries"]) is list and
+            inventory["inventory_sha256"] ==
+                sha256(canonical_bytes({
+                    key: value for key, value in inventory.items()
+                    if key != "inventory_sha256"
+                })) == inventory_pin["inventory_sha256"],
+            "Source5 ProbeV2 inventory schema or semantic digest differs")
+    entries = []
+    previous_path = ""
+    total_bytes = 0
+    file_count = 0
+    directory_count = 0
+    for position, value in enumerate(inventory["entries"]):
+        entry = exact(value, {
+            "path", "kind", "uid", "mode", "size", "raw_sha256",
+        }, f"Source5 ProbeV2 inventory entry[{position}]")
+        path = entry["path"]
+        require(type(path) is str and path.startswith(str(root) + "/") and
+                path > previous_path and "\\" not in path and
+                "\x00" not in path and ".." not in PurePosixPath(path).parts and
+                PurePosixPath(path).as_posix() == path,
+                f"Source5 ProbeV2 inventory entry[{position}] escaped or reordered its root")
+        previous_path = path
+        require(entry["kind"] in {"file", "directory"} and
+                type(entry["uid"]) is int and entry["uid"] == os.getuid() and
+                type(entry["mode"]) is int and 0 <= entry["mode"] <= 0o7777,
+                f"Source5 ProbeV2 inventory entry[{position}] type or identity differs")
+        if entry["kind"] == "file":
+            require(type(entry["size"]) is int and entry["size"] >= 0 and
+                    is_sha(entry["raw_sha256"]),
+                    f"Source5 ProbeV2 inventory file[{position}] pin is malformed")
+            total_bytes += entry["size"]
+            file_count += 1
+        else:
+            require(entry["size"] is None and entry["raw_sha256"] is None,
+                    f"Source5 ProbeV2 inventory directory[{position}] carries payload fields")
+            directory_count += 1
+        entries.append(entry)
+    actual_typed = sorted(typed_entries, key=lambda item: item["path"])
+    require(actual_typed == entries and
+            total_bytes == final["bytes_used"] and
+            file_count == final["file_count"] and
+            directory_count == final["directory_count"] and
+            final["device"] == final["mount"]["device"] and
+            final["bytes_limit"] <= declaration["max_bytes"] and
+            final["inode_limit"] + 1 <= declaration["max_inodes"] and
+            len(actual_typed) + 1 <= declaration["max_inodes"],
+            "Source5 ProbeV2 actual tree does not close over its source-pinned inventory")
+    root_info = root.lstat()
+    require((root_info.st_dev, root_info.st_ino, stat.S_IMODE(root_info.st_mode)) ==
+            (final["device"], final["inode"], final["mode"]) and
+            final["mode"] == 0o700 and final["bytes_used"] <= final["bytes_limit"] and
+            final["file_count"] + final["directory_count"] <= final["inode_limit"],
+            "Source5 ProbeV2 tree root identity or counters differ from its owner receipt")
+    owner_pin = {
+        "path": str(capture_receipt_path),
+        "raw_sha256": capture_entry["raw_sha256"],
+        "semantic_sha256": capture_entry["semantic_sha256"],
+    }
+    inventory_object_pin = {
+        "path": str(inventory_path),
+        "raw_sha256": inventory_entry["raw_sha256"],
+        "semantic_sha256": inventory_entry["semantic_sha256"],
+    }
+    return {
+        "owner_job_sha256": sha256(canonical_bytes(job)),
+        "root_path": str(root), "role": declaration["role"],
+        "owner_receipt_pin": owner_pin,
+        "inventory_pin": inventory_object_pin,
+        "inventory_sha256": inventory["inventory_sha256"],
+        "entry_count": len(entries), "byte_count": total_bytes,
+        "entries": entries,
+    }
+
+
+def _source5_archive_read_object_id(origin_path: str, raw_sha256: str) -> str:
+    origin_digest = sha256(origin_path.encode("utf-8", "strict"))
+    return f"{origin_digest[:2]}/{origin_digest}-{raw_sha256}.bin"
+
+
+def _source5_archive_read_object(value: object, label: str) -> dict[str, Any]:
+    row = exact(value, {
+        "owner_job_sha256", "origin_path", "raw_sha256", "byte_count",
+    }, label)
+    origin = row["origin_path"]
+    require(type(origin) is str and origin.startswith("/") and
+            "\\" not in origin and "\x00" not in origin and
+            PurePosixPath(origin).as_posix() == origin and
+            ".." not in PurePosixPath(origin).parts and
+            not any(ord(character) < 32 or ord(character) == 127
+                    for character in origin),
+            f"{label} origin is not normalized absolute path text")
+    require(is_sha(row["owner_job_sha256"]) and
+            is_sha(row["raw_sha256"]) and
+            type(row["byte_count"]) is int and
+            0 <= row["byte_count"] < (1 << 33),
+            f"{label} owner or raw-object pin is malformed")
+    return row
+
+
+def _source5_archive_read_tar_size(objects: list[dict[str, Any]]) -> int:
+    content = sum(
+        512 + ((row["byte_count"] + 511) // 512) * 512
+        for row in objects
+    )
+    return ((content + 1024 + 10 * 1024 - 1) // (10 * 1024)) * (10 * 1024)
+
+
+def build_source5_archive_read_request(
+    campaign_id: str, host_id: str, analysis_phase: str,
+    request_ordinal: int, objects: object,
+    maximum_response_bytes: int,
+) -> tuple[dict[str, Any], bytes, dict[str, str]]:
+    """Build one bounded read request for exact rows of one signed job manifest."""
+    require(type(campaign_id) is str and campaign_id and
+            type(host_id) is str and host_id and
+            analysis_phase in SOURCE5_ARCHIVE_READ_PURPOSES and
+            type(request_ordinal) is int and 0 <= request_ordinal < (1 << 64) and
+            type(maximum_response_bytes) is int and
+            MIN_SOURCE5_ARCHIVE_READ_BUNDLE_BYTES <= maximum_response_bytes < (1 << 64) and
+            type(objects) in (list, tuple) and
+            0 < len(objects) <= MAX_SOURCE5_ARCHIVE_READ_OBJECTS,
+            "Source5 archive read request identity or ceiling is malformed")
+    rows = [_source5_archive_read_object(
+        value, f"Source5 archive read request object[{index}]",
+    ) for index, value in enumerate(objects)]
+    require(rows == sorted(rows, key=lambda row: row["origin_path"]) and
+            len({row["origin_path"] for row in rows}) == len(rows) and
+            len({row["owner_job_sha256"] for row in rows}) == 1,
+            "Source5 archive read request objects are not one sorted unique original job")
+    require(_source5_archive_read_tar_size(rows) <= maximum_response_bytes,
+            "Source5 exact object tar exceeds its catalogued readback response ceiling")
+    request_body = {
+        "schema": SOURCE5_ARCHIVE_READ_REQUEST_SCHEMA_V1,
+        "campaign_id": campaign_id, "host_id": host_id,
+        "analysis_phase": analysis_phase,
+        "request_ordinal": request_ordinal,
+        "objects": rows,
+        "maximum_response_bytes": maximum_response_bytes,
+        "request_sha256": "",
+    }
+    semantic = sha256(canonical_bytes({
+        key: value for key, value in request_body.items()
+        if key != "request_sha256"
+    }))
+    request = {**request_body, "request_sha256": semantic}
+    raw = canonical_bytes(request)
+    require(len(raw) <= MAX_SOURCE5_ARCHIVE_READ_METADATA_BYTES,
+            "Source5 archive read request exceeds its metadata ceiling")
+    return request, raw, {"raw_sha256": sha256(raw),
+                          "semantic_sha256": semantic}
+
+
+def validate_source5_archive_read_request(raw: bytes) -> dict[str, Any]:
+    require(type(raw) is bytes and
+            0 < len(raw) <= MAX_SOURCE5_ARCHIVE_READ_METADATA_BYTES,
+            "Source5 archive read request is outside its bounded metadata ceiling")
+    try:
+        value = json.loads(raw.decode("ascii"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            "Source5 archive read request is not bounded canonical JSON",
+        ) from error
+    request = exact(value, {
+        "schema", "campaign_id", "host_id", "analysis_phase",
+        "request_ordinal", "objects", "maximum_response_bytes",
+        "request_sha256",
+    }, "Source5 archive read request")
+    require(raw == canonical_bytes(request) and
+            request["schema"] == SOURCE5_ARCHIVE_READ_REQUEST_SCHEMA_V1 and
+            type(request["campaign_id"]) is str and request["campaign_id"] and
+            type(request["host_id"]) is str and request["host_id"] and
+            request["analysis_phase"] in SOURCE5_ARCHIVE_READ_PURPOSES and
+            type(request["request_ordinal"]) is int and
+            0 <= request["request_ordinal"] < (1 << 64) and
+            type(request["maximum_response_bytes"]) is int and
+            MIN_SOURCE5_ARCHIVE_READ_BUNDLE_BYTES <=
+                request["maximum_response_bytes"] < (1 << 64) and
+            type(request["objects"]) is list and
+            0 < len(request["objects"]) <= MAX_SOURCE5_ARCHIVE_READ_OBJECTS,
+            "Source5 archive read request schema, identity or raw encoding differs")
+    rows = [_source5_archive_read_object(
+        row, f"Source5 archive read request object[{index}]",
+    ) for index, row in enumerate(request["objects"])]
+    require(rows == sorted(rows, key=lambda row: row["origin_path"]) and
+            len({row["origin_path"] for row in rows}) == len(rows) and
+            len({row["owner_job_sha256"] for row in rows}) == 1,
+            "Source5 archive read request object closure is not one sorted unique job")
+    body = {key: item for key, item in request.items()
+            if key != "request_sha256"}
+    require(request["request_sha256"] == sha256(canonical_bytes(body)),
+            "Source5 archive read request semantic digest differs")
+    return request
+
+
+def build_source5_archive_read_response(
+    request_raw: bytes, bundle_raw_sha256: str,
+    bundle_byte_count: int,
+) -> tuple[dict[str, Any], bytes, dict[str, str]]:
+    """Build a host-neutral response document binding one request to one tar body."""
+    request = validate_source5_archive_read_request(request_raw)
+    require(is_sha(bundle_raw_sha256) and type(bundle_byte_count) is int and
+            MIN_SOURCE5_ARCHIVE_READ_BUNDLE_BYTES <= bundle_byte_count <=
+                request["maximum_response_bytes"] and
+            bundle_byte_count == _source5_archive_read_tar_size(request["objects"]),
+            "Source5 archive read bundle pin exceeds the exact request ceiling")
+    body = {
+        "schema": SOURCE5_ARCHIVE_READ_RESPONSE_SCHEMA_V1,
+        "campaign_id": request["campaign_id"],
+        "host_id": request["host_id"],
+        "analysis_phase": request["analysis_phase"],
+        "request_ordinal": request["request_ordinal"],
+        "request_pin": {
+            "raw_sha256": sha256(request_raw),
+            "semantic_sha256": request["request_sha256"],
+        },
+        "objects": request["objects"],
+        "body_tar_pin": {"raw_sha256": bundle_raw_sha256,
+                          "byte_count": bundle_byte_count},
+        "response_sha256": "",
+    }
+    semantic = sha256(canonical_bytes({
+        key: value for key, value in body.items()
+        if key != "response_sha256"
+    }))
+    response = {**body, "response_sha256": semantic}
+    raw = canonical_bytes(response)
+    require(len(raw) <= MAX_SOURCE5_ARCHIVE_READ_METADATA_BYTES,
+            "Source5 archive read response exceeds its bounded metadata slot")
+    return response, raw, {"raw_sha256": sha256(raw),
+                           "semantic_sha256": semantic}
+
+
+def _source5_hash_archive_read_bundle(
+    path: Path, maximum_bytes: int, label: str,
+    cancel_event: threading.Event | None = None,
+) -> tuple[str, int]:
+    require(path.is_absolute() and path.resolve(strict=True) == path,
+            f"{label} path is not canonical")
+    before_path = path.lstat()
+    require(stat.S_ISREG(before_path.st_mode) and
+            before_path.st_uid == os.getuid() and
+            stat.S_IMODE(before_path.st_mode) == 0o600 and
+            before_path.st_nlink == 1 and
+            0 < before_path.st_size <= maximum_bytes,
+            f"{label} is not one bounded private regular file")
+    descriptor = os.open(
+        path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+        getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+    )
+    try:
+        before = os.fstat(descriptor)
+        require(_source5_same_file_identity(before_path, before),
+                f"{label} changed identity before open")
+        digest = _source5_hash_open_file(
+            descriptor, before.st_size, maximum_bytes, label,
+            cancel_event=cancel_event,
+        )
+        after = os.fstat(descriptor)
+        after_path = path.lstat()
+        require(_source5_same_file_identity(before, after) and
+                _source5_same_file_identity(before, after_path),
+                f"{label} changed during its bounded hash")
+        return digest, before.st_size
+    finally:
+        os.close(descriptor)
+
+
+def _source5_rename_noreplace(
+    directory_fd: int, source_name: str, destination_name: str,
+) -> None:
+    function = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    require(function is not None,
+            "atomic no-replace archive readback publication is unavailable")
+    function.argtypes = (
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    function.restype = ctypes.c_int
+    if function(directory_fd, os.fsencode(source_name), directory_fd,
+                 os.fsencode(destination_name), 1) != 0:
+        error_number = ctypes.get_errno()
+        raise Source5CampaignError(
+            "atomic no-replace archive readback publication failed: " +
+            os.strerror(error_number),
+        )
+
+
+def _source5_publish_readback_file(
+    directory_fd: int, incoming_name: str, final_name: str,
+    expected_sha256: str, expected_bytes: int, maximum_bytes: int,
+    label: str, rename_noreplace=None,
+) -> dict[str, str | int]:
+    def check(name: str) -> os.stat_result:
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+                info.st_size == expected_bytes <= maximum_bytes,
+                f"{label} is not its exact bounded regular file")
+        descriptor = os.open(
+            name, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+            getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=directory_fd,
+        )
+        try:
+            before = os.fstat(descriptor)
+            require(_source5_same_file_identity(info, before),
+                    f"{label} changed identity before publication")
+            digest = hashlib.sha256()
+            total = 0
+            while total < expected_bytes:
+                block = os.read(descriptor, min(
+                    SOURCE5_ARCHIVE_READ_COPY_BYTES,
+                    expected_bytes - total,
+                ))
+                require(bool(block), f"{label} shortened before publication")
+                digest.update(block)
+                total += len(block)
+            after = os.fstat(descriptor)
+            current = os.stat(name, dir_fd=directory_fd,
+                              follow_symlinks=False)
+            require(os.read(descriptor, 1) == b"" and
+                    total == expected_bytes and
+                    digest.hexdigest() == expected_sha256 and
+                    _source5_same_file_identity(before, after) and
+                    _source5_same_file_identity(before, current),
+                    f"{label} bytes or identity changed before publication")
+        finally:
+            os.close(descriptor)
+        return info
+
+    try:
+        final_info = check(final_name)
+    except FileNotFoundError:
+        check(incoming_name)
+        renamer = (_source5_rename_noreplace if rename_noreplace is None
+                   else rename_noreplace)
+        renamer(directory_fd, incoming_name, final_name)
+        os.fsync(directory_fd)
+        final_info = check(final_name)
+    else:
+        try:
+            incoming_info = check(incoming_name)
+        except FileNotFoundError:
+            incoming_info = None
+        if incoming_info is not None:
+            os.unlink(incoming_name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+    return {"raw_sha256": expected_sha256,
+            "byte_count": final_info.st_size}
+
+
+def publish_source5_archive_readback(
+    request_path: Path, response_incoming: Path,
+    bundle_incoming: Path, *, rename_noreplace=None,
+) -> dict[str, Any]:
+    """Publish one completed Root readback pair without taking the campaign lock."""
+    require(request_path.name == "request.json" and
+            response_incoming.name == "response.json.incoming" and
+            bundle_incoming.name == "response.tar.incoming" and
+            request_path.parent == response_incoming.parent ==
+                bundle_incoming.parent and
+            all(path.is_absolute() and path.resolve(strict=True) == path
+                for path in (request_path, response_incoming, bundle_incoming)),
+            "Source5 archive readback publication paths differ from the fixed catalogue slots")
+    request_raw, request_sha, request_info = read_stable(
+        request_path, "Source5 archive read request for publication",
+        MAX_SOURCE5_ARCHIVE_READ_METADATA_BYTES,
+    )
+    request = validate_source5_archive_read_request(request_raw)
+    require(request_sha == sha256(request_raw) and
+            stat.S_ISREG(request_info.st_mode) and
+            request_info.st_uid == os.getuid() and
+            stat.S_IMODE(request_info.st_mode) == 0o600 and
+            request_info.st_nlink == 1,
+            "Source5 archive read request changed before publication")
+    response_raw, _response_sha, response_info = read_stable(
+        response_incoming, "Source5 incoming archive read response",
+        MAX_SOURCE5_ARCHIVE_READ_METADATA_BYTES,
+    )
+    try:
+        response_value = json.loads(response_raw.decode("ascii"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            "Source5 incoming archive read response is malformed",
+        ) from error
+    response = exact(response_value, {
+        "schema", "campaign_id", "host_id", "analysis_phase",
+        "request_ordinal", "request_pin", "objects", "body_tar_pin",
+        "response_sha256",
+    }, "Source5 incoming archive read response")
+    body_pin = exact(response["body_tar_pin"], {
+        "raw_sha256", "byte_count",
+    }, "Source5 incoming archive read tar pin")
+    bundle_sha, bundle_bytes = _source5_hash_archive_read_bundle(
+        bundle_incoming, request["maximum_response_bytes"],
+        "Source5 incoming archive read tar",
+    )
+    expected_response, expected_response_raw, response_pin = \
+        build_source5_archive_read_response(
+            request_raw, bundle_sha, bundle_bytes,
+        )
+    require(response_raw == expected_response_raw and
+            response == expected_response and
+            response_info.st_uid == os.getuid() and
+            stat.S_IMODE(response_info.st_mode) == 0o600 and
+            response_info.st_nlink == 1 and
+            body_pin == {"raw_sha256": bundle_sha,
+                         "byte_count": bundle_bytes},
+            "Source5 incoming response is not the exact complete request-bound readback")
+    response_path = response_incoming.with_name("response.json")
+    bundle_path = bundle_incoming.with_name("response.tar")
+    directory_fd = os.open(
+        request_path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+        getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        response_final = _source5_publish_readback_file(
+            directory_fd, response_incoming.name, response_path.name,
+            response_pin["raw_sha256"], len(expected_response_raw),
+            MAX_SOURCE5_ARCHIVE_READ_METADATA_BYTES,
+            "Source5 archive read response",
+            rename_noreplace,
+        )
+        bundle_final = _source5_publish_readback_file(
+            directory_fd, bundle_incoming.name, bundle_path.name,
+            bundle_sha, bundle_bytes, request["maximum_response_bytes"],
+            "Source5 archive read tar",
+            rename_noreplace,
+        )
+    finally:
+        os.close(directory_fd)
+    return {
+        "schema": "allocatbelt.application-source5-archive-read-publication.v1",
+        "request_pin": {"path": str(request_path),
+                        "raw_sha256": request_sha,
+                        "semantic_sha256": request["request_sha256"]},
+        "response_pin": {"path": str(response_path),
+                         **response_final,
+                         "semantic_sha256": expected_response[
+                             "response_sha256"]},
+        "bundle_pin": {"path": str(bundle_path), **bundle_final},
+    }
+
+
+def _source5_archive_read_tar_member_name(row: dict[str, Any]) -> str:
+    origin_digest = sha256(row["origin_path"].encode("utf-8", "strict"))
+    return f"objects/{origin_digest}/{row['raw_sha256']}"
+
+
+def _source5_same_file_identity(left: os.stat_result,
+                                right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino, left.st_mode, left.st_size,
+            left.st_mtime_ns, left.st_ctime_ns, left.st_nlink, left.st_uid) == (
+            right.st_dev, right.st_ino, right.st_mode, right.st_size,
+            right.st_mtime_ns, right.st_ctime_ns, right.st_nlink, right.st_uid)
+
+
+def _source5_same_mutable_file_object(left: os.stat_result,
+                                      right: os.stat_result) -> bool:
+    """Compare identity/ownership while an append changes size and timestamps."""
+    return (left.st_dev, left.st_ino, stat.S_IFMT(left.st_mode),
+            stat.S_IMODE(left.st_mode), left.st_nlink, left.st_uid,
+            left.st_gid) == (
+            right.st_dev, right.st_ino, stat.S_IFMT(right.st_mode),
+            stat.S_IMODE(right.st_mode), right.st_nlink, right.st_uid,
+            right.st_gid)
+
+
+def _source5_hash_open_file(fd: int, expected_size: int,
+                            maximum: int, label: str,
+                            cancel_event: threading.Event | None = None) -> str:
+    before = os.fstat(fd)
+    require(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid() and
+            stat.S_IMODE(before.st_mode) == 0o600 and before.st_nlink == 1 and
+            before.st_size == expected_size <= maximum,
+            f"{label} is not one exact private bounded regular file")
+    os.lseek(fd, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    total = 0
+    while total < expected_size:
+        require(cancel_event is None or not cancel_event.is_set(),
+                f"{label} verification was cancelled")
+        block = os.read(fd, min(SOURCE5_ARCHIVE_READ_COPY_BYTES,
+                                expected_size - total))
+        require(bool(block), f"{label} shortened during bounded hash")
+        digest.update(block)
+        total += len(block)
+    require(os.read(fd, 1) == b"" and total == expected_size and
+            _source5_same_file_identity(before, os.fstat(fd)),
+            f"{label} changed while hashing")
+    return digest.hexdigest()
+
+
+def validate_source5_archive_read_response(
+    request_raw: bytes, response_raw: bytes, bundle_path: Path,
+    stage_root: Path, maximum_response_bytes: int,
+    signed_manifest: dict[str, Any], *,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    """Verify a Root response and stream exact signed objects into a private slot."""
+    request = validate_source5_archive_read_request(request_raw)
+    require(type(maximum_response_bytes) is int and
+            0 < maximum_response_bytes <= request["maximum_response_bytes"] and
+            type(response_raw) is bytes and
+            0 < len(response_raw) <= MAX_SOURCE5_ARCHIVE_READ_METADATA_BYTES,
+            "Source5 archive read response document exceeds its pinned bound")
+    try:
+        response_value = json.loads(response_raw.decode("ascii"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            "Source5 archive read response is not bounded canonical JSON",
+        ) from error
+    response = exact(response_value, {
+        "schema", "campaign_id", "host_id", "analysis_phase",
+        "request_ordinal", "request_pin", "objects", "body_tar_pin",
+        "response_sha256",
+    }, "Source5 archive read response")
+    request_pin = exact(response["request_pin"], {
+        "raw_sha256", "semantic_sha256",
+    }, "Source5 archive read response request pin")
+    bundle_pin = exact(response["body_tar_pin"], {
+        "raw_sha256", "byte_count",
+    }, "Source5 archive read response tar pin")
+    body = {key: value for key, value in response.items()
+            if key != "response_sha256"}
+    require(response_raw == canonical_bytes(response) and
+            response["schema"] == SOURCE5_ARCHIVE_READ_RESPONSE_SCHEMA_V1 and
+            response["campaign_id"] == request["campaign_id"] and
+            response["host_id"] == request["host_id"] and
+            response["analysis_phase"] == request["analysis_phase"] and
+            response["request_ordinal"] == request["request_ordinal"] and
+            request_pin == {
+                "raw_sha256": sha256(request_raw),
+                "semantic_sha256": request["request_sha256"],
+            } and response["objects"] == request["objects"] and
+            response["response_sha256"] ==
+                sha256(canonical_bytes(body)) and
+            is_sha(bundle_pin["raw_sha256"]) and
+            type(bundle_pin["byte_count"]) is int and
+            MIN_SOURCE5_ARCHIVE_READ_BUNDLE_BYTES <=
+                bundle_pin["byte_count"] <= maximum_response_bytes and
+            bundle_pin["byte_count"] ==
+                _source5_archive_read_tar_size(request["objects"]),
+            "Source5 archive read response differs from the exact request or tar ceiling")
+    manifest_fields = {
+        "schema", "campaign_id", "host_id", "phase", "job_index",
+        "job_ordinal", "job_sha256", "run_id", "job_record_raw_sha256",
+        "predecessor_ack_pin", "objects", "object_count", "payload_bytes",
+        "manifest_sha256",
+    }
+    signed_manifest = exact(
+        signed_manifest, manifest_fields,
+        "Source5 previously verified signed object manifest",
+    )
+    manifest_body = {key: value for key, value in signed_manifest.items()
+                     if key != "manifest_sha256"}
+    require(signed_manifest.get("schema") ==
+                "allocatbelt.application-source5-evidence-object-manifest.v1" and
+            signed_manifest.get("campaign_id") == request["campaign_id"] and
+            signed_manifest.get("host_id") == request["host_id"] and
+            type(signed_manifest.get("objects")) is list and
+            type(signed_manifest.get("object_count")) is int and
+            signed_manifest["object_count"] == len(signed_manifest["objects"]) and
+            is_sha(signed_manifest.get("manifest_sha256")) and
+            signed_manifest["manifest_sha256"] ==
+                sha256(canonical_bytes(manifest_body)),
+            "Source5 readback lacks its previously verified signed object manifest")
+    signed_rows = {row.get("origin_path"): row
+                   for row in signed_manifest["objects"]
+                   if type(row) is dict}
+    require(len(signed_rows) == len(signed_manifest["objects"]),
+            "Source5 signed object manifest repeats an origin path")
+    expected: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for position, row in enumerate(request["objects"]):
+        obj = _source5_archive_read_object(
+            row, f"Source5 archive read response object[{position}]",
+        )
+        signed = signed_rows.get(obj["origin_path"])
+        require(type(signed) is dict and
+                signed.get("raw_sha256") == obj["raw_sha256"] and
+                signed.get("byte_count") == obj["byte_count"] and
+                signed_manifest.get("job_sha256") == obj["owner_job_sha256"] and
+                signed.get("object_id") == _source5_archive_read_object_id(
+                    obj["origin_path"], obj["raw_sha256"],
+                ),
+                f"Source5 archive read object[{position}] is not an exact signed-manifest entry")
+        expected.append((obj, signed))
+    require(bundle_path.is_absolute() and
+            bundle_path.resolve(strict=True) == bundle_path and
+            stage_root.is_absolute() and
+            stage_root.resolve(strict=True) == stage_root,
+            "Source5 archive readback paths are not canonical")
+    require(cancel_event is None or not cancel_event.is_set(),
+            "Source5 archive readback was cancelled before staging")
+    stage_info = stage_root.lstat()
+    require(stat.S_ISDIR(stage_info.st_mode) and
+            stage_info.st_uid == os.getuid() and
+            stat.S_IMODE(stage_info.st_mode) == 0o700 and
+            not any(stage_root.iterdir()),
+            "Source5 archive read stage is not one empty private directory")
+    bundle_before_path = bundle_path.lstat()
+    require(stat.S_ISREG(bundle_before_path.st_mode) and
+            bundle_before_path.st_uid == os.getuid() and
+            stat.S_IMODE(bundle_before_path.st_mode) == 0o600 and
+            bundle_before_path.st_nlink == 1 and
+            bundle_before_path.st_size == bundle_pin["byte_count"] <=
+                maximum_response_bytes,
+            "Source5 archive read tar is not the exact bounded private regular file")
+    bundle_fd = os.open(
+        bundle_path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+        getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+    )
+    refs: dict[str, dict[str, Any]] = {}
+    try:
+        bundle_before = os.fstat(bundle_fd)
+        require(_source5_same_file_identity(bundle_before_path, bundle_before),
+                "Source5 archive read tar changed identity before open")
+        bundle_digest = _source5_hash_open_file(
+            bundle_fd, bundle_before.st_size, maximum_response_bytes,
+            "Source5 archive read response tar",
+            cancel_event=cancel_event,
+        )
+        require(bundle_digest == bundle_pin["raw_sha256"],
+                "Source5 archive read tar raw digest differs from its response pin")
+        os.lseek(bundle_fd, 0, os.SEEK_SET)
+        duplicate = os.fdopen(os.dup(bundle_fd), "rb", closefd=True)
+        try:
+            with tarfile.open(fileobj=duplicate, mode="r:") as archive:
+                require(not archive.pax_headers,
+                        "Source5 archive read tar has global PAX metadata")
+                members = iter(expected)
+                for position, pair in enumerate(members):
+                    require(cancel_event is None or not cancel_event.is_set(),
+                            "Source5 archive readback was cancelled during staging")
+                    obj, signed = pair
+                    try:
+                        member = archive.next()
+                    except (tarfile.TarError, OSError, EOFError) as error:
+                        raise Source5CampaignError(
+                            f"Source5 archive read tar member[{position}] is malformed",
+                        ) from error
+                    name = _source5_archive_read_tar_member_name(obj)
+                    require(member is not None and member.name == name and
+                            member.type in (tarfile.REGTYPE, tarfile.AREGTYPE) and
+                            not member.pax_headers and not member.linkname and
+                            member.mode & 0o777 == 0o600 and
+                            member.size == obj["byte_count"],
+                            f"Source5 archive read tar member[{position}] is not its exact regular object")
+                    input_stream = archive.extractfile(member)
+                    require(input_stream is not None,
+                            f"Source5 archive read tar member[{position}] has no file stream")
+                    stage_path = stage_root / (
+                        name.removeprefix("objects/").replace("/", "-")
+                    )
+                    descriptor = os.open(
+                        stage_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                        getattr(os, "O_CLOEXEC", 0) |
+                        getattr(os, "O_NOFOLLOW", 0), 0o600,
+                    )
+                    object_hash = hashlib.sha256()
+                    total = 0
+                    try:
+                        while total < member.size:
+                            require(cancel_event is None or
+                                    not cancel_event.is_set(),
+                                    "Source5 archive readback was cancelled during object copy")
+                            block = input_stream.read(min(
+                                SOURCE5_ARCHIVE_READ_COPY_BYTES,
+                                member.size - total,
+                            ))
+                            require(bool(block),
+                                    f"Source5 archive read object[{position}] shortened")
+                            total += len(block)
+                            require(total <= obj["byte_count"],
+                                    f"Source5 archive read object[{position}] exceeded its pin")
+                            object_hash.update(block)
+                            view = memoryview(block)
+                            while view:
+                                require(cancel_event is None or
+                                        not cancel_event.is_set(),
+                                        "Source5 archive readback was cancelled during staged write")
+                                written = os.write(descriptor, view)
+                                require(written > 0,
+                                        "Source5 archive read stage writer made no progress")
+                                view = view[written:]
+                        require(input_stream.read(1) == b"" and
+                                total == obj["byte_count"] and
+                                object_hash.hexdigest() == obj["raw_sha256"],
+                                f"Source5 archive read object[{position}] bytes differ from its ACK pin")
+                        require(cancel_event is None or not cancel_event.is_set(),
+                                "Source5 archive readback was cancelled before object publication")
+                        os.fchmod(descriptor, 0o400)
+                        os.fsync(descriptor)
+                    finally:
+                        input_stream.close()
+                        os.close(descriptor)
+                    staged_info = stage_path.lstat()
+                    require(stat.S_ISREG(staged_info.st_mode) and
+                            staged_info.st_uid == os.getuid() and
+                            stat.S_IMODE(staged_info.st_mode) == 0o400 and
+                            staged_info.st_nlink == 1 and
+                            staged_info.st_size == obj["byte_count"],
+                            f"Source5 archive read object[{position}] stage is not exact")
+                    refs[obj["origin_path"]] = {
+                        "origin_path": obj["origin_path"],
+                        "path": str(stage_path),
+                        "role": signed["role"],
+                        "host_id": request["host_id"],
+                        "raw_sha256": obj["raw_sha256"],
+                        "semantic_sha256": signed["semantic_sha256"],
+                        "byte_count": obj["byte_count"],
+                        "maximum_bytes": obj["byte_count"],
+                    }
+                try:
+                    extra = archive.next()
+                except (tarfile.TarError, OSError, EOFError) as error:
+                    raise Source5CampaignError(
+                        "Source5 archive read tar has malformed trailing members",
+                    ) from error
+                require(extra is None,
+                        "Source5 archive read tar has an extra or duplicate member")
+        finally:
+            duplicate.close()
+        bundle_after = os.fstat(bundle_fd)
+        bundle_after_path = bundle_path.lstat()
+        require(_source5_same_file_identity(bundle_before, bundle_after) and
+                _source5_same_file_identity(bundle_before, bundle_after_path),
+                "Source5 archive read tar changed during verification")
+    finally:
+        os.close(bundle_fd)
+    return {
+        "schema": SOURCE5_ARCHIVE_READ_RESPONSE_SCHEMA_V1,
+        "response": response, "response_pin": {
+            "raw_sha256": sha256(response_raw),
+            "semantic_sha256": response["response_sha256"],
+        },
+        "bundle_pin": {"raw_sha256": bundle_digest,
+                       "byte_count": bundle_pin["byte_count"]},
+        "refs": refs,
+    }
+
+
+def _source5_verify_persisted_archive_read_closure(
+    context: CampaignContext, phase: str, job: dict[str, Any],
+) -> dict[str, Any]:
+    """Reverify one retained signed ACK without opening any Root archive path."""
+    require(context.manifest.get("schema") in {EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA} and
+            context.host_evidence_budget_raw is not None and
+            context.archive_signer_context is not None and
+            context.archive_signer_context_pin is not None and
+            context.journal_width_contract is not None,
+            "Source5 archived read lacks the exact v4 budget/signer/width inputs")
+    declarations = _source5_job_path_declarations(context, phase, job)
+    by_role = {
+        role: _source5_archive_role_row(declarations, role)
+        for role in (
+            "source5_checkpoint_request", "source5_job_record",
+            "source5_checkpoint", "source5_object_manifest",
+            "source5_archive_ack", "source5_archive_signature",
+        )
+    }
+
+    def read_member(role: str) -> tuple[bytes, str]:
+        row = by_role[role]
+        raw, digest, info = read_stable(
+            Path(row["path"]), f"Source5 persisted read closure {role}",
+            row["max_file_bytes"],
+        )
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1,
+                f"Source5 persisted read closure {role} is not private immutable evidence")
+        return raw, digest
+
+    request_raw, request_sha = read_member("source5_checkpoint_request")
+    job_record_raw, job_record_sha = read_member("source5_job_record")
+    checkpoint_raw, checkpoint_sha = read_member("source5_checkpoint")
+    manifest_raw, manifest_sha = read_member("source5_object_manifest")
+    ack_raw, ack_sha = read_member("source5_archive_ack")
+    signature_raw, signature_sha = read_member("source5_archive_signature")
+    try:
+        job_record = json.loads(job_record_raw.decode("ascii"))
+        checkpoint = json.loads(checkpoint_raw.decode("ascii"))
+        object_manifest = json.loads(manifest_raw.decode("ascii"))
+        ack = json.loads(ack_raw.decode("ascii"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            "Source5 persisted archive read closure is malformed",
+        ) from error
+    require(all(raw == canonical_bytes(value) for raw, value in (
+                (job_record_raw, job_record), (checkpoint_raw, checkpoint),
+                (manifest_raw, object_manifest), (ack_raw, ack))) and
+            job_record.get("job") == job and
+            job_record.get("state") in {"valid_pair", "valid_soak"} and
+            job_record.get("record_sha256") == sha256(canonical_bytes({
+                key: value for key, value in job_record.items()
+                if key != "record_sha256"
+            })) and
+            checkpoint.get("checkpoint_sha256") == sha256(canonical_bytes({
+                key: value for key, value in checkpoint.items()
+                if key != "checkpoint_sha256"
+            })) and
+            object_manifest.get("manifest_sha256") == sha256(canonical_bytes({
+                key: value for key, value in object_manifest.items()
+                if key != "manifest_sha256"
+            })) and
+            ack.get("ack_sha256") == sha256(canonical_bytes({
+                key: value for key, value in ack.items()
+                if key != "ack_sha256"
+            })) and is_sha(signature_sha),
+            "Source5 persisted archive read documents changed raw identity or job binding")
+    job_sha = sha256(canonical_bytes(job))
+    require(object_manifest.get("campaign_id") ==
+                context.manifest["campaign_id"] and
+            object_manifest.get("host_id") == context.host_id and
+            object_manifest.get("phase") == phase and
+            object_manifest.get("job_ordinal") == job["ordinal"] and
+            object_manifest.get("run_id") == job["run_id"] and
+            object_manifest.get("job_sha256") == job_sha and
+            object_manifest.get("job_record_raw_sha256") == job_record_sha and
+            object_manifest.get("object_count") ==
+                len(object_manifest.get("objects", [])),
+            "Source5 retained object manifest differs from the exact original job record")
+    durable = exact(ack.get("durable_commit"), {
+        "commit_id", "archive_source5_directory", "checkpoint_pin",
+        "object_manifest_pin", "object_reopen_sha256", "object_count",
+        "payload_bytes", "job_record_validation",
+    }, "Source5 persisted durable archive commit")
+    archive_root_value = exact(durable["archive_source5_directory"], {
+        "path", "device", "inode", "mode",
+    }, "Source5 persisted archive root identity")
+    archive_root = Path(archive_root_value["path"])
+    leaf = f"{job['ordinal']:06d}-{job_sha}.json"
+    ack_pin = {
+        "path": str(archive_root / "acks" / phase / leaf),
+        "raw_sha256": ack_sha, "semantic_sha256": ack["ack_sha256"],
+    }
+    signature_pin = {
+        "path": str(archive_root / "acks" / "signatures" / phase /
+                     f"{leaf[:-5]}.sig"),
+        "raw_sha256": signature_sha,
+        "signer_fingerprint": ack.get("signer_fingerprint"),
+    }
+    checkpoint_pin = exact(ack.get("checkpoint_pin"), {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "Source5 persisted checkpoint pin")
+    manifest_pin = exact(ack.get("object_manifest_pin"), {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "Source5 persisted object-manifest pin")
+    require(checkpoint_pin["raw_sha256"] == checkpoint_sha and
+            checkpoint_pin["semantic_sha256"] ==
+                checkpoint["checkpoint_sha256"] and
+            manifest_pin["raw_sha256"] == manifest_sha and
+            manifest_pin["semantic_sha256"] ==
+                object_manifest["manifest_sha256"] and
+            request_sha == sha256(request_raw),
+            "Source5 persisted checkpoint/manifest/request pins differ from their bytes")
+    archive = context.modules[EVIDENCE_ARCHIVE_SOURCE_PATH]
+    verifier = getattr(archive, "verify_signed_ack_for_read", None)
+    require(callable(verifier),
+            "pinned evidence archive lacks restart-safe metadata-only read verification")
+    execution_manifest_pin = {
+        "path": context.manifest_pin["path"],
+        "raw_sha256": context.manifest_pin["raw_sha256"],
+        "semantic_sha256": context.manifest["manifest_sha256"],
+    }
+    signer_context_raw = canonical_bytes(context.archive_signer_context)
+    proof = verifier(
+        checkpoint_pin, checkpoint, checkpoint_raw, request_raw,
+        context.host_evidence_budget_raw,
+        {"path": by_role["source5_job_record"]["path"],
+         "raw_sha256": job_record_sha},
+        job_record_raw, context.plan_raw,
+        manifest_pin, object_manifest, manifest_raw,
+        ack_pin, ack, ack_raw,
+        signature_pin, signature_raw,
+        context.archive_signer_context_pin, signer_context_raw,
+        execution_manifest_pin, canonical_bytes(context.manifest),
+        expected_ack_pin=ack_pin,
+        expected_run_id=job["run_id"],
+        journal_width_contract_raw=canonical_bytes(
+            context.journal_width_contract,
+        ),
+        source_manifest_raw=_source5_selected_source_manifest_raw(context),
+    )
+    require(type(proof) is dict and
+            proof.get("schema") ==
+                "allocatbelt.application-source5-evidence-verified-read-ack.v1" and
+            proof.get("may_read") is True and
+            proof.get("may_reclaim") is False and
+            proof.get("object_manifest_pin") == manifest_pin and
+            proof.get("ack_pin") == ack_pin and
+            proof.get("job_identity") == {
+                "phase": phase,
+                "job_index": object_manifest["job_index"],
+                "ordinal": job["ordinal"], "run_id": job["run_id"],
+                "job_sha256": job_sha,
+            },
+            "Source5 persisted read closure lacks metadata-only GPG read authority")
+    cached_closure = (None if context.source5_archive_closures is None else
+                      context.source5_archive_closures.get((phase, job["run_id"])))
+    require(cached_closure is None or
+            (cached_closure.get("job_sha256") == job_sha and
+             cached_closure.get("job_record_pin") == {
+                 "path": by_role["source5_job_record"]["path"],
+                 "raw_sha256": job_record_sha,
+             } and cached_closure.get("checkpoint_pin") == checkpoint_pin and
+             cached_closure.get("manifest_pin") == manifest_pin and
+             cached_closure.get("ack_pin") == ack_pin and
+             cached_closure.get("signature_pin") == signature_pin),
+            "Source5 in-memory ACK closure differs from reverified persistent signed metadata")
+    host_receipt_pin = None
+    owner_host_receipt_pin = None
+    if phase in {"exploration", "aa", "confirmation"}:
+        evidence = exact(job_record.get("evidence"), set(job_record["evidence"]),
+                         "Source5 fixed read job-record evidence")
+        host_receipt_pin = exact(evidence.get("host_receipt"), {
+            "path", "raw_sha256", "host_verification_sha256",
+        }, "Source5 original strict fixed host receipt pin")
+        receipt_rows = [row for row in object_manifest["objects"]
+                        if row.get("origin_path") == host_receipt_pin["path"]]
+        require(len(receipt_rows) == 1 and
+                receipt_rows[0].get("role") == "fixed_pair_host_receipt" and
+                receipt_rows[0].get("raw_sha256") ==
+                    host_receipt_pin["raw_sha256"] and
+                receipt_rows[0].get("semantic_sha256") ==
+                    host_receipt_pin["host_verification_sha256"],
+                "Source5 fixed archive manifest does not contain its exact strict host receipt")
+        owner_host_receipt_pin = host_receipt_pin
+    else:
+        evidence = job_record.get("evidence")
+        if type(evidence) is dict and type(evidence.get("host_receipt")) is dict:
+            receipt_value = evidence["host_receipt"]
+            semantic_field = ("receipt_sha256" if
+                              "receipt_sha256" in receipt_value else None)
+            require(semantic_field is not None and
+                    set(receipt_value) == {
+                        "path", "raw_sha256", semantic_field,
+                    } and is_sha(receipt_value["raw_sha256"]) and
+                    is_sha(receipt_value[semantic_field]),
+                    "Source5 nonfixed host receipt pin is malformed")
+            owner_host_receipt_pin = dict(receipt_value)
+            receipt_rows = [row for row in object_manifest["objects"]
+                            if row.get("origin_path") == receipt_value["path"]]
+            require(len(receipt_rows) == 1 and
+                    "receipt" in receipt_rows[0].get("role", "").lower() and
+                    receipt_rows[0].get("raw_sha256") ==
+                        receipt_value["raw_sha256"] and
+                    receipt_rows[0].get("semantic_sha256") ==
+                        receipt_value[semantic_field],
+                    "Source5 nonfixed archive manifest omits its exact origin receipt")
+    return {
+        "job_sha256": job_sha,
+        "job_record_pin": {"path": by_role["source5_job_record"]["path"],
+                           "raw_sha256": job_record_sha},
+        "job_record": job_record, "job_record_raw": job_record_raw,
+        "request_pin": {"path": by_role["source5_checkpoint_request"]["path"],
+                        "raw_sha256": request_sha,
+                        "semantic_sha256": checkpoint["request_pin"][
+                            "semantic_sha256"]},
+        "request_raw": request_raw,
+        "checkpoint_pin": checkpoint_pin,
+        "checkpoint": checkpoint, "checkpoint_raw": checkpoint_raw,
+        "manifest_pin": manifest_pin,
+        "manifest": object_manifest, "manifest_raw": manifest_raw,
+        "ack_pin": ack_pin, "ack": ack, "ack_raw": ack_raw,
+        "signature_pin": signature_pin, "signature_raw": signature_raw,
+        "host_receipt_pin": host_receipt_pin,
+        "owner_host_receipt_pin": owner_host_receipt_pin,
+        "proof": proof,
+    }
+
+
+
+def _source5_archive_read_schedule(
+    context: CampaignContext,
+    readback_caps: dict[tuple[str, str], dict[str, int]],
+) -> list[dict[str, Any]]:
+    """Derive every permitted one-job read from the original Plan and replay calls."""
+    schedule: list[dict[str, Any]] = []
+
+    def add(phase: str, job_index: int, job: dict[str, Any],
+            analysis_phase: str, use: str) -> None:
+        key = (phase, job["run_id"])
+        caps = readback_caps.get(key)
+        require(type(caps) is dict and
+                caps["maximum_request_bytes"] <=
+                    MAX_SOURCE5_ARCHIVE_READ_METADATA_BYTES and
+                caps["maximum_response_bytes"] <=
+                    MAX_SOURCE5_ARCHIVE_READ_METADATA_BYTES and
+                caps["object_count"] <= MAX_SOURCE5_ARCHIVE_READ_OBJECTS and
+                caps["bundle_bytes"] <= (1 << 48),
+                f"Source5 {phase}/{job['run_id']} has no bounded readback projection")
+        schedule.append({
+            "request_ordinal": len(schedule),
+            "analysis_phase": analysis_phase,
+            "use": use,
+            "owner_phase": phase,
+            "job_index": job_index,
+            "job": job,
+            "job_sha256": sha256(canonical_bytes(job)),
+            "caps": caps,
+        })
+
+    initial_analyses = (
+        ("exploration", "exploration"),
+        ("aa", "aa"),
+        ("confirmation", "fixed_analysis"),
+    )
+    for owner_phase, analysis_phase in initial_analyses:
+        for job_index, job in enumerate(_host_jobs(context, owner_phase)):
+            add(owner_phase, job_index, job, analysis_phase, "phase_analysis")
+
+    confirmation_jobs = _host_jobs(context, "confirmation")
+    def trace_group_order(job: dict[str, Any]) -> tuple[str, int]:
+        kind = job["comparison_kind"]
+        contrast = (job["baseline_allocator"] if kind == "allocator"
+                    else job["allocator"])
+        group = (
+            job["family"], job["profile"], "open_loop",
+            job["load_percent"], kind, contrast,
+        )
+        return (json.dumps(group, sort_keys=True, separators=(",", ":")),
+                job["ordinal"])
+
+    fixed_trace_jobs = sorted([
+        (job_index, job) for job_index, job in enumerate(confirmation_jobs)
+        if job["mode"] == "open_loop"
+    ], key=lambda item: trace_group_order(item[1]))
+    for job_index, job in fixed_trace_jobs:
+        add("confirmation", job_index, job, "fixed_analysis",
+            "phase_analyzer_trace")
+    confirmation_by_run = {
+        job["run_id"]: (job_index, job)
+        for job_index, job in enumerate(confirmation_jobs)
+    }
+    pressure_jobs = _host_jobs(context, "pressure")
+    for job_index, pressure_job in enumerate(pressure_jobs):
+        predecessors = pressure_job.get("predecessor_run_ids")
+        require(type(predecessors) is list and len(predecessors) == 1 and
+                predecessors[0] in confirmation_by_run,
+                f"Source5 pressure job {pressure_job['run_id']} has no exact original confirmation predecessor")
+        predecessor_index, predecessor = confirmation_by_run[predecessors[0]]
+        add("confirmation", predecessor_index, predecessor,
+            "pressure_analysis", "pressure_predecessor")
+        add("pressure", job_index, pressure_job,
+            "pressure_analysis", "phase_analysis")
+
+    pressure_trace_jobs = sorted([
+        (job_index, job)
+        for job_index, job in enumerate(_host_jobs(context, "pressure"))
+        if job["mode"] == "open_loop"
+    ], key=lambda item: trace_group_order(item[1]))
+    for job_index, job in pressure_trace_jobs:
+        add("pressure", job_index, job, "pressure_analysis",
+            "phase_analyzer_trace")
+
+    for job_index, job in enumerate(_host_jobs(context, "soak")):
+        add("soak", job_index, job, "soak", "phase_analysis")
+
+    for owner_phase in ("exploration", "aa", "confirmation", "pressure", "soak"):
+        for job_index, job in enumerate(_host_jobs(context, owner_phase)):
+            add(owner_phase, job_index, job, "final_analysis", "final_replay")
+    for owner_phase, rows in (("confirmation", fixed_trace_jobs),
+                              ("pressure", pressure_trace_jobs)):
+        for job_index, job in rows:
+            add(owner_phase, job_index, job, "final_analysis",
+                "final_analyzer_trace")
+    original_job_count = sum(
+        len(_host_jobs(context, phase))
+        for phase in ("exploration", "aa", "confirmation", "pressure", "soak")
+    )
+    predecessor_count = sum(
+        len(job["predecessor_run_ids"])
+        for job in _host_jobs(context, "pressure")
+    )
+    trace_read_count = len(fixed_trace_jobs) + len(pressure_trace_jobs)
+    require(len({row["request_ordinal"] for row in schedule}) == len(schedule) and
+            len(schedule) == 2 * original_job_count + predecessor_count +
+                2 * trace_read_count,
+            "Source5 archive read schedule differs from the exact original analysis and predecessor replay calls")
+    return schedule
+
+
+def _source5_remove_archive_read_stage(
+    stage_root: Path, refs: dict[str, dict[str, Any]],
+) -> None:
+    require(stage_root.is_absolute() and
+            stage_root.resolve(strict=True) == stage_root,
+            "Source5 archive read stage path is not canonical")
+    root_info = stage_root.lstat()
+    require(stat.S_ISDIR(root_info.st_mode) and
+            root_info.st_uid == os.getuid() and
+            stat.S_IMODE(root_info.st_mode) == 0o700,
+            "Source5 archive read stage root is not one owned private directory")
+    directory_fd = os.open(
+        stage_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+        getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        names = set()
+        for origin, reference in refs.items():
+            path = Path(reference["path"])
+            require(path.parent == stage_root and path.name and
+                    path.name not in names and
+                    reference["origin_path"] == origin,
+                    "Source5 archive read stage reference escapes or repeats its fixed root")
+            names.add(path.name)
+            before_path = os.stat(path.name, dir_fd=directory_fd,
+                                  follow_symlinks=False)
+            require(stat.S_ISREG(before_path.st_mode) and
+                    before_path.st_uid == os.getuid() and
+                    stat.S_IMODE(before_path.st_mode) == 0o400 and
+                    before_path.st_nlink == 1 and
+                    before_path.st_size == reference["byte_count"],
+                    "Source5 archive read staged object changed before cleanup")
+            descriptor = os.open(
+                path.name, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+                getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=directory_fd,
+            )
+            try:
+                before = os.fstat(descriptor)
+                require(_source5_same_file_identity(before_path, before),
+                        "Source5 archive read staged object changed before open")
+                digest = hashlib.sha256()
+                total = 0
+                while total < reference["byte_count"]:
+                    block = os.read(descriptor, min(
+                        SOURCE5_ARCHIVE_READ_COPY_BYTES,
+                        reference["byte_count"] - total,
+                    ))
+                    require(bool(block),
+                            "Source5 archive read staged object shortened before cleanup")
+                    total += len(block)
+                    digest.update(block)
+                after = os.fstat(descriptor)
+                current = os.stat(path.name, dir_fd=directory_fd,
+                                  follow_symlinks=False)
+                require(os.read(descriptor, 1) == b"" and
+                        total == reference["byte_count"] and
+                        digest.hexdigest() == reference["raw_sha256"] and
+                        _source5_same_file_identity(before, after) and
+                        _source5_same_file_identity(before, current),
+                        "Source5 archive read staged object bytes or identity changed before cleanup")
+            finally:
+                os.close(descriptor)
+            os.unlink(path.name, dir_fd=directory_fd)
+        require(not os.listdir(directory_fd),
+                "Source5 archive read stage contains undeclared residual paths")
+    finally:
+        os.close(directory_fd)
+    parent_fd = os.open(
+        stage_root.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+        getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        current = os.stat(stage_root.name, dir_fd=parent_fd,
+                          follow_symlinks=False)
+        require(_source5_same_file_identity(root_info, current) and
+                not os.listdir(stage_root),
+                "Source5 archive read stage root changed before removal")
+        os.rmdir(stage_root.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _source5_prepare_archive_read_stage(
+    stage_root: Path, objects: list[dict[str, Any]], *,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Create an empty stage or discard only exact interrupted-import slots."""
+    require(cancel_event is None or
+            callable(getattr(cancel_event, "is_set", None)),
+            "Source5 readback stage cancellation token is malformed")
+    require(cancel_event is None or not cancel_event.is_set(),
+            "Source5 readback stage preparation was cancelled")
+    expected = {
+        _source5_archive_read_tar_member_name(row).removeprefix(
+            "objects/",
+        ).replace("/", "-"): row
+        for row in objects
+    }
+    require(len(expected) == len(objects),
+            "Source5 readback stage has colliding source-derived object names")
+    if not stage_root.exists() and not stage_root.is_symlink():
+        stage_root.mkdir(mode=0o700)
+        stage_root.chmod(0o700)
+        return
+    info = stage_root.lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and
+            stat.S_IMODE(info.st_mode) == 0o700,
+            "Source5 interrupted readback stage is not its exact private directory")
+    directory_fd = os.open(
+        stage_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+        getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        for name in os.listdir(directory_fd):
+            require(cancel_event is None or not cancel_event.is_set(),
+                    "Source5 interrupted readback stage inspection was cancelled")
+            row = expected.get(name)
+            require(type(row) is dict,
+                    "Source5 interrupted readback stage has an undeclared child")
+            before_path = os.stat(name, dir_fd=directory_fd,
+                                  follow_symlinks=False)
+            require(stat.S_ISREG(before_path.st_mode) and
+                    before_path.st_uid == os.getuid() and
+                    stat.S_IMODE(before_path.st_mode) in {0o400, 0o600} and
+                    before_path.st_nlink == 1 and
+                    0 <= before_path.st_size <= row["byte_count"],
+                    "Source5 interrupted readback child exceeds its exact object slot")
+            descriptor = os.open(
+                name, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+                getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=directory_fd,
+            )
+            try:
+                before = os.fstat(descriptor)
+                require(_source5_same_file_identity(before_path, before),
+                        "Source5 interrupted readback child changed before open")
+                digest = hashlib.sha256()
+                total = 0
+                while total < before.st_size:
+                    require(cancel_event is None or not cancel_event.is_set(),
+                            "Source5 interrupted readback child inspection was cancelled")
+                    block = os.read(descriptor, min(
+                        SOURCE5_ARCHIVE_READ_COPY_BYTES,
+                        before.st_size - total,
+                    ))
+                    require(bool(block),
+                            "Source5 interrupted readback child shortened during inspection")
+                    total += len(block)
+                    digest.update(block)
+                after = os.fstat(descriptor)
+                current = os.stat(name, dir_fd=directory_fd,
+                                  follow_symlinks=False)
+                require(os.read(descriptor, 1) == b"" and
+                        total == before.st_size and
+                        _source5_same_file_identity(before, after) and
+                        _source5_same_file_identity(before, current),
+                        "Source5 interrupted readback child changed during inspection")
+                if stat.S_IMODE(before.st_mode) == 0o400:
+                    require(before.st_size == row["byte_count"] and
+                            digest.hexdigest() == row["raw_sha256"],
+                            "completed interrupted readback child differs from its exact request pin")
+            finally:
+                os.close(descriptor)
+            os.unlink(name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        require(not os.listdir(directory_fd),
+                "Source5 interrupted readback stage did not become empty")
+    finally:
+        os.close(directory_fd)
+
+
+def _source5_materialize_archive_read_request(
+    request_path: Path, request_raw: bytes, request_pin: dict[str, Any],
+    maximum_bytes: int, pending_pin: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Reuse or recreate one deterministic request after an interrupted read handoff."""
+    request = validate_source5_archive_read_request(request_raw)
+    expected = {
+        "path": str(request_path), "raw_sha256": sha256(request_raw),
+        "semantic_sha256": request["request_sha256"],
+        "byte_count": len(request_raw),
+    }
+    require(request_path.is_absolute() and
+            request_path.resolve(strict=False) == request_path and
+            type(request_pin) is dict and
+            request_pin == {
+                "raw_sha256": expected["raw_sha256"],
+                "semantic_sha256": expected["semantic_sha256"],
+            } and 0 < len(request_raw) <= maximum_bytes,
+            "Source5 deterministic read request differs from its source-derived slot pin")
+    require(pending_pin is None or pending_pin == expected,
+            "Source5 interrupted read request differs from its append-only request pin")
+    if request_path.exists() or request_path.is_symlink():
+        saved_raw, saved_sha, info = read_stable(
+            request_path, "Source5 existing fixed archive read request slot",
+            maximum_bytes,
+        )
+        require(saved_raw == request_raw and saved_sha == expected["raw_sha256"] and
+                stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1,
+                "Source5 existing read request slot differs from deterministic original bytes")
+    else:
+        write_new(request_path, request_raw,
+                  "Source5 deterministic resumed archive read request")
+    return expected
+
+
+@contextmanager
+def archived_job_read_view(
+    context: CampaignContext, job: dict[str, Any], purpose: str,
+    *, cancel_event: threading.Event | None = None,
+):
+    """Read one exact ACKed job from Root into one bounded read-only local view."""
+    require(cancel_event is None or not cancel_event.is_set(),
+            "Source5 archive read view was cancelled before request publication")
+    require(context.manifest.get("schema") in {EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA} and
+            context.source5_archive_read_schedule is not None and
+            context.source5_archive_read_slot_paths is not None and
+            context.source5_archive_read_caps is not None,
+            "Source5 archived read view requires the exact prepared v4 readback layout")
+    cursor, _previous, _event_count, pending = \
+        _source5_archive_read_control_ledger_state(context)
+    require(cursor < len(context.source5_archive_read_schedule),
+            "Source5 archive read-control ledger has no remaining Plan row")
+    schedule_row = context.source5_archive_read_schedule[cursor]
+    require(schedule_row["analysis_phase"] == purpose and
+            schedule_row["job"] == job and
+            schedule_row["request_ordinal"] == cursor,
+            "Source5 archive read call differs from the next exact original Plan schedule row")
+    closure = _source5_verify_persisted_archive_read_closure(
+        context, schedule_row["owner_phase"], job,
+    )
+    manifest = closure["manifest"]
+    objects = [{
+        "owner_job_sha256": closure["job_sha256"],
+        "origin_path": row["origin_path"],
+        "raw_sha256": row["raw_sha256"],
+        "byte_count": row["byte_count"],
+    } for row in manifest["objects"]]
+    caps = schedule_row["caps"]
+    request, request_raw, request_pin = build_source5_archive_read_request(
+        context.manifest["campaign_id"], context.host_id, purpose, cursor,
+        objects, caps["bundle_bytes"],
+    )
+    slot_paths = context.source5_archive_read_slot_paths
+    request_path = Path(slot_paths["source5_archive_read_request_slot"])
+    response_path = Path(slot_paths["source5_archive_read_response_slot"])
+    response_incoming = Path(slot_paths[
+        "source5_archive_read_response_incoming"]
+    )
+    bundle_path = Path(slot_paths["source5_archive_read_bundle"])
+    bundle_incoming = Path(slot_paths[
+        "source5_archive_read_bundle_incoming"]
+    )
+    stage_root = Path(slot_paths["source5_archive_read_stage"])
+    _private_directory(request_path.parent)
+    request_pin = _source5_materialize_archive_read_request(
+        request_path, request_raw, request_pin,
+        caps["maximum_request_bytes"], pending,
+    )
+    if pending is None:
+        require(cancel_event is None or not cancel_event.is_set(),
+                "Source5 archive read view was cancelled before request publication")
+        _source5_append_archive_read_control_event(
+            context, schedule_row, "request_published",
+            request_pin=request_pin, response_pin=None, bundle_pin=None,
+            object_manifest_pin=closure["manifest_pin"],
+        )
+    _source5_prepare_archive_read_stage(
+        stage_root, request["objects"], cancel_event=cancel_event,
+    )
+    while not (response_path.exists() and bundle_path.exists()):
+        if cancel_event is not None and cancel_event.is_set():
+            raise Source5CampaignError(
+                "Source5 analyzer stopped waiting for its bounded archive readback",
+            )
+        time.sleep(0.25)
+    response_raw, response_sha, response_info = read_stable(
+        response_path, "Source5 published archive read response",
+        caps["maximum_response_bytes"],
+    )
+    require(stat.S_ISREG(response_info.st_mode) and
+            response_info.st_uid == os.getuid() and
+            stat.S_IMODE(response_info.st_mode) == 0o600 and
+            response_info.st_nlink == 1,
+            "Source5 published archive read response is not one private regular file")
+    bundle_sha, bundle_bytes = _source5_hash_archive_read_bundle(
+        bundle_path, caps["bundle_bytes"],
+        "Source5 published archive read bundle",
+        cancel_event=cancel_event,
+    )
+    try:
+        result = validate_source5_archive_read_response(
+            request_raw, response_raw, bundle_path, stage_root,
+            caps["bundle_bytes"], manifest,
+            cancel_event=cancel_event,
+        )
+    except BaseException:
+        _source5_prepare_archive_read_stage(stage_root, request["objects"])
+        raise
+    response_pin = {
+        "path": str(response_path), "raw_sha256": response_sha,
+        "semantic_sha256": result["response_pin"]["semantic_sha256"],
+        "byte_count": len(response_raw),
+    }
+    bundle_pin = {"path": str(bundle_path), "raw_sha256": bundle_sha,
+                  "byte_count": bundle_bytes}
+    require(result["response_pin"]["raw_sha256"] == response_sha and
+            result["bundle_pin"] == {
+                "raw_sha256": bundle_sha, "byte_count": bundle_bytes,
+            } and set(result["refs"]) == {
+                row["origin_path"] for row in manifest["objects"]
+            },
+            "Source5 archive read response did not close the exact signed object manifest")
+    view = {
+        "schema": "allocatbelt.application-source5-archived-job-read-view.v1",
+        "campaign_id": context.manifest["campaign_id"],
+        "host_id": context.host_id,
+        "phase": schedule_row["owner_phase"],
+        "job_index": schedule_row["job_index"],
+        "ordinal": job["ordinal"], "run_id": job["run_id"],
+        "job_sha256": closure["job_sha256"],
+        "checkpoint_pin": closure["checkpoint_pin"],
+        "checkpoint_raw": closure["checkpoint_raw"],
+        "manifest_pin": closure["manifest_pin"],
+        "manifest_raw": closure["manifest_raw"],
+        "archive_ack_pin": closure["ack_pin"],
+        "signature_pin": closure["signature_pin"],
+        "archive_request_pin": closure["request_pin"],
+        "archive_request_raw": closure["request_raw"],
+        "fixed_host_receipt_pin": closure["host_receipt_pin"],
+        "owner_host_receipt_pin": closure["owner_host_receipt_pin"],
+        "readback_request_pin": {key: request_pin[key] for key in (
+            "path", "raw_sha256", "semantic_sha256",
+        )},
+        "readback_response_pin": response_pin,
+        "readback_bundle_pin": bundle_pin,
+        "stage_root": str(stage_root),
+        "objects": result["refs"],
+        "qualification_eligible": False, "may_reclaim": False,
+    }
+    completed = False
+    try:
+        yield view
+        require(cancel_event is None or not cancel_event.is_set(),
+                "Source5 archive read view was cancelled before reader completion")
+        completed = True
+    finally:
+        if completed:
+            _source5_remove_archive_read_stage(stage_root, result["refs"])
+            _source5_unlink_exact_private_file(
+                request_path, request_pin["raw_sha256"],
+                caps["maximum_request_bytes"], "archive read request slot",
+            )
+            _source5_unlink_exact_private_file(
+                response_path, response_pin["raw_sha256"],
+                caps["maximum_response_bytes"], "archive read response slot",
+            )
+            _source5_unlink_exact_private_file(
+                bundle_path, bundle_pin["raw_sha256"],
+                caps["bundle_bytes"], "archive read bundle slot",
+            )
+            require(not response_incoming.exists() and
+                    not bundle_incoming.exists(),
+                    "Source5 archive read publication left an incoming duplicate")
+            require(cancel_event is None or not cancel_event.is_set(),
+                    "Source5 archive read view was cancelled before completion publication")
+            _source5_append_archive_read_control_event(
+                context, schedule_row, "response_verified",
+                request_pin=request_pin, response_pin=response_pin,
+                bundle_pin=bundle_pin,
+                object_manifest_pin=closure["manifest_pin"],
+            )
+
+
+def _source5_completed_archive_read_schedule_row(
+    schedule: list[dict[str, Any]], used_ordinals: set[int],
+    job: dict[str, Any], purpose: str, use: str,
+) -> dict[str, Any]:
+    """Choose one completed source-derived read ordinal, never a new row."""
+    require(type(schedule) is list and type(used_ordinals) is set and
+            type(job) is dict and type(purpose) is str and purpose and
+            type(use) is str and use,
+            "Source5 completed-read schedule selector inputs are malformed")
+    matches = [row for row in schedule
+               if type(row) is dict and row.get("analysis_phase") == purpose and
+               row.get("job") == job and row.get("use") == use]
+    require(matches,
+            "Source5 completed read has no exact original Plan schedule row")
+    matches.sort(key=lambda row: row["request_ordinal"])
+    if use in {"phase_analysis", "final_replay"}:
+        require(len(matches) == 1,
+                "Source5 completed owner read does not have one unique original schedule row")
+        # Owner verification and exact pilot projection may reopen the same
+        # completed request; this is byte revalidation, not a new read event.
+        return matches[0]
+    available = [row for row in matches
+                 if row.get("request_ordinal") not in used_ordinals]
+    require(available,
+            "Source5 completed read would consume an absent or repeated Plan ordinal")
+    return available[0]
+
+
+class _Source5CompletedArchiveReadProvider:
+    """IO-only provider that replays completed request ordinals without appends."""
+
+    def __init__(
+        self, context: CampaignContext,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        require(context.manifest.get("schema") in {EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA} and
+                type(context.source5_archive_read_schedule) is list and
+                type(context.source5_archive_read_slot_paths) is dict and
+                type(context.source5_archive_read_caps) is dict,
+                "Source5 completed-read provider requires the exact v4 readback layout")
+        require(cancel_event is None or
+                callable(getattr(cancel_event, "is_set", None)),
+                "Source5 completed-read cancellation token is malformed")
+        ledger = Path(context.source5_archive_read_slot_paths[
+            "source5_archive_read_control_ledger"
+        ])
+        require(ledger.is_absolute() and ledger.is_file() and
+                not ledger.is_symlink(),
+                "Source5 completed-read provider requires its retained control ledger")
+        ordinal, _head, _count, pending = \
+            _source5_archive_read_control_ledger_state(
+                context, force_reload=True,
+            )
+        require(ordinal > 0 and pending is None,
+                "Source5 completed-read provider refuses an empty or pending control ledger")
+        self.context = context
+        self.cancel_event = cancel_event
+        self._used_ordinals: set[int] = set()
+        self._provider_lock = threading.Lock()
+
+    @contextmanager
+    def open_view(self, job: dict[str, Any], purpose: str, *, use: str):
+        # One operation holds one window through validation and consumption.
+        with self._provider_lock:
+            row = _source5_completed_archive_read_schedule_row(
+                self.context.source5_archive_read_schedule,
+                self._used_ordinals, job, purpose, use,
+            )
+            self._used_ordinals.add(row["request_ordinal"])
+            with _source5_replay_completed_archive_read_view(
+                    self.context, row,
+                    cancel_event=self.cancel_event) as view:
+                yield view
+
+
+def source5_completed_archive_read_provider(
+    context: CampaignContext, *,
+    cancel_event: threading.Event | None = None,
+) -> _Source5CompletedArchiveReadProvider:
+    """Return the raw-view-only provider for a previously completed v4 ledger."""
+    return _Source5CompletedArchiveReadProvider(context, cancel_event)
+
+
+class _Source5ScheduledArchiveReadProvider:
+    """Expose only the next source-scheduled live archive row, one view at a time."""
+
+    def __init__(self, context: CampaignContext) -> None:
+        require(context.manifest.get("schema") in {EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA} and
+                type(context.source5_archive_read_schedule) is list and
+                type(context.source5_archive_read_slot_paths) is dict and
+                type(context.source5_archive_read_caps) is dict,
+                "Source5 scheduled archive provider requires the exact v4 readback layout")
+        self.context = context
+        self._provider_lock = threading.Lock()
+
+    @contextmanager
+    def open_view(self, job: dict[str, Any], purpose: str, *, use: str):
+        context = self.context
+        require(type(job) is dict and type(purpose) is str and purpose and
+                type(use) is str and use,
+                "Source5 scheduled archive view request is malformed")
+        with self._provider_lock:
+            ordinal, _head, _count, pending = \
+                _source5_archive_read_control_ledger_state(
+                    context, force_reload=True,
+                )
+            schedule = context.source5_archive_read_schedule
+            require(pending is None and ordinal < len(schedule),
+                    "Source5 scheduled archive provider has no closed next Plan row")
+            row = schedule[ordinal]
+            require(row.get("request_ordinal") == ordinal and
+                    row.get("analysis_phase") == purpose and
+                    row.get("use") == use and row.get("job") == job,
+                    "Source5 scheduled archive view differs from its exact next Plan row/use")
+            with archived_job_read_view(context, job, purpose) as view:
+                if job.get("phase") == "exploration" and use == "final_replay":
+                    record_pin = _raw_record_pin(
+                        _phase_root(context, "exploration"), job["run_id"],
+                    )
+                    record, record_raw, record_sha = read_json(
+                        Path(record_pin["path"]),
+                        "Source5 final exploration capacity record",
+                        4 * 1024 * 1024, record_pin["raw_sha256"],
+                    )
+                    require(record_raw == canonical_bytes(record) and
+                            record_sha == record_pin["raw_sha256"] and
+                            record.get("job") == job and
+                            record.get("state") == "valid_pair",
+                            "Source5 final exploration capacity record changed")
+                    _source5_capture_fixed_capacity_projection(
+                        context, record, view,
+                    )
+                yield view
+
+
+def _source5_wait_for_archive_read_pair(
+    response_path: Path, bundle_path: Path,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Wait for both separately atomically published response members."""
+    require(response_path.is_absolute() and bundle_path.is_absolute() and
+            (cancel_event is None or
+             callable(getattr(cancel_event, "is_set", None))),
+            "Source5 completed read response wait paths or cancellation token are malformed")
+    while True:
+        require(cancel_event is None or not cancel_event.is_set(),
+                "Source5 completed archive read was cancelled while awaiting its exact response pair")
+        response_ready = response_path.exists() or response_path.is_symlink()
+        bundle_ready = bundle_path.exists() or bundle_path.is_symlink()
+        if response_ready and bundle_ready:
+            return
+        time.sleep(0.25)
+
+
+@contextmanager
+def _source5_replay_completed_archive_read_view(
+    context: CampaignContext, schedule_row: dict[str, Any], *,
+    cancel_event: threading.Event | None = None,
+):
+    """Reopen exact Root objects under a completed control pair, without append."""
+    job = schedule_row["job"]
+    purpose = schedule_row["analysis_phase"]
+    request_ordinal = schedule_row["request_ordinal"]
+    require(context.manifest.get("schema") in {EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA} and
+            type(schedule_row) is dict and
+            type(request_ordinal) is int and request_ordinal >= 0 and
+            type(job) is dict and type(purpose) is str and
+            (cancel_event is None or
+             callable(getattr(cancel_event, "is_set", None))),
+            "Source5 completed archive read row is malformed")
+    require(cancel_event is None or not cancel_event.is_set(),
+            "Source5 completed archive read was cancelled before closure verification")
+    captured_pair: dict[str, dict[str, Any]] = {}
+    cursor, _previous, _event_count, pending = \
+        _source5_archive_read_control_ledger_state(
+            context, capture_request_ordinal=request_ordinal,
+            capture_output=captured_pair,
+        )
+    require(request_ordinal < cursor and pending is None,
+            "Source5 completed archive read ordinal is not closed")
+    closure = _source5_verify_persisted_archive_read_closure(
+        context, schedule_row["owner_phase"], job,
+    )
+    require(schedule_row["job_sha256"] == closure["job_sha256"] and
+            schedule_row["job_index"] == closure["manifest"]["job_index"],
+            "Source5 completed read schedule differs from its signed original job identity")
+    manifest = closure["manifest"]
+    objects = [{
+        "owner_job_sha256": closure["job_sha256"],
+        "origin_path": row["origin_path"],
+        "raw_sha256": row["raw_sha256"],
+        "byte_count": row["byte_count"],
+    } for row in manifest["objects"]]
+    caps = schedule_row["caps"]
+    request, request_raw, request_pin = build_source5_archive_read_request(
+        context.manifest["campaign_id"], context.host_id, purpose,
+        request_ordinal, objects, caps["bundle_bytes"],
+    )
+    slot_paths = context.source5_archive_read_slot_paths
+    request_path = Path(slot_paths["source5_archive_read_request_slot"])
+    response_path = Path(slot_paths["source5_archive_read_response_slot"])
+    response_incoming = Path(slot_paths[
+        "source5_archive_read_response_incoming",
+    ])
+    bundle_path = Path(slot_paths["source5_archive_read_bundle"])
+    bundle_incoming = Path(slot_paths[
+        "source5_archive_read_bundle_incoming",
+    ])
+    stage_root = Path(slot_paths["source5_archive_read_stage"])
+    recorded_request = captured_pair["request_published"]
+    recorded_response = captured_pair["response_verified"]
+    expected_request_pin = {
+        "path": str(request_path), "raw_sha256": sha256(request_raw),
+        "semantic_sha256": request["request_sha256"],
+        "byte_count": len(request_raw),
+    }
+    require(recorded_request["analysis_phase"] == purpose and
+            recorded_request["request_use"] == schedule_row["use"] and
+            recorded_request["request_ordinal"] == request_ordinal and
+            recorded_request["owner_job"] == {
+                "phase": schedule_row["owner_phase"],
+                "job_index": schedule_row["job_index"],
+                "ordinal": job["ordinal"], "run_id": job["run_id"],
+                "job_sha256": closure["job_sha256"],
+            } and
+            recorded_request["object_manifest_pin"] == closure["manifest_pin"] and
+            recorded_response["analysis_phase"] == purpose and
+            recorded_response["request_use"] == schedule_row["use"] and
+            recorded_response["request_ordinal"] == request_ordinal and
+            recorded_response["owner_job"] == recorded_request["owner_job"] and
+            recorded_response["object_manifest_pin"] == closure["manifest_pin"] and
+            recorded_request["request_pin"] == expected_request_pin and
+            recorded_response["request_pin"] == expected_request_pin,
+            "Source5 deterministic completed request differs from its captured control pair")
+    response_pin = recorded_response["response_pin"]
+    bundle_pin = recorded_response["bundle_pin"]
+    require(type(response_pin) is dict and type(bundle_pin) is dict and
+            response_pin["path"] == str(response_path) and
+            bundle_pin["path"] == str(bundle_path) and
+            response_pin["byte_count"] <= caps["maximum_response_bytes"] and
+            bundle_pin["byte_count"] == _source5_archive_read_tar_size(objects) and
+            bundle_pin["byte_count"] <= caps["bundle_bytes"],
+            "Source5 completed response pins exceed their original bounded slots")
+
+    _private_directory(request_path.parent)
+    require(not response_incoming.exists() and
+            not response_incoming.is_symlink() and
+            not bundle_incoming.exists() and not bundle_incoming.is_symlink(),
+            "Source5 completed read refuses a partial incoming publication")
+    request_pin = _source5_materialize_archive_read_request(
+        request_path, request_raw, request_pin,
+        caps["maximum_request_bytes"], None,
+    )
+    require(request_pin == expected_request_pin,
+            "Source5 materialized completed request differs from its recorded pin")
+
+    _source5_prepare_archive_read_stage(
+        stage_root, request["objects"], cancel_event=cancel_event,
+    )
+    _source5_wait_for_archive_read_pair(
+        response_path, bundle_path, cancel_event,
+    )
+    require(cancel_event is None or not cancel_event.is_set(),
+            "Source5 completed archive read was cancelled before response validation")
+    response_raw, response_sha, response_info = read_stable(
+        response_path, "Source5 replayed completed archive read response",
+        caps["maximum_response_bytes"], response_pin["raw_sha256"],
+    )
+    require(stat.S_ISREG(response_info.st_mode) and
+            response_info.st_uid == os.getuid() and
+            stat.S_IMODE(response_info.st_mode) == 0o600 and
+            response_info.st_nlink == 1 and
+            len(response_raw) == response_pin["byte_count"] and
+            response_sha == response_pin["raw_sha256"],
+            "Source5 replayed response differs from its exact completed raw pin")
+    bundle_sha, bundle_bytes = _source5_hash_archive_read_bundle(
+        bundle_path, caps["bundle_bytes"],
+        "Source5 replayed completed archive read bundle",
+        cancel_event=cancel_event,
+    )
+    require(bundle_sha == bundle_pin["raw_sha256"] and
+            bundle_bytes == bundle_pin["byte_count"],
+            "Source5 replayed bundle differs from its exact completed raw pin")
+    confirmed_request_raw, confirmed_request_sha, request_info = read_stable(
+        request_path, "Source5 replayed completed archive read request",
+        caps["maximum_request_bytes"], expected_request_pin["raw_sha256"],
+    )
+    require(confirmed_request_raw == request_raw and
+            confirmed_request_sha == expected_request_pin["raw_sha256"] and
+            stat.S_ISREG(request_info.st_mode) and
+            request_info.st_uid == os.getuid() and
+            stat.S_IMODE(request_info.st_mode) == 0o600 and
+            request_info.st_nlink == 1,
+            "Source5 replayed request slot changed after Root read it")
+    result = validate_source5_archive_read_response(
+        request_raw, response_raw, bundle_path, stage_root,
+        caps["bundle_bytes"], manifest,
+        cancel_event=cancel_event,
+    )
+    require(result["response_pin"]["raw_sha256"] == response_sha and
+            result["response_pin"]["semantic_sha256"] ==
+                response_pin["semantic_sha256"] and
+            result["bundle_pin"] == {
+                "raw_sha256": bundle_sha, "byte_count": bundle_bytes,
+            } and set(result["refs"]) == {
+                row["origin_path"] for row in manifest["objects"]
+            },
+            "Source5 replayed response does not close the exact signed object manifest")
+    view = {
+        "schema": "allocatbelt.application-source5-archived-job-read-view.v1",
+        "campaign_id": context.manifest["campaign_id"],
+        "host_id": context.host_id,
+        "phase": schedule_row["owner_phase"],
+        "job_index": schedule_row["job_index"],
+        "ordinal": job["ordinal"], "run_id": job["run_id"],
+        "job_sha256": closure["job_sha256"],
+        "checkpoint_pin": closure["checkpoint_pin"],
+        "checkpoint_raw": closure["checkpoint_raw"],
+        "manifest_pin": closure["manifest_pin"],
+        "manifest_raw": closure["manifest_raw"],
+        "archive_ack_pin": closure["ack_pin"],
+        "signature_pin": closure["signature_pin"],
+        "archive_request_pin": closure["request_pin"],
+        "archive_request_raw": closure["request_raw"],
+        "fixed_host_receipt_pin": closure["host_receipt_pin"],
+        "owner_host_receipt_pin": closure["owner_host_receipt_pin"],
+        "readback_request_pin": {
+            key: expected_request_pin[key]
+            for key in ("path", "raw_sha256", "semantic_sha256")
+        },
+        "readback_response_pin": response_pin,
+        "readback_bundle_pin": bundle_pin,
+        "stage_root": str(stage_root),
+        "objects": result["refs"],
+        "qualification_eligible": False, "may_reclaim": False,
+    }
+    completed = False
+    try:
+        yield view
+        require(cancel_event is None or not cancel_event.is_set(),
+                "Source5 completed archive read was cancelled before view completion")
+        completed = True
+    finally:
+        if completed:
+            _source5_remove_archive_read_stage(stage_root, result["refs"])
+            _source5_unlink_exact_private_file(
+                request_path, expected_request_pin["raw_sha256"],
+                caps["maximum_request_bytes"],
+                "replayed archive read request slot",
+            )
+            _source5_unlink_exact_private_file(
+                response_path, response_sha,
+                caps["maximum_response_bytes"],
+                "replayed archive read response slot",
+            )
+            _source5_unlink_exact_private_file(
+                bundle_path, bundle_sha, caps["bundle_bytes"],
+                "replayed archive read bundle slot",
+            )
+            require(not response_incoming.exists() and
+                    not bundle_incoming.exists(),
+                    "Source5 completed read left an incoming publication")
+
+
+def _source5_archive_read_control_event(
+    context: CampaignContext, schedule_row: dict[str, Any], action: str,
+    sequence: int, slot_paths: dict[str, str],
+    *, request_pin: dict[str, Any], response_pin: dict[str, Any] | None,
+    bundle_pin: dict[str, Any] | None, object_manifest_pin: dict[str, str],
+) -> dict[str, Any]:
+    require(action in {"request_published", "response_verified"} and
+            type(sequence) is int and 1 <= sequence < (1 << 64),
+            "Source5 read-control event action or sequence is malformed")
+    job = schedule_row["job"]
+    body = {
+        "schema": SOURCE5_ARCHIVE_READ_CONTROL_EVENT_SCHEMA_V1,
+        "sequence": sequence,
+        "campaign_id": context.manifest["campaign_id"],
+        "host_id": context.host_id,
+        "action": action,
+        "analysis_phase": schedule_row["analysis_phase"],
+        "request_use": schedule_row["use"],
+        "request_ordinal": schedule_row["request_ordinal"],
+        "owner_job": {
+            "phase": schedule_row["owner_phase"],
+            "job_index": schedule_row["job_index"],
+            "ordinal": job["ordinal"], "run_id": job["run_id"],
+            "job_sha256": schedule_row["job_sha256"],
+        },
+        "object_manifest_pin": object_manifest_pin,
+        "request_slot_path": slot_paths["source5_archive_read_request_slot"],
+        "response_slot_path": slot_paths["source5_archive_read_response_slot"],
+        "bundle_slot_path": slot_paths["source5_archive_read_bundle"],
+        "request_pin": request_pin,
+        "response_pin": response_pin,
+        "bundle_pin": bundle_pin,
+        "object_count": schedule_row["caps"]["object_count"],
+        "payload_bytes": schedule_row["caps"]["stage_bytes"],
+        "qualification_eligible": False,
+    }
+    return body
+
+
+def _source5_archive_read_control_ledger_byte_bound(
+    context: CampaignContext, schedule: list[dict[str, Any]],
+    slot_paths: dict[str, str],
+) -> dict[str, int]:
+    """Bound every canonical request/response control event for this exact Plan."""
+    event_count = 2 * len(schedule)
+    total = 0
+    maximum_line_bytes = 0
+    metadata_root = (context.output_root / context.manifest["campaign_id"] /
+                     "chronology" / context.host_id / "evidence-checkpoints")
+    for item in schedule:
+        job = item["job"]
+        leaf = f"{job['ordinal']:06d}-{item['job_sha256']}"
+        manifest_path = (metadata_root / item["owner_phase"] /
+                         f"{leaf}.object-manifest.json")
+        object_manifest_pin = {
+            "path": str(manifest_path), "raw_sha256": "f" * 64,
+            "semantic_sha256": "f" * 64,
+        }
+        request_pin = {
+            "path": slot_paths["source5_archive_read_request_slot"],
+            "raw_sha256": "f" * 64, "semantic_sha256": "f" * 64,
+            "byte_count": item["caps"]["maximum_request_bytes"],
+        }
+        response_pin = {
+            "path": slot_paths["source5_archive_read_response_slot"],
+            "raw_sha256": "f" * 64, "semantic_sha256": "f" * 64,
+            "byte_count": item["caps"]["maximum_response_bytes"],
+        }
+        bundle_pin = {
+            "path": slot_paths["source5_archive_read_bundle"],
+            "raw_sha256": "f" * 64,
+            "byte_count": item["caps"]["bundle_bytes"],
+        }
+        request_line = canonical_bytes({
+            "previous_sha256": "f" * 64,
+            "record": _source5_archive_read_control_event(
+                context, item, "request_published",
+                2 * item["request_ordinal"] + 1,
+                slot_paths, request_pin=request_pin,
+                response_pin=None, bundle_pin=None,
+                object_manifest_pin=object_manifest_pin,
+            ),
+            "record_sha256": "f" * 64,
+        })
+        response_line = canonical_bytes({
+            "previous_sha256": "f" * 64,
+            "record": _source5_archive_read_control_event(
+                context, item, "response_verified",
+                2 * item["request_ordinal"] + 2,
+                slot_paths, request_pin=request_pin,
+                response_pin=response_pin, bundle_pin=bundle_pin,
+                object_manifest_pin=object_manifest_pin,
+            ),
+            "record_sha256": "f" * 64,
+        })
+        total += len(request_line) + len(response_line)
+        maximum_line_bytes = max(maximum_line_bytes, len(request_line),
+                                 len(response_line))
+    require(event_count > 0 and total > 0,
+            "Source5 archive read-control ledger has no exact Plan events")
+    return {"maximum_bytes": total,
+            "maximum_line_bytes": maximum_line_bytes,
+            "maximum_event_count": event_count}
+
+
+def _source5_archive_read_control_ledger_state(
+    context: CampaignContext, *,
+    capture_request_ordinal: int | None = None,
+    capture_output: dict[str, dict[str, Any]] | None = None,
+    force_reload: bool = False,
+) -> tuple[int, str, int, dict[str, Any] | None]:
+    """Replay the bounded append-only read-control chain without loading it whole."""
+    require((capture_request_ordinal is None and capture_output is None) or
+            (type(capture_request_ordinal) is int and
+             capture_request_ordinal >= 0 and
+             type(capture_output) is dict and not capture_output),
+            "Source5 archive read-control capture request is malformed")
+    require(type(force_reload) is bool,
+            "Source5 archive read-control reload selector is malformed")
+    if (context.source5_archive_read_ledger_loaded and capture_output is None and
+            not force_reload):
+        return (
+            context.source5_archive_read_ordinal,
+            context.source5_archive_read_previous_sha256,
+            context.source5_archive_read_event_count,
+            context.source5_archive_read_pending_request_pin,
+        )
+    require(type(context.source5_archive_read_slot_paths) is dict and
+            type(context.source5_archive_read_caps) is dict and
+            type(context.source5_archive_read_schedule) is list,
+            "Source5 archive read-control ledger lacks its prepared bounded layout")
+    path = Path(context.source5_archive_read_slot_paths[
+        "source5_archive_read_control_ledger"]
+    )
+    maximum_bytes = context.source5_archive_read_caps["control_ledger_bytes"]
+    maximum_line = context.source5_archive_read_caps[
+        "control_ledger_line_bytes"]
+    try:
+        before_path = path.lstat()
+    except FileNotFoundError:
+        if path.parent.exists() or path.parent.is_symlink():
+            parent_info = path.parent.lstat()
+            require(stat.S_ISDIR(parent_info.st_mode) and
+                    parent_info.st_uid == os.getuid() and
+                    stat.S_IMODE(parent_info.st_mode) == 0o700 and
+                    not any(path.parent.iterdir()),
+                    "Source5 archive read-control ledger is missing after other host output exists")
+        else:
+            _private_directory(path.parent)
+        fd = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+            getattr(os, "O_CLOEXEC", 0) |
+            getattr(os, "O_NOFOLLOW", 0), 0o600,
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        parent_fd = os.open(
+            path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+            getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        before_path = path.lstat()
+    require(stat.S_ISREG(before_path.st_mode) and
+            before_path.st_uid == os.getuid() and
+            stat.S_IMODE(before_path.st_mode) == 0o600 and
+            before_path.st_nlink == 1 and
+            0 <= before_path.st_size <= maximum_bytes,
+            "Source5 archive read-control ledger changed type or exceeded its Plan bound")
+    fd = os.open(
+        path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+        getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+    )
+    event_count = 0
+    previous = "0" * 64
+    pending: dict[str, Any] | None = None
+    ledger_digest = hashlib.sha256()
+    try:
+        before = os.fstat(fd)
+        require(_source5_same_file_identity(before_path, before),
+                "Source5 archive read-control ledger changed before open")
+        with os.fdopen(os.dup(fd), "rb", closefd=True) as stream:
+            while True:
+                line = stream.readline(maximum_line + 1)
+                if not line:
+                    break
+                require(len(line) <= maximum_line and line.endswith(b"\n") and
+                        b"\r" not in line,
+                        "Source5 archive read-control line exceeds its derived canonical bound")
+                ledger_digest.update(line)
+                try:
+                    envelope = json.loads(line.decode("ascii"))
+                except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+                    raise Source5CampaignError(
+                        "Source5 archive read-control line is malformed",
+                    ) from error
+                envelope = exact(envelope, {
+                    "previous_sha256", "record", "record_sha256",
+                }, f"Source5 archive read-control envelope[{event_count}]")
+                record = exact(envelope["record"], {
+                    "schema", "sequence", "campaign_id", "host_id", "action",
+                    "analysis_phase", "request_use", "request_ordinal",
+                    "owner_job", "object_manifest_pin", "request_slot_path",
+                    "response_slot_path", "bundle_slot_path", "request_pin",
+                    "response_pin", "bundle_pin", "object_count",
+                    "payload_bytes", "qualification_eligible",
+                }, f"Source5 archive read-control record[{event_count}]")
+                require(line == canonical_bytes(envelope) and
+                        envelope["previous_sha256"] == previous and
+                        record["schema"] == SOURCE5_ARCHIVE_READ_CONTROL_EVENT_SCHEMA_V1 and
+                        record["sequence"] == event_count + 1 and
+                        record["campaign_id"] == context.manifest["campaign_id"] and
+                        record["host_id"] == context.host_id and
+                        record["qualification_eligible"] is False,
+                        f"Source5 archive read-control envelope[{event_count}] chain or identity differs")
+                ordinal = event_count // 2
+                require(ordinal < len(context.source5_archive_read_schedule),
+                        "Source5 archive read-control ledger exceeds its exact Plan schedule")
+                item = context.source5_archive_read_schedule[ordinal]
+                expected_action = ("request_published" if event_count % 2 == 0
+                                   else "response_verified")
+                job = item["job"]
+                metadata_root = (context.output_root /
+                                 context.manifest["campaign_id"] /
+                                 "chronology" / context.host_id /
+                                 "evidence-checkpoints")
+                manifest_path = (metadata_root / item["owner_phase"] /
+                                 f"{job['ordinal']:06d}-{item['job_sha256']}"
+                                 ".object-manifest.json")
+                expected = _source5_archive_read_control_event(
+                    context, item, expected_action, event_count + 1,
+                    context.source5_archive_read_slot_paths,
+                    request_pin=record["request_pin"],
+                    response_pin=(record["response_pin"]
+                                  if expected_action == "response_verified" else None),
+                    bundle_pin=(record["bundle_pin"]
+                                if expected_action == "response_verified" else None),
+                    object_manifest_pin=record["object_manifest_pin"],
+                )
+                require(record == expected and
+                        type(record["object_manifest_pin"]) is dict and
+                        set(record["object_manifest_pin"]) == {
+                            "path", "raw_sha256", "semantic_sha256",
+                        } and
+                        record["object_manifest_pin"]["path"] ==
+                            str(manifest_path) and
+                        all(is_sha(record["object_manifest_pin"][field])
+                            for field in ("raw_sha256", "semantic_sha256")),
+                        f"Source5 archive read-control record[{event_count}] differs from its Plan slot")
+                if capture_output is not None and \
+                        item["request_ordinal"] == capture_request_ordinal:
+                    key = ("request_published" if
+                           expected_action == "request_published" else
+                           "response_verified")
+                    require(key not in capture_output,
+                            "Source5 archive read-control repeats its captured action")
+                    capture_output[key] = dict(record)
+                if expected_action == "request_published":
+                    pin = record["request_pin"]
+                    require(type(pin) is dict and set(pin) == {
+                        "path", "raw_sha256", "semantic_sha256", "byte_count",
+                    } and pin["path"] == context.source5_archive_read_slot_paths[
+                        "source5_archive_read_request_slot"] and
+                        is_sha(pin["raw_sha256"]) and
+                        is_sha(pin["semantic_sha256"]) and
+                        type(pin["byte_count"]) is int and
+                        0 < pin["byte_count"] <= item["caps"]["maximum_request_bytes"],
+                        "Source5 archive read-control request pin is malformed")
+                    pending = pin
+                else:
+                    request_pin = record["request_pin"]
+                    response_pin = record["response_pin"]
+                    bundle_pin = record["bundle_pin"]
+                    require(request_pin == pending and
+                            type(response_pin) is dict and set(response_pin) == {
+                                "path", "raw_sha256", "semantic_sha256",
+                                "byte_count",
+                            } and response_pin["path"] == context.source5_archive_read_slot_paths[
+                                "source5_archive_read_response_slot"] and
+                            is_sha(response_pin["raw_sha256"]) and
+                            is_sha(response_pin["semantic_sha256"]) and
+                            type(response_pin["byte_count"]) is int and
+                            0 < response_pin["byte_count"] <=
+                                item["caps"]["maximum_response_bytes"] and
+                            type(bundle_pin) is dict and set(bundle_pin) == {
+                                "path", "raw_sha256", "byte_count",
+                            } and bundle_pin["path"] == context.source5_archive_read_slot_paths[
+                                "source5_archive_read_bundle"] and
+                            is_sha(bundle_pin["raw_sha256"]) and
+                            type(bundle_pin["byte_count"]) is int and
+                            0 < bundle_pin["byte_count"] <=
+                                item["caps"]["maximum_bundle_bytes"],
+                            "Source5 archive read-control response pins are malformed")
+                    pending = None
+                previous = sha256(canonical_bytes({
+                    "previous_sha256": envelope["previous_sha256"],
+                    "record": record,
+                }))
+                require(envelope["record_sha256"] == previous,
+                        f"Source5 archive read-control record[{event_count}] digest differs")
+                event_count += 1
+        after = os.fstat(fd)
+        after_path = path.lstat()
+        require(_source5_same_file_identity(before, after) and
+                _source5_same_file_identity(before, after_path) and
+                event_count <= context.source5_archive_read_caps[
+                    "control_ledger_event_count"],
+                "Source5 archive read-control ledger changed during replay or exceeds its schedule")
+    finally:
+        os.close(fd)
+    context.source5_archive_read_ordinal = event_count // 2
+    context.source5_archive_read_previous_sha256 = previous
+    context.source5_archive_read_event_count = event_count
+    context.source5_archive_read_pending_request_pin = pending
+    context.source5_archive_read_ledger_raw_sha256 = ledger_digest.hexdigest()
+    context.source5_archive_read_ledger_byte_count = after.st_size
+    context.source5_archive_read_ledger_file_identity = (
+        after.st_dev, after.st_ino, after.st_mode, after.st_size,
+        after.st_mtime_ns, after.st_ctime_ns, after.st_nlink, after.st_uid,
+    )
+    context.source5_archive_read_ledger_loaded = True
+    if capture_output is not None:
+        require(event_count % 2 == 0 and pending is None and
+                capture_request_ordinal < event_count // 2 and
+                set(capture_output) == {
+                    "request_published", "response_verified",
+                },
+                "Source5 completed read-control ordinal is absent, pending, or partial")
+    return event_count // 2, previous, event_count, pending
+
+
+def _source5_append_archive_read_control_event(
+    context: CampaignContext, schedule_row: dict[str, Any], action: str,
+    *, request_pin: dict[str, Any], response_pin: dict[str, Any] | None,
+    bundle_pin: dict[str, Any] | None,
+    object_manifest_pin: dict[str, str],
+) -> None:
+    cursor, previous, event_count, pending = \
+        _source5_archive_read_control_ledger_state(context)
+    require(context.source5_archive_read_ordinal == cursor and
+            context.source5_archive_read_event_count == event_count and
+            context.source5_archive_read_previous_sha256 == previous and
+            schedule_row["request_ordinal"] == cursor,
+            "Source5 archive read-control append cursor differs from its replayed ledger")
+    if action == "request_published":
+        require(event_count % 2 == 0 and pending is None and
+                response_pin is None and bundle_pin is None,
+                "Source5 archive read-control request does not start one exact pair")
+    else:
+        require(action == "response_verified" and event_count % 2 == 1 and
+                pending == request_pin and response_pin is not None and
+                bundle_pin is not None,
+                "Source5 archive read-control response does not close its exact request")
+    record = _source5_archive_read_control_event(
+        context, schedule_row, action, event_count + 1,
+        context.source5_archive_read_slot_paths,
+        request_pin=request_pin, response_pin=response_pin,
+        bundle_pin=bundle_pin, object_manifest_pin=object_manifest_pin,
+    )
+    digest = sha256(canonical_bytes({
+        "previous_sha256": previous, "record": record,
+    }))
+    raw = canonical_bytes({
+        "previous_sha256": previous, "record": record,
+        "record_sha256": digest,
+    })
+    path = Path(context.source5_archive_read_slot_paths[
+        "source5_archive_read_control_ledger"]
+    )
+    caps = context.source5_archive_read_caps
+    require(len(raw) <= caps["control_ledger_line_bytes"],
+            "Source5 archive read-control event exceeded its source-derived line width")
+    parent_fd = os.open(
+        path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+        getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        before_path = os.stat(path.name, dir_fd=parent_fd,
+                              follow_symlinks=False)
+        require(stat.S_ISREG(before_path.st_mode) and
+                before_path.st_uid == os.getuid() and
+                stat.S_IMODE(before_path.st_mode) == 0o600 and
+                before_path.st_nlink == 1,
+                "Source5 archive read-control ledger is not one private regular file")
+        descriptor = os.open(
+            path.name, os.O_RDWR | os.O_APPEND |
+            getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            before = os.fstat(descriptor)
+            require(_source5_same_file_identity(before_path, before) and
+                    before.st_size + len(raw) <= caps["control_ledger_bytes"],
+                    "Source5 archive read-control ledger exceeded its full-Plan byte bound")
+            offset = 0
+            while offset < len(raw):
+                count = os.write(descriptor, raw[offset:])
+                require(count > 0,
+                        "Source5 archive read-control ledger writer made no progress")
+                offset += count
+            os.fsync(descriptor)
+            after = os.fstat(descriptor)
+            path_after = os.stat(path.name, dir_fd=parent_fd,
+                                 follow_symlinks=False)
+            require(after.st_size == before.st_size + len(raw) and
+                    os.pread(descriptor, len(raw), before.st_size) == raw and
+                    os.pread(descriptor, 1, after.st_size) == b"" and
+                    _source5_same_mutable_file_object(before, after) and
+                    _source5_same_mutable_file_object(after, path_after) and
+                    path_after.st_size == after.st_size,
+                    "Source5 archive read-control ledger changed during append")
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_fd)
+    context.source5_archive_read_event_count = event_count + 1
+    context.source5_archive_read_previous_sha256 = digest
+    if action == "response_verified":
+        context.source5_archive_read_ordinal += 1
+        context.source5_archive_read_pending_request_pin = None
+    else:
+        context.source5_archive_read_pending_request_pin = request_pin
+    context.source5_archive_read_ledger_raw_sha256 = None
+    context.source5_archive_read_ledger_byte_count = None
+    context.source5_archive_read_ledger_file_identity = None
+
+
+def _source5_archive_context(
+    context: CampaignContext, phase: str, job_index: int,
+    predecessor_ack_pin: dict[str, str] | None,
+) -> dict[str, Any]:
+    require(context.host_evidence_budget_pin is not None and
+            context.archive_signer_context is not None and
+            context.manifest["schema"] in {
+                EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA},
+            "Source5 archive context requires a closed signed budgeted Source5 profile")
+    source_pin = context.source_manifest_pins[context.host_id]
+    return {
+        "schema": context.modules[EVIDENCE_ARCHIVE_SOURCE_PATH].CONTEXT_SCHEMA_V1,
+        "campaign_id": context.manifest["campaign_id"],
+        "host_id": context.host_id,
+        "phase": phase,
+        "job_index": job_index,
+        "source_manifest_pin": {
+            "path": source_pin["path"],
+            "raw_sha256": source_pin["raw_sha256"],
+            "semantic_sha256": context.sources[context.host_id]["manifest_sha256"],
+        },
+        "execution_manifest_pin": {
+            "path": context.manifest_pin["path"],
+            "raw_sha256": context.manifest_pin["raw_sha256"],
+            "semantic_sha256": context.manifest["manifest_sha256"],
+        },
+        "plan_pin": {
+            "path": context.plan_pin["path"],
+            "raw_sha256": context.plan_pin["raw_sha256"],
+            "semantic_sha256": context.plan_semantic_sha256,
+        },
+        "resource_budget_pin": context.host_evidence_budget_pin,
+        "predecessor_ack_pin": predecessor_ack_pin,
+        "authorized_signer_fingerprint": context.archive_signer_context[
+            "authorized_primary_fingerprint"],
+    }
+
+
+def _source5_preparatory_reclaim_anchor(
+    context: CampaignContext, *, checkpoint: dict[str, Any] | None = None,
+    declarations: list[dict[str, Any]] | None = None,
+) -> Path:
+    """Derive the nofollow IO anchor for the two reserved origin domains.
+
+    The anchor supplies no additional origin authority and receives no new
+    files. Every reclaimed path must remain an exact authenticated job row
+    and signed checkpoint entry under its own artifact or output root.
+    """
+    require(context.manifest.get("schema") == PREPARATORY_EXECUTION_SCHEMA and
+            context.scope == PREPARATORY_SCOPE,
+            "preparatory reclaim anchor requires its exact scoped profile")
+    roots = (context.artifact_root, context.output_root)
+    require(all(isinstance(root, Path) and root.is_absolute() and
+                root.resolve(strict=True) == root for root in roots),
+            "preparatory origin domains are not canonical absolute directories")
+    anchor = Path(os.path.commonpath([str(root) for root in roots]))
+    require(anchor not in roots and anchor != Path("/") and
+            anchor.resolve(strict=True) == anchor,
+            "preparatory origin domains require one private common ancestor")
+    for path in (anchor, *roots):
+        info = path.lstat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o700,
+                "preparatory reclaim anchor or origin domain is not owned and private")
+    require((checkpoint is None and declarations is None) or
+            (type(checkpoint) is dict and type(declarations) is list),
+            "preparatory reclaim origin closure is incomplete")
+    if checkpoint is None:
+        return anchor
+    rows = {row["path"]: row for row in declarations}
+    require(len(rows) == len(declarations),
+            "preparatory reclaim catalogue repeats an origin path")
+    seen = set()
+    for entry in checkpoint["entries"]:
+        origin = entry["origin_path"]
+        row = rows.get(origin)
+        require(origin not in seen and type(row) is dict and row["kind"] == "file" and
+                row["storage_root"] in {str(root) for root in roots} and
+                Path(origin).is_relative_to(Path(row["storage_root"])) and
+                Path(origin) != Path(row["storage_root"]) and
+                row.get("origin_pin") is None and row["phase"] == "exploration" and
+                type(row["run_id"]) is str and row["run_id"] and
+                0 <= entry["byte_count"] <= row["max_file_bytes"],
+                "preparatory reclaim origin leaves its exact signed job catalogue row")
+        seen.add(origin)
+    return anchor
+
+
+def _source5_archive_role_row(
+    declarations: list[dict[str, Any]], role: str,
+) -> dict[str, Any]:
+    rows = [row for row in declarations if row["role"] == role]
+    require(len(rows) == 1 and rows[0]["kind"] == "file" and
+            rows[0]["max_inodes"] == 1 and
+            rows[0]["max_file_bytes"] == rows[0]["max_bytes"],
+            f"Source5 job catalogue lacks one exact {role} file role")
+    return rows[0]
+
+
+def _source5_create_transfer_offer(
+    context: CampaignContext, phase: str, job_index: int,
+    job: dict[str, Any], job_record_pin: dict[str, str],
+    job_record_raw: bytes, predecessor_ack_pin: dict[str, str] | None,
+) -> dict[str, Any]:
+    """Seal one completed job's exact packet and publish its durable ACK offer."""
+    require(context.host_evidence_budget_pin is not None and
+            context.host_evidence_budget_raw is not None,
+            "Source5 per-job archive transfer lacks the frozen host budget bytes")
+    archive = context.modules[EVIDENCE_ARCHIVE_SOURCE_PATH]
+    packet = context.modules[EVIDENCE_TRANSFER_PACKET_SOURCE_PATH]
+    budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    declarations = _source5_job_path_declarations(context, phase, job)
+    excluded = (
+        budget_module.NON_EXPORTABLE_JOB_RECORD_ROLES |
+        budget_module.FAILURE_WINDOW_ONLY_ROLES |
+        budget_module.TRANSIENT_JOB_EVIDENCE_ROLES |
+        budget_module.ARCHIVE_LOCAL_METADATA_ROLES |
+        budget_module.ALWAYS_LOCAL_EVIDENCE_ROLES |
+        {"journal_width_contract", "preparatory_journal_width_contract"}
+    )
+    entries: list[dict[str, Any]] = []
+    owner_receipt_bytes: dict[str, bytes] = {}
+    captured_entries: dict[str, dict[str, Any]] = {}
+    tree_inventories: list[dict[str, Any]] = []
+    for declaration in declarations:
+        if declaration["kind"] != "file" or declaration["role"] in excluded:
+            continue
+        captured = _source5_capture_file_declaration(context, declaration)
+        if captured is None:
+            continue
+        entry = {
+            "origin_path": captured["origin_path"],
+            "role": captured["role"],
+            "byte_count": captured["byte_count"],
+            "raw_sha256": captured["raw_sha256"],
+            "semantic_sha256": captured["semantic_sha256"],
+        }
+        entries.append(entry)
+        captured_entries[entry["origin_path"]] = {
+            **entry, "role": captured["role"],
+        }
+        if "receipt" in declaration["role"].lower():
+            raw, actual, _info = read_stable(
+                Path(declaration["path"]),
+                f"Source5 {phase}/{job['run_id']} owner receipt",
+                declaration["max_file_bytes"],
+            )
+            require(actual == entry["raw_sha256"] and
+                    len(raw) == entry["byte_count"],
+                    "Source5 owner receipt changed between capture and packet request")
+            owner_receipt_bytes[entry["origin_path"]] = raw
+    for declaration in declarations:
+        if declaration["kind"] != "tree" or declaration["role"] == "directory_node":
+            continue
+        require(declaration["role"] in budget_module.SUCCESS_EMPTY_TMP_TREE_ROLES or
+                declaration["role"] == "opaque_trace",
+                "Source5 successful job has an unsupported dynamic tree role")
+        typed_inventory: list[dict[str, Any]] = []
+        tree_rows = list(_source5_capture_tree_declaration(
+            context, declaration, typed_inventory,
+        ))
+        if declaration["role"] in budget_module.SUCCESS_EMPTY_TMP_TREE_ROLES:
+            require(not tree_rows and not typed_inventory,
+                    "Source5 successful owner TMP tree is nonempty despite its independent zero proof")
+            continue
+        for captured in tree_rows:
+            entry = {
+                "origin_path": captured["origin_path"],
+                "role": captured["role"],
+                "byte_count": captured["byte_count"],
+                "raw_sha256": captured["raw_sha256"],
+                "semantic_sha256": captured["semantic_sha256"],
+            }
+            entries.append(entry)
+            captured_entries[entry["origin_path"]] = entry
+        tree_inventories.append(_source5_probe_tree_inventory(
+            context, job, declaration, typed_inventory, tree_rows,
+            captured_entries, owner_receipt_bytes,
+        ))
+    entries.sort(key=lambda row: row["origin_path"])
+    tree_inventories.sort(key=lambda row: row["root_path"])
+    require(entries == sorted(entries, key=lambda row: row["origin_path"]) and
+            len({row["origin_path"] for row in entries}) == len(entries) and
+            entries,
+            "Source5 successful job has no sorted unique reclaimable owner objects")
+    require(type(job_record_pin) is dict and
+            set(job_record_pin) == {"path", "raw_sha256"} and
+            sha256(job_record_raw) == job_record_pin["raw_sha256"] and
+            job_record_raw == canonical_bytes(json.loads(job_record_raw)),
+            "Source5 archive request lacks its exact immutable original job record")
+    require(context.plan_raw and
+            sha256(context.plan_raw) == context.plan_pin["raw_sha256"],
+            "Source5 archive request lacks its exact original PlanV3 bytes")
+    request_row = _source5_archive_role_row(
+        declarations, "source5_checkpoint_request",
+    )
+    packet_row = _source5_archive_role_row(
+        declarations, "source5_transfer_packet",
+    )
+    offer_row = _source5_archive_role_row(
+        declarations, "source5_transfer_offer",
+    )
+    receiver_row = _source5_archive_role_row(
+        declarations, "source5_ack_bundle",
+    )
+    request_path = Path(request_row["path"])
+    packet_path = Path(packet_row["path"])
+    offer_path = Path(offer_row["path"])
+    receiver_path = Path(receiver_row["path"])
+    for parent in (request_path.parent, packet_path.parent,
+                   offer_path.parent, receiver_path.parent):
+        _private_directory(parent)
+    archive_context = _source5_archive_context(
+        context, phase, job_index, predecessor_ack_pin,
+    )
+    request, request_pin = archive.build_checkpoint_request(
+        archive_context, job_record_pin, job_record_raw, context.plan_raw,
+        entries, owner_receipt_bytes, request_path,
+        tree_inventories=tree_inventories,
+    )
+    request_raw = canonical_bytes(request)
+    require(sha256(request_raw) == request_pin["raw_sha256"] and
+            request["request_sha256"] == request_pin["semantic_sha256"],
+            "Source5 checkpoint request changed after its exact write")
+    packet_pin = packet.export_transfer_packet(
+        request_raw, request_pin, context.host_evidence_budget_pin["path"],
+        packet_path, offer_path, receiver_path,
+    )
+    offer, offer_pin = packet.publish_transfer_offer(
+        request_raw, request_pin,
+        {key: packet_pin[key] for key in ("path", "raw_sha256", "byte_count")},
+        context.host_evidence_budget_raw, context.host_evidence_budget_pin,
+        offer_path, receiver_path,
+    )
+    return {
+        "request": request, "request_raw": request_raw,
+        "request_pin": request_pin,
+        "entries": entries, "owner_receipt_bytes": owner_receipt_bytes,
+        "packet_pin": packet_pin, "offer": offer, "offer_pin": offer_pin,
+        "budget_raw": context.host_evidence_budget_raw,
+        "budget_pin": context.host_evidence_budget_pin,
+        "job_record_pin": job_record_pin,
+        "job_record_raw": job_record_raw,
+        "archive_context": archive_context,
+        "declarations": declarations,
+    }
+
+
+def _source5_write_archive_member(
+    declaration: dict[str, Any], raw: bytes, label: str,
+    semantic_sha256: str | None = None,
+) -> dict[str, str]:
+    require(type(raw) is bytes and len(raw) <= declaration["max_file_bytes"] and
+            declaration["kind"] == "file" and
+            declaration["max_inodes"] == 1,
+            f"Source5 {label} exceeds its exact catalogued metadata cap")
+    path = Path(declaration["path"])
+    raw_sha = write_new(path, raw, f"Source5 {label}")
+    require(raw_sha == sha256(raw) and
+            (semantic_sha256 is None or is_sha(semantic_sha256)),
+            f"Source5 {label} changed during its bounded write")
+    return {"path": str(path), "raw_sha256": raw_sha,
+            **({"semantic_sha256": semantic_sha256}
+               if semantic_sha256 is not None else {})}
+
+
+def _source5_wait_for_ack_bundle(
+    path: Path, maximum_bytes: int,
+) -> tuple[bytes, dict[str, Any]]:
+    """Wait for the separate publisher to atomically expose a complete bundle."""
+    while True:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            time.sleep(0.25)
+            continue
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+                0 < info.st_size <= maximum_bytes,
+                "Source5 published ACK receiver is not one bounded private regular file")
+        raw, raw_sha, stable = read_stable(
+            path, "Source5 published durable ACK bundle", maximum_bytes,
+        )
+        require((info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                 info.st_mtime_ns, info.st_ctime_ns, info.st_nlink) ==
+                (stable.st_dev, stable.st_ino, stable.st_mode,
+                 stable.st_size, stable.st_mtime_ns, stable.st_ctime_ns,
+                 stable.st_nlink),
+                "Source5 ACK receiver changed during bounded stable read")
+        return raw, {"path": str(path), "raw_sha256": raw_sha,
+                     "byte_count": len(raw)}
+
+
+def _source5_unlink_exact_private_file(
+    path_value: str | Path, expected_sha256: str, maximum_bytes: int,
+    label: str,
+) -> None:
+    path = Path(path_value)
+    require(path.is_absolute() and path.resolve(strict=True) == path and
+            is_sha(expected_sha256),
+            f"Source5 {label} path or expected digest is not canonical")
+    parent_fd = os.open(
+        path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+        getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        before_path = os.stat(path.name, dir_fd=parent_fd,
+                              follow_symlinks=False)
+        require(stat.S_ISREG(before_path.st_mode) and
+                before_path.st_uid == os.getuid() and
+                stat.S_IMODE(before_path.st_mode) == 0o600 and
+                before_path.st_nlink == 1 and
+                0 < before_path.st_size <= maximum_bytes,
+                f"Source5 {label} changed type or exceeded its exact transient cap")
+        descriptor = os.open(
+            path.name, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+            getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            before = os.fstat(descriptor)
+            require((before.st_dev, before.st_ino, before.st_mode,
+                     before.st_size, before.st_mtime_ns, before.st_ctime_ns,
+                     before.st_nlink, before.st_uid) ==
+                    (before_path.st_dev, before_path.st_ino,
+                     before_path.st_mode, before_path.st_size,
+                     before_path.st_mtime_ns, before_path.st_ctime_ns,
+                     before_path.st_nlink, before_path.st_uid),
+                    f"Source5 {label} changed identity before open")
+            digest = hashlib.sha256()
+            total = 0
+            while total < before.st_size:
+                block = os.read(descriptor, min(1024 * 1024,
+                                                before.st_size - total))
+                require(bool(block), f"Source5 {label} shortened before reclaim")
+                digest.update(block)
+                total += len(block)
+            after = os.fstat(descriptor)
+            require(os.read(descriptor, 1) == b"" and
+                    total == before.st_size and digest.hexdigest() == expected_sha256 and
+                    (before.st_dev, before.st_ino, before.st_mode,
+                     before.st_size, before.st_mtime_ns, before.st_ctime_ns,
+                     before.st_nlink, before.st_uid) ==
+                    (after.st_dev, after.st_ino, after.st_mode, after.st_size,
+                     after.st_mtime_ns, after.st_ctime_ns, after.st_nlink,
+                     after.st_uid),
+                    f"Source5 {label} bytes or identity changed before reclaim")
+        finally:
+            os.close(descriptor)
+        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        require((current.st_dev, current.st_ino, current.st_mode,
+                 current.st_size, current.st_mtime_ns, current.st_ctime_ns,
+                 current.st_nlink, current.st_uid) ==
+                (before_path.st_dev, before_path.st_ino, before_path.st_mode,
+                 before_path.st_size, before_path.st_mtime_ns,
+                 before_path.st_ctime_ns, before_path.st_nlink,
+                 before_path.st_uid),
+                f"Source5 {label} path changed before exact unlink")
+        os.unlink(path.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _source5_wait_verify_and_reclaim_archive_job(
+    context: CampaignContext, handoff: dict[str, Any],
+    predecessor_ack_pin: dict[str, str] | None,
+    phase: str, run_id: str,
+) -> dict[str, Any]:
+    """Verify Root's separate signed ACK, persist its exact docs, then reclaim."""
+    require(context.host_evidence_budget_pin is not None and
+            context.host_evidence_budget_raw is not None and
+            context.archive_signer_context is not None and
+            context.archive_signer_context_pin is not None,
+            "Source5 archive ACK verification lacks its exact local pins")
+    archive = context.modules[EVIDENCE_ARCHIVE_SOURCE_PATH]
+    packet = context.modules[EVIDENCE_TRANSFER_PACKET_SOURCE_PATH]
+    declarations = handoff["declarations"]
+    receiver = handoff["offer"]["acknowledgement_receiver"]
+    bundle_path = Path(receiver["path"])
+    max_bundle_bytes = receiver["maximum_bytes"]
+    print(f"Source5 awaiting signed archive ACK at {bundle_path}",
+          file=sys.stderr, flush=True)
+    bundle_raw, bundle_pin = _source5_wait_for_ack_bundle(
+        bundle_path, max_bundle_bytes,
+    )
+    transferred = packet.read_ack_bundle(
+        bundle_path, handoff["budget_raw"], handoff["budget_pin"],
+        canonical_bytes(handoff["offer"]), handoff["offer_pin"], bundle_pin,
+        canonical_bytes(context.archive_signer_context),
+        context.archive_signer_context_pin,
+        canonical_bytes(context.manifest), {
+            "path": context.manifest_pin["path"],
+            "raw_sha256": context.manifest_pin["raw_sha256"],
+            "semantic_sha256": context.manifest["manifest_sha256"],
+        },
+        journal_width_contract_raw=canonical_bytes(
+            context.journal_width_contract,
+        ),
+        source_manifest_raw=_source5_selected_source_manifest_raw(context),
+    )
+    checkpoint = transferred["checkpoint"]
+    manifest = transferred["manifest"]
+    manifest_rows = {row["origin_path"]: row
+                     for row in manifest["objects"]}
+    stage_rows = []
+    staging_root = (_source5_preparatory_reclaim_anchor(
+        context, checkpoint=checkpoint, declarations=declarations,
+    ) if context.manifest["schema"] == PREPARATORY_EXECUTION_SCHEMA else
+        context.artifact_root)
+    for entry in checkpoint["entries"]:
+        object_row = manifest_rows.get(entry["origin_path"])
+        require(type(object_row) is dict,
+                "Source5 ACK object manifest omits a checkpoint origin")
+        local_file, _literal = archive._staged_descriptor(
+            entry["origin_path"], str(staging_root), entry,
+        )
+        stage_rows.append({
+            "origin_path": entry["origin_path"],
+            "object_id": object_row["object_id"],
+            "remote_object_pin": object_row["object_pin"],
+            "local_staged_file": local_file,
+        })
+    stage_map_body = {
+        "schema": archive.STAGE_MAP_SCHEMA_V1,
+        "checkpoint_pin": transferred["checkpoint_pin"],
+        "object_manifest_pin": transferred["manifest_pin"],
+        "rows": stage_rows,
+        "stage_map_sha256": "",
+    }
+    stage_map = {
+        **stage_map_body,
+        "stage_map_sha256": sha256(canonical_bytes({
+            key: value for key, value in stage_map_body.items()
+            if key != "stage_map_sha256"
+        })),
+    }
+    role_paths = {
+        role: _source5_archive_role_row(declarations, role)
+        for role in (
+            "source5_checkpoint", "source5_object_manifest",
+            "source5_archive_ack", "source5_archive_signature",
+            "source5_stage_map",
+        )
+    }
+    for role, raw, semantic_key, label in (
+        ("source5_checkpoint", transferred["checkpoint_raw"],
+         "checkpoint_sha256", "final checkpoint"),
+        ("source5_object_manifest", transferred["manifest_raw"],
+         "manifest_sha256", "object manifest"),
+        ("source5_archive_ack", transferred["ack_raw"],
+         "ack_sha256", "durable ACK"),
+        ("source5_archive_signature", transferred["signature_raw"],
+         None, "detached signature"),
+        ("source5_stage_map", canonical_bytes(stage_map),
+         "stage_map_sha256", "verified stage map"),
+    ):
+        semantic = (None if semantic_key is None else
+                    transferred["ack"][semantic_key]
+                    if role == "source5_archive_ack" else
+                    stage_map[semantic_key]
+                    if role == "source5_stage_map" else
+                    transferred["checkpoint"][semantic_key]
+                    if role == "source5_checkpoint" else
+                    transferred["manifest"][semantic_key])
+        _source5_write_archive_member(
+            role_paths[role], raw, label, semantic,
+        )
+    stage_map_pin = {
+        "path": role_paths["source5_stage_map"]["path"],
+        "raw_sha256": sha256(canonical_bytes(stage_map)),
+        "semantic_sha256": stage_map["stage_map_sha256"],
+    }
+    signer_context_pin = context.archive_signer_context_pin
+    signer_context_raw = canonical_bytes(context.archive_signer_context)
+    execution_manifest_pin = {
+        "path": context.manifest_pin["path"],
+        "raw_sha256": context.manifest_pin["raw_sha256"],
+        "semantic_sha256": context.manifest["manifest_sha256"],
+    }
+    execution_manifest_raw = canonical_bytes(context.manifest)
+    width_raw = canonical_bytes(context.journal_width_contract)
+    verified = archive.verify_durable_ack(
+        transferred["checkpoint_pin"], checkpoint,
+        transferred["checkpoint_raw"], handoff["request_raw"],
+        handoff["budget_raw"], handoff["job_record_pin"],
+        handoff["job_record_raw"], context.plan_raw,
+        transferred["manifest_pin"], manifest,
+        transferred["manifest_raw"], transferred["ack_pin"],
+        transferred["ack"], transferred["ack_raw"],
+        transferred["signature_pin"], transferred["signature_raw"],
+        signer_context_pin, signer_context_raw, execution_manifest_pin,
+        execution_manifest_raw, stage_map_pin, stage_map,
+        str(staging_root), predecessor_ack_pin,
+        journal_width_contract_raw=width_raw,
+        source_manifest_raw=_source5_selected_source_manifest_raw(context),
+    )
+    archive.reclaim_acknowledged_local_paths(
+        checkpoint, verified, stage_map, str(staging_root),
+        checkpoint_raw=transferred["checkpoint_raw"],
+        request_raw=handoff["request_raw"],
+        host_budget_raw=handoff["budget_raw"],
+        job_record_bytes=handoff["job_record_raw"],
+        plan_bytes=context.plan_raw,
+        object_manifest=manifest,
+        manifest_raw=transferred["manifest_raw"],
+        ack=transferred["ack"], ack_raw=transferred["ack_raw"],
+        signature_raw=transferred["signature_raw"],
+        signer_context_pin=signer_context_pin,
+        signer_context_raw=signer_context_raw,
+        execution_manifest_pin=execution_manifest_pin,
+        execution_manifest_raw=execution_manifest_raw,
+        journal_width_contract_raw=width_raw,
+        source_manifest_raw=_source5_selected_source_manifest_raw(context),
+    )
+    packet_pin = handoff["packet_pin"]
+    _source5_unlink_exact_private_file(
+        packet_pin["path"], packet_pin["raw_sha256"],
+        packet_pin["maximum_packet_bytes"], "transfer packet",
+    )
+    _source5_unlink_exact_private_file(
+        bundle_path, bundle_pin["raw_sha256"], max_bundle_bytes,
+        "ACK response bundle",
+    )
+    if context.source5_archive_ack_pins is None:
+        context.source5_archive_ack_pins = {}
+    context.source5_archive_ack_pins[(phase, run_id)] = transferred["ack_pin"]
+    if context.source5_archive_closures is None:
+        context.source5_archive_closures = {}
+    persisted_record = json.loads(handoff["job_record_raw"])
+    context.source5_archive_closures[(phase, run_id)] = {
+        "job_sha256": sha256(canonical_bytes(persisted_record["job"])),
+        "job_record_pin": handoff["job_record_pin"],
+        "request_pin": handoff["request_pin"],
+        "checkpoint_pin": transferred["checkpoint_pin"],
+        "manifest_pin": transferred["manifest_pin"],
+        "ack_pin": transferred["ack_pin"],
+        "signature_pin": transferred["signature_pin"],
+        "host_receipt_pin": persisted_record.get("evidence", {}).get(
+            "host_receipt",
+        ),
+    }
+    return {
+        "ack_pin": transferred["ack_pin"],
+        "checkpoint_pin": transferred["checkpoint_pin"],
+        "manifest_pin": transferred["manifest_pin"],
+        "signature_pin": transferred["signature_pin"],
+        "verified_capability": verified,
+    }
+
+
+
+def _source5_predecessor_archive_ack_pin(
+    context: CampaignContext, job: dict[str, Any],
+) -> dict[str, str] | None:
+    predecessors = job.get("predecessor_run_ids", [])
+    require(type(predecessors) is list and len(predecessors) <= 1 and
+            all(type(value) is str and value for value in predecessors),
+            "Source5 original job has a malformed PlanV3 predecessor list")
+    if not predecessors:
+        return None
+    require(job["phase"] == "pressure" and
+            context.host_evidence_budget_pin is not None and
+            context.host_evidence_budget_raw is not None and
+            context.archive_signer_context is not None and
+            context.archive_signer_context_pin is not None,
+            "Source5 pressure predecessor lacks the exact source/budget/signer context")
+    predecessor_run_id = predecessors[0]
+    candidates = [row for row in _host_jobs(context, "confirmation")
+                  if row["run_id"] == predecessor_run_id]
+    require(len(candidates) == 1,
+            "Source5 pressure predecessor is not one exact original confirmation job")
+    predecessor = candidates[0]
+    declarations = _source5_job_path_declarations(
+        context, "confirmation", predecessor,
+    )
+    by_role = {
+        role: _source5_archive_role_row(declarations, role)
+        for role in (
+            "source5_checkpoint_request", "source5_job_record",
+            "source5_checkpoint", "source5_object_manifest",
+            "source5_archive_ack", "source5_archive_signature",
+        )
+    }
+
+    def read_member(role: str) -> tuple[bytes, str]:
+        row = by_role[role]
+        raw, digest, info = read_stable(
+            Path(row["path"]),
+            f"Source5 persisted predecessor {role}",
+            row["max_file_bytes"],
+        )
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o600,
+                f"Source5 persisted predecessor {role} is not private regular evidence")
+        return raw, digest
+
+    request_raw, _request_sha = read_member("source5_checkpoint_request")
+    checkpoint_raw, checkpoint_raw_sha = read_member("source5_checkpoint")
+    manifest_raw, manifest_raw_sha = read_member("source5_object_manifest")
+    ack_raw, ack_raw_sha = read_member("source5_archive_ack")
+    signature_raw, signature_raw_sha = read_member("source5_archive_signature")
+    job_record_raw, job_record_sha = read_member("source5_job_record")
+    try:
+        checkpoint = json.loads(checkpoint_raw)
+        manifest = json.loads(manifest_raw)
+        ack = json.loads(ack_raw)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            "Source5 persisted predecessor ACK metadata is malformed",
+        ) from error
+    require(all(raw == canonical_bytes(value) for raw, value in (
+                (checkpoint_raw, checkpoint), (manifest_raw, manifest),
+                (ack_raw, ack))) and
+            is_sha(checkpoint.get("checkpoint_sha256")) and
+            is_sha(manifest.get("manifest_sha256")) and
+            is_sha(ack.get("ack_sha256")) and
+            is_sha(signature_raw_sha),
+            "Source5 persisted predecessor ACK metadata is not canonical")
+    checkpoint_pin = exact(ack.get("checkpoint_pin"), {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "Source5 persisted predecessor checkpoint pin")
+    manifest_pin = exact(ack.get("object_manifest_pin"), {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "Source5 persisted predecessor manifest pin")
+    require(checkpoint_pin["raw_sha256"] == checkpoint_raw_sha and
+            checkpoint_pin["semantic_sha256"] == checkpoint["checkpoint_sha256"] and
+            manifest_pin["raw_sha256"] == manifest_raw_sha and
+            manifest_pin["semantic_sha256"] == manifest["manifest_sha256"],
+            "Source5 persisted predecessor checkpoint/manifest raw pins differ")
+    durable = ack.get("durable_commit")
+    require(type(durable) is dict and
+            type(durable.get("archive_source5_directory")) is dict and
+            type(durable["archive_source5_directory"].get("path")) is str,
+            "Source5 persisted predecessor lacks its signed archive root")
+    source5_root = Path(durable["archive_source5_directory"]["path"])
+    job_sha = sha256(canonical_bytes(predecessor))
+    leaf = f"{predecessor['ordinal']:06d}-{job_sha}.json"
+    ack_pin = {
+        "path": str(source5_root / "acks" / "confirmation" / leaf),
+        "raw_sha256": ack_raw_sha,
+        "semantic_sha256": ack["ack_sha256"],
+    }
+    signature_pin = {
+        "path": str(source5_root / "acks" / "signatures" /
+                     "confirmation" / f"{leaf[:-5]}.sig"),
+        "raw_sha256": signature_raw_sha,
+        "signer_fingerprint": ack.get("signer_fingerprint"),
+    }
+    archive = context.modules[EVIDENCE_ARCHIVE_SOURCE_PATH]
+    proof = archive.verify_signed_ack_for_predecessor(
+        checkpoint_pin, checkpoint, checkpoint_raw, request_raw,
+        context.host_evidence_budget_raw,
+        {"path": by_role["source5_job_record"]["path"],
+         "raw_sha256": job_record_sha},
+        job_record_raw, context.plan_raw,
+        manifest_pin, manifest, manifest_raw,
+        ack_pin, ack, ack_raw,
+        signature_pin, signature_raw,
+        context.archive_signer_context_pin,
+        canonical_bytes(context.archive_signer_context),
+        {"path": context.manifest_pin["path"],
+         "raw_sha256": context.manifest_pin["raw_sha256"],
+         "semantic_sha256": context.manifest["manifest_sha256"]},
+        canonical_bytes(context.manifest),
+        expected_ack_pin=ack_pin,
+        expected_run_id=predecessor_run_id,
+        successor_run_id=job["run_id"],
+        journal_width_contract_raw=canonical_bytes(
+            context.journal_width_contract,
+        ),
+        source_manifest_raw=_source5_selected_source_manifest_raw(context),
+    )
+    require(type(proof) is dict and
+            proof.get("schema") ==
+                "allocatbelt.application-source5-evidence-predecessor-ack.v1" and
+            proof.get("may_reclaim") is False and
+            proof.get("ack_pin") == ack_pin and
+            proof.get("plan_predecessor", {}).get("run_id") == predecessor_run_id and
+            proof.get("plan_predecessor", {}).get("successor", {}).get("run_id") ==
+                job["run_id"],
+            "Source5 predecessor ACK proof does not bind its exact original Plan edge")
+    if context.source5_archive_ack_pins is None:
+        context.source5_archive_ack_pins = {}
+    context.source5_archive_ack_pins[("confirmation", predecessor_run_id)] = ack_pin
+    return ack_pin
+
+
+
+def _source5_file_semantic_digest(
+    context: CampaignContext, path: Path, role: str,
+    raw_sha256: str, byte_count: int, owner_semantic: str | None,
+) -> str | None:
+    if owner_semantic is not None:
+        return owner_semantic
+    self_fields = {
+        "source5_archive_signer_context": ("signer_context_sha256",),
+        "journal_width_contract": ("contract_sha256",),
+        "source5_checkpoint_request": ("request_sha256",),
+        "source5_transfer_offer": ("offer_sha256",),
+        "source5_checkpoint": ("checkpoint_sha256",),
+        "source5_object_manifest": ("manifest_sha256",),
+        "source5_archive_ack": ("ack_sha256",),
+        "source5_stage_map": ("stage_map_sha256",),
+        "host_evidence_budget": ("budget_sha256",),
+        "analysis_artifact": ("analysis_sha256",),
+        "component_receipt": ("receipt_sha256",),
+        "fixed_pair_host_receipt": ("receipt_sha256",),
+        "capacity_host_receipt": ("receipt_sha256",),
+        "preparation": ("preparation_sha256",),
+        "prepared_completion": ("completion_sha256",),
+        "source5_job_record": ("record_sha256",),
+        "source5_job_disposition": ("disposition_sha256",),
+    }.get(role, ())
+    if role.startswith("probe_capture_receipt"):
+        self_fields = ("receipt_sha256",)
+    elif role.startswith("probe_capture_inventory"):
+        self_fields = ("inventory_sha256",)
+    if not self_fields:
+        return None
+    require(byte_count <= context.chronology.MAX_COMPLETION_BYTES,
+            f"Source5 {role} semantic document exceeds its pinned parser bound: {path}")
+    value, _raw, actual = read_json(
+        path, f"Source5 {role} semantic evidence",
+        context.chronology.MAX_COMPLETION_BYTES, raw_sha256,
+    )
+    for field in self_fields:
+        claimed = value.get(field)
+        if claimed is None:
+            continue
+        semantic = sha256(canonical_bytes({
+            key: item for key, item in value.items() if key != field
+        }))
+        require(claimed == semantic,
+                f"Source5 {role} self-digest differs from its exact canonical bytes: {path}")
+        return semantic
+    raise Source5CampaignError(
+        f"Source5 {role} evidence has no recognized semantic digest: {path}",
+    )
+
+
+def _source5_capture_file_declaration(
+    context: CampaignContext, declaration: dict[str, Any],
+) -> dict[str, Any] | None:
+    path = Path(declaration["path"])
+    label = f"Source5 indexed {declaration['role']} {path}"
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        require(declaration["origin_pin"] is None,
+                f"Source5 pinned immutable input is missing during capture: {path}")
+        return None
+    maximum = declaration["max_file_bytes"]
+    if stat.S_ISLNK(before.st_mode):
+        target = os.readlink(path).encode("utf-8", "strict")
+        after = path.lstat()
+        require((before.st_dev, before.st_ino, before.st_mode,
+                 before.st_mtime_ns, before.st_ctime_ns) ==
+                (after.st_dev, after.st_ino, after.st_mode,
+                 after.st_mtime_ns, after.st_ctime_ns),
+                f"Source5 literal symlink changed during capture: {path}")
+        byte_count = len(target)
+        raw_sha = sha256(target)
+        source_kind = "symlink"
+    else:
+        require(stat.S_ISREG(before.st_mode),
+                f"Source5 indexed path is not a regular file or literal symlink: {path}")
+        raw_sha = context.fixed_pair._hash_regular_file(path, maximum, label)
+        after = path.stat(follow_symlinks=False)
+        require((before.st_dev, before.st_ino, before.st_mode,
+                 before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
+                (after.st_dev, after.st_ino, after.st_mode,
+                 after.st_size, after.st_mtime_ns, after.st_ctime_ns),
+                f"Source5 indexed file changed during capture: {path}")
+        byte_count = before.st_size
+        source_kind = "file"
+    require(byte_count <= maximum,
+            f"Source5 indexed output exceeds its exact producer file ceiling: {path}")
+    origin_pin = declaration["origin_pin"]
+    owner_raw = None if origin_pin is None else origin_pin["raw_sha256"]
+    owner_semantic = None if origin_pin is None else origin_pin["semantic_sha256"]
+    require(owner_raw is None or raw_sha == owner_raw,
+            f"Source5 immutable input raw pin changed during capture: {path}")
+    semantic = _source5_file_semantic_digest(
+        context, path, declaration["role"], raw_sha, byte_count,
+        owner_semantic,
+    )
+    if declaration["role"] == "host_evidence_budget":
+        require(context.host_evidence_budget_pin is not None and
+                path == Path(context.host_evidence_budget_pin["path"]) and
+                raw_sha == context.host_evidence_budget_pin["raw_sha256"] and
+                semantic == context.host_evidence_budget_pin["semantic_sha256"],
+                "Source5 v2 host-budget catalogue row differs from its exact pin")
+    return {
+        "role": declaration["role"], "host_id": declaration["host_id"],
+        "origin_path": str(path), "local_path": str(path),
+        "raw_sha256": raw_sha, "semantic_sha256": semantic,
+        "byte_count": byte_count, "maximum_bytes": maximum,
+        "source_path": str(path), "source_kind": source_kind,
+    }
+
+
+def _source5_capture_tree_declaration(
+    context: CampaignContext, declaration: dict[str, Any],
+    typed_entries_out: list[dict[str, Any]] | None = None,
+) -> Any:
+    root = Path(declaration["path"])
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError as error:
+        raise Source5CampaignError(
+            f"Source5 declared dynamic owner root is missing: {root}",
+        ) from error
+    require(stat.S_ISDIR(root_info.st_mode) and not stat.S_ISLNK(root_info.st_mode),
+            f"Source5 dynamic owner root is not a real directory: {root}")
+    require(root_info.st_uid == os.getuid() and
+            stat.S_IMODE(root_info.st_mode) == 0o700,
+            f"Source5 dynamic owner root is not one private owned directory: {root}")
+    inode_count = 1
+    total_bytes = 0
+    pending = [root]
+    while pending:
+        directory_path = pending.pop()
+        try:
+            directory_path_info = directory_path.lstat()
+            directory_fd = os.open(
+                directory_path, os.O_RDONLY |
+                getattr(os, "O_DIRECTORY", 0) |
+                getattr(os, "O_CLOEXEC", 0) |
+                getattr(os, "O_NOFOLLOW", 0),
+            )
+        except OSError as error:
+            raise Source5CampaignError(
+                f"Source5 dynamic owner directory changed during capture: {directory_path}: {error}",
+            ) from error
+        try:
+            opened_info = os.fstat(directory_fd)
+            require(stat.S_ISDIR(opened_info.st_mode) and
+                    (opened_info.st_dev, opened_info.st_ino) ==
+                    (directory_path_info.st_dev, directory_path_info.st_ino),
+                    f"Source5 dynamic owner directory changed identity: {directory_path}")
+            with os.scandir(directory_fd) as scan:
+                for entry in scan:
+                    name = entry.name
+                    child = directory_path / name
+                    info = os.stat(name, dir_fd=directory_fd,
+                                   follow_symlinks=False)
+                    inode_count += 1
+                    require(inode_count <= declaration["max_inodes"],
+                            f"Source5 dynamic owner tree exceeds its inode ceiling: {root}")
+                    if stat.S_ISDIR(info.st_mode):
+                        if typed_entries_out is not None:
+                            require(info.st_uid == os.getuid(),
+                                    f"Source5 typed tree directory is not owner-owned: {child}")
+                            typed_entries_out.append({
+                                "path": str(child), "kind": "directory",
+                                "uid": info.st_uid,
+                                "mode": stat.S_IMODE(info.st_mode),
+                                "size": None, "raw_sha256": None,
+                            })
+                        pending.append(child)
+                        continue
+                    require(stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode),
+                            f"Source5 dynamic owner tree contains an unsupported node: {child}")
+                    file_declaration = {
+                        **declaration, "path": str(child), "kind": "file",
+                        "max_bytes": declaration["max_file_bytes"],
+                        "origin_pin": None,
+                    }
+                    row = _source5_capture_file_declaration(context, file_declaration)
+                    require(row is not None,
+                            f"Source5 dynamic tree file disappeared during capture: {child}")
+                    if typed_entries_out is not None:
+                        require(stat.S_ISREG(info.st_mode) and
+                                info.st_uid == os.getuid() and info.st_nlink == 1,
+                                f"Source5 ProbeV2 tree payload is not one owned regular file: {child}")
+                        typed_entries_out.append({
+                            "path": str(child), "kind": "file",
+                            "uid": info.st_uid,
+                            "mode": stat.S_IMODE(info.st_mode),
+                            "size": row["byte_count"],
+                            "raw_sha256": row["raw_sha256"],
+                        })
+                    total_bytes += row["byte_count"]
+                    require(total_bytes <= declaration["max_bytes"],
+                            f"Source5 dynamic owner tree exceeds its byte ceiling: {root}")
+                    yield row
+            after_open = os.fstat(directory_fd)
+            after_path = directory_path.lstat()
+            require((opened_info.st_dev, opened_info.st_ino,
+                     opened_info.st_mode, opened_info.st_mtime_ns,
+                     opened_info.st_ctime_ns) ==
+                    (after_open.st_dev, after_open.st_ino,
+                     after_open.st_mode, after_open.st_mtime_ns,
+                     after_open.st_ctime_ns) and
+                    (after_open.st_dev, after_open.st_ino) ==
+                    (after_path.st_dev, after_path.st_ino),
+                    f"Source5 dynamic owner directory changed during capture: {directory_path}")
+        finally:
+            os.close(directory_fd)
+
+
+def _source5_index_capture_rows(
+    context: CampaignContext, budget: dict[str, Any], budget_module: Any,
+):
+    catalogue = budget_module.verify_path_catalogue_chunks(
+        budget["path_catalogue"],
+    )
+    for declaration in budget_module.iter_path_catalogue_rows(catalogue):
+        if declaration["role"] in (
+                budget_module.TRANSIENT_JOB_EVIDENCE_ROLES |
+                budget_module.FAILURE_WINDOW_ONLY_ROLES |
+                budget_module.SOURCE5_NON_INDEX_TRANSIENT_ROLES):
+            # These exact rows remain in the signed budget catalogue and live
+            # job packet accounting. Their raw files are reclaimed after ACK
+            # or exist only in the stopped failure window, so they are not
+            # members of the final all-success origin index.
+            continue
+        if declaration["role"] == "directory_node":
+            path = Path(declaration["path"])
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            require(stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode),
+                    f"Source5 declared directory node changed type: {path}")
+            continue
+        if declaration["role"] == "origin_receipt":
+            # The origin receipt is finalized after the index is written and
+            # is bound once as an external v3 closure row, never duplicated
+            # inside the owner index.
+            continue
+        if declaration["kind"] == "file":
+            row = _source5_capture_file_declaration(context, declaration)
+            if row is not None:
+                yield row
+            continue
+        yield from _source5_capture_tree_declaration(context, declaration)
+
+
+def _source5_index_catalogue_rows(
+    budget: dict[str, Any], budget_module: Any,
+):
+    catalogue = budget_module.verify_path_catalogue_chunks(
+        budget["path_catalogue"],
+    )
+    for declaration in budget_module.iter_path_catalogue_rows(catalogue):
+        if declaration["role"] in (
+                budget_module.TRANSIENT_JOB_EVIDENCE_ROLES |
+                budget_module.FAILURE_WINDOW_ONLY_ROLES):
+            continue
+        yield declaration
+
+
+def _source5_capture_external_row(
+    path: str, role: str, host_id: str | None,
+    raw_sha256: str, semantic_sha256: str | None,
+    byte_count: int, maximum_bytes: int,
+) -> dict[str, Any]:
+    return {
+        "role": role, "host_id": host_id,
+        "origin_path": path, "local_path": path,
+        "raw_sha256": raw_sha256, "semantic_sha256": semantic_sha256,
+        "byte_count": byte_count, "maximum_bytes": maximum_bytes,
+        "source_path": path, "source_kind": "file",
+    }
+
+
+def _source5_capture_indexed_source_rows(
+    entries: Any,
+):
+    for row in entries.iter_rows():
+        source = Path(row["origin_path"])
+        try:
+            info = source.lstat()
+        except OSError as error:
+            raise Source5CampaignError(
+                f"Source5 indexed evidence disappeared before capture: {source}: {error}",
+            ) from error
+        require(stat.S_ISLNK(info.st_mode) or stat.S_ISREG(info.st_mode),
+                f"Source5 indexed evidence changed node type before capture: {source}")
+        yield {
+            "role": row["role"], "host_id": row["host_id"],
+            "origin_path": row["origin_path"],
+            "raw_sha256": row["raw_sha256"],
+            "semantic_sha256": row["semantic_sha256"],
+            "byte_count": row["byte_count"],
+            "maximum_bytes": row["maximum_bytes"],
+            "source_path": row["origin_path"],
+            "source_kind": "symlink" if stat.S_ISLNK(info.st_mode) else "file",
+        }
+
+
+def finalize_host_evidence(
+    context: CampaignContext, pressure_material_index: Path,
+    soak_material_index: Path, storage_reservation_path: Path,
+) -> dict[str, Any]:
+    """Write a bounded v3 index, origin receipt, captured store and request."""
+    require(context.scope == "final_frozen" and
+            context.manifest["schema"] == EXECUTION_SCHEMA_V4 and
+            context.prepared_input_completion is not None,
+            "Source5 host-evidence finalization requires the exact bounded prepared generation")
+    budget_pin = activate_source5_host_evidence_budget_v3(
+        context, pressure_material_index, soak_material_index,
+        storage_reservation_path,
+    )
+    context.host_evidence_budget_pin = budget_pin
+    budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    transport = context.modules["scripts/application-source5-evidence-transport-v3.py"]
+    budget_path = Path(budget_pin["path"])
+    budget, _budget_raw, _budget_sha = read_json(
+        budget_path, "Source5 finalized host evidence budget",
+        context.chronology.MAX_SOURCE5_HOST_EVIDENCE_BUDGET_BYTES,
+        budget_pin["raw_sha256"],
+    )
+    budget = budget_module.validate_host_evidence_budget_v3(
+        budget,
+        journal_width_contract_raw=canonical_bytes(
+            context.journal_width_contract,
+        ),
+    )
+    require(budget["budget_sha256"] == budget_pin["semantic_sha256"],
+            "Source5 finalized host budget semantic pin differs")
+    reservation_roots = budget["storage_reservation"]["roots"]
+    evidence_roots = [Path(value["path"]) for value in reservation_roots.values()
+                      if value["role"] == "evidence_store"]
+    scratch_roots = [Path(value["path"]) for value in reservation_roots.values()
+                     if value["role"] == "scratch"]
+    require(len(evidence_roots) == 1 and len(scratch_roots) == 1,
+            "Source5 v2 storage reservation lacks its unique evidence/scratch roots")
+    evidence_root = evidence_roots[0]
+    scratch_root = scratch_roots[0]
+    require(evidence_root.resolve(strict=True) == evidence_root and
+            scratch_root.resolve(strict=True) == scratch_root,
+            "Source5 v2 evidence/sort roots traverse an alias")
+    campaign_id = context.manifest["campaign_id"]
+    host_id = context.host_id
+    private_root = _private_directory(
+        evidence_root / campaign_id / "source5" / host_id,
+    )
+    index_directory = _private_directory(private_root / "evidence-index-v3")
+    capture_directory = _private_directory(private_root / "captured-evidence-v2")
+    catalogue = budget_module.verify_path_catalogue_chunks(
+        budget["path_catalogue"],
+    )
+    transport_caps = budget["transport"]
+    data_byte_bound = (
+        catalogue["maximum_index_bytes"] -
+        catalogue["maximum_index_manifest_bytes"]
+    )
+    unsorted_rows = _source5_index_capture_rows(
+        context, budget, budget_module,
+    )
+    sorted_rows = transport.sort_index_rows_v3(
+        unsorted_rows, scratch_directory=scratch_root,
+        maximum_entries=transport_caps["maximum_index_entries"],
+        maximum_data_bytes=data_byte_bound,
+    )
+    index_root, index_pin, index_files = transport.write_index_v3(
+        campaign_id=campaign_id, host_id=host_id,
+        source_root=str(context.source_root),
+        input_root=str(context.input_root), output_root=str(context.output_root),
+        host_evidence_budget=budget_pin, entries=sorted_rows,
+        directory=index_directory,
+        maximum_entries=transport_caps["maximum_index_entries"],
+        maximum_index_bytes=transport_caps["maximum_index_bytes"],
+    )
+    index_root, index_entries = transport.open_index_v3(
+        index_pin, budget_pin=budget_pin,
+        campaign_id=campaign_id, host_id=host_id,
+        source_root=str(context.source_root), input_root=str(context.input_root),
+        output_root=str(context.output_root),
+        maximum_entries=transport_caps["maximum_index_entries"],
+        maximum_index_bytes=transport_caps["maximum_index_bytes"],
+    )
+    closure = transport.validate_index_against_catalogue_v3(
+        index_entries.iter_rows(),
+        _source5_index_catalogue_rows(budget, budget_module),
+    )
+    require(closure["entry_count"] == index_root["entry_count"],
+            "Source5 v3 index writer does not close over its complete original owner catalogue")
+
+    chronology_root = (context.output_root / campaign_id / "chronology" / host_id)
+    receipt_path = chronology_root / "source5-origin-journal-receipt-v3.json"
+    with context.chronology.campaign_host_lock(
+        context.output_root, campaign_id, host_id, timeout_seconds=30.0,
+    ) as lock:
+        replay = _validate_locked_context(context, lock)
+        state = replay["state"]
+        require(state["pending"] is None and state["source5_pending"] is None and
+                state["cleanup_blocked"] is False and
+                state["source5_cleanup_blocked"] is False,
+                "Source5 evidence finalization requires settled authorized owners and clean cleanup state")
+        required_analyses = {
+            "exploration", "aa", "fixed_analysis", "pressure_analysis",
+            "soak", "final_analysis",
+        }
+        require(required_analyses <= set(state["source5_analyses"]),
+                "Source5 host evidence finalization requires every original phase and final analysis event")
+        receipt_pin = context.chronology.capture_source5_origin_journal_receipt_locked(
+            lock, api_pin(context.manifest_pin), index_pin, receipt_path,
+            host_evidence_budget_pin=budget_pin,
+        )
+    receipt, _receipt_raw, _receipt_sha = read_json(
+        Path(receipt_pin["path"]), "Source5 v3 origin journal receipt",
+        context.chronology.MAX_COMPLETION_BYTES, receipt_pin["raw_sha256"],
+    )
+    journal = {key: receipt["journal"][key] for key in (
+        "path", "raw_sha256", "byte_count", "record_count", "terminal_head",
+    )}
+
+    external_rows = []
+    for item in index_entries.external_files(host_id):
+        role = item["role"]
+        external_rows.append(_source5_capture_external_row(
+            item["path"], role, host_id, item["raw_sha256"],
+            item["semantic_sha256"], item["byte_count"],
+            context.chronology._source5_journal_role_limit(role),
+        ))
+    for chunk in catalogue["chunks"]:
+        external_rows.append(_source5_capture_external_row(
+            chunk["path"], "host_evidence_budget_chunk", host_id,
+            chunk["raw_sha256"], chunk["semantic_sha256"],
+            chunk["byte_count"], 8 * 1024 * 1024,
+        ))
+    external_rows.append(_source5_capture_external_row(
+        receipt_pin["path"], "origin_receipt", host_id,
+        receipt_pin["raw_sha256"], receipt_pin["semantic_sha256"],
+        len(canonical_bytes(receipt)),
+        context.chronology._source5_journal_role_limit("origin_receipt"),
+    ))
+    external_rows.sort(key=lambda row: row["origin_path"])
+    indexed_source_rows = _source5_capture_indexed_source_rows(index_entries)
+
+    def captured_rows():
+        merged = heapq.merge(
+            indexed_source_rows, iter(external_rows),
+            key=lambda row: row["origin_path"],
+        )
+        prior = ""
+        for row in merged:
+            require(row["origin_path"] > prior,
+                    f"Source5 v3 capture roles alias at {row['origin_path']}")
+            prior = row["origin_path"]
+            yield row
+
+    store_root, store_pin = transport.build_captured_store_v2(
+        campaign_id=campaign_id, host_id=host_id,
+        budget_pin=budget_pin, index_pin=index_pin,
+        origin_receipt_pin=receipt_pin, entries=captured_rows(),
+        root=capture_directory,
+        maximum_entries=transport_caps["maximum_store_entries"],
+        maximum_payload_bytes=transport_caps["maximum_store_payload_bytes"],
+        maximum_metadata_bytes=transport_caps["maximum_store_metadata_bytes"],
+        maximum_root_bytes=transport_caps["maximum_store_root_bytes"],
+    )
+    opened_store = transport.open_captured_store_v2(
+        store_pin, budget_pin=budget_pin, index_pin=index_pin,
+        origin_receipt_pin=receipt_pin,
+        maximum_entries=transport_caps["maximum_store_entries"],
+        maximum_payload_bytes=transport_caps["maximum_store_payload_bytes"],
+        maximum_metadata_bytes=transport_caps["maximum_store_metadata_bytes"],
+        maximum_root_bytes=transport_caps["maximum_store_root_bytes"],
+    )
+    require(opened_store.root["store_sha256"] == store_root["store_sha256"],
+            "Source5 captured-store post-write closure differs")
+    provenance = context.manifest["prepared_input_generation"]["provenance"]
+    request = context.chronology.build_source5_host_journal_request_v3(
+        scope="final_prepared_bounded", campaign_id=campaign_id, host_id=host_id,
+        source_root=str(context.source_root), input_root=str(context.input_root),
+        output_root=str(context.output_root),
+        execution_manifest_pin={
+            "path": context.manifest_pin["path"],
+            "raw_sha256": context.manifest_pin["raw_sha256"],
+            "semantic_sha256": context.manifest["manifest_sha256"],
+        },
+        provenance=provenance, journal=journal,
+        origin_receipt_pin=receipt_pin, evidence_index_pin=index_pin,
+        host_evidence_budget_pin=budget_pin, captured_store_pin=store_pin,
+    )
+    request_path = chronology_root / "source5-host-journal-request-v3.json"
+    request_raw = canonical_bytes(request)
+    request_sha = write_new(request_path, request_raw,
+                            "Source5 bounded host-journal request v3")
+    return {
+        "schema": "allocatbelt.application-source5-host-evidence-capture.v3",
+        "campaign_id": campaign_id, "host_id": host_id,
+        "host_evidence_budget": budget_pin,
+        "evidence_index": index_pin,
+        "origin_receipt": receipt_pin,
+        "captured_store": store_pin,
+        "host_journal_request": {
+            "path": str(request_path), "raw_sha256": request_sha,
+        },
+        "indexed_path_count": index_root["entry_count"],
+        "captured_entry_count": store_root["entry_count"],
+        "qualification_eligible": False, "execution_ready": False,
+    }
+
+
 def run_host(context: CampaignContext, phase: str,
              pressure_material_index: Path | None = None,
-             soak_material_index: Path | None = None) -> dict[str, Any]:
+             soak_material_index: Path | None = None,
+             storage_reservation_path: Path | None = None) -> dict[str, Any]:
     require(phase in {
         "all", "exploration", "aa", "confirmation", "fixed_analysis",
         "pressure", "pressure_analysis", "soak", "final_analysis",
     }, "Source5 selected phase is outside the closed original phase enum")
+    if context.scope == PREPARATORY_SCOPE:
+        require(phase in {"all", "exploration"},
+                "preparatory Source5 scope is closed to original exploration only")
+        return run_preparatory_exploration(context)
+    if context.scope == "final_frozen":
+        require(context.manifest["schema"] == EXECUTION_SCHEMA_V4,
+                "full Horizon host-evidence retention requires the signer-context execution manifest v4")
+        require(pressure_material_index is not None and
+                soak_material_index is not None and
+                storage_reservation_path is not None,
+                "bounded final Source5 execution requires both producer indices and the caller-pinned whole-host storage reservation")
+        context.host_evidence_budget_pin = activate_source5_host_evidence_budget_v3(
+            context, pressure_material_index, soak_material_index,
+            storage_reservation_path,
+        )
     if context.scope == "prospective_exploration":
         require(phase in {"all", "exploration"},
                 "prospective Source5 manifests are closed to exploration export only")
@@ -3062,6 +13942,7 @@ def run_host(context: CampaignContext, phase: str,
         ),
     }[phase]
     outcomes = []
+    blocked = False
     for action in sequence:
         if action.startswith("fixed:"):
             outcomes.append(run_fixed_phase(context, action.split(":", 1)[1]))
@@ -3075,11 +13956,28 @@ def run_host(context: CampaignContext, phase: str,
             require(soak_material_index is not None,
                     "Source5 Soak execution requires its raw-pinned original parent-recipe/build-receipt materials index")
             outcomes.append(run_soak_phase(context, soak_material_index))
+        if (outcomes and type(outcomes[-1]) is dict and
+                outcomes[-1].get("blocked") is True):
+            blocked = True
+            break
+    evidence_capture = None
+    if phase in {"all", "final_analysis"} and not blocked:
+        require(pressure_material_index is not None and
+                soak_material_index is not None and
+                storage_reservation_path is not None,
+                "final Source5 host-evidence capture requires both original producer indices and the caller-pinned storage reservation")
+        evidence_capture = finalize_host_evidence(
+            context, pressure_material_index, soak_material_index,
+            storage_reservation_path,
+        )
     return {
         "scope": context.scope,
         "campaign_id": context.manifest["campaign_id"],
         "host_id": context.host_id,
         "actions": outcomes,
+        "blocked": blocked,
+        **({"host_evidence_capture": evidence_capture}
+           if evidence_capture is not None else {}),
         "campaign_qualification_eligible": False,
     }
 
@@ -3104,13 +14002,14 @@ def verify_source5_final_cohort(manifest_paths: object) -> dict[str, Any]:
         key: first_manifest[key] for key in (
             "campaign_id", "hosts", "original_inputs", "execution_sources",
             "modules", "observed_hosts", "phase_order", "protocol_sha256",
-            "scope", "prepared_input_generation",
+            "scope", "prepared_input_generation", "archive_signer_contexts",
+            "journal_width_contracts",
         ) if key in first_manifest
     }
-    require(first_manifest.get("schema") == EXECUTION_SCHEMA_V2 and
-            first_manifest.get("scope") == "final_prepared" and
+    require(first_manifest.get("schema") == EXECUTION_SCHEMA_V4 and
+            first_manifest.get("scope") == "final_prepared_bounded" and
             first_manifest.get("phase_order") == list(PHASE_ORDER),
-            "Source5 final cohort requires the immutable prepared Source5 execution schema")
+            "Source5 final cohort requires the bounded prepared Source5 execution schema")
     decisions: list[dict[str, Any]] = []
     blockers: list[str] = []
     common_registration = None
@@ -3201,6 +14100,15 @@ def _parser() -> argparse.ArgumentParser:
     verify = commands.add_parser("verify", help="validate closed SourceV5 inputs and the 15-entry capacity ancestry")
     verify.add_argument("--manifest", required=True, type=Path)
     verify.add_argument("--host-id", required=True)
+    publish_readback = commands.add_parser(
+        "publish-archive-readback",
+        help="publish one complete Root response from its fixed incoming slots",
+    )
+    publish_readback.add_argument("--request", required=True, type=Path)
+    publish_readback.add_argument("--manifest", required=True, type=Path)
+    publish_readback.add_argument("--host-id", required=True)
+    publish_readback.add_argument("--response-incoming", required=True, type=Path)
+    publish_readback.add_argument("--bundle-incoming", required=True, type=Path)
     index_soak = commands.add_parser(
         "index-soak-materials",
         help="verify and raw-pin the exact original Soak recipe/build receipt",
@@ -3209,6 +14117,7 @@ def _parser() -> argparse.ArgumentParser:
     index_soak.add_argument("--host-id", required=True)
     index_soak.add_argument("--recipe", required=True, type=Path)
     index_soak.add_argument("--build-receipt", required=True, type=Path)
+    index_soak.add_argument("--resource-budget", type=Path)
     index_soak.add_argument("--output", required=True, type=Path)
     cohort = commands.add_parser(
         "verify-final-cohort",
@@ -3219,6 +14128,12 @@ def _parser() -> argparse.ArgumentParser:
         metavar="HOST=PATH",
         help="one original host ID and its independent Source5 execution manifest; repeat three times",
     )
+    export_pilot = commands.add_parser(
+        "export-preparatory-capacity-pilot",
+        help="export the exact original 360 archived pilots through held SourceA validation",
+    )
+    export_pilot.add_argument("--manifest", required=True, type=Path)
+    export_pilot.add_argument("--host-id", required=True)
     run = commands.add_parser("run-host", help="execute the exact original phase schedule for one native host")
     run.add_argument("--manifest", required=True, type=Path)
     run.add_argument("--host-id", required=True)
@@ -3228,13 +14143,3212 @@ def _parser() -> argparse.ArgumentParser:
     ), default="all")
     run.add_argument("--pressure-material-index", type=Path)
     run.add_argument("--soak-material-index", type=Path)
+    run.add_argument("--evidence-storage-reservation", type=Path)
     return parser
+
+
+def _source5_recheck_reclaimed_job_origins(
+    context: CampaignContext, closure: dict[str, Any],
+) -> None:
+    """Require exact acknowledged object/tree origins to remain reclaimed."""
+    checkpoint = closure["checkpoint"]
+    for index, entry in enumerate(checkpoint["entries"]):
+        require(type(entry) is dict and type(entry.get("origin_path")) is str,
+                f"Source5 reclaimed checkpoint entry[{index}] is malformed")
+        path = Path(entry["origin_path"])
+        require(not path.exists() and not path.is_symlink(),
+                f"Source5 acknowledged payload origin was restored or retained: {path}")
+    try:
+        request = json.loads(closure["request_raw"].decode("ascii"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            "Source5 retained checkpoint request is malformed during resume",
+        ) from error
+    require(closure["request_raw"] == canonical_bytes(request),
+            "Source5 retained checkpoint request is not canonical during resume")
+    tree_rows = request.get("tree_inventories", [])
+    require(type(tree_rows) is list,
+            "Source5 retained ProbeV2 tree closure is malformed during resume")
+    for tree_index, tree in enumerate(tree_rows):
+        require(type(tree) is dict and type(tree.get("root_path")) is str and
+                type(tree.get("entries")) is list,
+                f"Source5 retained ProbeV2 tree[{tree_index}] is malformed")
+        root = Path(tree["root_path"])
+        if root.exists() or root.is_symlink():
+            info = root.lstat()
+            require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and
+                    stat.S_IMODE(info.st_mode) == 0o700 and
+                    root.resolve(strict=True) == root and not any(root.iterdir()),
+                    f"Source5 acknowledged ProbeV2 tree retains an unknown child: {root}")
+        for entry in tree["entries"]:
+            require(type(entry) is dict and type(entry.get("path")) is str and
+                    entry.get("kind") in {"file", "directory"},
+                    f"Source5 retained ProbeV2 tree[{tree_index}] child is malformed")
+            path = Path(entry["path"])
+            require(not path.exists() and not path.is_symlink(),
+                    f"Source5 acknowledged ProbeV2 child was restored or retained: {path}")
+    for proof_index, proof in enumerate(checkpoint["empty_tmp_proofs"]):
+        require(type(proof) is dict and type(proof.get("path")) is str,
+                f"Source5 empty TMP proof[{proof_index}] is malformed during resume")
+        path = Path(proof["path"])
+        require(path.exists() and not path.is_symlink(),
+                f"Source5 independently proven empty TMP root disappeared: {path}")
+        if proof.get("domain") == "application_tmpdir":
+            info = path.lstat()
+            require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and
+                    stat.S_IMODE(info.st_mode) == 0o700 and
+                    path.resolve(strict=True) == path and not any(path.iterdir()) and
+                    proof.get("bytes_used") == 0 and proof.get("inode_count") == 0,
+                    f"Source5 application TMP proof is no longer an exact empty private root: {path}")
+            continue
+        actual = context.fixed_pair._tmpdir_usage(path, {
+            "bytes_limit": proof["bytes_limit"],
+            "inode_limit": proof["inode_limit"],
+        })
+        require(all(actual.get(field) == proof[field] for field in (
+                    "path", "device", "inode", "mode", "mount",
+                    "bytes_used", "file_count", "directory_count",
+                    "bytes_limit", "inode_limit")) and
+                proof["bytes_used"] == 0 and proof["file_count"] == 0 and
+                proof["directory_count"] == 0,
+                f"Source5 fixed/pressure TMP proof changed after archive ACK: {path}")
+
+
+
+def _source5_assert_uncompleted_catalogue_paths_absent(
+    context: CampaignContext, budget: dict[str, Any], budget_module: Any,
+    finished_keys: set[tuple[str, str]],
+) -> None:
+    """Reject exact catalogued outputs for any not-yet-consumed Plan ordinal."""
+    catalogue = budget_module.verify_path_catalogue_chunks(
+        budget["path_catalogue"],
+    )
+    for row in budget_module.iter_path_catalogue_rows(catalogue):
+        if row["role"] in budget_module.FAILURE_WINDOW_ONLY_ROLES:
+            path = Path(row["path"])
+            require(not path.exists() and not path.is_symlink(),
+                    f"Source5 failure-only path exists before a failed owner: {path}")
+        if (row["phase"] is None or row["run_id"] is None or
+                row["role"] == "directory_node" or
+                row.get("origin_pin") is not None or
+                (row["phase"], row["run_id"]) in finished_keys):
+            continue
+        path = Path(row["path"])
+        require(not path.exists() and not path.is_symlink(),
+                f"Source5 uncompleted original ordinal has an unexplained catalogue path: {path}")
+
+
+
+def _source5_require_uncompleted_catalogue_paths_absent(
+    context: CampaignContext, lock: Any, verified: dict[str, Any],
+) -> None:
+    """Revalidate the signed v3 catalogue frontier before any phase dispatch."""
+    if context.manifest.get("schema") == PREPARATORY_EXECUTION_SCHEMA:
+        state = verified["state"]
+        jobs = _host_jobs(context, "exploration")
+        finished = set(state["source5_finished"])
+        expected = {("exploration", job["run_id"]) for job in jobs[:len(finished)]}
+        require(len(jobs) == 360 and finished == state["source5_seen_jobs"] == expected and
+                all(row.get("state") == "valid_pair" for row in state["source5_finished"].values()),
+                "preparatory dispatch lacks its exact successful original prefix")
+        _validate_source5_preparatory_profile_artifacts(
+            context, context.preparatory_width_contract, context.preparatory_width_pin,
+            context.preparatory_budget, context.preparatory_budget_raw,
+            context.preparatory_budget_pin,
+        )
+        _source5_assert_uncompleted_catalogue_paths_absent(
+            context, context.preparatory_budget,
+            context.modules[EVIDENCE_BUDGET_SOURCE_PATH], finished,
+        )
+        return
+    require(context.manifest.get("schema") == EXECUTION_SCHEMA_V4 and
+            type(context.journal_width_contract) is dict and
+            type(context.host_evidence_budget_pin) is dict and
+            type(context.host_evidence_budget_raw) is bytes,
+            "Source5 v4 dispatch lacks its exact ready host budget/width closure")
+    budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    pin = exact(context.host_evidence_budget_pin, {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "Source5 v4 dispatch host-budget pin")
+    require(is_sha(pin["raw_sha256"]) and is_sha(pin["semantic_sha256"]) and
+            sha256(context.host_evidence_budget_raw) == pin["raw_sha256"],
+            "Source5 v4 dispatch host-budget raw pin differs")
+    try:
+        value = json.loads(context.host_evidence_budget_raw.decode("ascii"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            "Source5 v4 dispatch host budget is malformed",
+        ) from error
+    budget = budget_module.validate_host_evidence_budget_v3(
+        value,
+        journal_width_contract_raw=canonical_bytes(
+            context.journal_width_contract,
+        ),
+    )
+    require(context.host_evidence_budget_raw == canonical_bytes(budget) and
+            budget["budget_sha256"] == pin["semantic_sha256"] and
+            budget["campaign_id"] == context.manifest["campaign_id"] and
+            budget["host_id"] == context.host_id,
+            "Source5 v4 dispatch host budget differs from its exact raw/semantic identity")
+    finished_keys, _phase_records, state = _source5_storage_finished_prefix(
+        context, lock, budget_module,
+    )
+    require(state is verified["state"] and
+            state["head"] == verified["state"]["head"] and
+            state["record_count"] == verified["state"]["record_count"],
+            "Source5 dispatch storage frontier differs from the current locked journal")
+    _source5_assert_uncompleted_catalogue_paths_absent(
+        context, budget, budget_module, finished_keys,
+    )
+
+
+
+def _source5_validate_fresh_phase_start_locked(
+    context: CampaignContext, lock: Any, phase: str,
+    jobs: list[dict[str, Any]], verified: dict[str, Any],
+) -> tuple[int, list[dict[str, Any]]]:
+    """Start only an absent phase whose live SourceA journal has no phase rows."""
+    require(context.manifest.get("schema") in {EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA} and
+            type(verified) is dict and type(verified.get("prepared")) is dict and
+            type(verified.get("state")) is dict,
+            "Source5 fresh phase start requires its current validated v4 context")
+    prepared = verified["prepared"]
+    state = verified["state"]
+    expected_jobs = _host_jobs(context, phase)
+    phase_root = _phase_root(context, phase)
+    require(jobs == expected_jobs and
+            not phase_root.exists() and not phase_root.is_symlink(),
+            f"Source5 {phase} fresh start requires its exact original jobs and absent phase root")
+    read_journal = getattr(context.chronology, "_read_journal", None)
+    require(callable(read_journal),
+            "selected SourceA chronology lacks its locked journal replay API")
+    # This read runs under the same live fd-owned lock as dispatch. The cached
+    # object identity proves the seen/finished sets came from this lock replay.
+    current = read_journal(lock, prepared)
+    require(current is state,
+            "Source5 fresh-start state is not the current SourceA journal object under this lock")
+    require(state.get("pending") is None and
+            state.get("source5_pending") is None and
+            state.get("cleanup_blocked") is False and
+            state.get("source5_cleanup_blocked") is False and
+            state.get("source5_failed_owner_window") is False,
+            "Source5 fresh phase start refuses pending, failed, or cleanup-blocked journal state")
+    seen = state.get("source5_seen_jobs")
+    finished = state.get("source5_finished")
+    authorized = state.get("source5_authorized")
+    require(type(seen) is set and type(finished) is dict and
+            type(authorized) is dict and
+            all(type(key) is tuple and len(key) == 2 and
+                type(key[0]) is str and type(key[1]) is str
+                for key in seen | set(finished)),
+            "Source5 fresh phase start lacks exact SourceA seen/finished maps")
+    require(not any(key[0] == phase for key in seen) and
+            not any(key[0] == phase for key in finished) and
+            not any(type(row) is dict and
+                    type(row.get("details")) is dict and
+                    row["details"].get("phase") == phase
+                    for row in authorized.values()),
+            f"Source5 absent {phase} phase root conflicts with consumed SourceA ordinals")
+    require(not phase_root.exists() and not phase_root.is_symlink(),
+            f"Source5 {phase} phase root appeared during fresh-start validation")
+    return 0, []
+
+
+
+def _source5_validate_phase_root_children(
+    context: CampaignContext, phase_root: Path, phase: str, next_index: int,
+) -> None:
+    """Accept only direct children declared by the authenticated prep catalogue.
+
+    This grants no authority to file contents: ledger, metadata and owner
+    custody are independently replayed by the caller. A completed pilot may
+    survive an idempotent export; SourceA still replays all owners before the
+    exporter can accept its exact existing bytes.
+    """
+    if context.manifest.get("schema") != PREPARATORY_EXECUTION_SCHEMA:
+        require(set(os.listdir(phase_root)) <= {"job-records", "controller-ledger.jsonl"},
+                f"Source5 {phase} retained phase root is unsafe or unexplained")
+        return
+    require(phase == "exploration" and type(next_index) is int and 0 <= next_index <= 360,
+            "preparatory phase-root validation changed its original frontier")
+    budget = context.preparatory_budget
+    require(type(context.preparatory_budget_raw) is bytes and
+            context.preparatory_budget_raw == canonical_bytes(budget) and
+            sha256(context.preparatory_budget_raw) == context.preparatory_budget_pin["raw_sha256"],
+            "preparatory phase-root catalogue is outside its exact raw budget pin")
+    module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    catalogue = module.verify_path_catalogue_chunks(budget["path_catalogue"])
+    allowed = {}
+    for row in module.iter_path_catalogue_rows(catalogue):
+        path = Path(row["path"])
+        if path.parent != phase_root:
+            continue
+        require(path.name not in allowed and row["storage_root"] == str(context.output_root) and
+                row.get("host_id") in {None, context.host_id},
+                "preparatory phase-root child aliases or leaves its reserved domain")
+        if row["kind"] == "tree" and row["role"] == "directory_node":
+            require(row["max_inodes"] == 1,
+                    "preparatory phase-root directory is not one exact node")
+        else:
+            require(row["kind"] == "file" and
+                    ((row["role"] == "source5_phase_ledger" and
+                      path.name == "controller-ledger.jsonl" and row["phase"] == phase) or
+                     (row["role"] == "capacity_artifact" and
+                      path.name == "capacity-pilot.json" and row["phase"] == "exploration" and
+                      row["run_id"] is None)),
+                    "preparatory phase-root has an unsupported direct file declaration")
+            if row["role"] == "capacity_artifact" and next_index != 360:
+                continue
+        allowed[path.name] = row
+    for name in os.listdir(phase_root):
+        require(name in allowed,
+                f"Source5 {phase} retained phase root is unsafe or unexplained")
+        row = allowed[name]
+        path = phase_root / name
+        info = path.lstat()
+        require(path.resolve(strict=True) == path and info.st_uid == os.getuid(),
+                "preparatory phase-root child changed owner or traverses an alias")
+        if row["kind"] == "tree":
+            require(stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o700,
+                    "preparatory phase-root child is not one private directory")
+        else:
+            require(stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o600 and
+                    info.st_nlink == 1 and info.st_size <= row["max_file_bytes"],
+                    "preparatory phase-root child is not one bounded private file")
+
+
+def _source5_validate_resume_prefix_locked(
+    context: CampaignContext, lock: Any, phase: str,
+    jobs: list[dict[str, Any]],
+) -> tuple[int, list[dict[str, Any]]]:
+    """Validate one SourceA-authorized original prefix and all host-side reclaim facts."""
+    phase_root = _phase_root(context, phase)
+    require(phase_root.exists() or phase_root.is_symlink(),
+            f"Source5 {phase} resume requires an existing retained phase root")
+    try:
+        root_info = phase_root.lstat()
+    except OSError as error:
+        raise Source5CampaignError(
+            f"Source5 {phase} retained phase root cannot be inspected: {error}",
+        ) from error
+    require(stat.S_ISDIR(root_info.st_mode) and not stat.S_ISLNK(root_info.st_mode) and
+            root_info.st_uid == os.getuid() and stat.S_IMODE(root_info.st_mode) == 0o700 and
+            phase_root.resolve(strict=True) == phase_root,
+            f"Source5 {phase} retained phase root is unsafe or unexplained")
+    ledger_path = phase_root / "controller-ledger.jsonl"
+    try:
+        ledger_info = ledger_path.lstat()
+    except OSError as error:
+        raise Source5CampaignError(
+            f"Source5 {phase} retained phase root is missing its original ledger: {error}",
+        ) from error
+    require(stat.S_ISREG(ledger_info.st_mode) and ledger_info.st_uid == os.getuid() and
+            stat.S_IMODE(ledger_info.st_mode) == 0o600 and ledger_info.st_nlink == 1,
+            f"Source5 {phase} retained phase ledger is not one exact private regular file")
+    preparatory = context.manifest.get("schema") == PREPARATORY_EXECUTION_SCHEMA
+    require(not preparatory or phase == "exploration",
+            "preparatory Source5 resume is closed to original exploration")
+    resume_api = getattr(
+        context.chronology,
+        "source5_preparatory_exploration_resume_prefix_locked" if preparatory else
+        "source5_phase_resume_prefix_locked", None,
+    )
+    require(context.manifest.get("schema") in {EXECUTION_SCHEMA_V4, PREPARATORY_EXECUTION_SCHEMA} and
+            callable(resume_api),
+            "Source5 same-phase resume lacks its Source-pinned v4 prefix API")
+    verified = _validate_locked_context(context, lock)
+    prepared = verified["prepared"]
+    state = verified["state"]
+    prefix = (resume_api(lock, api_pin(context.manifest_pin)) if preparatory else
+              resume_api(lock, api_pin(context.manifest_pin), phase))
+    prefix = exact(prefix, {
+        "schema", "campaign_id", "host_id", "phase", "execution_manifest",
+        "source_epoch", "journal_head", "journal_record_count", "job_count",
+        "next_index", "completed_records", "component_replay_required",
+        "archive_reclaim_recheck_required", "qualification_eligible",
+    }, f"Source5 {phase} authenticated resume prefix")
+    execution_pin = exact(prefix["execution_manifest"], {
+        "path", "raw_sha256",
+    }, f"Source5 {phase} resume execution-manifest pin")
+    epoch_builder = getattr(context.chronology, "_source5_analysis_epoch", None)
+    require(callable(epoch_builder),
+            "Source5 selected chronology lacks its source-epoch projection")
+    expected_epoch = epoch_builder(prepared)
+    next_index = prefix["next_index"]
+    require(prefix["schema"] == "allocatbelt.application-source5-resume-prefix.v1" and
+            prefix["campaign_id"] == context.manifest["campaign_id"] and
+            prefix["host_id"] == context.host_id and prefix["phase"] == phase and
+            execution_pin == {
+                "path": context.manifest_pin["path"],
+                "raw_sha256": context.manifest_pin["raw_sha256"],
+            } and prefix["source_epoch"] == expected_epoch and
+            prefix["journal_head"] == state["head"] and
+            prefix["journal_record_count"] == state["record_count"] and
+            prefix["job_count"] == len(jobs) and
+            type(next_index) is int and 0 <= next_index <= len(jobs) and
+            prefix["component_replay_required"] is True and
+            prefix["archive_reclaim_recheck_required"] is True and
+            prefix["qualification_eligible"] is False and
+            type(prefix["completed_records"]) is list and
+            len(prefix["completed_records"]) == next_index,
+            f"Source5 {phase} resume prefix is outside the exact current Source/journal epoch")
+    if phase_root.exists() or phase_root.is_symlink():
+        info = phase_root.lstat()
+        require(stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and
+                info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700 and
+                phase_root.resolve(strict=True) == phase_root,
+                f"Source5 {phase} resume root has an unsafe or unexplained child")
+    _source5_validate_phase_root_children(context, phase_root, phase, next_index)
+    ledger_path = phase_root / "controller-ledger.jsonl"
+    if ledger_path.exists() or ledger_path.is_symlink():
+        ledger = _phase_ledger_records(
+            ledger_path, _source5_phase_ledger_byte_bound(context, phase, jobs),
+        )
+    else:
+        ledger = []
+    require(len(ledger) == next_index and
+            all(row.get("job") == jobs[index]
+                for index, row in enumerate(ledger)),
+            f"Source5 {phase} local ledger is not the exact authenticated prefix")
+    record_dir = phase_root / "job-records"
+    if record_dir.exists() or record_dir.is_symlink():
+        info = record_dir.lstat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o700 and
+                record_dir.resolve(strict=True) == record_dir and
+                set(os.listdir(record_dir)) == {
+                    f"{job['run_id']}.json" for job in jobs[:next_index]
+                },
+                f"Source5 {phase} job-record directory contains an unexplained ordinal")
+    else:
+        require(next_index == 0,
+                f"Source5 {phase} resume prefix has no local job-record directory")
+    completed = state["source5_finished"]
+    rows = prefix["completed_records"]
+    for index, (job, record, prefix_row) in enumerate(zip(
+            jobs[:next_index], ledger, rows, strict=True)):
+        row = exact(prefix_row, {
+            "job", "record", "record_sha256", "authorization_id",
+            "job_terminal_head", "ack_pin",
+        }, f"Source5 {phase} completed resume row[{index}]")
+        record_pin = exact(row["record"], {"path", "raw_sha256"},
+                           f"Source5 {phase} resume row[{index}] record pin")
+        record_path = record_dir / f"{job['run_id']}.json"
+        raw, raw_sha, info = read_stable(
+            record_path, f"Source5 {phase} resumed job record",
+            _source5_job_record_byte_bound(context, phase, job),
+        )
+        require(row["job"] == job and record_pin == {
+                    "path": str(record_path), "raw_sha256": raw_sha,
+                } and row["record_sha256"] == record.get("record_sha256") and
+                row["record_sha256"] == sha256(canonical_bytes({
+                    key: value for key, value in record.items()
+                    if key != "record_sha256"
+                })) and raw == canonical_bytes(record) and
+                raw_sha == record_pin["raw_sha256"] and
+                stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1,
+                f"Source5 {phase} resumed local record differs from its exact row/pin")
+        finished = completed.get((phase, job["run_id"]))
+        require(type(finished) is dict and
+                row["authorization_id"] == finished.get("authorization_id") and
+                row["job_terminal_head"] == finished.get("record_sha256"),
+                f"Source5 {phase} resumed record differs from the original journal terminal")
+        _source5_match_finished_record(phase, job, record, finished)
+        closure = _source5_verify_persisted_archive_read_closure(
+            context, phase, job,
+        )
+        require(closure["job_record"] == record and
+                closure["job_record_raw"] == raw and
+                row["ack_pin"] == closure["ack_pin"],
+                f"Source5 {phase} resumed owner lacks its exact local signed ACK closure")
+        budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+        _source5_verify_completed_archive_metadata(
+            context, phase, job, closure, budget_module,
+        )
+        _source5_recheck_reclaimed_job_origins(context, closure)
+    return next_index, ledger
+
+
+
+def _source5_selected_source_manifest_raw(context: CampaignContext) -> bytes:
+    """Rebuild the exact canonical selected SourceManifest bytes from its pin."""
+    source = context.sources.get(context.host_id)
+    pin = context.source_manifest_pins.get(context.host_id)
+    require(type(source) is dict and type(pin) is dict and
+            type(pin.get("path")) is str and
+            is_sha(pin.get("raw_sha256")) and
+            source.get("schema") ==
+                context.modules[EVIDENCE_BUDGET_SOURCE_PATH].SOURCE_SCHEMA and
+            is_sha(source.get("manifest_sha256")),
+            "Source5 archive read lacks the exact selected SourceManifest pin")
+    raw = canonical_bytes(source)
+    require(sha256(raw) == pin["raw_sha256"] and
+            source["manifest_sha256"] == sha256(canonical_bytes({
+                key: value for key, value in source.items()
+                if key != "manifest_sha256"
+            })),
+            "Source5 selected SourceManifest raw/semantic closure differs")
+    return raw
+
+
+
+def _source5_credit_preparatory_catalogue_file(
+    row: dict[str, Any], label: str,
+) -> tuple[int, int]:
+    """Credit an existing setup file only from its exact catalogue raw pin."""
+    require(type(row) is dict and row.get("kind") == "file" and
+            type(row.get("storage_root")) is str and
+            type(row.get("origin_pin")) is dict and
+            set(row["origin_pin"]) == {"raw_sha256", "semantic_sha256"} and
+            is_sha(row["origin_pin"]["raw_sha256"]),
+            "preparatory storage credit lacks one typed raw-pinned catalogue file")
+    path = Path(row["path"])
+    try:
+        before = path.lstat()
+    except FileNotFoundError as error:
+        raise Source5CampaignError(
+            f"required preparatory catalogue artifact disappeared: {path}",
+        ) from error
+    raw, digest, info = read_stable(
+        path, label, row["max_file_bytes"],
+    )
+    after = path.lstat()
+    require(path.resolve(strict=True) == path and
+            stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+            stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+            _source5_same_file_identity(before, info) and
+            _source5_same_file_identity(info, after) and
+            digest == row["origin_pin"]["raw_sha256"] and
+            len(raw) <= row["max_file_bytes"],
+            f"preparatory catalogue artifact changed its exact private raw identity: {path}")
+    return len(raw), 1
+
+def _source5_credit_preparatory_control_ledger(
+    context: CampaignContext, path: Path, maximum_bytes: int,
+) -> tuple[int, int]:
+    """Credit the exact empty read-control prefix just replayed under the host lock."""
+    expected_identity = context.source5_archive_read_ledger_file_identity
+    expected_bytes = context.source5_archive_read_ledger_byte_count
+    expected_sha = context.source5_archive_read_ledger_raw_sha256
+    require(type(expected_identity) is tuple and len(expected_identity) == 8 and
+            type(expected_bytes) is int and expected_bytes == 0 and
+            expected_sha == hashlib.sha256(b"").hexdigest(),
+            "preparatory read-control credit lacks its exact replayed empty-prefix snapshot")
+    raw, digest, info = read_stable(
+        path, "Source5 preparatory read-control ledger", maximum_bytes,
+    )
+    current = path.lstat()
+    actual = (
+        info.st_dev, info.st_ino, info.st_mode, info.st_size,
+        info.st_mtime_ns, info.st_ctime_ns, info.st_nlink, info.st_uid,
+    )
+    current_identity = (
+        current.st_dev, current.st_ino, current.st_mode, current.st_size,
+        current.st_mtime_ns, current.st_ctime_ns, current.st_nlink,
+        current.st_uid,
+    )
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+            stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+            len(raw) == expected_bytes and digest == expected_sha and
+            actual == current_identity == expected_identity,
+            "preparatory read-control ledger changed after authenticated empty-prefix replay")
+    return len(raw), 1
+
+def _source5_credit_preparatory_journal(
+    context: CampaignContext, row: dict[str, Any],
+    core_result: dict[str, Any],
+) -> tuple[int, int]:
+    """Credit the one SourceA-replayed setup journal record, never a prefix guess."""
+    path = Path(row["path"])
+    raw, _digest, info = read_stable(
+        path, "Source5 preparatory setup chronology journal",
+        row["max_file_bytes"],
+    )
+    after = path.lstat()
+    require(path.resolve(strict=True) == path and
+            stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+            stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+            _source5_same_file_identity(info, after) and
+            len(raw) <= row["max_file_bytes"] and
+            raw.endswith(b"\n") and raw.count(b"\n") == 1,
+            "preparatory chronology journal is not one exact private setup record")
+    try:
+        envelope = json.loads(raw.decode("ascii"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            "preparatory chronology setup journal is malformed",
+        ) from error
+    envelope = exact(envelope, {
+        "previous_sha256", "record", "record_sha256",
+    }, "preparatory chronology setup envelope")
+    record = envelope["record"]
+    require(type(record) is dict and raw == canonical_bytes(envelope) and
+            envelope["previous_sha256"] == "0" * 64 and
+            type(record.get("sequence")) is int and record["sequence"] == 1 and
+            record.get("campaign_id") == context.manifest["campaign_id"] and
+            record.get("host_id") == context.host_id and
+            record.get("event") == PREPARATORY_SETUP_EVENT and
+            sha256(canonical_bytes({
+                "previous_sha256": envelope["previous_sha256"],
+                "record": record,
+            })) == envelope["record_sha256"] == core_result["journal_head"] ==
+                core_result["registration_head"] and
+            core_result["journal_record_count"] == 1,
+            "preparatory setup journal does not match the SourceA-replayed registration head")
+    return len(raw), 1
+
+def _source5_discard_preparatory_catalogue_chunks(
+    output_directory: Path, previous: dict[str, Any] | None,
+) -> None:
+    if previous is None:
+        return
+    root_fd = os.open(
+        output_directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+        getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        for index, row in enumerate(previous["chunks"]):
+            path = Path(row["path"])
+            require(path.parent == output_directory and
+                    path.name == f"path-catalogue-{index:08d}.jsonl",
+                    "temporary prep catalogue chunk escaped its deterministic private output directory")
+            raw, digest, info = read_stable(
+                path, "prior unsealed prep catalogue chunk", row["byte_count"],
+            )
+            require(digest == row["raw_sha256"] and
+                    len(raw) == row["byte_count"] and
+                    info.st_uid == os.getuid() and
+                    stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1,
+                    "prior unsealed prep catalogue chunk changed before builder retry")
+            os.unlink(path.name, dir_fd=root_fd)
+        os.fsync(root_fd)
+        require(not os.listdir(root_fd),
+                "unsealed prep catalogue output directory retained undeclared files")
+    finally:
+        os.close(root_fd)
+
+def _source5_preparatory_archive_read_schedule(
+    context: CampaignContext,
+    readback_caps: dict[tuple[str, str], dict[str, int]],
+) -> list[dict[str, Any]]:
+    jobs = _host_jobs(context, "exploration")
+    schedule = []
+    for index, job in enumerate(jobs):
+        caps = readback_caps.get(("exploration", job["run_id"]))
+        require(type(caps) is dict,
+                f"preparatory archive read lacks caps for {job['run_id']}")
+        schedule.append({
+            "request_ordinal": index,
+            "analysis_phase": "exploration",
+            "use": "capacity_pilot_export",
+            "owner_phase": "exploration",
+            "job_index": index,
+            "job": job,
+            "job_sha256": sha256(canonical_bytes(job)),
+            "caps": {
+                "maximum_request_bytes": caps["request_bytes"],
+                "maximum_response_bytes": caps["response_bytes"],
+                "bundle_bytes": caps["bundle_bytes"],
+                "stage_bytes": caps["stage_bytes"],
+                "stage_inodes": caps["stage_inodes"],
+                "object_count": caps["object_count"],
+                "maximum_object_bytes": caps["maximum_object_bytes"],
+                "live_window_bytes": caps["live_window_bytes"],
+                "live_window_inodes": caps["live_window_inodes"],
+            },
+        })
+    require(len(schedule) == 360 and
+            [row["request_ordinal"] for row in schedule] == list(range(360)),
+            "preparatory archive read schedule does not close over all 360 Plan jobs")
+    return schedule
+
+def _source5_preparatory_budget_body(
+    context: CampaignContext, original_pins: dict[str, Any],
+    width: dict[str, Any], width_pin: dict[str, str],
+    reservation: dict[str, Any], reservation_pin: dict[str, Any],
+    catalogue: dict[str, Any], archive_caps: dict[tuple[str, str], dict[str, int]],
+    readback_caps: dict[tuple[str, str], dict[str, int]],
+    read_schedule: list[dict[str, Any]], read_control: dict[str, int],
+    job_record_cap: int,
+) -> dict[str, Any]:
+    prep_module = context.modules[PREPARATORY_BUDGET_SOURCE_PATH]
+    budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    jobs = _host_jobs(context, "exploration")
+    record_bounds = []
+    phase_ledger_bytes = 0
+    for job in jobs:
+        row = {
+            "ordinal": job["ordinal"], "run_id": job["run_id"],
+            "job_sha256": sha256(canonical_bytes(job)),
+            "maximum_record_bytes": _source5_job_record_byte_bound(
+                context, "exploration", job,
+            ),
+        }
+        require(row["maximum_record_bytes"] <= job_record_cap,
+                "preparatory per-job record exceeds its source-derived row cap")
+        record_bounds.append(row)
+        phase_ledger_bytes += row["maximum_record_bytes"]
+    callback_width = width["total_event_bytes"]
+    schedule = {
+        "phase": "exploration",
+        "original_job_count": 360,
+        "original_callback_event_count": 2160,
+        "setup_event_count": 1,
+        "maximum_failed_event_count_uplift":
+            width["maximum_failed_event_count_uplift"],
+        "maximum_journal_event_count": width["total_event_count"],
+        "maximum_journal_bytes": callback_width,
+        "maximum_phase_ledger_bytes": phase_ledger_bytes,
+        "maximum_job_record_bytes_by_ordinal": record_bounds,
+    }
+    archive_job_caps = []
+    persistent_archive_metadata_bytes = 0
+    payload_bytes = 0
+    object_count = 0
+    for index, job in enumerate(jobs):
+        key = ("exploration", job["run_id"])
+        caps = archive_caps[key]
+        read_caps = readback_caps[key]
+        row = {
+            "phase": "exploration", "job_index": index,
+            "ordinal": job["ordinal"], "run_id": job["run_id"],
+            "job_sha256": sha256(canonical_bytes(job)),
+            **caps,
+            "readback_request_bytes": read_caps["request_bytes"],
+            "readback_response_bytes": read_caps["response_bytes"],
+            "readback_bundle_bytes": read_caps["bundle_bytes"],
+            "readback_stage_bytes": read_caps["stage_bytes"],
+            "readback_stage_inodes": read_caps["stage_inodes"],
+            "readback_object_count": read_caps["object_count"],
+            "readback_window_bytes": read_caps["live_window_bytes"],
+            "readback_window_inodes": read_caps["live_window_inodes"],
+        }
+        archive_job_caps.append(row)
+        persistent_archive_metadata_bytes += sum(caps[name] for name in (
+            "checkpoint_request_bytes", "transfer_offer_bytes",
+            "checkpoint_bytes", "object_manifest_bytes", "archive_ack_bytes",
+            "signature_bytes", "stage_map_bytes",
+        ))
+        payload_bytes += read_caps["stage_bytes"]
+        object_count += read_caps["object_count"]
+    maximum_archive = {
+        name: max(row[name] for row in archive_job_caps)
+        for name in (
+            "checkpoint_request_bytes", "transfer_packet_bytes",
+            "checkpoint_bytes", "object_manifest_bytes", "archive_ack_bytes",
+            "signature_bytes", "ack_bundle_bytes", "stage_map_bytes",
+            "transfer_offer_bytes",
+        )
+    }
+    readback_window_bytes = max(
+        row["readback_window_bytes"] for row in archive_job_caps
+    )
+    readback_window_inodes = max(
+        row["readback_window_inodes"] for row in archive_job_caps
+    )
+    archive_transport = {
+        "schema": "allocatbelt.application-source5-preparatory-archive-transport.v1",
+        "per_job": archive_job_caps,
+        "maximum_per_job": maximum_archive,
+        "unique_object_payload_bytes": payload_bytes,
+        "unique_object_count": object_count,
+        "maximum_signature_bytes": budget_module.ARCHIVE_SIGNATURE_QUOTA_BYTES,
+        "read_request_count": 360,
+        "read_control_event_count": read_control["maximum_event_count"],
+        "read_control_ledger_bytes": read_control["maximum_bytes"],
+        "read_control_ledger_maximum_line_bytes":
+            read_control["maximum_line_bytes"],
+        "maximum_readback_window_bytes": readback_window_bytes,
+        "maximum_readback_window_inodes": readback_window_inodes,
+    }
+    retention = {
+        "schema": "allocatbelt.application-source5-preparatory-retention.v1",
+        "source_policy": catalogue["retention_policy"],
+        "persistent_job_record_bytes": phase_ledger_bytes,
+        "persistent_job_record_count": 360,
+        "persistent_archive_metadata_bytes": persistent_archive_metadata_bytes,
+        "maximum_failed_owner_window_bytes":
+            width["maximum_failed_owner_window_bytes"],
+        "maximum_active_transfer_window_bytes":
+            catalogue["retention_policy"]["maximum_window_total_bytes"],
+        "maximum_active_transfer_window_inodes":
+            catalogue["retention_policy"]["maximum_window_total_inodes"],
+        "maximum_active_readback_window_bytes": readback_window_bytes,
+        "maximum_active_readback_window_inodes": readback_window_inodes,
+        "maximum_catalogue_sort_scratch_bytes":
+            catalogue["maximum_sort_scratch_bytes"],
+        "maximum_catalogue_sort_scratch_inodes":
+            catalogue["maximum_sort_scratch_inodes"],
+        "no_reclaim_roles": [
+            "typed_source_file", "typed_source_symlink", "source_manifest",
+            "spec_v3", "plan_v3", "observed_host", "preparation",
+            "capacity_completion", "capacity_host_receipt", "capacity_ledger",
+            "capacity_artifact", "source5_archive_signer_context",
+            "source5_archive_signer_keyring", "source5_archive_signer_gpgv",
+        ],
+    }
+    required_bytes = {
+        row["path"]: catalogue["retention_policy"][
+            "maximum_live_root_byte_bounds"].get(row["path"], 0)
+        for row in reservation["roots"]
+    }
+    required_inodes = {
+        row["path"]: catalogue["retention_policy"][
+            "maximum_live_root_inode_bounds"].get(row["path"], 0)
+        for row in reservation["roots"]
+    }
+    chunk_bytes = sum(chunk["byte_count"] for chunk in catalogue["chunks"])
+    artifact_path = str(context.artifact_root)
+    required_bytes[artifact_path] += chunk_bytes
+    required_inodes[artifact_path] += len(catalogue["chunks"])
+    scratch_path = str(next(Path(row["path"]) for row in reservation["roots"]
+                            if row["role"] == "scratch"))
+    required_bytes[scratch_path] = max(
+        required_bytes[scratch_path],
+        catalogue["retention_policy"]["persistent_root_byte_bounds"].get(
+            scratch_path, 0) + catalogue["maximum_sort_scratch_bytes"],
+    )
+    required_inodes[scratch_path] = max(
+        required_inodes[scratch_path],
+        catalogue["retention_policy"]["persistent_root_inode_bounds"].get(
+            scratch_path, 0) + catalogue["maximum_sort_scratch_inodes"],
+    )
+    storage = {
+        "pin": reservation_pin,
+        "roots": reservation["roots"],
+        "required_bytes_by_root": required_bytes,
+        "required_inodes_by_root": required_inodes,
+    }
+    seed = {
+        "schema": PREPARATORY_BUDGET_SCHEMA,
+        "campaign_id": context.manifest["campaign_id"],
+        "host_id": context.host_id,
+        "profile": "preparatory_exploration_360_v1",
+        "execution_basis_sha256": context.preparatory_execution_basis_sha256,
+        "original_pins": original_pins,
+        "owner_contract": {
+            **context.owner_evidence_contract,
+            "journal_width_contract": width,
+            "journal_width_contract_raw": canonical_bytes(width),
+        },
+        "schedule": schedule,
+        "read_schedule": read_schedule,
+        "journal_width_contract_pin": width_pin,
+        "path_catalogue": catalogue,
+        "archive_transport": archive_transport,
+        "retention_policy": retention,
+        "storage_reservation": storage,
+        "readiness": {
+            "preparatory_budget_complete": True,
+            "preparatory_execution_ready": True,
+            "full_horizon_execution_ready": False,
+            "component_gate_ready": False,
+            "qualification_eligible": False,
+        },
+    }
+    catalogue_reader = _source5_preparatory_catalogue_row_reader(
+        context, budget_module, catalogue,
+    )
+    _require_prep = prep_module.build_host_evidence_budget_v1(
+        seed, catalogue_module=budget_module,
+        owner_catalogue_module=context.modules[EVIDENCE_CATALOGUE_SOURCE_PATH],
+        campaign_module=context.campaign,
+        input_preparation_module=context.modules[
+            SOURCE5_INPUT_PREPARATION_SOURCE_PATH],
+        spec_raw=canonical_bytes(context.spec),
+        source_manifest_raw=canonical_bytes(
+            context.sources[context.host_id],
+        ),
+        execution_module_pins=context.manifest["modules"][context.host_id],
+        catalogue_row_reader=catalogue_reader,
+    )
+    return _require_prep
+
+def _source5_preparatory_budget_ready_for_manifest(
+    context: CampaignContext, reservation_path: Path,
+) -> dict[str, Any]:
+    """Produce and raw-pin the finite selected-host width and 360-job budget."""
+    prep_module = context.modules[PREPARATORY_BUDGET_SOURCE_PATH]
+    budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    budget_dir = _private_directory(
+        context.artifact_root / context.manifest["campaign_id"] /
+        "source5" / context.host_id / "evidence-budget",
+    )
+    width_path = budget_dir / "preparatory-journal-width-v1.json"
+    budget_path = budget_dir / "host-evidence-budget-preparatory-v1.json"
+    require(not width_path.exists() and not width_path.is_symlink() and
+            not budget_path.exists() and not budget_path.is_symlink(),
+            "preparatory width or budget output already exists and cannot be replaced")
+    reservation, reservation_pin = _validate_live_storage_reservation(
+        context, reservation_path,
+    )
+    projection = _source5_preparatory_width_projection(context)
+    width = projection["contract"]
+    width_raw = canonical_bytes(width)
+    width_sha = write_new(
+        width_path, width_raw, "Source5 preparatory journal-width contract",
+    )
+    width_pin = {
+        "path": str(width_path), "raw_sha256": width_sha,
+        "semantic_sha256": width["contract_sha256"],
+    }
+    context.preparatory_width_contract = width
+    context.preparatory_width_pin = width_pin
+    context.journal_width_contract = width
+    context.journal_width_contract_pin = width_pin
+    context.journal_width_budget_pin = {
+        "path": str(budget_path), "raw_sha256": "f" * 64,
+        "semantic_sha256": "f" * 64,
+    }
+    context.preparatory_budget_pin = dict(context.journal_width_budget_pin)
+    context.host_evidence_budget_pin = dict(context.journal_width_budget_pin)
+
+    catalogue_directory = _private_directory(
+        budget_dir / "preparatory-path-catalogue-v1",
+    )
+    require(not any(catalogue_directory.iterdir()),
+            "preparatory path-catalogue directory already contains children")
+    jobs = _host_jobs(context, "exploration")
+    require(len(jobs) == 360,
+            "preparatory budget admission requires all 360 original exploration jobs")
+    job_record_cap = max(
+        _source5_job_record_byte_bound(context, "exploration", job)
+        for job in jobs
+    )
+    require(type(job_record_cap) is int and job_record_cap > 0,
+            "preparatory record-admission ceiling is not source-derived")
+    budget_cap = 1
+    prior_catalogue = None
+    final_body = None
+    final_raw = None
+    final_catalogue = None
+    final_catalogue_job_pins = None
+    final_read_slots = None
+    for _iteration in range(8):
+        (path_rows, _job_rows, job_catalogue_pins, archive_caps,
+         readback_caps, read_schedule, read_control, read_slots,
+         _catalogue_dir, scratch_root) = _source5_preparatory_path_rows(
+            context, reservation, reservation_pin, width_pin, budget_cap,
+        )
+        if prior_catalogue is not None:
+            _source5_discard_preparatory_catalogue_chunks(
+                catalogue_directory, prior_catalogue,
+            )
+        catalogue = budget_module.write_path_catalogue_chunks(
+            path_rows, catalogue_directory,
+            scratch_directory_value=scratch_root,
+        )
+        body = _source5_preparatory_budget_body(
+            context, _source5_preparatory_original_pins(context),
+            width, width_pin, reservation, reservation_pin, catalogue,
+            archive_caps, readback_caps, read_schedule, read_control,
+            job_record_cap,
+        )
+        raw = canonical_bytes(body)
+        measured = len(raw)
+        require(0 < measured <= prep_module.MAX_BUDGET_BYTES,
+                "source-derived preparatory budget exceeds its finite byte ceiling")
+        if measured == budget_cap:
+            final_body, final_raw, final_catalogue = body, raw, catalogue
+            final_catalogue_job_pins = job_catalogue_pins
+            final_read_slots = read_slots
+            break
+        budget_cap = measured
+        prior_catalogue = catalogue
+    else:
+        raise Source5CampaignError(
+            "preparatory budget/catalogue row self-size projection did not converge",
+        )
+    require(type(final_body) is dict and type(final_raw) is bytes and
+            type(final_catalogue) is dict,
+            "preparatory source-derived budget projection is incomplete")
+    budget_sha = write_new(
+        budget_path, final_raw, "Source5 bounded preparatory host budget",
+    )
+    budget_pin = {
+        "path": str(budget_path), "raw_sha256": budget_sha,
+        "semantic_sha256": final_body["budget_sha256"],
+    }
+    context.preparatory_budget = final_body
+    context.preparatory_budget_raw = final_raw
+    context.preparatory_budget_pin = budget_pin
+    context.host_evidence_budget_raw = final_raw
+    context.host_evidence_budget_pin = budget_pin
+    context.journal_width_budget_pin = budget_pin
+    _source5_restore_preparatory_archive_readback_context(
+        context, final_body, budget_module,
+    )
+    require(final_catalogue_job_pins == context.job_path_catalogue_pins and
+            final_read_slots == context.source5_archive_read_slot_paths,
+            "preparatory job/read slots differ after the frozen catalogue replay")
+    return {
+        "width": width, "width_pin": width_pin,
+        "budget": final_body, "budget_raw": final_raw,
+        "budget_pin": budget_pin, "catalogue": final_catalogue,
+    }
+
+def _source5_preparatory_catalogue_row_reader(
+    context: CampaignContext, budget_module: Any, catalogue_value: object,
+):
+    """Return an IO-only reader restricted to this budget's exact local chunks."""
+    manifest = budget_module.validate_path_catalogue_manifest(catalogue_value)
+    expected_directory = (
+        context.artifact_root / context.manifest["campaign_id"] / "source5" /
+        context.host_id / "evidence-budget" / "preparatory-path-catalogue-v1"
+    )
+    chunks = {}
+    for row in manifest["chunks"]:
+        path = Path(row["path"])
+        require(path.is_absolute() and path.parent == expected_directory and
+                path.name.startswith("path-catalogue-") and
+                path.name.endswith(".jsonl") and path not in chunks,
+                "preparatory catalogue reader rejects a nonlocal or duplicate chunk path")
+        chunks[path] = row
+
+    def read_chunk(path_value: str, maximum_bytes: int) -> bytes:
+        path = Path(path_value)
+        row = chunks.get(path)
+        require(row is not None and maximum_bytes == row["byte_count"],
+                "preparatory catalogue reader rejects an undeclared chunk/size request")
+        raw, digest, info = read_stable(
+            path, "Source5 captured local preparatory catalogue chunk",
+            maximum_bytes, row["raw_sha256"],
+        )
+        current = path.lstat()
+        require(digest == row["raw_sha256"] == row["semantic_sha256"] and
+                len(raw) == row["byte_count"] and stat.S_ISREG(info.st_mode) and
+                info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600 and
+                info.st_nlink == 1 and _source5_same_file_identity(info, current),
+                "preparatory catalogue chunk changed its exact private raw identity")
+        return raw
+
+    return read_chunk
+
+def _source5_preparatory_core_value(
+    context: CampaignContext,
+) -> dict[str, Any]:
+    prep_module = context.modules[PREPARATORY_BUDGET_SOURCE_PATH]
+    fields = set(prep_module.EXECUTION_CORE_FIELDS)
+    return exact({key: context.manifest[key] for key in fields}, fields,
+                 "Source5 preparatory execution core")
+
+def _source5_preparatory_job_catalogue_pins(
+    context: CampaignContext, catalogue: dict[str, Any], budget_module: Any,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    root = (context.artifact_root / context.manifest["campaign_id"] /
+            "source5" / context.host_id / "job-path-catalogues" /
+            "exploration")
+    jobs = _host_jobs(context, "exploration")
+    expected = {job["run_id"]: job for job in jobs}
+    result = {}
+    for row in budget_module.iter_path_catalogue_rows(catalogue):
+        if row["role"] != "source5_job_row_catalogue":
+            continue
+        job = expected.get(row["run_id"])
+        pin = row.get("origin_pin")
+        require(type(job) is dict and row["phase"] == "exploration" and
+                row["kind"] == "file" and
+                row["host_id"] == context.host_id and
+                row["storage_root"] == str(context.artifact_root) and
+                row["max_file_bytes"] == row["max_bytes"] > 0 and
+                type(pin) is dict and is_sha(pin.get("raw_sha256")) and
+                pin.get("semantic_sha256") is None,
+                "preparatory per-job path catalogue row is malformed")
+        key = ("exploration", job["run_id"])
+        expected_path = (root /
+                         f"{job['ordinal']:06d}-{sha256(canonical_bytes(job))}.jsonl")
+        require(row["path"] == str(expected_path) and key not in result,
+                "preparatory per-job catalogue path differs from its exact original ordinal")
+        result[key] = {
+            "path": row["path"], "raw_sha256": pin["raw_sha256"],
+            "byte_count": row["max_file_bytes"],
+        }
+    require(set(result) == {("exploration", run_id) for run_id in expected},
+            "preparatory per-job path catalogues do not cover all original jobs")
+    return result
+
+def _source5_preparatory_original_pins(
+    context: CampaignContext,
+) -> dict[str, Any]:
+    """Bind the immutable pre-rate generation without a final-manifest cycle."""
+    require(context.manifest.get("schema") == PREPARATORY_EXECUTION_SCHEMA and
+            type(context.preparatory_capacity_generation) is dict and
+            type(context.preparatory_capacity_registration) is dict and
+            type(context.preparatory_execution_basis_sha256) is str and
+            is_sha(context.preparatory_execution_basis_sha256),
+            "Source5 preparatory pins require the selected prep execution basis")
+    generation = context.manifest["preparatory_capacity_generation"]
+    registration = context.preparatory_capacity_registration
+    source_manifests = {
+        host: {
+            "path": context.source_manifest_pins[host]["path"],
+            "raw_sha256": context.source_manifest_pins[host]["raw_sha256"],
+            "semantic_sha256": context.sources[host]["manifest_sha256"],
+            "source_tree_sha256": context.sources[host]["source"][
+                "source_tree_sha256"],
+        }
+        for host in context.manifest["hosts"]
+    }
+    module_pins = context.manifest["modules"][context.host_id]
+    normalized_modules = {
+        path: {"path": path, "sha256": pin["sha256"]}
+        for path, pin in sorted(module_pins.items())
+    }
+    observed_hosts = {
+        host: raw_pin(row["artifact"],
+                      f"Source5 prep {host} observed-host pin")
+        for host, row in context.manifest["observed_hosts"].items()
+    }
+    return {
+        "preparation": dict(generation["provenance"]["preparation_pin"]),
+        "capacity_generation": {
+            "path": generation["completion"]["path"],
+            "raw_sha256": generation["completion"]["raw_sha256"],
+            "semantic_sha256": generation["completion"]["semantic_sha256"],
+            "provenance": generation["provenance"],
+        },
+        "initial_spec": {
+            "path": context.spec_pin["path"],
+            "raw_sha256": context.spec_pin["raw_sha256"],
+            "semantic_sha256": context.spec_semantic_sha256,
+        },
+        "initial_plan": {
+            "path": context.plan_pin["path"],
+            "raw_sha256": context.plan_pin["raw_sha256"],
+            "semantic_sha256": context.plan_semantic_sha256,
+        },
+        "source_manifests": source_manifests,
+        "observed_hosts": observed_hosts,
+        "typed_modules": normalized_modules,
+        "archive_signer_context": {
+            "artifact": {
+                "path": context.archive_signer_context_pin["path"],
+                "raw_sha256": context.archive_signer_context_pin["raw_sha256"],
+            },
+            "semantic_sha256": context.archive_signer_context_pin[
+                "semantic_sha256"],
+        },
+        "capacity_registration": {
+            "registration_head": registration["registration_head"],
+            "capacity_schedule_sha256":
+                registration["capacity_schedule_sha256"],
+            "ledger": registration["ledger"],
+        },
+        "execution_basis_sha256": context.preparatory_execution_basis_sha256,
+    }
+
+def _source5_preparatory_control_ledger_path(
+    context: CampaignContext,
+) -> Path:
+    """Return the persistent control-ledger path under the reserved output root."""
+    return (context.output_root / context.manifest["campaign_id"] / "source5" /
+            context.host_id / "archive-read-control.jsonl")
+
+
+def _source5_prepared_fixed_spec_host_artifact(
+    context: CampaignContext,
+) -> tuple[dict[str, str], bytes, dict[str, Any]]:
+    """Reopen the materialized Spec.host bytes and bind their inline adapter."""
+    fixed_pin = exact(
+        getattr(context, "fixed_spec_host_pin", None),
+        {"path", "raw_sha256"}, "Source5 fixed Spec host pin",
+    )
+    expected_path = (context.input_root / "fixed-spec-hosts" /
+                     f"{context.host_id}.json")
+    require(fixed_pin["path"] == str(expected_path) and
+            is_sha(fixed_pin["raw_sha256"]),
+            "Source5 fixed Spec host pin differs from its exact deterministic input path")
+    raw, actual_sha, info = read_stable(
+        expected_path, "Source5 fixed Spec host bytes", 32 * 1024 * 1024,
+        fixed_pin["raw_sha256"],
+    )
+    try:
+        value = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            "Source5 fixed Spec host bytes are malformed",
+        ) from error
+    expected_host = next(
+        item for item in context.spec["hosts"]
+        if item["host_id"] == context.host_id
+    )
+    binding = exact(getattr(context, "prepared_fixed_host_binding", None), {
+        "schema", "host_id", "fixed_spec_host_pin",
+        "prepared_host_context_pin", "spec_host_semantic_sha256",
+        "boot_id_sha256", "kernel_release", "controls_sha256",
+        "process_affinity", "network_namespace_inode", "binding_sha256",
+    }, "Source5 inline prepared fixed-host adapter")
+    preparation = context.modules.get(SOURCE5_INPUT_PREPARATION_SOURCE_PATH)
+    validator = getattr(preparation,
+                        "_validate_prepared_fixed_host_binding", None)
+    require(callable(validator) and validator(binding) == binding,
+            "Source5 fixed-host adapter is not valid under its selected preparation module")
+    observed, observed_raw, observed_sha = read_json(
+        Path(context.observed_host_pin["path"]),
+        "Source5 selected capacity-host context", MAX_ARTIFACT_BYTES,
+        context.observed_host_pin["raw_sha256"],
+    )
+    require(raw == canonical_bytes(value) and value == expected_host and
+            stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+            stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+            actual_sha == fixed_pin["raw_sha256"] and
+            binding["schema"] ==
+                "allocatbelt.application-source5-fixed-pair-host-binding.v1" and
+            binding["host_id"] == context.host_id and
+            binding["fixed_spec_host_pin"] == fixed_pin and
+            binding["prepared_host_context_pin"] == context.observed_host_pin and
+            binding["spec_host_semantic_sha256"] ==
+                sha256(canonical_bytes(expected_host)) and
+            binding["boot_id_sha256"] == observed.get("boot_id_sha256") and
+            binding["kernel_release"] == observed.get("kernel_release") and
+            binding["controls_sha256"] == observed.get("controls_sha256") and
+            binding["process_affinity"] == observed.get("cpu_affinity") and
+            binding["network_namespace_inode"] ==
+                observed.get("network_namespace_inode") and
+            observed_raw == canonical_bytes(observed) and
+            observed_sha == context.observed_host_pin["raw_sha256"],
+            "Source5 fixed Spec host bytes/adapter differ from the original prepared host context")
+    return dict(fixed_pin), raw, binding
+
+
+def _source5_preparatory_path_rows(
+    context: CampaignContext, reservation: dict[str, Any],
+    reservation_pin: dict[str, Any], width_pin: dict[str, str],
+    budget_cap: int,
+) -> tuple[
+        list[dict[str, Any]],
+        dict[tuple[str, str], list[dict[str, Any]]],
+        dict[tuple[str, str], dict[str, Any]],
+        dict[tuple[str, str], dict[str, int]],
+        dict[tuple[str, str], dict[str, int]],
+        list[dict[str, Any]], dict[str, int], dict[str, str], Path, Path]:
+    """Enumerate the finite prep-only owner, journal and archive path roles."""
+    _source5_preparatory_reclaim_anchor(context)
+    budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    fixed = context.fixed_pair
+    limits = context.owner_evidence_contract["fixed_pair"]["limits"]
+    campaign_id = context.manifest["campaign_id"]
+    host_id = context.host_id
+    artifact_root = context.artifact_root
+    output_root = context.output_root
+    roots = {row["role"]: Path(row["path"])
+             for row in reservation["roots"]}
+    require({"artifact", "output", "scratch", "evidence_store"} <= set(roots) and
+            roots["artifact"] == artifact_root and roots["output"] == output_root,
+            "preparatory Source5 reservation lacks its exact writable-domain closure")
+    scratch_root = roots["scratch"]
+    require(scratch_root.resolve(strict=True) == scratch_root and
+            scratch_root.is_dir() and scratch_root.stat().st_uid == os.getuid() and
+            stat.S_IMODE(scratch_root.stat().st_mode) == 0o700,
+            "preparatory Source5 catalogue needs its owned private scratch root")
+    base = artifact_root / campaign_id / "source5" / host_id
+    prep_budget_dir = base / "evidence-budget"
+    width_path = prep_budget_dir / "preparatory-journal-width-v1.json"
+    budget_path = prep_budget_dir / "host-evidence-budget-preparatory-v1.json"
+    manifest_path = base / "preparatory-execution-manifest-v1.json"
+    catalogue_dir = prep_budget_dir / "preparatory-path-catalogue-v1"
+    readback_root = scratch_root / campaign_id / host_id / "archive-readback"
+    packet_root = scratch_root / campaign_id / host_id / "evidence-packets"
+    metadata_root = (output_root / campaign_id / "chronology" / host_id /
+                     "evidence-checkpoints")
+    jobs = _host_jobs(context, "exploration")
+    exclusive_job_roots: dict[str, tuple[str, str]] = {}
+    for job in jobs:
+        run_id = job["run_id"]
+        job_root = (artifact_root / campaign_id / "source5" / host_id /
+                    "job-artifacts" / "exploration" / run_id).absolute()
+        key = str(job_root)
+        require(key not in exclusive_job_roots,
+                "preparatory selected-host jobs do not have disjoint output roots")
+        exclusive_job_roots[key] = ("exploration", run_id)
+    read_slots = {
+        "source5_archive_read_request_slot": str(readback_root / "request.json"),
+        "source5_archive_read_response_slot": str(readback_root / "response.json"),
+        "source5_archive_read_response_incoming":
+            str(readback_root / "response.json.incoming"),
+        "source5_archive_read_bundle": str(readback_root / "response.tar"),
+        "source5_archive_read_bundle_incoming":
+            str(readback_root / "response.tar.incoming"),
+        "source5_archive_read_stage": str(readback_root / "stage"),
+        budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE: str(
+            _source5_preparatory_control_ledger_path(context)),
+    }
+    all_rows: list[dict[str, Any]] = []
+    job_rows: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    job_row_by_path: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
+    directory_rows: dict[str, dict[str, Any]] = {}
+
+    def add_job_row(row: dict[str, Any], phase: str | None,
+                    run_id: str | None) -> None:
+        if phase is None or run_id is None:
+            return
+        key = (phase, run_id)
+        rows_by_path = job_row_by_path.setdefault(key, {})
+        prior = rows_by_path.get(row["path"])
+        require(prior is None or prior == row,
+                f"preparatory job path repeats incompatible declarations: {row['path']}")
+        if prior is None:
+            rows_by_path[row["path"]] = row
+            job_rows.setdefault(key, []).append(row)
+
+    def domain(path: Path) -> str:
+        matches = [root for role, root in roots.items()
+                   if role != "evidence_store" and path.is_relative_to(root)]
+        require(matches,
+                f"preparatory Source5 path has no host-local reserved root: {path}")
+        return str(max(matches, key=lambda root: len(root.parts)))
+
+    def directory_scope(path: Path) -> tuple[str, str | None, str | None]:
+        for candidate in (path, *path.parents):
+            group = exclusive_job_roots.get(str(candidate))
+            if group is not None:
+                phase, run_id = group
+                return "fixed_pair", phase, run_id
+        return "source5_controller", None, None
+
+    def add_directory(
+        path_value: Path | str, *, storage_root: str | None,
+    ) -> dict[str, Any]:
+        path = Path(path_value).absolute()
+        key = str(path)
+        root = domain(path) if storage_root == "auto" else storage_root
+        owner, phase, run_id = directory_scope(path)
+        row = {
+            "path": key, "kind": "tree", "role": "directory_node",
+            "host_id": host_id, "max_bytes": 0, "max_file_bytes": 0,
+            "max_inodes": 1, "storage_root": root, "owner": owner,
+            "phase": phase, "run_id": run_id, "member_index": None,
+            "aggregate_id": None, "aggregate_max_bytes": None,
+            "origin_pin": None,
+        }
+        prior = directory_rows.get(key)
+        if prior is None:
+            directory_rows[key] = row
+        else:
+            require(prior == row,
+                    f"preparatory Source5 directory path aliases incompatible rows: {path}")
+            row = prior
+        return row
+
+    def add_parents(path_value: Path | str, storage_root: str | None) -> None:
+        if storage_root is None:
+            return
+        path = Path(path_value).absolute()
+        root = Path(storage_root).absolute()
+        require(path.is_relative_to(root),
+                f"preparatory Source5 path escapes its reserved storage root: {path}")
+        parent = path.parent
+        while parent.is_relative_to(root):
+            row = add_directory(parent, storage_root=str(root))
+            add_job_row(row, row["phase"], row["run_id"])
+            if parent == root:
+                break
+            parent = parent.parent
+
+    add_directory(catalogue_dir, storage_root=str(artifact_root))
+    add_parents(catalogue_dir, str(artifact_root))
+    for root, _root_role in ((artifact_root, "artifact"),
+                             (output_root, "output"),
+                             (scratch_root, "scratch")):
+        add_directory(root, storage_root=str(root))
+
+    def add_file(
+        path_value: Path | str, role: str, maximum: int, owner: str, *,
+        storage_root: str | None, phase: str | None = None,
+        run_id: str | None = None, member_index: int | None = None,
+        aggregate_id: str | None = None, aggregate_maximum: int | None = None,
+        origin_pin: dict[str, str] | None = None, host: str | None = None,
+        add_to_job: bool = True,
+    ) -> dict[str, Any]:
+        path = Path(path_value).absolute()
+        root = domain(path) if storage_root == "auto" else storage_root
+        row = {
+            "path": str(path), "kind": "file", "role": role,
+            "host_id": host, "max_bytes": maximum,
+            "max_file_bytes": maximum, "max_inodes": 1,
+            "storage_root": root, "owner": owner,
+            "phase": phase, "run_id": run_id,
+            "member_index": member_index, "aggregate_id": aggregate_id,
+            "aggregate_max_bytes": aggregate_maximum,
+            "origin_pin": (None if origin_pin is None else {
+                "raw_sha256": origin_pin["raw_sha256"],
+                "semantic_sha256": origin_pin.get("semantic_sha256"),
+            }),
+        }
+        checked = budget_module._catalogue_row(
+            row, f"preparatory Source5 {role} row",
+        )
+        all_rows.append(checked)
+        if add_to_job:
+            add_job_row(checked, phase, run_id)
+        add_parents(path, root)
+        return checked
+
+    def add_tree(
+        path_value: Path | str, maximum: int, maximum_file: int,
+        maximum_inodes: int, owner: str, *, storage_root: str,
+        phase: str | None, run_id: str | None,
+        member_index: int | None = None,
+        role: str = "normal_app_output",
+    ) -> dict[str, Any]:
+        path = Path(path_value).absolute()
+        row = {
+            "path": str(path), "kind": "tree", "role": role,
+            "host_id": host_id, "max_bytes": maximum,
+            "max_file_bytes": maximum_file, "max_inodes": maximum_inodes,
+            "storage_root": storage_root, "owner": owner,
+            "phase": phase, "run_id": run_id,
+            "member_index": member_index, "aggregate_id": None,
+            "aggregate_max_bytes": None, "origin_pin": None,
+        }
+        checked = budget_module._catalogue_row(
+            row, f"preparatory Source5 {role} tree row",
+        )
+        all_rows.append(checked)
+        add_job_row(checked, phase, run_id)
+        add_parents(path, storage_root)
+        return checked
+
+    # The exact selected typed SourceV5 closure and immutable original inputs.
+    for source_row in context.source["source"]["files"]:
+        relative = PurePosixPath(source_row["path"])
+        add_file(context.source_root.joinpath(*relative.parts),
+                 "typed_source_file" if source_row["kind"] == "file" else
+                 "typed_source_symlink", source_row["size"], "source",
+                 storage_root=None,
+                 origin_pin={"raw_sha256": source_row["sha256"]},
+                 host=host_id, add_to_job=False)
+    for selected_host in context.manifest["hosts"]:
+        source_value = context.sources[selected_host]
+        source_pin = context.source_manifest_pins[selected_host]
+        add_file(source_pin["path"], "source_manifest",
+                 MAX_MANIFEST_BYTES, "source", storage_root=None,
+                 origin_pin={"raw_sha256": source_pin["raw_sha256"],
+                             "semantic_sha256": source_value["manifest_sha256"]},
+                 host=selected_host, add_to_job=False)
+        observed_ref = context.manifest["observed_hosts"][selected_host]["artifact"]
+        add_file(observed_ref["path"], "observed_host", MAX_ARTIFACT_BYTES,
+                 "inputs", storage_root=None,
+                 origin_pin={"raw_sha256": observed_ref["raw_sha256"]},
+                 host=selected_host, add_to_job=False)
+        for budget_host, budget_pin in context.preparatory_capacity_generation[
+                "resource_budgets"].items():
+            if budget_pin["path"] not in {row["path"] for row in all_rows}:
+                add_file(budget_pin["path"], "preparation", MAX_ARTIFACT_BYTES,
+                         "inputs", storage_root=None,
+                         origin_pin={"raw_sha256": budget_pin["raw_sha256"],
+                                     "semantic_sha256": budget_pin[
+                                         "semantic_sha256"]},
+                         host=budget_host, add_to_job=False)
+    if getattr(context, "fixed_spec_host_pin", None) is not None:
+        fixed_spec_pin, fixed_spec_raw, _fixed_binding = \
+            _source5_prepared_fixed_spec_host_artifact(context)
+        add_file(
+            fixed_spec_pin["path"], "observed_host", len(fixed_spec_raw),
+            "inputs", storage_root=None,
+            origin_pin={"raw_sha256": fixed_spec_pin["raw_sha256"],
+                        "semantic_sha256": None},
+            host=host_id, add_to_job=False,
+        )
+    input_preparation = context.modules[SOURCE5_INPUT_PREPARATION_SOURCE_PATH]
+    preregistration_digest = context.campaign.preregistration_digest(
+        context.spec,
+    )
+    capacity_pilot_maximum = input_preparation.capacity_pilot_maximum_bytes(
+        context.spec, context.host_id, context.campaign.ALLOCATORS,
+        preregistration_digest,
+    )
+    require(type(capacity_pilot_maximum) is int and
+            0 < capacity_pilot_maximum <= (1 << 64) - 1,
+            "Source5 capacity-pilot row bound is not a positive source-derived u64")
+    capacity_pilot_path = (
+        _phase_root(context, "exploration") / "capacity-pilot.json"
+    )
+    add_file(
+        capacity_pilot_path, "capacity_artifact", capacity_pilot_maximum,
+        "source5_controller", storage_root=str(output_root),
+        phase="exploration", run_id=None, host=host_id,
+        add_to_job=False,
+    )
+    add_file(context.spec_pin["path"], "spec_v3",
+             len(canonical_bytes(context.spec)),
+             "inputs", storage_root=None,
+             origin_pin={"raw_sha256": context.spec_pin["raw_sha256"],
+                         "semantic_sha256": context.spec_semantic_sha256},
+             host=host_id, add_to_job=False)
+    add_file(context.plan_pin["path"], "plan_v3", len(context.plan_raw),
+             "inputs", storage_root=None,
+             origin_pin={"raw_sha256": context.plan_pin["raw_sha256"],
+                         "semantic_sha256": context.plan_semantic_sha256},
+             host=host_id, add_to_job=False)
+    generation = context.manifest["preparatory_capacity_generation"]
+    add_file(generation["completion"]["path"], "capacity_completion",
+             MAX_ARTIFACT_BYTES, "capacity_stage", storage_root=None,
+             origin_pin={"raw_sha256": generation["completion"]["raw_sha256"],
+                         "semantic_sha256": generation["completion"][
+                             "semantic_sha256"]}, host=host_id,
+             add_to_job=False)
+    add_file(generation["provenance"]["preparation_pin"]["path"],
+             "preparation", MAX_ARTIFACT_BYTES, "inputs", storage_root=None,
+             origin_pin={"raw_sha256": generation["provenance"][
+                 "preparation_pin"]["raw_sha256"]}, host=host_id,
+             add_to_job=False)
+    for capacity_row in context.preparatory_capacity_generation[
+            "capacity_preparations"]:
+        for field, role in (("completion", "capacity_completion"),
+                            ("host_verification", "capacity_host_receipt"),
+                            ("ledger", "capacity_ledger")):
+            pin = capacity_row[field]
+            raw_pin_value = pin.get("raw_sha256")
+            if type(raw_pin_value) is not str or pin["path"] in {
+                    row["path"] for row in all_rows}:
+                continue
+            add_file(pin["path"], role, MAX_ARTIFACT_BYTES,
+                     "capacity_stage", storage_root=None,
+                     origin_pin={"raw_sha256": raw_pin_value},
+                     host=capacity_row["host_id"], add_to_job=False)
+        for entry in capacity_row["entries"]:
+            for field in ("request", "artifact", "receipt"):
+                pin = entry[field]
+                if pin["path"] in {row["path"] for row in all_rows}:
+                    continue
+                capacity_artifact_sha = pin.get(
+                    "raw_sha256", pin.get("sha256"),
+                )
+                require(is_sha(capacity_artifact_sha),
+                        "preparatory capacity-generation artifact pin is malformed")
+                add_file(pin["path"], "capacity_artifact",
+                         MAX_ARTIFACT_BYTES, "capacity_stage",
+                         storage_root=None,
+                         origin_pin={"raw_sha256": capacity_artifact_sha},
+                         host=capacity_row["host_id"], add_to_job=False)
+
+    add_file(reservation_pin["path"], "storage_reservation",
+             reservation_pin["byte_count"], "source5_controller",
+             storage_root=str(artifact_root),
+             origin_pin={"raw_sha256": reservation_pin["raw_sha256"],
+                         "semantic_sha256": reservation_pin[
+                             "semantic_sha256"]}, host=host_id,
+             add_to_job=False)
+    width_raw, width_actual_sha, _width_info = read_stable(
+        width_path, "Source5 preparatory width catalogue pin",
+        16 * 1024 * 1024, width_pin["raw_sha256"],
+    )
+    require(width_actual_sha == width_pin["raw_sha256"] and
+            len(width_raw) <= 16 * 1024 * 1024,
+            "preparatory width catalogue raw pin differs")
+    add_file(str(width_path), "preparatory_journal_width_contract",
+             len(width_raw), "source5_controller",
+             storage_root=str(artifact_root),
+             origin_pin={"raw_sha256": width_pin["raw_sha256"],
+                         "semantic_sha256": width_pin["semantic_sha256"]},
+             host=host_id, add_to_job=False)
+    add_file(str(budget_path), "host_evidence_budget", budget_cap,
+             "source5_controller", storage_root=str(artifact_root),
+             host=host_id, add_to_job=False)
+    prep_module = context.modules[PREPARATORY_BUDGET_SOURCE_PATH]
+    manifest_basis = prep_module.build_execution_basis(context.manifest)
+    manifest_sized_body = {
+        **context.manifest,
+        "preparatory_journal_width_contracts": {
+            host_id: {
+                "artifact": {
+                    "path": str(width_path),
+                    "raw_sha256": width_pin["raw_sha256"],
+                },
+                "semantic_sha256": width_pin["semantic_sha256"],
+            },
+        },
+        "preparatory_host_budgets": {
+            host_id: {
+                "artifact": {
+                    "path": str(budget_path),
+                    "raw_sha256": "f" * 64,
+                },
+                "semantic_sha256": "f" * 64,
+            },
+        },
+        "preparatory_execution_basis_sha256": manifest_basis,
+        "manifest_sha256": "f" * 64,
+    }
+    manifest_cap = len(canonical_bytes(manifest_sized_body))
+    add_file(str(manifest_path), "execution_manifest", manifest_cap,
+             "inputs", storage_root=str(artifact_root), host=host_id,
+             add_to_job=False)
+    signer_context = context.archive_signer_context
+    add_file(context.archive_signer_context_pin["path"],
+             "source5_archive_signer_context", MAX_ARCHIVE_SIGNER_CONTEXT_BYTES,
+             "source5_controller", storage_root=None,
+             origin_pin={"raw_sha256": context.archive_signer_context_pin[
+                 "raw_sha256"],
+                 "semantic_sha256": context.archive_signer_context_pin[
+                     "semantic_sha256"]}, host=host_id, add_to_job=False)
+    for name, role, maximum in (
+        ("keyring_pin", "source5_archive_signer_keyring",
+         MAX_ARCHIVE_KEYRING_BYTES),
+        ("gpgv_pin", "source5_archive_signer_gpgv",
+         MAX_ARCHIVE_GPGV_BYTES),
+    ):
+        add_file(signer_context[name]["path"], role, maximum,
+                 "source5_controller", storage_root=None,
+                 origin_pin={"raw_sha256": signer_context[name]["raw_sha256"]},
+                 host=host_id, add_to_job=False)
+
+    # Persistent setup and phase records; the setup event is already in the
+    # journal and the 360 owner rows remain the original callback horizon.
+    ledger_path = _phase_root(context, "exploration") / "controller-ledger.jsonl"
+    ledger_bytes = _source5_phase_ledger_byte_bound(context, "exploration", jobs)
+    add_file(ledger_path, "source5_phase_ledger", ledger_bytes,
+             "source5_controller", storage_root=str(output_root),
+             phase="exploration", host=host_id, add_to_job=False)
+    add_file(output_root / campaign_id / "chronology" / host_id /
+             "dispatch-journal.jsonl", "journal",
+             context.preparatory_budget["schedule"]["maximum_journal_bytes"]
+             if context.preparatory_budget is not None else
+             context.preparatory_width_contract["total_event_bytes"],
+             "chronology", storage_root=str(output_root), host=host_id,
+             add_to_job=False)
+    phase_root = _phase_root(context, "exploration")
+    add_file(phase_root / "not-run-dispositions.json",
+             "source5_job_disposition",
+             _source5_disposition_byte_bound(context, "exploration"),
+             "source5_controller", storage_root=str(output_root),
+             phase="exploration", host=host_id, add_to_job=False)
+
+    # One exact 360-job fixed-owner catalogue and its future local records.
+    job_catalogue_root = base / "job-path-catalogues" / "exploration"
+    _private_directory(job_catalogue_root)
+    fixed_jobs = jobs
+    for index, job in enumerate(fixed_jobs):
+        run_id = job["run_id"]
+        job_sha = sha256(canonical_bytes(job))
+        root = (artifact_root / campaign_id / "source5" / host_id /
+                "job-artifacts" / "exploration" / run_id)
+        job_group = f"fixed-output-{sha256(canonical_bytes(job))}"
+        pair_limit = limits["MAX_PAIR_OUTPUT_BYTES"]
+        helper_path = (artifact_root / campaign_id / "source5" / host_id /
+                       "helper-inputs" / f"exploration-{run_id}.json")
+        add_file(helper_path, "source5_helper_input",
+                 _source5_helper_input_byte_bound(context, "exploration", job),
+                 "source5_controller", storage_root=str(artifact_root),
+                 phase="exploration", run_id=run_id)
+        record_path = phase_root / "job-records" / f"{run_id}.json"
+        record_bound = _source5_job_record_byte_bound(context, "exploration", job)
+        add_file(record_path, "source5_job_record", record_bound,
+                 "source5_controller", storage_root=str(output_root),
+                 phase="exploration", run_id=run_id)
+        add_file(phase_root / "job-records" / f"{run_id}.disposition.json",
+                 "source5_job_disposition",
+                 _source5_job_disposition_byte_bound(job),
+                 "source5_controller", storage_root=str(output_root),
+                 phase="exploration", run_id=run_id)
+        for filename, role, maximum in (
+            ("fixed-pair-execution-overlay.json", "fixed_pair_artifact",
+             256 * 1024 * 1024),
+            (".fixed-pair-runtime-bindings.json", "normal_app_output",
+             limits["MAX_RUNTIME_BYTES"]),
+            ("processes.tsv", "normal_app_output", limits["MAX_RUNTIME_BYTES"]),
+            ("metadata.tsv", "normal_app_output", limits["MAX_RUNTIME_BYTES"]),
+            ("app-events.jsonl", "normal_app_output", pair_limit),
+            ("fixed-pair-execution-receipt.json", "component_receipt",
+             limits["MAX_RECEIPT_BYTES"]),
+        ):
+            aggregate = (job_group if role == "normal_app_output" and
+                         filename not in {".fixed-pair-runtime-bindings.json"}
+                         else None)
+            add_file(root / filename, role, maximum,
+                     "fixed_pair", storage_root=str(artifact_root),
+                     phase="exploration", run_id=run_id,
+                     aggregate_id=aggregate,
+                     aggregate_maximum=(pair_limit if aggregate else None))
+        add_file(_source5_fixed_host_receipt_path(context, job),
+                 "fixed_pair_host_receipt", limits["MAX_RECEIPT_BYTES"],
+                 "fixed_pair", storage_root=str(output_root),
+                 phase="exploration", run_id=run_id, host=host_id)
+        descriptors = fixed._member_descriptors(job, context.campaign)
+        for member_index, descriptor in enumerate(descriptors):
+            stem = f"{descriptor['pair']}-{descriptor['executor']}"
+            slug = (f"{member_index:02d}-{descriptor['pair']}-"
+                    f"{descriptor['executor']}-{descriptor['allocator']}")
+            member_files = {
+                f"{stem}.stdout.tsv": limits["MAX_STDOUT_BYTES"],
+                f"{stem}.stderr.txt": limits["MAX_STDERR_BYTES"],
+                f"{stem}.direct-time.json": limits["MAX_TIME_BYTES"],
+                f"{stem}.ids.tsv": limits["MAX_ID_BYTES"],
+                f"{stem}.shutdown.tsv": limits["MAX_RUNTIME_BYTES"],
+                f"{stem}.capacity-families.tsv": limits["MAX_RUNTIME_BYTES"],
+                f"{stem}.runtime.tsv": limits["MAX_RUNTIME_BYTES"],
+                f"{stem}.runtime-expectation.json": limits["MAX_RUNTIME_BYTES"],
+                f"{stem}.runtime-validation.json": limits["MAX_RUNTIME_BYTES"],
+                f"probes/{slug}.stdout.json": limits["MAX_PROBE_STDOUT_BYTES"],
+                f"probes/{slug}.stderr.txt": limits["MAX_PROBE_STDERR_BYTES"],
+                f"probes/{slug}.replay.stdout.json": limits["MAX_PROBE_STDOUT_BYTES"],
+                f"probes/{slug}.replay.stderr.txt": limits["MAX_PROBE_STDERR_BYTES"],
+            }
+            for relative, maximum in member_files.items():
+                add_file(root / relative, "normal_app_output", maximum,
+                         "fixed_pair", storage_root=str(artifact_root),
+                         phase="exploration", run_id=run_id,
+                         member_index=member_index, aggregate_id=job_group,
+                         aggregate_maximum=pair_limit)
+            add_tree(root / "tmp" / slug, limits["MAX_TMPDIR_BYTES"],
+                     limits["MAX_TMPDIR_BYTES"],
+                     limits["MAX_TMPDIR_INODES"] + 1, "fixed_pair",
+                     storage_root=str(artifact_root), phase="exploration",
+                     run_id=run_id, member_index=member_index)
+            add_tree(root / "probes" / "tmp" / slug,
+                     limits["MAX_TMPDIR_BYTES"],
+                     limits["MAX_TMPDIR_BYTES"],
+                     limits["MAX_TMPDIR_INODES"] + 1, "fixed_pair",
+                     storage_root=str(artifact_root), phase="exploration",
+                     run_id=run_id, member_index=member_index)
+        cleanup_root = (output_root / campaign_id / "source5" / host_id /
+                        "exploration" / "cleanup-sidecars")
+        cleanup_path = (cleanup_root /
+                        f"{job['ordinal']:06d}-{job_sha}-member0.json")
+        for member_index in range(2):
+            cleanup_path = (cleanup_root /
+                            f"{job['ordinal']:06d}-{job_sha}-"
+                            f"member{member_index}.json")
+            add_file(cleanup_path, budget_module.SOURCE5_CLEANUP_SIDECAR_ROLE,
+                     source5_cleanup_sidecar_source_byte_bound(context),
+                     "chronology", storage_root=str(output_root),
+                     phase="exploration", run_id=run_id,
+                     member_index=member_index)
+            add_file(str(cleanup_path) + ".refusal.json",
+                     budget_module.SOURCE5_CLEANUP_SIDECAR_REFUSAL_ROLE,
+                     budget_module.SOURCE5_CLEANUP_REFUSAL_BYTES,
+                     "chronology", storage_root=str(output_root),
+                     phase="exploration", run_id=run_id,
+                     member_index=member_index)
+    # The transport caps are derived from exact selected job declarations;
+    # callers do not multiply a parser ceiling by 360.
+    base_rows = list(all_rows) + list(directory_rows.values())
+    archive_caps = budget_module.project_archive_job_caps(base_rows)
+    readback_caps = budget_module.project_archive_readback_caps(base_rows)
+    expected_jobs = {("exploration", job["run_id"]) for job in jobs}
+    require(set(archive_caps) == expected_jobs and
+            set(readback_caps) == expected_jobs,
+            "preparatory archive projections do not close over all original jobs")
+    metadata_root = (output_root / campaign_id / "chronology" / host_id /
+                     "evidence-checkpoints" / "exploration")
+    packet_phase_root = packet_root / "exploration"
+    for job in jobs:
+        cap = archive_caps[("exploration", job["run_id"])]
+        job_sha = sha256(canonical_bytes(job))
+        leaf = f"{job['ordinal']:06d}-{job_sha}"
+        run_id = job["run_id"]
+        for filename, role, field in (
+            (f"{leaf}.request.json", "source5_checkpoint_request",
+             "checkpoint_request_bytes"),
+            (f"{leaf}.offer.json", "source5_transfer_offer",
+             "transfer_offer_bytes"),
+            (f"{leaf}.ack.tar", "source5_ack_bundle", "ack_bundle_bytes"),
+            (f"{leaf}.ack.tar.incoming", "source5_ack_bundle_incoming",
+             "ack_bundle_bytes"),
+            (f"{leaf}.checkpoint.json", "source5_checkpoint",
+             "checkpoint_bytes"),
+            (f"{leaf}.object-manifest.json", "source5_object_manifest",
+             "object_manifest_bytes"),
+            (f"{leaf}.ack.json", "source5_archive_ack", "archive_ack_bytes"),
+            (f"{leaf}.ack.sig", "source5_archive_signature", "signature_bytes"),
+            (f"{leaf}.stage-map.json", "source5_stage_map", "stage_map_bytes"),
+        ):
+            add_file(metadata_root / filename, role, cap[field],
+                     "source5_controller", storage_root=str(output_root),
+                     phase="exploration", run_id=run_id, host=host_id,
+                     add_to_job=True)
+        add_file(packet_phase_root / f"{leaf}.tar",
+                 "source5_transfer_packet", cap["transfer_packet_bytes"],
+                 "source5_controller", storage_root=str(scratch_root),
+                 phase="exploration", run_id=run_id, host=host_id)
+
+    job_catalogue_pins: dict[tuple[str, str], dict[str, Any]] = {}
+    for job in jobs:
+        key = ("exploration", job["run_id"])
+        declarations = sorted(job_rows.get(key, []), key=lambda row: row["path"])
+        require(declarations and
+                len({row["path"] for row in declarations}) == len(declarations),
+                f"preparatory per-job path catalogue is empty or duplicated: {key}")
+        raw = b"".join(canonical_bytes(row) for row in declarations)
+        require(all(len(canonical_bytes(row)) <=
+                    budget_module.PATH_CATALOGUE_ROW_BYTES
+                    for row in declarations),
+                f"preparatory per-job path row exceeds its fixed parser cap: {key}")
+        job_sha = sha256(canonical_bytes(job))
+        job_catalogue_path = (job_catalogue_root /
+                              f"{job['ordinal']:06d}-{job_sha}.jsonl")
+        if job_catalogue_path.exists() or job_catalogue_path.is_symlink():
+            saved_raw, job_catalogue_sha, saved_info = read_stable(
+                job_catalogue_path,
+                "Source5 existing preparatory original-job path catalogue",
+                len(raw),
+            )
+            require(saved_raw == raw and stat.S_ISREG(saved_info.st_mode) and
+                    saved_info.st_uid == os.getuid() and
+                    stat.S_IMODE(saved_info.st_mode) == 0o600 and
+                    saved_info.st_nlink == 1,
+                    "existing preparatory job catalogue differs from its exact deterministic rows")
+        else:
+            job_catalogue_sha = write_new(
+                job_catalogue_path, raw,
+                "Source5 preparatory original-job path catalogue",
+            )
+        job_catalogue_pins[key] = {
+            "path": str(job_catalogue_path),
+            "raw_sha256": job_catalogue_sha,
+            "byte_count": len(raw),
+        }
+        add_file(job_catalogue_path, "source5_job_row_catalogue", len(raw),
+                 "source5_controller", storage_root=str(artifact_root),
+                 phase="exploration", run_id=job["run_id"],
+                 origin_pin={"raw_sha256": job_catalogue_sha}, host=host_id,
+                 add_to_job=False)
+    caps = {
+        "request": max(row["request_bytes"]
+                       for row in readback_caps.values()),
+        "response": max(row["response_bytes"]
+                        for row in readback_caps.values()),
+        "bundle": max(row["bundle_bytes"]
+                      for row in readback_caps.values()),
+        "stage": max(row["stage_bytes"]
+                     for row in readback_caps.values()),
+        "stage_inodes": max(row["stage_inodes"]
+                             for row in readback_caps.values()),
+        "object_count": max(row["object_count"]
+                            for row in readback_caps.values()),
+        "object_bytes": max(row["maximum_object_bytes"]
+                            for row in readback_caps.values()),
+        "window_bytes": max(row["live_window_bytes"]
+                            for row in readback_caps.values()),
+        "window_inodes": max(row["live_window_inodes"]
+                             for row in readback_caps.values()),
+    }
+    read_schedule = []
+    for index, job in enumerate(jobs):
+        job_caps = readback_caps[("exploration", job["run_id"])]
+        read_schedule.append({
+            "analysis_phase": "exploration", "owner_phase": "exploration",
+            "job_index": index, "job": job,
+            "job_sha256": sha256(canonical_bytes(job)),
+            "request_ordinal": index, "use": "capacity_pilot_export",
+            "caps": {
+                "bundle_bytes": job_caps["bundle_bytes"],
+                "maximum_request_bytes": job_caps["request_bytes"],
+                "maximum_response_bytes": job_caps["response_bytes"],
+                "object_count": job_caps["object_count"],
+                "stage_bytes": job_caps["stage_bytes"],
+            },
+        })
+    for role, name, kind, maximum, maximum_file, inodes in (
+        ("source5_archive_read_request_slot", "request.json", "file",
+         caps["request"], caps["request"], 1),
+        ("source5_archive_read_response_slot", "response.json", "file",
+         caps["response"], caps["response"], 1),
+        ("source5_archive_read_response_incoming", "response.json.incoming", "file",
+         caps["response"], caps["response"], 1),
+        ("source5_archive_read_bundle", "response.tar", "file",
+         caps["bundle"], caps["bundle"], 1),
+        ("source5_archive_read_bundle_incoming", "response.tar.incoming", "file",
+         caps["bundle"], caps["bundle"], 1),
+    ):
+        add_file(readback_root / name, role, maximum, "source5_controller",
+                 storage_root=str(scratch_root), host=host_id,
+                 add_to_job=False)
+    add_tree(readback_root / "stage", caps["stage"], caps["object_bytes"],
+             caps["stage_inodes"], "source5_controller",
+             storage_root=str(scratch_root), phase=None, run_id=None,
+             role="source5_archive_read_stage")
+    read_control = _source5_archive_read_control_ledger_byte_bound(
+        context, [
+            {"request_ordinal": row["request_ordinal"],
+             "analysis_phase": row["analysis_phase"],
+             "use": row["use"], "owner_phase": row["owner_phase"],
+             "job_index": row["job_index"], "job": row["job"],
+             "job_sha256": row["job_sha256"],
+             "caps": {
+                 "maximum_request_bytes": row["caps"]["maximum_request_bytes"],
+                 "maximum_response_bytes": row["caps"]["maximum_response_bytes"],
+                 "bundle_bytes": row["caps"]["bundle_bytes"],
+                 "stage_bytes": row["caps"]["stage_bytes"],
+                 "stage_inodes": readback_caps[("exploration", row["job"]["run_id"])]["stage_inodes"],
+                 "object_count": row["caps"]["object_count"],
+                 "maximum_object_bytes": readback_caps[("exploration", row["job"]["run_id"])]["maximum_object_bytes"],
+                 "live_window_bytes": readback_caps[("exploration", row["job"]["run_id"])]["live_window_bytes"],
+                 "live_window_inodes": readback_caps[("exploration", row["job"]["run_id"])]["live_window_inodes"],
+             }} for row in read_schedule
+        ], read_slots,
+    )
+    add_file(read_slots[budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE],
+             budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE,
+             read_control["maximum_bytes"], "source5_controller",
+             storage_root=str(output_root), host=host_id, add_to_job=False)
+    # Directory nodes are emitted exactly once, separately from file/tree
+    # rows; each declared tree owns its own root inode.
+    return (all_rows + list(directory_rows.values()), job_rows,
+            job_catalogue_pins, archive_caps, readback_caps, read_schedule,
+            read_control, read_slots, Path(catalogue_dir), scratch_root)
+
+def _source5_preparatory_remaining_projection(
+    storage_value: object, credit_bytes_value: object,
+    credit_inodes_value: object,
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Purely subtract verified setup allocations from each sealed root cap."""
+    storage = exact(storage_value, {
+        "pin", "roots", "required_bytes_by_root", "required_inodes_by_root",
+    }, "preparatory storage projection")
+    reservation_pin = exact(storage["pin"], {
+        "path", "raw_sha256", "semantic_sha256", "byte_count",
+    }, "preparatory storage projection pin")
+    require(type(reservation_pin["path"]) is str and
+            reservation_pin["path"].startswith("/") and
+            is_sha(reservation_pin["raw_sha256"]) and
+            is_sha(reservation_pin["semantic_sha256"]) and
+            type(reservation_pin["byte_count"]) is int and
+            reservation_pin["byte_count"] > 0,
+            "preparatory storage projection pin is malformed")
+    roots = storage["roots"]
+    require(type(roots) is list and bool(roots),
+            "preparatory storage projection has no caller roots")
+    root_rows = {}
+    for index, candidate in enumerate(roots):
+        row = exact(candidate, {
+            "path", "role", "reserved_bytes", "reserved_inodes", "filesystem_id",
+        }, f"preparatory storage root[{index}]")
+        require(type(row["path"]) is str and row["path"].startswith("/") and
+                type(row["role"]) is str and type(row["filesystem_id"]) is str and
+                row["path"] not in root_rows and
+                type(row["reserved_bytes"]) is int and row["reserved_bytes"] >= 0 and
+                type(row["reserved_inodes"]) is int and row["reserved_inodes"] >= 0,
+                f"preparatory storage root[{index}] identity/caps are malformed")
+        root_rows[row["path"]] = row
+    root_ids = set(root_rows)
+    full_bytes = storage["required_bytes_by_root"]
+    full_inodes = storage["required_inodes_by_root"]
+    credit_bytes = credit_bytes_value
+    credit_inodes = credit_inodes_value
+    require(type(full_bytes) is dict and type(full_inodes) is dict and
+            type(credit_bytes) is dict and type(credit_inodes) is dict and
+            set(full_bytes) == set(full_inodes) ==
+                set(credit_bytes) == set(credit_inodes) == root_ids,
+            "preparatory storage projection does not close over exact string root IDs")
+    remaining_bytes: dict[str, int] = {}
+    remaining_inodes: dict[str, int] = {}
+    for root in root_ids:
+        row = root_rows[root]
+        full_byte_count = full_bytes[root]
+        full_inode_count = full_inodes[root]
+        byte_credit = credit_bytes[root]
+        inode_credit = credit_inodes[root]
+        require(type(full_byte_count) is int and
+                0 <= full_byte_count <= row["reserved_bytes"] and
+                type(full_inode_count) is int and
+                0 <= full_inode_count <= row["reserved_inodes"] and
+                type(byte_credit) is int and 0 <= byte_credit <= full_byte_count and
+                type(inode_credit) is int and 0 <= inode_credit <= full_inode_count,
+                f"preparatory setup credit exceeds the exact source bound for {root}")
+        # Preserve caller reserve above the source projection. Only measured,
+        # authenticated allocations are subtracted from that root's cap.
+        remaining_bytes[root] = row["reserved_bytes"] - byte_credit
+        remaining_inodes[root] = row["reserved_inodes"] - inode_credit
+    return remaining_bytes, remaining_inodes
+
+def _source5_preparatory_remaining_storage_requirements(
+    context: CampaignContext, core_result: dict[str, Any],
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Subtract only raw-pinned setup allocations from the prep full-horizon cap.
+
+    The original 360 jobs, all failure/readback windows and all uncreated
+    outputs remain fully reserved.  This projection is valid only before any
+    exploration job or readback ordinal has begun.
+    """
+    _validate_source5_preparatory_profile_artifacts(
+        context, context.preparatory_width_contract,
+        context.preparatory_width_pin, context.preparatory_budget,
+        context.preparatory_budget_raw, context.preparatory_budget_pin,
+    )
+    budget = context.preparatory_budget
+    budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    require(type(budget) is dict and type(context.preparatory_budget_raw) is bytes and
+            type(context.preparatory_budget_pin) is dict and
+            context.host_evidence_budget_pin == context.preparatory_budget_pin and
+            core_result.get("journal_record_count") == 1 and
+            core_result.get("journal_head") == core_result.get("registration_head"),
+            "preparatory remaining-space replay is not at its setup-only frontier")
+    storage = exact(budget.get("storage_reservation"), {
+        "pin", "roots", "required_bytes_by_root", "required_inodes_by_root",
+    }, "preparatory remaining storage reservation")
+    roots = storage["roots"]
+    require(type(roots) is list and bool(roots),
+            "preparatory remaining storage reservation has no roots")
+    root_paths = {row["path"] for row in roots}
+    full_bytes = storage["required_bytes_by_root"]
+    full_inodes = storage["required_inodes_by_root"]
+    require(type(full_bytes) is dict and type(full_inodes) is dict and
+            set(full_bytes) == root_paths == set(full_inodes),
+            "preparatory source-derived root bounds do not close over the caller reservation")
+    credit_bytes = {path: 0 for path in root_paths}
+    credit_inodes = {path: 0 for path in root_paths}
+    catalogue = budget_module.verify_path_catalogue_chunks(
+        budget["path_catalogue"],
+    )
+    role_rows: dict[str, dict[str, Any]] = {}
+    base = (context.artifact_root / context.manifest["campaign_id"] /
+            "source5" / context.host_id)
+    allowed_base_children: set[str] = set()
+    special_roles = {
+        "execution_manifest", "host_evidence_budget",
+        "preparatory_journal_width_contract", "storage_reservation",
+        "journal", budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE,
+    }
+    for row in budget_module.iter_path_catalogue_rows(catalogue):
+        catalogue_path = Path(row["path"])
+        if catalogue_path.is_relative_to(base):
+            relative_parts = catalogue_path.relative_to(base).parts
+            if relative_parts:
+                allowed_base_children.add(relative_parts[0])
+        root = row["storage_root"]
+        if root is None:
+            continue
+        require(root in root_paths and Path(row["path"]).is_relative_to(Path(root)),
+                f"preparatory catalogue row escapes its reserved root: {row['path']}")
+        if row["role"] in special_roles:
+            require(row["role"] not in role_rows,
+                    f"preparatory catalogue repeats the {row['role']} setup role")
+            role_rows[row["role"]] = row
+            continue
+        path = Path(row["path"])
+        if row["kind"] == "tree" and row["role"] == "directory_node":
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and
+                    stat.S_IMODE(info.st_mode) == 0o700 and
+                    path.resolve(strict=True) == path and row["max_inodes"] == 1,
+                    f"preparatory setup directory changed its exact identity: {path}")
+            credit_inodes[root] += 1
+            continue
+        if row["kind"] == "file" and row.get("origin_pin") is not None:
+            size, inodes = _source5_credit_preparatory_catalogue_file(
+                row, f"preparatory setup file {row['role']}",
+            )
+            credit_bytes[root] += size
+            credit_inodes[root] += inodes
+            continue
+        # Every non-setup, unpinned output remains future capacity.  A file or
+        # dynamic tree already present at this frontier is unexplained state.
+        require(not path.exists() and not path.is_symlink(),
+                f"preparatory phase has an unpinned pre-existing output: {path}")
+
+    expected_roles = special_roles
+    require(set(role_rows) == expected_roles,
+            "preparatory catalogue omits an exact setup, budget, journal, or read-control role")
+    expected_files = {
+        "execution_manifest": (
+            context.manifest_pin["path"], context.manifest_pin["raw_sha256"],
+            context.manifest["manifest_sha256"], canonical_bytes(context.manifest),
+        ),
+        "host_evidence_budget": (
+            context.preparatory_budget_pin["path"],
+            context.preparatory_budget_pin["raw_sha256"],
+            context.preparatory_budget_pin["semantic_sha256"],
+            context.preparatory_budget_raw,
+        ),
+        "preparatory_journal_width_contract": (
+            context.preparatory_width_pin["path"],
+            context.preparatory_width_pin["raw_sha256"],
+            context.preparatory_width_pin["semantic_sha256"],
+            canonical_bytes(context.preparatory_width_contract),
+        ),
+        "storage_reservation": (
+            storage["pin"]["path"], storage["pin"]["raw_sha256"],
+            storage["pin"]["semantic_sha256"], None,
+        ),
+    }
+    for role, (path_text, raw_sha, semantic_sha, expected_raw) in expected_files.items():
+        row = role_rows[role]
+        require(row["kind"] == "file" and row["path"] == path_text and
+                row["storage_root"] in root_paths and
+                (row["origin_pin"] is None or row["origin_pin"] == {
+                    "raw_sha256": raw_sha, "semantic_sha256": semantic_sha,
+                }),
+                f"preparatory setup catalogue row {role} changed its pin/path")
+        raw, digest, info = read_stable(
+            Path(path_text), f"preparatory exact {role}", row["max_file_bytes"],
+            raw_sha,
+        )
+        current = Path(path_text).lstat()
+        require(expected_raw is None or raw == expected_raw,
+                f"preparatory exact {role} bytes changed after budget validation")
+        if role == "storage_reservation":
+            try:
+                reservation_value = json.loads(raw)
+            except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+                raise Source5CampaignError(
+                    "preparatory storage reservation became malformed",
+                ) from error
+            require(raw == canonical_bytes(reservation_value) and
+                    reservation_value.get("reservation_sha256") == semantic_sha and
+                    budget_module.build_storage_reservation_value(
+                        context.manifest["campaign_id"], context.host_id,
+                        reservation_value.get("roots"),
+                    ) == reservation_value,
+                    "preparatory storage reservation self/semantic pin changed")
+        require(digest == raw_sha and stat.S_ISREG(info.st_mode) and
+                info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600 and
+                info.st_nlink == 1 and _source5_same_file_identity(info, current) and
+                len(raw) <= row["max_file_bytes"],
+                f"preparatory exact {role} file changed its private raw identity")
+        credit_bytes[row["storage_root"]] += len(raw)
+        credit_inodes[row["storage_root"]] += 1
+
+    journal_row = role_rows["journal"]
+    journal_size, journal_inodes = _source5_credit_preparatory_journal(
+        context, journal_row, core_result,
+    )
+    credit_bytes[journal_row["storage_root"]] += journal_size
+    credit_inodes[journal_row["storage_root"]] += journal_inodes
+
+    control_row = role_rows[budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE]
+    control_path = Path(context.source5_archive_read_slot_paths[
+        budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE
+    ])
+    require(control_row["kind"] == "file" and
+            control_row["path"] == str(control_path) and
+            control_path.exists() and not control_path.is_symlink(),
+            "preparatory read-control ledger is absent or changed path")
+    cursor, head, event_count, pending = _source5_archive_read_control_ledger_state(
+        context, force_reload=True,
+    )
+    require(cursor == 0 and event_count == 0 and head == "0" * 64 and pending is None,
+            "preparatory read-control ledger is not at its exact empty-prefix frontier")
+    control_size, control_inodes = _source5_credit_preparatory_control_ledger(
+        context, control_path, control_row["max_file_bytes"],
+    )
+    credit_bytes[control_row["storage_root"]] += control_size
+    credit_inodes[control_row["storage_root"]] += control_inodes
+
+    # Catalogue chunks are persistent setup files created by the external sort;
+    # validate each exact raw pin before crediting its physical allocation.
+    artifact_root = str(context.artifact_root)
+    for chunk in catalogue["chunks"]:
+        raw, digest, info = read_stable(
+            Path(chunk["path"]), "preparatory path-catalogue chunk",
+            chunk["byte_count"], chunk["raw_sha256"],
+        )
+        current = Path(chunk["path"]).lstat()
+        require(digest == chunk["raw_sha256"] == chunk["semantic_sha256"] and
+                len(raw) == chunk["byte_count"] and stat.S_ISREG(info.st_mode) and
+                info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600 and
+                info.st_nlink == 1 and _source5_same_file_identity(info, current) and
+                Path(chunk["path"]).parent ==
+                    Path(role_rows["preparatory_journal_width_contract"]["path"]).parent /
+                    "preparatory-path-catalogue-v1",
+                "preparatory path-catalogue chunk changed its exact private pin/path")
+        credit_bytes[artifact_root] += len(raw)
+        credit_inodes[artifact_root] += 1
+
+    remaining_bytes, remaining_inodes = \
+        _source5_preparatory_remaining_projection(
+            storage, credit_bytes, credit_inodes,
+        )
+    scratch_roots = [Path(row["path"]) for row in roots
+                     if row["role"] == "scratch"]
+    require(len(scratch_roots) == 1 and
+            not any(scratch_roots[0].iterdir()),
+            "preparatory scratch root retains an unbudgeted sorter/readback child")
+    budget_dir = base / "evidence-budget"
+    catalogue_dir = budget_dir / "preparatory-path-catalogue-v1"
+    job_catalogue_dir = base / "job-path-catalogues" / "exploration"
+
+    def require_directory_contents(
+        path: Path, expected: set[str], label: str, *, exact_children: bool = True,
+    ) -> None:
+        info = path.lstat()
+        actual_children = set(os.listdir(path))
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o700 and
+                path.resolve(strict=True) == path and
+                (actual_children == expected if exact_children else
+                 actual_children <= expected),
+                f"preparatory {label} has an unexpected child, alias or mode")
+
+    require_directory_contents(
+        base, allowed_base_children, "setup root", exact_children=False,
+    )
+    require({
+        "preparatory-execution-manifest-v1.json", "archive-read-control.jsonl",
+        "evidence-budget", "job-path-catalogues",
+    } <= set(os.listdir(base)),
+            "preparatory setup root is missing a pinned manifest/budget/catalogue/ledger")
+    require_directory_contents(budget_dir, {
+        "preparatory-journal-width-v1.json",
+        "host-evidence-budget-preparatory-v1.json",
+        "preparatory-path-catalogue-v1",
+    }, "budget root")
+    require_directory_contents(
+        catalogue_dir,
+        {Path(row["path"]).name for row in catalogue["chunks"]},
+        "path-catalogue chunk directory",
+    )
+    expected_job_catalogues = {
+        f"{job['ordinal']:06d}-{sha256(canonical_bytes(job))}.jsonl"
+        for job in _host_jobs(context, "exploration")
+    }
+    require_directory_contents(job_catalogue_dir, expected_job_catalogues,
+                               "original-job catalogue directory")
+    return remaining_bytes, remaining_inodes
+
+def _source5_preparatory_width_projection(
+    context: CampaignContext,
+) -> dict[str, Any]:
+    """Recompute the finite setup plus exact 360-row callback width contract."""
+    require(context.manifest.get("schema") == PREPARATORY_EXECUTION_SCHEMA and
+            context.scope == PREPARATORY_SCOPE,
+            "preparatory width projection requires the explicit prep context")
+    preparation = context.modules[PREPARATORY_BUDGET_SOURCE_PATH]
+    basis = preparation.build_execution_basis(context.manifest)
+    require(basis == context.manifest.get(
+                "preparatory_execution_basis_sha256", basis),
+            "preparatory width projection changed its sealed execution basis")
+    context.preparatory_execution_basis_sha256 = basis
+    jobs = _host_jobs(context, "exploration")
+    require(len(jobs) == 360,
+            "preparatory width projection requires all 360 original selected-host jobs")
+    context.journal_width_jobs = {"exploration": jobs}
+    chronology_pins = _source5_original_pins_for_context(context)
+    original_pins = _source5_preparatory_original_pins(context)
+    # The budget digest is intentionally a fixed-width template here. Its raw
+    # bytes are produced after this contract and cannot feed back into it.
+    budget_path = (context.artifact_root / context.manifest["campaign_id"] /
+                   "source5" / context.host_id / "evidence-budget" /
+                   "host-evidence-budget-preparatory-v1.json")
+    context.journal_width_budget_pin = {
+        "path": str(budget_path), "raw_sha256": "f" * 64,
+        "semantic_sha256": "f" * 64,
+    }
+    rows = [source5_journal_width_projection(
+        context, "exploration", index, job,
+    ) for index, job in enumerate(jobs)]
+    generation = context.manifest["preparatory_capacity_generation"]
+    registration = context.preparatory_capacity_registration
+    selected_rows = [row for row in context.preparatory_capacity_generation[
+        "capacity_preparations"] if row.get("host_id") == context.host_id]
+    require(len(selected_rows) == 1,
+            "preparatory width registration lacks its selected 15-context capacity row")
+    registration_details = {
+        "campaign_id": context.manifest["campaign_id"],
+        "host_id": context.host_id,
+        "completion": generation["completion"],
+        "provenance": generation["provenance"],
+        "host_completion": registration["host_completion"],
+        "host_verification": registration["host_verification"],
+        "capacity_ledger": registration["ledger"],
+        "capacity_schedule_sha256": registration[
+            "capacity_schedule_sha256"],
+        "entries": selected_rows[0]["entries"],
+        "qualification_eligible": False,
+        "controller_chronology_proven": False,
+    }
+    setup_line_bytes = _source5_journal_event_line_bytes(
+        context, chronology_pins, PREPARATORY_SETUP_EVENT,
+        registration_details, 1,
+    )
+    width = preparation.build_journal_width_contract(
+        campaign_id=context.manifest["campaign_id"], host_id=context.host_id,
+        execution_basis_sha256=basis,
+        original_pins=original_pins,
+        initial_spec_pin={
+            "path": context.spec_pin["path"],
+            "raw_sha256": context.spec_pin["raw_sha256"],
+            "semantic_sha256": context.spec_semantic_sha256,
+        },
+        initial_plan_pin={
+            "path": context.plan_pin["path"],
+            "raw_sha256": context.plan_pin["raw_sha256"],
+            "semantic_sha256": context.plan_semantic_sha256,
+        },
+        capacity_generation_pin=generation["completion"],
+        source_manifest_pin={
+            "path": context.source_manifest_pins[context.host_id]["path"],
+            "raw_sha256": context.source_manifest_pins[context.host_id][
+                "raw_sha256"],
+            "semantic_sha256": context.source["manifest_sha256"],
+        },
+        owner_pins=_source5_journal_width_owner_pins(context),
+        setup_line_bytes=setup_line_bytes,
+        job_rows=rows,
+    )
+    return {
+        "path": None,
+        "raw_sha256": sha256(canonical_bytes(width)),
+        "semantic_sha256": width["contract_sha256"],
+        "contract": width,
+    }
+
+def _source5_restore_preparatory_archive_readback_context(
+    context: CampaignContext, budget: dict[str, Any],
+    budget_module: Any,
+) -> None:
+    catalogue = budget_module.validate_path_catalogue_manifest(
+        budget["path_catalogue"],
+    )
+    catalogue = budget_module.verify_path_catalogue_chunks(catalogue)
+    rows = budget_module.iter_path_catalogue_rows(catalogue)
+    readback_caps = budget_module.project_archive_readback_caps(rows)
+    expected_jobs = {("exploration", job["run_id"])
+                     for job in _host_jobs(context, "exploration")}
+    require(set(readback_caps) == expected_jobs,
+            "preparatory readback catalogue does not close over all 360 jobs")
+    schedule = _source5_preparatory_archive_read_schedule(
+        context, readback_caps,
+    )
+    slot_roles = (
+        set(budget_module.SOURCE5_ARCHIVE_READ_TRANSIENT_ROLES) |
+        {budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE}
+    )
+    slot_rows = {}
+    for row in budget_module.iter_path_catalogue_rows(catalogue):
+        if row["role"] in slot_roles:
+            require(row["role"] not in slot_rows,
+                    "preparatory archive-read catalogue repeats a reusable slot")
+            slot_rows[row["role"]] = row
+    require(set(slot_rows) == slot_roles,
+            "preparatory archive-read catalogue omits a reusable slot or ledger")
+    cap_fields = (
+        "request_bytes", "response_bytes", "bundle_bytes", "stage_bytes",
+        "stage_inodes", "object_count", "maximum_object_bytes",
+        "live_window_bytes", "live_window_inodes",
+    )
+    caps = {name: max(value[name] for value in readback_caps.values())
+            for name in cap_fields}
+    expected_rows = {
+        "source5_archive_read_request_slot":
+            ("file", caps["request_bytes"], caps["request_bytes"], 1),
+        "source5_archive_read_response_slot":
+            ("file", caps["response_bytes"], caps["response_bytes"], 1),
+        "source5_archive_read_response_incoming":
+            ("file", caps["response_bytes"], caps["response_bytes"], 1),
+        "source5_archive_read_bundle":
+            ("file", caps["bundle_bytes"], caps["bundle_bytes"], 1),
+        "source5_archive_read_bundle_incoming":
+            ("file", caps["bundle_bytes"], caps["bundle_bytes"], 1),
+        "source5_archive_read_stage":
+            ("tree", caps["stage_bytes"], caps["maximum_object_bytes"],
+             caps["stage_inodes"]),
+    }
+    slot_paths = {}
+    roots = set()
+    for role, (kind, maximum, maximum_file, inodes) in expected_rows.items():
+        row = slot_rows[role]
+        require(row["kind"] == kind and row["max_bytes"] == maximum and
+                row["max_file_bytes"] == maximum_file and
+                row["max_inodes"] == inodes and row["phase"] is None and
+                row["run_id"] is None and row["member_index"] is None and
+                row["aggregate_id"] is None and
+                row["owner"] == "source5_controller" and
+                row["storage_root"] is not None,
+                f"preparatory archive-read slot {role} differs from its exact cap")
+        slot_paths[role] = row["path"]
+        roots.add(row["storage_root"])
+    require(len(roots) == 1,
+            "preparatory archive-read slots span multiple scratch roots")
+    scratch = Path(next(iter(roots)))
+    expected_root = scratch / context.manifest["campaign_id"] / context.host_id / "archive-readback"
+    exact_paths = {
+        "source5_archive_read_request_slot": "request.json",
+        "source5_archive_read_response_slot": "response.json",
+        "source5_archive_read_response_incoming": "response.json.incoming",
+        "source5_archive_read_bundle": "response.tar",
+        "source5_archive_read_bundle_incoming": "response.tar.incoming",
+        "source5_archive_read_stage": "stage",
+    }
+    require(all(Path(slot_paths[role]) == expected_root / name
+                for role, name in exact_paths.items()),
+            "preparatory archive-read slots changed their deterministic one-window layout")
+    ledger = slot_rows[budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE]
+    control = _source5_archive_read_control_ledger_byte_bound(
+        context, schedule, slot_paths,
+    )
+    expected_ledger = _source5_preparatory_control_ledger_path(context)
+    require(ledger["kind"] == "file" and ledger["path"] == str(expected_ledger) and
+            ledger["max_bytes"] == control["maximum_bytes"] and
+            ledger["max_inodes"] == 1 and ledger["owner"] == "source5_controller" and
+            ledger["storage_root"] == str(context.output_root) and
+            ledger["phase"] is None and ledger["run_id"] is None and
+            ledger["member_index"] is None,
+            "preparatory read-control ledger path/byte bound differs from its full schedule")
+    context.source5_archive_read_slot_paths = {
+        **slot_paths,
+        budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE: ledger["path"],
+    }
+    context.source5_archive_read_caps = {
+        "maximum_request_bytes": caps["request_bytes"],
+        "maximum_response_bytes": caps["response_bytes"],
+        "maximum_bundle_bytes": caps["bundle_bytes"],
+        "maximum_stage_bytes": caps["stage_bytes"],
+        "maximum_stage_inodes": caps["stage_inodes"],
+        "maximum_object_count": caps["object_count"],
+        "maximum_object_bytes": caps["maximum_object_bytes"],
+        "maximum_live_window_bytes": caps["live_window_bytes"],
+        "maximum_live_window_inodes": caps["live_window_inodes"],
+        "control_ledger_bytes": control["maximum_bytes"],
+        "control_ledger_line_bytes": control["maximum_line_bytes"],
+        "control_ledger_event_count": control["maximum_event_count"],
+    }
+    context.source5_archive_read_schedule = schedule
+    context.job_path_catalogue_pins = \
+        _source5_preparatory_job_catalogue_pins(context, catalogue,
+                                                budget_module)
+
+def _source5_verify_preparatory_core_locked(
+    context: CampaignContext, *, lock: Any | None = None,
+) -> dict[str, Any]:
+    """Replay setup under the existing SourceA lock, or acquire it once."""
+    chronology = context.chronology
+    if lock is not None:
+        return _source5_verify_preparatory_core_with_lock(context, lock)
+    with chronology.campaign_host_lock(
+        context.output_root, context.manifest["campaign_id"], context.host_id,
+    ) as acquired:
+        return _source5_verify_preparatory_core_with_lock(context, acquired)
+
+def _source5_verify_preparatory_core_with_lock(
+    context: CampaignContext, lock: Any,
+) -> dict[str, Any]:
+    """Replay capacity setup without reacquiring the active chronology lock."""
+    chronology = context.chronology
+    verifier = getattr(
+        chronology, "validate_source5_preparatory_execution_core_locked", None,
+    )
+    require(callable(verifier),
+            "selected SourceA lacks preparatory execution-core replay")
+    result = verifier(lock, _source5_preparatory_core_value(context))
+    result = exact(result, {
+        "schema", "campaign_id", "host_id", "execution_basis_sha256",
+        "registration_head", "initial_spec_pin", "initial_plan_pin",
+        "capacity_generation_pin", "job_count", "job_list_sha256",
+        "journal_head", "journal_record_count", "qualification_eligible",
+        "launch_authorized",
+    }, "SourceA preparatory core verification")
+    jobs = _host_jobs(context, "exploration")
+    registration = context.preparatory_capacity_registration
+    generation_pin = context.manifest["preparatory_capacity_generation"][
+        "completion"]
+    basis = context.modules[PREPARATORY_BUDGET_SOURCE_PATH].build_execution_basis(
+        context.manifest,
+    )
+    require(result["schema"] ==
+                "allocatbelt.application-source5-preparatory-core-verification.v1" and
+            result["campaign_id"] == context.manifest["campaign_id"] and
+            result["host_id"] == context.host_id and
+            result["execution_basis_sha256"] == basis and
+            result["registration_head"] == registration["registration_head"] and
+            result["initial_spec_pin"] == {
+                "path": context.spec_pin["path"],
+                "raw_sha256": context.spec_pin["raw_sha256"],
+                "semantic_sha256": context.spec_semantic_sha256,
+            } and
+            result["initial_plan_pin"] == {
+                "path": context.plan_pin["path"],
+                "raw_sha256": context.plan_pin["raw_sha256"],
+                "semantic_sha256": context.plan_semantic_sha256,
+            } and
+            result["capacity_generation_pin"] == generation_pin and
+            result["job_count"] == 360 and
+            result["job_list_sha256"] == sha256(canonical_bytes(jobs)) and
+            result["registration_head"] == result["journal_head"] and
+            result["journal_record_count"] == 1 and
+            result["qualification_eligible"] is False and
+            result["launch_authorized"] is False,
+            "SourceA preparatory core replay differs from the original setup/360-job horizon")
+    return result
+
+def _validate_source5_preparatory_budget_arithmetic(
+    context: CampaignContext, budget: dict[str, Any],
+    catalogue: dict[str, Any], budget_module: Any,
+) -> None:
+    """Recompute transfer, readback, retention, and per-root prep bounds."""
+    jobs = _host_jobs(context, "exploration")
+    expected_keys = {("exploration", job["run_id"]) for job in jobs}
+    archive_caps = budget_module.project_archive_job_caps(
+        budget_module.iter_path_catalogue_rows(catalogue),
+    )
+    readback_caps = budget_module.project_archive_readback_caps(
+        budget_module.iter_path_catalogue_rows(catalogue),
+    )
+    require(set(archive_caps) == expected_keys and
+            set(readback_caps) == expected_keys,
+            "preparatory budget path catalogue has another job-group closure")
+    expected_read_schedule = []
+    expected_per_job = []
+    metadata_total = 0
+    payload_total = 0
+    object_total = 0
+    for index, job in enumerate(jobs):
+        key = ("exploration", job["run_id"])
+        transport = archive_caps[key]
+        readback = readback_caps[key]
+        expected_per_job.append({
+            "phase": "exploration", "job_index": index,
+            "ordinal": job["ordinal"], "run_id": job["run_id"],
+            "job_sha256": sha256(canonical_bytes(job)),
+            **transport,
+            "readback_request_bytes": readback["request_bytes"],
+            "readback_response_bytes": readback["response_bytes"],
+            "readback_bundle_bytes": readback["bundle_bytes"],
+            "readback_stage_bytes": readback["stage_bytes"],
+            "readback_stage_inodes": readback["stage_inodes"],
+            "readback_object_count": readback["object_count"],
+            "readback_window_bytes": readback["live_window_bytes"],
+            "readback_window_inodes": readback["live_window_inodes"],
+        })
+        expected_read_schedule.append({
+            "analysis_phase": "exploration",
+            "owner_phase": "exploration",
+            "job_index": index,
+            "job": job,
+            "job_sha256": sha256(canonical_bytes(job)),
+            "request_ordinal": index,
+            "use": "capacity_pilot_export",
+            "caps": {
+                "bundle_bytes": readback["bundle_bytes"],
+                "maximum_request_bytes": readback["request_bytes"],
+                "maximum_response_bytes": readback["response_bytes"],
+                "object_count": readback["object_count"],
+                "stage_bytes": readback["stage_bytes"],
+            },
+        })
+        metadata_total += sum(transport[field] for field in (
+            "checkpoint_request_bytes", "transfer_offer_bytes",
+            "checkpoint_bytes", "object_manifest_bytes", "archive_ack_bytes",
+            "signature_bytes", "stage_map_bytes",
+        ))
+        payload_total += readback["stage_bytes"]
+        object_total += readback["object_count"]
+    maximum_archive = {
+        field: max(row[field] for row in expected_per_job)
+        for field in (
+            "checkpoint_request_bytes", "transfer_packet_bytes",
+            "checkpoint_bytes", "object_manifest_bytes", "archive_ack_bytes",
+            "signature_bytes", "ack_bundle_bytes", "stage_map_bytes",
+            "transfer_offer_bytes",
+        )
+    }
+    readback_window_bytes = max(
+        row["readback_window_bytes"] for row in expected_per_job
+    )
+    readback_window_inodes = max(
+        row["readback_window_inodes"] for row in expected_per_job
+    )
+    slot_roles = set(budget_module.SOURCE5_ARCHIVE_READ_TRANSIENT_ROLES) | {
+        budget_module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE,
+    }
+    slot_rows = {
+        row["role"]: row
+        for row in budget_module.iter_path_catalogue_rows(catalogue)
+        if row["role"] in slot_roles
+    }
+    require(set(slot_rows) == slot_roles,
+            "preparatory archive readback catalogue omits its exact one-window slots")
+    slots = {role: row["path"] for role, row in slot_rows.items()}
+    control = _source5_archive_read_control_ledger_byte_bound(
+        context, _source5_preparatory_archive_read_schedule(
+            context, readback_caps,
+        ), slots,
+    )
+    expected_transport = {
+        "schema": "allocatbelt.application-source5-preparatory-archive-transport.v1",
+        "per_job": expected_per_job,
+        "maximum_per_job": maximum_archive,
+        "unique_object_payload_bytes": payload_total,
+        "unique_object_count": object_total,
+        "maximum_signature_bytes": budget_module.ARCHIVE_SIGNATURE_QUOTA_BYTES,
+        "read_request_count": 360,
+        "read_control_event_count": control["maximum_event_count"],
+        "read_control_ledger_bytes": control["maximum_bytes"],
+        "read_control_ledger_maximum_line_bytes": control[
+            "maximum_line_bytes"],
+        "maximum_readback_window_bytes": readback_window_bytes,
+        "maximum_readback_window_inodes": readback_window_inodes,
+    }
+    require(budget["archive_transport"] == expected_transport and
+            budget["read_schedule"] == expected_read_schedule,
+            "preparatory archive/readback budget differs from the exact 360 signed-object projections")
+    width = context.preparatory_width_contract
+    require(type(width) is dict,
+            "preparatory storage projection lost its exact journal-width contract")
+    record_bounds = [{
+        "ordinal": job["ordinal"], "run_id": job["run_id"],
+        "job_sha256": sha256(canonical_bytes(job)),
+        "maximum_record_bytes": _source5_job_record_byte_bound(
+            context, "exploration", job,
+        ),
+    } for job in jobs]
+    phase_ledger_bytes = sum(row["maximum_record_bytes"]
+                             for row in record_bounds)
+    retention = catalogue["retention_policy"]
+    expected_retention = {
+        "schema": "allocatbelt.application-source5-preparatory-retention.v1",
+        "source_policy": retention,
+        "persistent_job_record_bytes": phase_ledger_bytes,
+        "persistent_job_record_count": 360,
+        "persistent_archive_metadata_bytes": metadata_total,
+        "maximum_failed_owner_window_bytes":
+            width["maximum_failed_owner_window_bytes"],
+        "maximum_active_transfer_window_bytes":
+            retention["maximum_window_total_bytes"],
+        "maximum_active_transfer_window_inodes":
+            retention["maximum_window_total_inodes"],
+        "maximum_active_readback_window_bytes": readback_window_bytes,
+        "maximum_active_readback_window_inodes": readback_window_inodes,
+        "maximum_catalogue_sort_scratch_bytes":
+            catalogue["maximum_sort_scratch_bytes"],
+        "maximum_catalogue_sort_scratch_inodes":
+            catalogue["maximum_sort_scratch_inodes"],
+        "no_reclaim_roles": [
+            "typed_source_file", "typed_source_symlink", "source_manifest",
+            "spec_v3", "plan_v3", "observed_host", "preparation",
+            "capacity_completion", "capacity_host_receipt", "capacity_ledger",
+            "capacity_artifact", "source5_archive_signer_context",
+            "source5_archive_signer_keyring", "source5_archive_signer_gpgv",
+        ],
+    }
+    require(budget["retention_policy"] == expected_retention and
+            budget["schedule"]["maximum_phase_ledger_bytes"] ==
+                phase_ledger_bytes and
+            budget["schedule"]["maximum_job_record_bytes_by_ordinal"] ==
+                record_bounds and
+            budget["schedule"]["maximum_journal_bytes"] ==
+                width["total_event_bytes"] and
+            budget["schedule"]["maximum_journal_event_count"] ==
+                width["total_event_count"],
+            "preparatory retention/journal/record arithmetic differs from its source projections")
+    storage = exact(budget["storage_reservation"], {
+        "pin", "roots", "required_bytes_by_root", "required_inodes_by_root",
+    }, "preparatory storage reservation")
+    reservation_pin = exact(storage["pin"], {
+        "path", "raw_sha256", "semantic_sha256", "byte_count",
+    }, "preparatory storage reservation pin")
+    reservation_raw, reservation_sha, _reservation_info = read_stable(
+        Path(reservation_pin["path"]),
+        "Source5 preparatory storage reservation",
+        16 * 1024 * 1024, reservation_pin["raw_sha256"],
+    )
+    try:
+        reservation_value = json.loads(reservation_raw)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            "Source5 preparatory storage reservation is malformed",
+        ) from error
+    require(reservation_raw == canonical_bytes(reservation_value) and
+            reservation_sha == reservation_pin["raw_sha256"] and
+            reservation_pin["semantic_sha256"] ==
+                reservation_value.get("reservation_sha256") and
+            budget_module.build_storage_reservation_value(
+                context.manifest["campaign_id"], context.host_id,
+                reservation_value.get("roots"),
+            ) == reservation_value and
+            storage["roots"] == reservation_value["roots"],
+            "preparatory storage reservation raw/semantic/root binding differs")
+    roots = storage["roots"]
+    root_paths = {row["path"] for row in roots}
+    required_bytes = dict(retention["maximum_live_root_byte_bounds"])
+    required_inodes = dict(retention["maximum_live_root_inode_bounds"])
+    artifact_root = str(context.artifact_root)
+    scratch_root = str(next(Path(row["path"]) for row in roots
+                            if row["role"] == "scratch"))
+    for row in roots:
+        required_bytes.setdefault(row["path"], 0)
+        required_inodes.setdefault(row["path"], 0)
+    catalogue_chunk_bytes = sum(row["byte_count"]
+                                for row in catalogue["chunks"])
+    required_bytes[artifact_root] += catalogue_chunk_bytes
+    required_inodes[artifact_root] += len(catalogue["chunks"])
+    required_bytes[scratch_root] = max(
+        required_bytes[scratch_root],
+        retention["persistent_root_byte_bounds"].get(scratch_root, 0) +
+        catalogue["maximum_sort_scratch_bytes"],
+    )
+    required_inodes[scratch_root] = max(
+        required_inodes[scratch_root],
+        retention["persistent_root_inode_bounds"].get(scratch_root, 0) +
+        catalogue["maximum_sort_scratch_inodes"],
+    )
+    require(root_paths == set(required_bytes) == set(required_inodes) and
+            storage["required_bytes_by_root"] == required_bytes and
+            storage["required_inodes_by_root"] == required_inodes and
+            all(row["reserved_bytes"] >= required_bytes[row["path"]] and
+                row["reserved_inodes"] >= required_inodes[row["path"]]
+                for row in roots),
+            "preparatory storage reservation does not cover exact source/catalogue/window bytes and inodes")
+
+def _validate_source5_preparatory_profile_artifacts(
+    context: CampaignContext, width_value: object, width_pin: object,
+    budget_value: object, budget_raw: bytes | None, budget_pin: object,
+) -> None:
+    preparation = context.modules[PREPARATORY_BUDGET_SOURCE_PATH]
+    basis = preparation.build_execution_basis(context.manifest)
+    require(basis == context.preparatory_execution_basis_sha256,
+            "Source5 preparatory manifest execution basis changed")
+    expected_width = _source5_preparatory_width_projection(context)
+    require(type(width_pin) is dict and type(width_value) is dict and
+            expected_width["contract"] == width_value and
+            expected_width["raw_sha256"] == width_pin["raw_sha256"] and
+            expected_width["semantic_sha256"] == width_pin["semantic_sha256"],
+            "Source5 preparatory width contract differs from deterministic 360-job projection")
+    require(type(budget_value) is dict and type(budget_raw) is bytes and
+            type(budget_pin) is dict and budget_raw == canonical_bytes(budget_value),
+            "Source5 preparatory budget raw context is malformed")
+    original_pins = _source5_preparatory_original_pins(context)
+    preparation.validate_journal_width_contract(
+        width_value,
+        expected_campaign_id=context.manifest["campaign_id"],
+        expected_host_id=context.host_id,
+        expected_execution_basis_sha256=basis,
+        expected_original_pins=original_pins,
+        expected_job_rows=expected_width["contract"]["job_rows"],
+    )
+    budget_module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    catalogue_reader = _source5_preparatory_catalogue_row_reader(
+        context, budget_module, budget_value["path_catalogue"],
+    )
+    preparation.validate_host_evidence_budget_v1(
+        budget_value,
+        expected_campaign_id=context.manifest["campaign_id"],
+        expected_host_id=context.host_id,
+        expected_execution_basis_sha256=basis,
+        expected_width_pin=width_pin,
+        expected_width=width_value,
+        execution_manifest_raw=canonical_bytes(context.manifest),
+        source_manifest_raw=canonical_bytes(context.sources[context.host_id]),
+        plan_raw=context.plan_raw,
+        width_contract_raw=canonical_bytes(width_value),
+        catalogue_module=budget_module,
+        owner_catalogue_module=context.modules[EVIDENCE_CATALOGUE_SOURCE_PATH],
+        campaign_module=context.campaign,
+        input_preparation_module=context.modules[
+            SOURCE5_INPUT_PREPARATION_SOURCE_PATH],
+        spec_raw=canonical_bytes(context.spec),
+        catalogue_row_reader=catalogue_reader,
+    )
+    require(budget_value["original_pins"] ==
+                _source5_preparatory_original_pins(context) and
+            budget_value["owner_contract"] ==
+                context.owner_evidence_contract,
+            "preparatory budget original pins/owner contract differ from the selected Source")
+    catalogue = budget_module.validate_path_catalogue_manifest(
+        budget_value["path_catalogue"],
+    )
+    catalogue = budget_module.verify_path_catalogue_chunks(catalogue)
+    width_rows = [row for row in budget_module.iter_path_catalogue_rows(catalogue)
+                  if row["role"] == "preparatory_journal_width_contract"]
+    require(len(width_rows) == 1 and
+            width_rows[0]["path"] == width_pin["path"] and
+            width_rows[0]["origin_pin"] == {
+                "raw_sha256": width_pin["raw_sha256"],
+                "semantic_sha256": width_pin["semantic_sha256"],
+            } and width_rows[0]["kind"] == "file",
+            "preparatory path catalogue omits the exact raw-pinned width contract")
+    reservation_pin = budget_value["storage_reservation"].get("pin")
+    _require_prep_reservation = exact(
+        reservation_pin, {"path", "raw_sha256", "semantic_sha256", "byte_count"},
+        "preparatory budget storage reservation pin",
+    )
+    reservation_rows = [row for row in budget_module.iter_path_catalogue_rows(catalogue)
+                        if row["role"] == "storage_reservation"]
+    require(len(reservation_rows) == 1 and
+            reservation_rows[0]["path"] == _require_prep_reservation["path"] and
+            reservation_rows[0]["origin_pin"] == {
+                "raw_sha256": _require_prep_reservation["raw_sha256"],
+                "semantic_sha256": _require_prep_reservation["semantic_sha256"],
+            }, "preparatory path catalogue omits its caller storage reservation")
+    manifest_rows = [row for row in budget_module.iter_path_catalogue_rows(catalogue)
+                     if row["role"] == "execution_manifest"]
+    require(len(manifest_rows) == 1 and
+            manifest_rows[0]["path"] == context.manifest_pin["path"] and
+            manifest_rows[0]["kind"] == "file" and
+            manifest_rows[0]["storage_root"] == str(context.artifact_root),
+            "preparatory path catalogue omits its exact sealed manifest origin")
+    _manifest_raw, _manifest_sha, _manifest_info = read_stable(
+        Path(context.manifest_pin["path"]),
+        "Source5 preparatory manifest catalogue pin", MAX_MANIFEST_BYTES,
+        context.manifest_pin["raw_sha256"],
+    )
+    require(manifest_rows[0]["max_file_bytes"] == len(_manifest_raw),
+            "preparatory manifest catalogue row differs from its exact canonical byte count")
+    if getattr(context, "fixed_spec_host_pin", None) is not None:
+        fixed_pin, fixed_raw, _binding = \
+            _source5_prepared_fixed_spec_host_artifact(context)
+        fixed_rows = [row for row in budget_module.iter_path_catalogue_rows(catalogue)
+                      if row["role"] == "observed_host" and
+                      row["path"] == fixed_pin["path"]]
+        require(len(fixed_rows) == 1 and
+                fixed_rows[0]["kind"] == "file" and
+                fixed_rows[0]["host_id"] == context.host_id and
+                fixed_rows[0]["owner"] == "inputs" and
+                fixed_rows[0]["storage_root"] is None and
+                fixed_rows[0]["phase"] is None and
+                fixed_rows[0]["run_id"] is None and
+                fixed_rows[0]["member_index"] is None and
+                fixed_rows[0]["aggregate_id"] is None and
+                fixed_rows[0]["aggregate_max_bytes"] is None and
+                fixed_rows[0]["max_bytes"] == len(fixed_raw) and
+                fixed_rows[0]["max_file_bytes"] == len(fixed_raw) and
+                fixed_rows[0]["max_inodes"] == 1 and
+                fixed_rows[0]["origin_pin"] == {
+                    "raw_sha256": fixed_pin["raw_sha256"],
+                    "semantic_sha256": None,
+                },
+                "preparatory catalogue omits its resident fixed Spec host bytes")
+    width_rows = [row for row in budget_module.iter_path_catalogue_rows(catalogue)
+                  if row["role"] == "preparatory_journal_width_contract"]
+    require(width_rows[0]["max_file_bytes"] == len(canonical_bytes(width_value)),
+            "preparatory width catalogue cap differs from its exact canonical byte count")
+    _validate_source5_preparatory_budget_arithmetic(
+        context, budget_value, catalogue, budget_module,
+    )
+    require(sha256(budget_raw) == budget_pin["raw_sha256"] and
+            budget_value["budget_sha256"] == budget_pin["semantic_sha256"],
+            "Source5 preparatory budget bytes differ from their manifest pin")
+    context.preparatory_budget = budget_value
+    context.preparatory_budget_raw = budget_raw
+    context.preparatory_budget_pin = dict(budget_pin)
+    context.host_evidence_budget_raw = budget_raw
+    context.host_evidence_budget_pin = dict(budget_pin)
+    # The generic archive/packet APIs receive the exact source-derived width
+    # bytes through their existing width-contract keyword; the schema is
+    # interpreted by the separately pinned preparatory budget validator.
+    context.journal_width_contract = width_value
+    context.journal_width_contract_pin = dict(width_pin)
+    context.journal_width_budget_pin = dict(budget_pin)
+    _source5_restore_preparatory_archive_readback_context(
+        context, budget_value, budget_module,
+    )
+
+def build_source5_preparatory_execution_manifest(
+    manifest_core: object, storage_reservation_path: Path,
+    output_directory: Path,
+) -> dict[str, Any]:
+    """Build a host-scoped prep manifest only after SourceA verifies setup."""
+    require(type(manifest_core) is dict and
+            type(storage_reservation_path) is Path and
+            type(output_directory) is Path and output_directory.is_absolute(),
+            "preparatory manifest builder inputs are malformed")
+    campaign_id = manifest_core.get("campaign_id")
+    host_id = manifest_core.get("host_id")
+    require(type(campaign_id) is str and campaign_id and
+            type(host_id) is str and host_id and
+            output_directory == (Path(manifest_core["artifact_root"]) /
+                campaign_id / "source5" / host_id),
+            "preparatory manifest output path differs from its selected-host role")
+    output_directory = _private_directory(output_directory)
+    manifest_path = output_directory / "preparatory-execution-manifest-v1.json"
+    require(not manifest_path.exists() and not manifest_path.is_symlink(),
+            "preparatory execution manifest already exists and cannot be replaced")
+    context = load_context(
+        manifest_path, host_id, manifest_value=manifest_core,
+        manifest_raw_sha256="f" * 64, allow_preparatory_core=True,
+    )
+    require(context.scope == PREPARATORY_SCOPE and
+            context.manifest.get("schema") == PREPARATORY_EXECUTION_SCHEMA,
+            "preparatory execution builder did not load the exact SourceH core")
+    _source5_prepared_host_binding(context, materialize=True)
+    core_result = _source5_verify_preparatory_core_locked(context)
+    require(core_result["launch_authorized"] is False and
+            core_result["qualification_eligible"] is False,
+            "preparatory setup validation returned launch/qualification authority")
+    artifacts = _source5_preparatory_budget_ready_for_manifest(
+        context, storage_reservation_path,
+    )
+    prep_module = context.modules[PREPARATORY_BUDGET_SOURCE_PATH]
+    core = _source5_preparatory_core_value(context)
+    body = {
+        **core,
+        "preparatory_journal_width_contracts": {
+            host_id: {
+                "artifact": {
+                    "path": artifacts["width_pin"]["path"],
+                    "raw_sha256": artifacts["width_pin"]["raw_sha256"],
+                },
+                "semantic_sha256": artifacts["width_pin"]["semantic_sha256"],
+            },
+        },
+        "preparatory_host_budgets": {
+            host_id: {
+                "artifact": {
+                    "path": artifacts["budget_pin"]["path"],
+                    "raw_sha256": artifacts["budget_pin"]["raw_sha256"],
+                },
+                "semantic_sha256": artifacts["budget_pin"]["semantic_sha256"],
+            },
+        },
+        "preparatory_execution_basis_sha256":
+            context.preparatory_execution_basis_sha256,
+        "qualification_eligible": False,
+    }
+    sealed = prep_module.seal_execution_manifest(body)
+    raw = canonical_bytes(sealed)
+    require(0 < len(raw) <= MAX_MANIFEST_BYTES,
+            "preparatory execution manifest exceeds its finite metadata limit")
+    manifest_sha = write_new(
+        manifest_path, raw, "Source5 preparatory execution manifest",
+    )
+    require(manifest_sha == sha256(raw),
+            "preparatory execution manifest raw digest changed during publication")
+    checked = load_context(manifest_path, host_id)
+    # Create the already-budgeted empty read-control ledger before the first
+    # owner. Later pure verification replays, but never initializes, it.
+    _source5_archive_read_control_ledger_state(checked)
+    require(checked.manifest == sealed and
+            checked.manifest_pin == {
+                "path": str(manifest_path), "raw_sha256": manifest_sha,
+            } and checked.preparatory_budget_pin == artifacts["budget_pin"] and
+            checked.preparatory_width_pin == artifacts["width_pin"],
+            "published preparatory manifest did not reopen to the same source-derived artifacts")
+    return {
+        "schema": "allocatbelt.application-source5-preparatory-execution-publication.v1",
+        "manifest": {
+            "path": str(manifest_path), "raw_sha256": manifest_sha,
+            "semantic_sha256": sealed["manifest_sha256"],
+        },
+        "journal_width_contract": artifacts["width_pin"],
+        "host_budget": artifacts["budget_pin"],
+        "setup_registration_head": core_result["registration_head"],
+        "preparatory_job_count": 360,
+        "preparatory_callback_count": 2160,
+        "readback_request_count": 360,
+        "readback_control_event_count": 720,
+        "qualification_eligible": False,
+        "full_horizon_execution_ready": False,
+    }
+
+def run_preparatory_exploration(
+    context: CampaignContext,
+) -> dict[str, Any]:
+    """Run only the 360 original exploration owners under the prep budget.
+
+    Capacity-pilot export is a separate captured-read operation and no
+    provisional Source5 phase-analysis event is written here.
+    """
+    require(context.manifest.get("schema") == PREPARATORY_EXECUTION_SCHEMA and
+            context.scope == PREPARATORY_SCOPE and
+            type(context.preparatory_budget) is dict and
+            type(context.preparatory_budget_raw) is bytes and
+            type(context.preparatory_budget_pin) is dict and
+            context.spec.get("rates") == [] and
+            context.spec.get("oracles") == [] and
+            _host_jobs(context, "exploration") and
+            len(_host_jobs(context, "exploration")) == 360,
+            "preparatory exploration requires its exact raw-pinned 360-job profile")
+    readiness = context.preparatory_budget.get("readiness")
+    require(type(readiness) is dict and
+            readiness.get("preparatory_budget_complete") is True and
+            readiness.get("preparatory_execution_ready") is True and
+            readiness.get("full_horizon_execution_ready") is False and
+            readiness.get("qualification_eligible") is False,
+            "preparatory Source5 host budget is not ready for its scoped 360-job profile")
+    reservation = context.preparatory_budget.get("storage_reservation")
+    require(type(reservation) is dict and
+            type(reservation.get("pin")) is dict and
+            type(reservation["pin"].get("path")) is str,
+            "preparatory Source5 budget lacks its exact live storage reservation")
+    result = run_fixed_phase(context, "exploration")
+    return {
+        "schema": "allocatbelt.application-source5-preparatory-exploration-result.v1",
+        "profile": "preparatory_exploration_360_v1",
+        "campaign_id": context.manifest["campaign_id"],
+        "host_id": context.host_id,
+        "phase": "exploration",
+        "original_job_count": 360,
+        "original_callback_event_count": 2160,
+        "setup_event_count": 1,
+        "execution_manifest": context.manifest_pin,
+        "host_budget": context.preparatory_budget_pin,
+        "phase_result": result,
+        "pilot_export_pending": result.get("blocked") is not True,
+        "provisional_analysis_written": False,
+        "full_horizon_execution_ready": False,
+        "qualification_eligible": False,
+    }
+
+def _source5_preparatory_dispatch_storage_requirements(
+    context: CampaignContext, lock: Any, expected_index: int,
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Recheck the retained prefix and credit only authenticated allocations.
+
+    Future persistent outputs and the complete reusable transfer, readback,
+    failure and sort windows stay reserved. Neither apparent filesystem use
+    nor reclaimed payload bytes count as credit against that bound.
+    """
+    require(context.manifest.get("schema") == PREPARATORY_EXECUTION_SCHEMA and
+            context.scope == PREPARATORY_SCOPE,
+            "preparatory dispatch storage requires the exact scoped profile")
+    _source5_preparatory_reclaim_anchor(context)
+    jobs = _host_jobs(context, "exploration")
+    require(len(jobs) == 360 and type(expected_index) is int and
+            0 <= expected_index <= len(jobs),
+            "preparatory dispatch changed its original 360-job frontier")
+    index, records = _source5_validate_resume_prefix_locked(
+        context, lock, "exploration", jobs,
+    )
+    require(index == expected_index,
+            "preparatory dispatch prefix changed before the next owner")
+    verified = _validate_locked_context(context, lock)
+    state = verified["state"]
+    budget = context.preparatory_budget
+    module = context.modules[EVIDENCE_BUDGET_SOURCE_PATH]
+    _validate_source5_preparatory_profile_artifacts(
+        context, context.preparatory_width_contract,
+        context.preparatory_width_pin, budget,
+        context.preparatory_budget_raw, context.preparatory_budget_pin,
+    )
+    finished = {("exploration", job["run_id"]) for job in jobs[:index]}
+    require(set(state["source5_finished"]) == state["source5_seen_jobs"] == finished,
+            "preparatory dispatch state is not its exact completed prefix")
+    catalogue = module.verify_path_catalogue_chunks(budget["path_catalogue"])
+    _source5_assert_uncompleted_catalogue_paths_absent(
+        context, budget, module, finished,
+    )
+    storage = budget["storage_reservation"]
+    roots = {row["path"]: row for row in storage["roots"]}
+    byte_credit = {root: 0 for root in roots}
+    inode_credit = {root: 0 for root in roots}
+    credited_paths: set[str] = set()
+    directory_paths: set[str] = set()
+
+    def credit(row: dict[str, Any], size: int, inodes: int) -> None:
+        root = row["storage_root"]
+        path = row["path"]
+        require(root in roots and path not in credited_paths and
+                Path(path).is_relative_to(Path(root)) and
+                type(size) is int and 0 <= size <= row["max_bytes"] and
+                type(inodes) is int and 0 <= inodes <= row["max_inodes"],
+                "preparatory dispatch credit aliases or exceeds its exact row")
+        credited_paths.add(path)
+        byte_credit[root] += size
+        inode_credit[root] += inodes
+
+    expected_files = {
+        context.manifest_pin["path"]: context.manifest_pin["raw_sha256"],
+        context.preparatory_budget_pin["path"]:
+            context.preparatory_budget_pin["raw_sha256"],
+        context.preparatory_width_pin["path"]:
+            context.preparatory_width_pin["raw_sha256"],
+        storage["pin"]["path"]: storage["pin"]["raw_sha256"],
+    }
+    # Metadata credit is limited to bytes directly closed by the freshly
+    # signed ACK. Other retained metadata keeps its full reservation.
+    for job, record in zip(jobs[:index], records, strict=True):
+        closure = _source5_verify_persisted_archive_read_closure(
+            context, "exploration", job,
+        )
+        require(closure["job_record"] == record,
+                "preparatory dispatch ACK differs from its retained record")
+        _source5_verify_completed_archive_metadata(
+            context, "exploration", job, closure, module,
+        )
+        _source5_recheck_reclaimed_job_origins(context, closure)
+        for key in ("job_record", "request", "checkpoint", "manifest", "ack", "signature"):
+            pin = closure[key + "_pin"]
+            # ACK/checkpoint origin pins refer to Root. Use the corresponding
+            # exact host catalogue role, never open those Root paths.
+            role = {"job_record": "source5_job_record",
+                    "request": "source5_checkpoint_request",
+                    "checkpoint": "source5_checkpoint",
+                    "manifest": "source5_object_manifest",
+                    "ack": "source5_archive_ack",
+                    "signature": "source5_archive_signature"}[key]
+            declarations = _source5_job_path_declarations(context, "exploration", job)
+            row = _source5_archive_role_row(declarations, role)
+            require(row["path"] not in expected_files,
+                    "preparatory signed metadata aliases a persistent input")
+            expected_files[row["path"]] = pin["raw_sha256"]
+
+    ledger_path = str(_phase_root(context, "exploration") / "controller-ledger.jsonl")
+    control_path = context.source5_archive_read_slot_paths[
+        module.SOURCE5_ARCHIVE_READ_CONTROL_ROLE]
+    cursor, _head, _events, pending = _source5_archive_read_control_ledger_state(
+        context, force_reload=True,
+    )
+    require(cursor == 0 and pending is None,
+            "preparatory APP dispatch cannot follow a started pilot export")
+    seen_expected: set[str] = set()
+    for row in module.iter_path_catalogue_rows(catalogue):
+        root = row["storage_root"]
+        if root is None:
+            continue
+        require(root in roots,
+                "preparatory catalogue names an unreserved writable root")
+        path = Path(row["path"])
+        if row["kind"] == "tree":
+            if row["role"] != "directory_node":
+                continue
+            directory_paths.add(str(path))
+            if not path.exists() and not path.is_symlink():
+                continue
+            info = path.lstat()
+            require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and
+                    stat.S_IMODE(info.st_mode) == 0o700 and
+                    path.resolve(strict=True) == path and row["max_inodes"] == 1,
+                    "preparatory dispatch directory changed identity or mode")
+            credit(row, 0, 1)
+            continue
+        digest = expected_files.get(str(path))
+        if digest is None and row.get("origin_pin") is not None:
+            digest = row["origin_pin"]["raw_sha256"]
+        if digest is not None:
+            size, inodes = _source5_credit_preparatory_catalogue_file(
+                {**row, "origin_pin": {"raw_sha256": digest,
+                                       "semantic_sha256": None}},
+                "Source5 preparatory exact retained dispatch file",
+            )
+            credit(row, size, inodes)
+            if str(path) in expected_files:
+                seen_expected.add(str(path))
+        elif str(path) == ledger_path:
+            raw, _digest, info = read_stable(path, "preparatory retained phase ledger",
+                                             row["max_file_bytes"])
+            require(raw == b"".join(canonical_bytes(record) for record in records) and
+                    stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                    stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+                    _source5_same_file_identity(info, path.lstat()),
+                    "preparatory phase ledger changed after prefix verification")
+            credit(row, len(raw), 1)
+        elif row["role"] == "journal":
+            raw, _digest, info = read_stable(path, "preparatory live journal",
+                                             row["max_file_bytes"])
+            identity = lambda value: (value.st_dev, value.st_ino, value.st_mode,
+                                      value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+            require(identity(info) == identity(path.lstat()) == state.get("file_stat") and
+                    stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                    stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1,
+                    "preparatory journal changed after SourceA replay")
+            credit(row, len(raw), 1)
+        elif str(path) == control_path:
+            size, inodes = _source5_credit_preparatory_control_ledger(
+                context, path, row["max_file_bytes"],
+            )
+            credit(row, size, inodes)
+    require(seen_expected == set(expected_files),
+            "preparatory dispatch catalogue omits a retained signed input")
+    for chunk in catalogue["chunks"]:
+        row = {"path": chunk["path"], "storage_root": str(context.artifact_root),
+               "kind": "file", "max_file_bytes": chunk["byte_count"],
+               "max_bytes": chunk["byte_count"], "max_inodes": 1,
+               "origin_pin": {"raw_sha256": chunk["raw_sha256"],
+                              "semantic_sha256": chunk["semantic_sha256"]}}
+        size, inodes = _source5_credit_preparatory_catalogue_file(
+            row, "preparatory retained path-catalogue chunk",
+        )
+        credit(row, size, inodes)
+    scratch = [Path(row["path"]) for row in roots.values() if row["role"] == "scratch"]
+    require(len(scratch) == 1,
+            "preparatory dispatch has no unique reusable scratch root")
+    for directory, children, files in os.walk(scratch[0], followlinks=False):
+        require(not files and directory in directory_paths and
+                all(str(Path(directory) / name) in directory_paths
+                    for name in children),
+                "preparatory dispatch scratch retains an unexplained path")
+    return _source5_preparatory_remaining_projection(
+        storage, byte_credit, inode_credit,
+    )
+
+
+class _Source5PreparatoryArchiveReadProvider:
+    """Use each original export ordinal, replaying completed rows on restart."""
+
+    def __init__(self, context: CampaignContext):
+        require(context.manifest.get("schema") == PREPARATORY_EXECUTION_SCHEMA and
+                context.scope == PREPARATORY_SCOPE and
+                type(context.source5_archive_read_schedule) is list and
+                len(context.source5_archive_read_schedule) == 360,
+                "preparatory pilot provider lacks its exact 360-row schedule")
+        self.context = context
+        self.index = 0
+        self._provider_lock = threading.Lock()
+
+    @contextmanager
+    def open_view(self, job: dict[str, Any], purpose: str, *, use: str):
+        with self._provider_lock:
+            context = self.context
+            schedule = context.source5_archive_read_schedule
+            require(self.index < len(schedule),
+                    "preparatory pilot provider has no additional original row")
+            row = schedule[self.index]
+            require(row["request_ordinal"] == self.index and row["job"] == job and
+                    purpose == row["analysis_phase"] == "exploration" and
+                    use == row["use"] == "capacity_pilot_export",
+                    "preparatory pilot provider changed its original export order")
+            cursor, _head, _count, pending = _source5_archive_read_control_ledger_state(
+                context, force_reload=True,
+            )
+            if pending is not None and self.index < cursor:
+                # The fixed shared slots still belong to this exact pending
+                # next row. Finish that IO window before reopening any earlier
+                # completed row; do not overwrite its request or append a new
+                # ordinal. SourceA will numerically replay this owner in order.
+                require(cursor < len(schedule),
+                        "preparatory pending read is outside its original schedule")
+                pending_row = schedule[cursor]
+                with archived_job_read_view(
+                        context, pending_row["job"], pending_row["analysis_phase"]):
+                    pass
+                after_cursor, _head, _count, after_pending = (
+                    _source5_archive_read_control_ledger_state(context, force_reload=True)
+                )
+                require(after_cursor == cursor + 1 and after_pending is None,
+                        "preparatory pending read did not close its exact original row")
+                cursor = after_cursor
+            require(self.index <= cursor,
+                    "preparatory pilot provider cannot skip a readback ordinal")
+            manager = (_source5_replay_completed_archive_read_view(context, row)
+                       if self.index < cursor else
+                       archived_job_read_view(context, job, purpose))
+            with manager as view:
+                yield view
+            self.index += 1
+
+
+def export_source5_preparatory_capacity_pilot(context: CampaignContext) -> dict[str, Any]:
+    """Export only through SourceA's held validator and one IO-only provider."""
+    require(context.manifest.get("schema") == PREPARATORY_EXECUTION_SCHEMA and
+            context.scope == PREPARATORY_SCOPE,
+            "preparatory pilot export requires the exact scoped execution")
+    exporter = getattr(context.chronology,
+                       "export_source5_preparatory_capacity_pilot_locked", None)
+    require(callable(exporter),
+            "selected SourceA lacks its held preparatory pilot exporter")
+    with context.chronology.campaign_host_lock(
+            context.output_root, context.manifest["campaign_id"], context.host_id) as lock:
+        jobs = _host_jobs(context, "exploration")
+        count, _records = _source5_validate_resume_prefix_locked(
+            context, lock, "exploration", jobs,
+        )
+        require(count == len(jobs) == 360,
+                "preparatory pilot export requires all original successful owners")
+        return exporter(lock, api_pin(context.manifest_pin),
+                        _Source5PreparatoryArchiveReadProvider(context))
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "publish-archive-readback":
+            context = load_context(args.manifest, args.host_id)
+            packet = context.modules[EVIDENCE_TRANSFER_PACKET_SOURCE_PATH]
+            rename_noreplace = getattr(packet, "_rename_noreplace", None)
+            require(callable(rename_noreplace),
+                    "pinned transfer-packet module lacks atomic no-replace publication")
+            result = publish_source5_archive_readback(
+                args.request, args.response_incoming, args.bundle_incoming,
+                rename_noreplace=rename_noreplace,
+            )
+            sys.stdout.buffer.write(canonical_bytes(result))
+            return 0
         if args.command == "verify-final-cohort":
             manifest_paths: dict[str, Path] = {}
             for value in args.host_manifest:
@@ -3248,7 +17362,9 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.buffer.write(canonical_bytes(result))
             return 0 if result["status"] == "verified" else 3
         context = load_context(args.manifest, args.host_id)
-        if args.command == "verify":
+        if args.command == "export-preparatory-capacity-pilot":
+            result = export_source5_preparatory_capacity_pilot(context)
+        elif args.command == "verify":
             with context.chronology.campaign_host_lock(
                 context.output_root, context.manifest["campaign_id"],
                 context.host_id, timeout_seconds=30.0,
@@ -3273,12 +17389,14 @@ def main(argv: list[str] | None = None) -> int:
                 "host_id": context.host_id,
                 **create_soak_material_index(
                     context, args.recipe, args.build_receipt, args.output,
+                    args.resource_budget,
                 ),
                 "qualification_eligible": False,
             }
         else:
             result = run_host(context, args.phase, args.pressure_material_index,
-                              args.soak_material_index)
+                              args.soak_material_index,
+                              args.evidence_storage_reservation)
         sys.stdout.buffer.write(canonical_bytes(result))
         return 0
     except (Source5CampaignError, OSError, TypeError, ValueError, KeyError,

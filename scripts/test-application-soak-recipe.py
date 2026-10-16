@@ -446,7 +446,22 @@ class SourceV5CliFixture:
     Missing capacity evidence keeps both campaign readiness and launch false.
     """
 
-    def __init__(self, temporary_root: Path):
+    @staticmethod
+    def synthetic_a48_controls() -> list[dict[str, Any]]:
+        """Return a fixture-only eight-control cardinality witness (no measurements)."""
+        return [{
+            "control_id": f"fixture-aa-{allocator}-{executor}",
+            "allocator": allocator, "executor": executor,
+            "family": "mixed", "profile": "mixed",
+            "mode": "capacity", "load_percent": None, "pairs": 6,
+            "purpose": "synthetic A/A plan cardinality witness",
+        } for allocator in builder.ALLOCATORS
+          for executor in ("bounded", "tokio")]
+
+    def __init__(
+        self, temporary_root: Path, *,
+        aa_controls_override: list[dict[str, Any]] | None = None,
+    ):
         self.root = temporary_root / "source-v5"
         self.root.mkdir(mode=0o700)
         self.input_root = temporary_root / "input-v5"
@@ -465,6 +480,23 @@ class SourceV5CliFixture:
             "scripts/application-source-inventory.py", "scripts/application-runtime-readback.py",
             campaign_inputs.FEEDBACK_RUNTIME_PATH, campaign_inputs.FEEDBACK_POLICY_PATH,
             campaign_inputs.FEEDBACK_SENSOR_PATH,
+            "scripts/application-campaign.py",
+            "scripts/application-byte-capacity.py",
+            "scripts/application-campaign-chronology.py",
+            "scripts/application-capacity-stage.py",
+            "scripts/run-application-pair.sh",
+            "scripts/application-fixed-pair.py",
+            "scripts/application-pressure-pair.py",
+            "scripts/application-source5-campaign.py",
+            "scripts/application-source5-soak.py",
+            "scripts/application-soak-readback.py",
+            "scripts/application-source5-offline-dispatch.py",
+            "scripts/application-source5-evidence-transport-v3.py",
+            "scripts/application-source5-evidence-budget.py",
+            "scripts/application-source5-evidence-catalogue.py",
+            "scripts/application-feedback-composition.py",
+            "scripts/application-feedback-readback.py",
+            "scripts/application-pressure-readback.py",
         })
         for relative in sorted(source_paths, key=lambda item: item.encode("utf-8")):
             if relative == "Cargo.lock":
@@ -608,6 +640,9 @@ class SourceV5CliFixture:
         self.spec["schema"] = campaign.SPEC_SCHEMA_V3
         self.spec["campaign_id"] = "campaign-source-v5-cli-fixture"
         self.spec["runner_sha256"] = harness["soak_runner"]["sha256"]
+        if aa_controls_override is not None:
+            self.spec["aa_controls"] = [dict(row)
+                                        for row in aa_controls_override]
         for host in self.spec["hosts"]:
             host["controls"]["cpu_set"] = str(min(os.sched_getaffinity(0)))
             host["host_fingerprint_sha256"] = digest(campaign.canonical_bytes(host["controls"]))

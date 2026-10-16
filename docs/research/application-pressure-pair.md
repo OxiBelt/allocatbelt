@@ -273,6 +273,50 @@ The host-receipt and offline-pair entrypoints accept only pair-recipe v2. The
 archived standalone pair-recipe v1 readers and runners keep their original
 closed shape; v1 does not gain the `probe_capture` budget field.
 
+### Archived fixed predecessor during a live pressure launch
+
+When the original confirmation predecessor's payload has already been
+offloaded, the Source5 launcher may pass the additive
+`pressure_predecessor_context` keyword through `run_pressure_pair_locked`, its
+prerequisite preparation, the strict pair replay and the strict host-receipt
+verifier. This value is a runtime-only, non-JSON object issued by the
+Source5-pinned chronology module's
+`build_source5_pressure_predecessor_context_locked(lock, execution_manifest_pin,
+active_authorization_context, *, captured_evidence)` factory. The factory runs
+under the original held lock after it validates the prepared campaign context
+and current pressure authorization, replays the exact fixed predecessor from
+the bounded archived read view, and reconstructs its fixed-predecessor receipt
+from the original Source/job/metrics facts.
+
+The pressure owner accepts that object only after the captured
+Source5-pinned chronology module's
+`validate_source5_pressure_predecessor_context(context, lock=lock,
+authorization_context=details, recipe_pin=recipe_pin, output_root=output_root)`
+accepts its issuer, live lock registry, host/job scope, exact active
+authorization, and recipe/output binding. The pressure owner retains the
+already-loaded pinned chronology module instance supplied by the launcher; it
+checks the source bytes against the SourceV5 inventory without compiling a
+second chronology module that would have a different live-lock registry. The
+chronology validator authenticates the opaque context, replays the fixed
+predecessor from its captured byte view, and returns the existing
+`allocatbelt.application-source5-pressure-prerequisites.v1` projection. The
+projection carries the current job/index/helper/authorization and journal
+heads plus the exact seven-field `fixed_predecessor` result: `run_id`,
+`job_record`, `receipt`, `receipt_value`, `component_sha256`,
+`process_metrics_sha256`, and `state`. The owner checks these against the
+active authorization and execution overlay, reads the always-local original
+job record under the live lock, freshly reconstructs the receipt, and compares
+its raw pin/value and component/metrics digests with the captured result before
+the ordinary strict pressure checks continue.
+
+The archived one-job view is consumed only by the source-pinned chronology
+validator; it is never passed as `evidence_path_map` to the full host-journal
+offline API. The pair recipe, normal-APP output/readback, pressure proof,
+ProbeV2 policy/runtime gates and host receipt retain their original closed
+schemas and exact component projection. Omitting the context preserves the
+existing strict/live path; a JSON object or caller-supplied success flag is
+not a captured predecessor capability.
+
 The new origin receipt is separate from the original pair sidecar, pressure
 readbacks, SpecV3, PlanV3 and chronology files. The strict v1 validation and
 execution APIs retain their existing behavior and inputs.
@@ -283,18 +327,39 @@ The new Python entry points are:
 verify_pressure_pair_with_host_receipt(
     recipe_pin, output_root, readback_pin, host_receipt_path,
     *, chronology_module, lock, authorization_context,
+    pressure_predecessor_context=None,
 ) -> {"path", "raw_sha256", "receipt_sha256"}
+
+run_pressure_pair_locked(
+    recipe_path, expected_recipe_sha256, output_root,
+    chronology_module, lock, authorization_context,
+    on_app_started, on_app_terminal, *,
+    pressure_predecessor_context=None,
+) -> component_result
 
 # Public origin-host fixture wrapper; caller supplies real completed pins and
 # the active lock/auth context. It does not manufacture capture evidence.
 capture_pressure_pair_origin_fixture(
     recipe_pin, output_root, readback_pin, host_receipt_path,
     *, chronology_module, lock, authorization_context,
+    pressure_predecessor_context=None,
 ) -> {"path", "raw_sha256", "receipt_sha256"}
 
 validate_pressure_pair_artifacts_offline(
     recipe_pin, output_root, readback_pin, host_verification_pin,
     evidence_path_map,
+) -> replay_result
+
+validate_pressure_pair_artifacts(
+    recipe, output_root, readback_path, expected_readback_sha256,
+    *, chronology_module, lock, authorization_context,
+    captured_evidence=hview, pressure_predecessor_context=None,
+) -> replay_result
+
+verify_pressure_pair_with_captured_outputs(
+    recipe, output_root, readback_pin, host_receipt_pin,
+    *, chronology_module, lock, authorization_context,
+    captured_evidence=hview, pressure_predecessor_context=None,
 ) -> replay_result
 ```
 
@@ -306,3 +371,42 @@ provide the pure completed-host-journal dispatcher. It will not return a
 `validated` pair summary until chronology, fixed-predecessor, normal-APP and
 registered-job artifacts have all been independently replayed. Continuous
 Soak remains a separate Source5 cohort dependency.
+
+### Replaying a reclaimed pair from the Root H-view
+
+`validate_pressure_pair_artifacts(..., captured_evidence=view)` and
+`verify_pressure_pair_with_captured_outputs(...)` are additive Source5 paths for
+the exact one-job H-view issued by Root after its persisted ACK, detached GPG
+signature and original job record have been revalidated. The pressure owner
+checks the raw/canonical request, checkpoint and object-manifest closure again,
+binds it to the original pressure job, Source/Spec/Plan/execution/budget pins,
+the strict pressure host receipt and the two ProbeV2 typed TMP trees, and reads
+captured bytes only through the private staged object view. SourceV5 modules,
+application binaries, oracles and original campaign inputs remain pinned reads
+at their resident paths. The one-job view never enters the historical full-host
+`evidence_path_map` API.
+
+This replay recomputes the two pressure streams, both ProbeV2 captures, feedback
+composition and trace validation, APP output/runtime readback, and the exact
+two-row process ledger. It checks the original strict pressure host facts and
+asks the already-loaded SourceV5 chronology module to validate the optional
+opaque `pressure_predecessor_context` for a fresh replay of the original fixed
+predecessor. It launches no APP or pressure worker, writes no replacement
+evidence, and keeps qualification and execution readiness false. Root remains
+the authority for GPG verification and H-view issuance.
+
+### Bounded Source5 application TMPDIR owner-return proof
+
+The bounded Source5 pressure authorization carries the exact
+`tmpdir_budget` pin and byte/inode limits. Before either APP starts, the pair
+owner records each original TMPDIR's device/inode/mode and mount identity,
+available capacity and those frozen limits. The shared pressure supervisor's
+`on_owner_return` callback captures the final fixed-owner inventory immediately
+after the APP owner returns and before the pressure tail continues. The pair
+readback v2 and host-verification receipt v2 carry both snapshots unchanged.
+For a successful pair, each final snapshot must retain the same root and mount
+identity and report zero bytes, files and subdirectories. Captured H-view replay
+requires the signed request's two empty-TMP proofs to equal the strict v2
+receipt projections; it never infers an empty root from absent archived files
+or re-stats a reclaimed path. The legacy v1 receipt remains readable by the
+legacy identity-map path but cannot authorize bounded captured success.

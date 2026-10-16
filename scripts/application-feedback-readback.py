@@ -104,6 +104,8 @@ MAX_PROBE_OUTPUT_BYTES = 512 * 1024
 MAX_APP_BINARY_BYTES = 512 * 1024 * 1024
 PROBE_CAPTURE_RECEIPT_SCHEMA = "allocatbelt.application-feedback-probe-capture.v2"
 FEEDBACK_OFFLINE_CONTEXT_SCHEMA = "allocatbelt.application-feedback-offline-replay-context.v1"
+FEEDBACK_CAPTURED_OFFLINE_CONTEXT_SCHEMA = "allocatbelt.application-feedback-captured-offline-replay-context.v1"
+PRESSURE_CAPTURED_OFFLINE_CONTEXT_SCHEMA = "allocatbelt.application-source5-pressure-captured-replay.v1"
 EVIDENCE_PATH_MAP_SCHEMA = "allocatbelt.application-pressure-evidence-path-map.v1"
 PRESSURE_PAIR_REPLAY_REQUEST_SCHEMA = "allocatbelt.application-feedback-pressure-pair-replay-request.v1"
 CAPACITY_REQUEST_SCHEMA_V1 = "allocatbelt.application-byte-capacity-request.v1"
@@ -1634,7 +1636,7 @@ def validate_calibrated_construction_probe_v2(
 def _check_calibrated_construction_probe_v2_inputs(
     probe_pin: object, source_manifest: dict[str, Any], capacity_artifact_pin: object,
     identity: dict[str, Any], expected_policy: dict[str, Any] | None = None,
-    capacity_floor_policy_id: str | None = None,
+    capacity_floor_policy_id: str | None = None, *, artifact_view: Any = None,
 ) -> tuple[str, dict[str, Any], Path, Path, str, Path]:
     """Check every static V2 source/policy input without launching an APP."""
     require(source_manifest.get("schema") == SOURCE_MANIFEST_SCHEMA_V5, "calibrated construction probe requires SourceV5")
@@ -1644,7 +1646,11 @@ def _check_calibrated_construction_probe_v2_inputs(
     require(pin["allocator"] in APPLICATION_ALLOCATOR_LABELS and pin["allocator"] == identity["allocator"], "calibrated probe allocator differs from the selected application artifact")
     digest(pin["binary_sha256"], "calibrated probe binary SHA-256")
     require(pin["binary_sha256"] == identity["binary_sha256"], "calibrated probe binary differs from feedback identity")
-    probe, probe_sha = read_canonical(Path(pin["path"]), "calibrated construction probe v2", MAX_CONSTRUCTION_PROBE_BYTES, pin["raw_sha256"])
+    probe, probe_sha = read_canonical(
+        Path(pin["path"]), "calibrated construction probe v2",
+        MAX_CONSTRUCTION_PROBE_BYTES, pin["raw_sha256"],
+        artifact_view=artifact_view,
+    )
     resolved_policy = resolve_calibrated_feedback_policy_v5(
         source_manifest, probe, capacity_artifact_pin, identity,
         capacity_floor_policy_id=capacity_floor_policy_id,
@@ -1669,6 +1675,87 @@ def _check_calibrated_construction_probe_v2_inputs(
 
 
 def _validate_feedback_offline_context(value: object) -> dict[str, Any]:
+    if type(value) is dict and value.get("schema") in {
+            FEEDBACK_CAPTURED_OFFLINE_CONTEXT_SCHEMA,
+            PRESSURE_CAPTURED_OFFLINE_CONTEXT_SCHEMA,
+    }:
+        if value["schema"] == FEEDBACK_CAPTURED_OFFLINE_CONTEXT_SCHEMA:
+            context = exact(value, {
+                "schema", "artifact_view", "captured_origin_paths",
+                "evidence_file_paths", "evidence_directory_paths",
+                "source_symlink_paths", "tree_inventories",
+                "probe_capture_pin", "capacity_bundle",
+            }, "captured feedback offline replay context")
+        else:
+            context = exact(value, {
+                "schema", "artifact_view", "captured_origin_paths",
+                "evidence_file_paths", "evidence_directory_paths",
+                "source_symlink_paths", "tree_inventories",
+                "probe_capture_pin", "capacity_bundle",
+            }, "captured pressure feedback replay context")
+        view = context["artifact_view"]
+        require(callable(getattr(view, "has_file", None)) and
+                callable(getattr(view, "read", None)) and
+                callable(getattr(view, "open_snapshot", None)),
+                "captured feedback replay has no exact artifact-view reader")
+
+        def path_set(value: object, label: str) -> frozenset[str]:
+            require(type(value) is list and len(value) <=
+                    MAX_OFFLINE_PATH_MAP_ENTRIES,
+                    f"{label} is malformed or oversized")
+            rendered = [str(absolute_path(item, f"{label}[{index}]"))
+                        for index, item in enumerate(value)]
+            require(rendered == sorted(set(rendered)),
+                    f"{label} is not sorted and unique")
+            return frozenset(rendered)
+
+        captured = path_set(context["captured_origin_paths"],
+                            "captured feedback object origins")
+        files = path_set(context["evidence_file_paths"],
+                         "captured feedback owner inventory files")
+        directories = path_set(context["evidence_directory_paths"],
+                               "captured feedback owner inventory directories")
+        source_symlinks = path_set(context["source_symlink_paths"],
+                                   "resident SourceV5 symlink paths")
+        require(captured and captured <= files and
+                not captured.intersection(directories) and
+                source_symlinks <= files and
+                all(view.has_file(path) for path in captured),
+                "captured feedback object closure differs from the strict owner inventory")
+        require(type(context["tree_inventories"]) is list,
+                "captured feedback typed tree inventory is not a list")
+        capture = exact(context["probe_capture_pin"], {
+            "path", "raw_sha256", "receipt_sha256",
+        }, "captured calibrated probe receipt pin")
+        absolute_path(capture["path"], "captured calibrated probe receipt path")
+        digest(capture["raw_sha256"], "captured calibrated probe receipt raw SHA-256")
+        digest(capture["receipt_sha256"], "captured calibrated probe receipt digest")
+        bundle = exact(context["capacity_bundle"], {
+            "request", "artifact", "receipt",
+        }, "captured offline capacity producer bundle")
+        for name, pin_value in bundle.items():
+            pin = exact(pin_value, {"path", "raw_sha256"},
+                        f"captured offline capacity {name} pin")
+            absolute_path(pin["path"], f"captured offline capacity {name} path")
+            digest(pin["raw_sha256"],
+                   f"captured offline capacity {name} raw SHA-256")
+        require(len({bundle[name]["path"] for name in bundle}) == 3,
+                "captured capacity producer paths must be distinct")
+        frozen_capture = types.MappingProxyType(dict(capture))
+        frozen_bundle = types.MappingProxyType({
+            name: types.MappingProxyType(dict(bundle[name])) for name in bundle
+        })
+        return types.MappingProxyType({
+            "schema": context["schema"], "artifact_view": view,
+            "captured": True, "captured_files": captured,
+            "mapped_paths": captured | files | directories,
+            "mapped_directories": directories,
+            "mapped_files": files,
+            "mapped_symlinks": source_symlinks,
+            "tree_inventories": tuple(context["tree_inventories"]),
+            "probe_capture_pin": frozen_capture,
+            "capacity_bundle": frozen_bundle,
+        })
     try:
         snapshot = json.loads(canonical_bytes(value).decode("ascii"))
     except (TypeError, ValueError, UnicodeError) as error:
@@ -1740,6 +1827,7 @@ def _validate_feedback_offline_context(value: object) -> dict[str, Any]:
     })
     return types.MappingProxyType({
         "schema": context["schema"], "evidence_path_map": frozen_mapping,
+        "captured": False, "captured_files": frozenset(),
         "mapped_directories": frozenset(directories), "mapped_paths": frozenset(local_paths),
         "mapped_files": frozenset(files), "mapped_symlinks": frozenset(symlinks),
         "probe_capture_pin": frozen_capture, "capacity_bundle": frozen_bundle,
@@ -1767,6 +1855,44 @@ def _require_offline_directories(context: dict[str, Any], paths: set[str], label
     for raw_path in paths:
         require(raw_path in context["mapped_directories"],
                 f"feedback evidence path map does not mark {label} as a directory: {raw_path}")
+
+
+def _captured_view_for_path(context: dict[str, Any], path: str | Path) -> Any:
+    if context.get("captured") is True and str(path) in context["captured_files"]:
+        return context["artifact_view"]
+    return None
+
+
+def _required_captured_file_view(
+    context: dict[str, Any], path_value: object, label: str,
+) -> Any:
+    path = str(absolute_path(path_value, f"{label} path"))
+    _require_offline_files(context, {path}, label)
+    require(path in context["captured_files"],
+            f"{label} is not an exact captured owner output")
+    return context["artifact_view"]
+
+
+def _hash_captured_file(
+    artifact_view: Any, path: Path, label: str, maximum: int,
+) -> tuple[int, str]:
+    require(artifact_view.has_file(path),
+            f"{label} is absent from the exact captured refs")
+    total = 0
+    hasher = hashlib.sha256()
+    with artifact_view.open_snapshot(path, label, maximum) as (
+            stream, expected_sha, byte_count):
+        require(type(byte_count) is int and 0 <= byte_count <= maximum,
+                f"{label} captured size exceeds its finite parser bound")
+        while total < byte_count:
+            block = stream.read(min(1024 * 1024, byte_count - total))
+            require(bool(block), f"{label} captured object was truncated")
+            total += len(block)
+            hasher.update(block)
+        require(stream.read(1) == b"" and total == byte_count and
+                hasher.hexdigest() == expected_sha,
+                f"{label} captured object differs from its exact raw pin")
+    return total, hasher.hexdigest()
 
 
 def _sha256_stable_file(path: Path, label: str, maximum: int) -> tuple[int, str]:
@@ -1843,28 +1969,45 @@ def _preflight_probe_capture_tree(
     _require_offline_directories(context, {str(output_directory), str(tmp_path)},
                                  "ProbeV2 output/TMPDIR root")
     _require_offline_files(context, expected_output_files, "ProbeV2 output/receipt member")
-    try:
-        require(output_directory.resolve(strict=True) == output_directory and
-                tmp_path.resolve(strict=True) == tmp_path,
-                "offline ProbeV2 output/TMPDIR traverses an alias")
-        output_info = output_directory.lstat()
-        tmp_info = tmp_path.lstat()
-        with os.scandir(output_directory) as entries:
-            output_names = {entry.name for entry in entries}
-    except OSError as error:
-        raise ValidationError(f"cannot inspect copied ProbeV2 output/TMPDIR root: {error}") from error
-    require(stat.S_ISDIR(output_info.st_mode) and not stat.S_ISLNK(output_info.st_mode) and
-            output_info.st_uid == os.getuid() and stat.S_IMODE(output_info.st_mode) == 0o700 and
-            stat.S_ISDIR(tmp_info.st_mode) and not stat.S_ISLNK(tmp_info.st_mode) and
-            tmp_info.st_uid == os.getuid() and stat.S_IMODE(tmp_info.st_mode) == 0o700,
-            "copied ProbeV2 output/TMPDIR roots are not owned private directories")
-    require(output_names == {
-        "tmp", "stdout.bin", "stderr.bin", "owner-result.json", "tmpdir-inventory.json",
-        "capture-receipt.json",
-    }, "copied ProbeV2 output root has an unpinned or missing member")
+    if context.get("captured") is True:
+        require(str(output_directory) in context["mapped_directories"] and
+                str(tmp_path) in context["mapped_directories"],
+                "captured ProbeV2 output/TMPDIR roots lack owner-receipt directory facts")
+        direct_files = {
+            path for path in context["mapped_files"]
+            if Path(path).parent == output_directory
+        }
+        direct_directories = {
+            path for path in context["mapped_directories"]
+            if Path(path).parent == output_directory
+        }
+        require(direct_files == expected_output_files and
+                direct_directories == {str(tmp_path)},
+                "captured ProbeV2 output root differs from its exact owner inventory")
+    else:
+        try:
+            require(output_directory.resolve(strict=True) == output_directory and
+                    tmp_path.resolve(strict=True) == tmp_path,
+                    "offline ProbeV2 output/TMPDIR traverses an alias")
+            output_info = output_directory.lstat()
+            tmp_info = tmp_path.lstat()
+            with os.scandir(output_directory) as entries:
+                output_names = {entry.name for entry in entries}
+        except OSError as error:
+            raise ValidationError(f"cannot inspect copied ProbeV2 output/TMPDIR root: {error}") from error
+        require(stat.S_ISDIR(output_info.st_mode) and not stat.S_ISLNK(output_info.st_mode) and
+                output_info.st_uid == os.getuid() and stat.S_IMODE(output_info.st_mode) == 0o700 and
+                stat.S_ISDIR(tmp_info.st_mode) and not stat.S_ISLNK(tmp_info.st_mode) and
+                tmp_info.st_uid == os.getuid() and stat.S_IMODE(tmp_info.st_mode) == 0o700,
+                "copied ProbeV2 output/TMPDIR roots are not owned private directories")
+        require(output_names == {
+            "tmp", "stdout.bin", "stderr.bin", "owner-result.json", "tmpdir-inventory.json",
+            "capture-receipt.json",
+        }, "copied ProbeV2 output root has an unpinned or missing member")
     inventory_value, inventory_raw_sha = read_canonical(
         Path(inventory_pin["path"]), "offline ProbeV2 TMPDIR inventory sidecar",
         MAX_PROBE_TMPDIR_INVENTORY_BYTES, inventory_pin["raw_sha256"],
+        artifact_view=_captured_view_for_path(context, inventory_pin["path"]),
     )
     exact(inventory_value, {"schema", "entries", "inventory_sha256"},
           "offline ProbeV2 TMPDIR inventory sidecar")
@@ -1905,7 +2048,8 @@ def _preflight_probe_capture_tree(
         except ValueError as error:
             raise ValidationError("offline ProbeV2 TMPDIR inventory escapes its root") from error
         require(relative.parts and item_text not in expected and item["kind"] in ("file", "directory") and
-                type(item["uid"]) is int and item["uid"] >= 0 and item["uid"] == os.getuid() and
+                type(item["uid"]) is int and item["uid"] >= 0 and
+                item["uid"] == os.getuid() and
                 type(item["mode"]) is int and 0 <= item["mode"] <= 0o7777,
                 "offline ProbeV2 TMPDIR inventory identity/type is malformed")
         if item["kind"] == "file":
@@ -1922,6 +2066,50 @@ def _preflight_probe_capture_tree(
     require(paths_in_order == sorted(paths_in_order) and total_bytes <= byte_limit and
             len(canonical_bytes(inventory)) <= MAX_PROBE_TMPDIR_INVENTORY_BYTES,
             "offline ProbeV2 TMPDIR inventory is unordered or exceeds its finite bound")
+    if context.get("captured") is True:
+        tree_rows = [exact(row, {
+            "owner_job_sha256", "root_path", "role", "owner_receipt_pin",
+            "inventory_pin", "inventory_sha256", "entry_count", "byte_count",
+            "entries",
+        }, f"captured ProbeV2 typed tree[{index}]")
+            for index, row in enumerate(context["tree_inventories"])
+            if type(row) is dict and row.get("root_path") == str(tmp_path)]
+        require(len(tree_rows) == 1,
+                "captured ProbeV2 request has no unique typed TMPDIR tree row")
+        tree = tree_rows[0]
+        receipt_pin = context["probe_capture_pin"]
+        expected_owner_pin = {
+            "path": receipt_pin["path"],
+            "raw_sha256": receipt_pin["raw_sha256"],
+            "semantic_sha256": receipt_pin["receipt_sha256"],
+        }
+        expected_inventory_pin = {
+            "path": inventory_pin["path"],
+            "raw_sha256": inventory_pin["raw_sha256"],
+            "semantic_sha256": inventory_pin["inventory_sha256"],
+        }
+        require(tree["role"] == "opaque_trace" and
+                tree["owner_receipt_pin"] == expected_owner_pin and
+                tree["inventory_pin"] == expected_inventory_pin and
+                tree["inventory_sha256"] == inventory_pin["inventory_sha256"] and
+                tree["entries"] == inventory and
+                tree["entry_count"] == len(inventory) and
+                tree["byte_count"] == total_bytes,
+                "captured ProbeV2 typed tree differs from its exact owner receipt/inventory")
+        required_directories = {str(tmp_path)} | {
+            path for path, item in expected.items()
+            if item["kind"] == "directory"
+        }
+        require(required_directories <= context["mapped_directories"],
+                "captured ProbeV2 typed tree omits an authenticated directory fact")
+        for item_path, item in expected.items():
+            if item["kind"] == "file":
+                size, raw_sha = _hash_captured_file(
+                    context["artifact_view"], Path(item_path),
+                    "captured ProbeV2 TMPDIR file", byte_limit,
+                )
+                require(size == item["size"] and raw_sha == item["raw_sha256"],
+                        "captured ProbeV2 TMPDIR file differs from its typed inventory")
     require(initial["path"] == final["path"] == str(tmp_path) and
             initial["mode"] == final["mode"] == 0o700 and
             initial["device"] == final["device"] and initial["inode"] == final["inode"] and
@@ -1934,6 +2122,7 @@ def _preflight_probe_capture_tree(
     owner_result, owner_result_raw_sha = read_canonical(
         Path(owner_pin["path"]), "offline FixedR8 owner-result sidecar",
         MAX_PROBE_OWNER_RESULT_BYTES, owner_pin["raw_sha256"],
+        artifact_view=_captured_view_for_path(context, owner_pin["path"]),
     )
     exact(owner_result, {
         "schema", "direct", "start_callback_count", "start_callback_proofs",
@@ -1946,6 +2135,9 @@ def _preflight_probe_capture_tree(
             owner_result["owner_result_sha256"] == owner_pin["owner_result_sha256"] ==
             digest_object(owner_result_body),
             "offline FixedR8 owner-result sidecar digest differs from its receipt pin")
+
+    if context.get("captured") is True:
+        return inventory
 
     pending = [tmp_path]
     observed: dict[str, os.stat_result] = {}
@@ -2373,7 +2565,9 @@ def _preflight_offline_probe_evidence(
             stat.S_IMODE(capture_output_info.st_mode) == 0o700,
             "copied ProbeV2 output root is not an owned private directory")
     capture_raw, _capture_sha = read_stable(
-        capture_path, "offline ProbeV2 capture receipt", MAX_PROBE_CAPTURE_RECEIPT_BYTES,
+        capture_path, "offline ProbeV2 capture receipt",
+        MAX_PROBE_CAPTURE_RECEIPT_BYTES,
+        artifact_view=_captured_view_for_path(context, capture_path),
     )
     capture = validate_probe_capture_receipt_envelope(
         capture_raw, capture_pin["raw_sha256"], capture_pin["receipt_sha256"],
@@ -2418,8 +2612,16 @@ def _preflight_offline_probe_evidence(
                        "offline ProbeV2 stderr pin")
     _require_offline_files(context, {stdout_pin["path"], stderr_pin["path"]},
                            "offline ProbeV2 raw output")
-    stdout, stdout_sha = read_stable(Path(stdout_pin["path"]), "offline ProbeV2 stdout", MAX_PROBE_OUTPUT_BYTES)
-    stderr, stderr_sha = read_stable(Path(stderr_pin["path"]), "offline ProbeV2 stderr", MAX_PROBE_OUTPUT_BYTES)
+    stdout, stdout_sha = read_stable(
+        Path(stdout_pin["path"]), "offline ProbeV2 stdout",
+        MAX_PROBE_OUTPUT_BYTES,
+        artifact_view=_captured_view_for_path(context, stdout_pin["path"]),
+    )
+    stderr, stderr_sha = read_stable(
+        Path(stderr_pin["path"]), "offline ProbeV2 stderr",
+        MAX_PROBE_OUTPUT_BYTES,
+        artifact_view=_captured_view_for_path(context, stderr_pin["path"]),
+    )
     require(stdout_sha == stdout_pin["raw_sha256"] == probe_pin["raw_sha256"] and
             stdout == canonical_bytes(probe) and stderr_sha == stderr_pin["raw_sha256"] and not stderr,
             "offline ProbeV2 receipt does not retain the original exact stdout and empty stderr")
@@ -2499,20 +2701,28 @@ def validate_calibrated_construction_probe_v2_offline(
     probe_sha, probe, binary, source_root, _capacity_sha, capacity_path = _check_calibrated_construction_probe_v2_inputs(
         pin, source_manifest, capacity_pin, identity, expected_policy,
         capacity_floor_policy_id,
+        artifact_view=_captured_view_for_path(context, pin["path"]),
     )
     _verify_capacity_bundle_v5_offline(source_manifest, source_pin, identity, capacity_pin, context)
     receipt_pin = context["probe_capture_pin"]
     receipt_raw, receipt_raw_sha = read_stable(
         Path(receipt_pin["path"]), "strict origin-host calibrated probe receipt",
         MAX_PROBE_CAPTURE_RECEIPT_BYTES,
+        artifact_view=_captured_view_for_path(context, receipt_pin["path"]),
     )
     receipt = validate_probe_capture_receipt_envelope(
         receipt_raw, receipt_pin["raw_sha256"], receipt_pin["receipt_sha256"],
     )
-    receipt_info = Path(receipt_pin["path"]).lstat()
-    require(stat.S_ISREG(receipt_info.st_mode) and receipt_info.st_uid == os.getuid() and
-            stat.S_IMODE(receipt_info.st_mode) == 0o600,
-            "origin-host calibrated probe receipt is not a fresh owned mode-0600 file")
+    if context.get("captured") is True:
+        receipt_size = context["artifact_view"].objects[
+            receipt_pin["path"]
+        ]["byte_count"]
+    else:
+        receipt_info = Path(receipt_pin["path"]).lstat()
+        require(stat.S_ISREG(receipt_info.st_mode) and receipt_info.st_uid == os.getuid() and
+                stat.S_IMODE(receipt_info.st_mode) == 0o600,
+                "origin-host calibrated probe receipt is not a fresh owned mode-0600 file")
+        receipt_size = receipt_info.st_size
     expected_source = {
         "path": source_pin["path"], "raw_sha256": digest(source_pin["raw_sha256"], "SourceV5 raw SHA-256"),
         "semantic_sha256": digest(source_manifest.get("manifest_sha256"), "SourceV5 semantic SHA-256"),
@@ -2557,6 +2767,7 @@ def validate_calibrated_construction_probe_v2_offline(
     observed, observed_raw_sha = read_canonical(
         Path(observed_pin["path"]), "origin-host observed-host context",
         MAX_SOURCE_MANIFEST_BYTES, observed_pin["raw_sha256"],
+        artifact_view=_captured_view_for_path(context, observed_pin["path"]),
     )
     observed = exact(observed, {
         "schema", "host_id", "boot_id_sha256", "controls_sha256", "controls",
@@ -2638,6 +2849,7 @@ def validate_calibrated_construction_probe_v2_offline(
         owner_result_path, "captured FixedR8 direct owner result",
         MAX_PROBE_OWNER_RESULT_BYTES, digest(owner_result_pin["raw_sha256"],
                                              "captured FixedR8 owner-result raw SHA-256"),
+        artifact_view=_captured_view_for_path(context, owner_result_path),
     )
     exact(owner_result, {
         "schema", "direct", "start_callback_count", "start_callback_proofs",
@@ -2653,10 +2865,11 @@ def validate_calibrated_construction_probe_v2_offline(
             owner_result["start_callback_proofs"] ==
             ([] if receipt["start_callback_proof"] is None else [receipt["start_callback_proof"]]),
             "captured FixedR8 owner result differs from the receipt's original direct status/callback")
-    owner_result_info = owner_result_path.lstat()
-    require(stat.S_ISREG(owner_result_info.st_mode) and owner_result_info.st_uid == os.getuid() and
-            stat.S_IMODE(owner_result_info.st_mode) == 0o600,
-            "captured FixedR8 owner-result file is not an owned mode-0600 file")
+    if context.get("captured") is not True:
+        owner_result_info = owner_result_path.lstat()
+        require(stat.S_ISREG(owner_result_info.st_mode) and owner_result_info.st_uid == os.getuid() and
+                stat.S_IMODE(owner_result_info.st_mode) == 0o600,
+                "captured FixedR8 owner-result file is not an owned mode-0600 file")
     inventory_pin = exact(receipt["tmpdir_inventory_pin"], {
         "path", "raw_sha256", "inventory_sha256",
     }, "captured ProbeV2 TMPDIR inventory pin")
@@ -2668,6 +2881,7 @@ def validate_calibrated_construction_probe_v2_offline(
         inventory_path, "captured ProbeV2 TMPDIR inventory sidecar",
         MAX_PROBE_TMPDIR_INVENTORY_BYTES, digest(inventory_pin["raw_sha256"],
                                                  "ProbeV2 TMPDIR inventory raw SHA-256"),
+        artifact_view=_captured_view_for_path(context, inventory_path),
     )
     exact(inventory_value, {"schema", "entries", "inventory_sha256"},
           "captured ProbeV2 TMPDIR inventory sidecar")
@@ -2678,10 +2892,11 @@ def validate_calibrated_construction_probe_v2_offline(
             digest(inventory_value["inventory_sha256"], "ProbeV2 TMPDIR inventory digest") ==
             inventory_pin["inventory_sha256"] == digest_object(inventory_body),
             "captured ProbeV2 TMPDIR inventory differs from its exact raw/semantic pins")
-    inventory_info = inventory_path.lstat()
-    require(stat.S_ISREG(inventory_info.st_mode) and inventory_info.st_uid == os.getuid() and
-            stat.S_IMODE(inventory_info.st_mode) == 0o600,
-            "captured ProbeV2 TMPDIR inventory is not an owned mode-0600 file")
+    if context.get("captured") is not True:
+        inventory_info = inventory_path.lstat()
+        require(stat.S_ISREG(inventory_info.st_mode) and inventory_info.st_uid == os.getuid() and
+                stat.S_IMODE(inventory_info.st_mode) == 0o600,
+                "captured ProbeV2 TMPDIR inventory is not an owned mode-0600 file")
     inventory = inventory_value["entries"]
     direct = exact(owner_result["direct"], DIRECT_CAPTURE_FIELDS,
                    "owned calibrated probe process capture")
@@ -2740,11 +2955,12 @@ def validate_calibrated_construction_probe_v2_offline(
     stderr_pin = exact(receipt["stderr"], {"path", "raw_sha256"}, "captured probe stderr pin")
     _require_offline_paths(context, {stdout_pin["path"], stderr_pin["path"]},
                            "owned calibrated probe output")
-    for label, output_pin in (("stdout", stdout_pin), ("stderr", stderr_pin)):
-        output_info = Path(output_pin["path"]).lstat()
-        require(stat.S_ISREG(output_info.st_mode) and output_info.st_uid == os.getuid() and
-                stat.S_IMODE(output_info.st_mode) == 0o600,
-                f"captured ProbeV2 {label} is not an owned mode-0600 file")
+    if context.get("captured") is not True:
+        for label, output_pin in (("stdout", stdout_pin), ("stderr", stderr_pin)):
+            output_info = Path(output_pin["path"]).lstat()
+            require(stat.S_ISREG(output_info.st_mode) and output_info.st_uid == os.getuid() and
+                    stat.S_IMODE(output_info.st_mode) == 0o600,
+                    f"captured ProbeV2 {label} is not an owned mode-0600 file")
     storage_budget = exact(receipt["storage_budget"], {
         "tmpdir_bytes", "tmpdir_inodes", "stdout_bytes", "stderr_bytes",
         "owner_result_bytes", "inventory_bytes", "failure_bytes", "receipt_bytes", "output_inodes",
@@ -2760,13 +2976,21 @@ def validate_calibrated_construction_probe_v2_offline(
             storage_budget["failure_bytes"] == MAX_PROBE_CAPTURE_FAILURE_BYTES and
             0 < storage_budget["receipt_bytes"] <= MAX_PROBE_CAPTURE_RECEIPT_BYTES and
             7 <= storage_budget["output_inodes"] <= 4096 and
-            receipt_info.st_size <= storage_budget["receipt_bytes"],
+            receipt_size <= storage_budget["receipt_bytes"],
             "origin-host probe storage budget exceeds the finite owner limits")
     receipt_budget_bound = _probe_capture_receipt_budget_bound(receipt)
     require(storage_budget["receipt_bytes"] >= receipt_budget_bound,
             "origin-host probe receipt budget is below its recomputed prospective canonical bound")
-    stdout, stdout_sha = read_stable(Path(stdout_pin["path"]), "captured ProbeV2 stdout", MAX_PROBE_OUTPUT_BYTES)
-    stderr, stderr_sha = read_stable(Path(stderr_pin["path"]), "captured ProbeV2 stderr", MAX_PROBE_OUTPUT_BYTES)
+    stdout, stdout_sha = read_stable(
+        Path(stdout_pin["path"]), "captured ProbeV2 stdout",
+        MAX_PROBE_OUTPUT_BYTES,
+        artifact_view=_captured_view_for_path(context, stdout_pin["path"]),
+    )
+    stderr, stderr_sha = read_stable(
+        Path(stderr_pin["path"]), "captured ProbeV2 stderr",
+        MAX_PROBE_OUTPUT_BYTES,
+        artifact_view=_captured_view_for_path(context, stderr_pin["path"]),
+    )
     require(stdout_sha == stdout_pin["raw_sha256"] and stderr_sha == stderr_pin["raw_sha256"] and
             receipt["output_matches_probe"] is True and receipt["stderr_empty"] is True and
             len(stdout) <= storage_budget["stdout_bytes"] and
@@ -2802,15 +3026,16 @@ def validate_calibrated_construction_probe_v2_offline(
             Path(receipt["tmpdir_initial"]["path"]).parent == output_directory and
             Path(output_mount["mount_point"]).is_absolute(),
             "origin-host probe storage paths are outside their captured private output root")
-    try:
-        output_members = {item.name for item in output_directory.iterdir()}
-    except OSError as error:
-        raise ValidationError(f"cannot enumerate origin-host probe output root: {error}") from error
-    require(output_members == {
-        "tmp", "stdout.bin", "stderr.bin", "owner-result.json", "tmpdir-inventory.json",
-        "capture-receipt.json",
-    },
-            "origin-host probe output root has missing or unpinned members")
+    if context.get("captured") is not True:
+        try:
+            output_members = {item.name for item in output_directory.iterdir()}
+        except OSError as error:
+            raise ValidationError(f"cannot enumerate origin-host probe output root: {error}") from error
+        require(output_members == {
+            "tmp", "stdout.bin", "stderr.bin", "owner-result.json", "tmpdir-inventory.json",
+            "capture-receipt.json",
+        },
+                "origin-host probe output root has missing or unpinned members")
     initial_tmp = exact(receipt["tmpdir_initial"], {
         "path", "device", "inode", "mode", "mount", "available_bytes", "available_inodes",
         "bytes_limit", "inode_limit",
@@ -3329,9 +3554,14 @@ def _verify_pressure_proof(
     recipe: dict[str, Any], production: tuple[int, int], drain: tuple[int, int], *,
     offline_replayed_proof: dict[str, Any] | None = None,
     allow_pressure_v2: bool = False,
+    artifact_view: Any = None,
 ) -> tuple[bool, str]:
     pin = recipe["external_pressure_proof"]
-    proof, raw_sha = read_canonical(Path(pin["path"]), "external pressure readback", MAX_PRESSURE_PROOF_BYTES, pin["raw_sha256"])
+    proof, raw_sha = read_canonical(
+        Path(pin["path"]), "external pressure readback",
+        MAX_PRESSURE_PROOF_BYTES, pin["raw_sha256"],
+        artifact_view=artifact_view,
+    )
     pressure_fields = {
         "schema", "status", "recipe_sha256", "recipe_raw_sha256", "validator_sha256", "condition_sha256", "identity",
         "run_sha256", "events_sha256",
@@ -3469,9 +3699,13 @@ def _runtime_key_allowed(key: str) -> bool:
 
 def _verify_runtime_binding(
     recipe: dict[str, Any], final_policy: dict[str, dict[str, Any]], accepted_sample_count: int,
+    *, artifact_view: Any = None,
 ) -> tuple[bool, str, bool]:
     pin = recipe["final_runtime_binding"]
-    raw, raw_sha = read_stable(Path(pin["path"]), "final runtime binding", MAX_RUNTIME_BINDING_BYTES)
+    raw, raw_sha = read_stable(
+        Path(pin["path"]), "final runtime binding",
+        MAX_RUNTIME_BINDING_BYTES, artifact_view=artifact_view,
+    )
     require(raw_sha == pin["raw_sha256"], "final runtime binding raw SHA-256 differs from caller pin")
     require(raw.endswith(b"\n") and b"\r" not in raw and b"\x00" not in raw, "runtime binding has invalid LF framing")
     try:
@@ -3596,6 +3830,7 @@ def _verify_runtime_binding(
 
 def _verify_soak_final_binding_v3(
     recipe: dict[str, Any], source_manifest_binding: dict[str, Any], manifest: dict[str, Any],
+    *, artifact_view: Any = None,
 ) -> dict[str, Any]:
     """Bind the feedback trace to its independently audited SourceV5 soak run."""
     source_manifest = source_manifest_binding["value"]
@@ -3606,10 +3841,12 @@ def _verify_soak_final_binding_v3(
     receipt, receipt_sha = read_canonical(
         Path(receipt_pin["path"]), "Rust runtime-soak v2 receipt", MAX_SOAK_BINDING_BYTES,
         digest(receipt_pin["raw_sha256"], "Rust soak receipt raw SHA-256"),
+        artifact_view=artifact_view,
     )
     readback, readback_sha = read_canonical(
         Path(readback_pin["path"]), "application-soak-readback v2 composite", MAX_SOAK_BINDING_BYTES,
         digest(readback_pin["raw_sha256"], "soak readback raw SHA-256"),
+        artifact_view=artifact_view,
     )
     exact(receipt, SOAK_RECEIPT_FIELDS_V2, "Rust runtime-soak v2 receipt")
     exact(readback, SOAK_READBACK_FIELDS_V2, "audited application soak readback v2")
@@ -4400,8 +4637,8 @@ def _begin_reconciliation(model: PolicyModel, event: dict[str, Any]) -> None:
 
 
 def _validate_event_stream(
-    stream: BoundedLines,
-    directory_fd: int,
+    stream: BoundedLines | CapturedBoundedLines,
+    directory_fd: int | None,
     expectation: dict[str, Any],
     manifest: dict[str, Any],
     expected_sha: str,
@@ -4572,8 +4809,8 @@ def _decimal(value: str, label: str) -> int:
 
 
 def _validate_resource_sample_rows(
-    stream: BoundedLines,
-    directory_fd: int,
+    stream: BoundedLines | CapturedBoundedLines,
+    directory_fd: int | None,
     expectation: dict[str, Any],
     manifest: dict[str, Any],
     expected_sha: str,
@@ -4732,12 +4969,67 @@ def _verify_feedback_replay(
     *, offline_replay_context: object | None = None,
     offline_replayed_proof: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    replay_context = (None if offline_replay_context is None else
+                      _validate_feedback_offline_context(offline_replay_context))
+    captured = (replay_context is not None and
+                replay_context.get("captured") is True)
+    captured_view = (replay_context["artifact_view"] if captured else None)
+    if captured:
+        expectation_origin = str(absolute_path(
+            str(expectation_path), "captured feedback expectation path",
+        ))
+        require(expectation_origin in replay_context["captured_files"],
+                "captured feedback expectation is absent from the exact archived output refs")
     expectation, expectation_raw_sha = read_canonical(
         expectation_path, "feedback expectation", MAX_EXPECTATION_BYTES,
         digest(expected_expectation_sha256, "expected expectation raw SHA-256"),
+        artifact_view=_captured_view_for_path(replay_context, expectation_path)
+        if captured else None,
     )
     recipe = _validate_expectation_body({key: value for key, value in expectation.items() if key != "recipe_sha256"})
     require(digest(expectation.get("recipe_sha256"), "expectation self digest") == digest_object(recipe), "feedback expectation self digest is invalid")
+    if captured:
+        source_manifest_pin = exact(
+            recipe.get("host_binding"), {"path", "raw_sha256"},
+            "captured feedback resident SourceV5 manifest pin",
+        )
+        source_manifest_origin = str(absolute_path(
+            source_manifest_pin["path"],
+            "captured feedback resident SourceV5 manifest path",
+        ))
+        _require_offline_files(
+            replay_context, {source_manifest_origin},
+            "resident source manifest",
+        )
+        require(source_manifest_origin not in replay_context["captured_files"],
+                "source manifest must remain a resident pinned input")
+        trace_origin = str(absolute_path(
+            str(trace_directory), "captured feedback trace directory",
+        ))
+        _require_offline_directories(
+            replay_context, {trace_origin}, "captured feedback trace root",
+        )
+        expected_trace_origins = {
+            str(Path(trace_origin) / name) for name in TRACE_FILES
+        }
+        _require_offline_files(
+            replay_context, expected_trace_origins,
+            "captured feedback trace member",
+        )
+        actual_trace_origins = {
+            path for path in replay_context["mapped_files"]
+            if Path(path) != Path(trace_origin) and
+            Path(trace_origin) in Path(path).parents
+        }
+        nested_trace_directories = {
+            path for path in replay_context["mapped_directories"]
+            if Path(path) != Path(trace_origin) and
+            Path(trace_origin) in Path(path).parents
+        }
+        require(actual_trace_origins == expected_trace_origins,
+                "captured feedback trace has an unpinned or missing output member")
+        require(not nested_trace_directories,
+                "captured feedback trace directory contains an unpinned nested directory")
     source_manifest = _verify_source_manifest(recipe)
     if recipe["schema"] in (EXPECTATION_SCHEMA_V5, EXPECTATION_SCHEMA_V6):
         capacity_floor_policy_id = recipe["policy"].get("capacity_floor_policy_id")
@@ -4763,29 +5055,63 @@ def _verify_feedback_replay(
         "feedback-events.jsonl": digest(expected_artifact_sha256.get("events"), "expected events raw SHA-256"),
         "resource-samples.tsv": digest(expected_artifact_sha256.get("samples"), "expected samples raw SHA-256"),
     }
-    root_fd = _open_trace_directory(absolute_path(str(trace_directory), "trace directory"))
+    trace_root = absolute_path(str(trace_directory), "trace directory")
+    root_fd: int | None = None
+    if not captured:
+        root_fd = _open_trace_directory(trace_root)
     try:
         require(TRACE_FILES == set(artifact_pins), "feedback trace artifact pins do not match the fixed file set")
-        _validate_trace_directory_layout(root_fd)
-        with BoundedLines(root_fd, "feedback-trace-manifest.tsv", "feedback trace manifest", MAX_MANIFEST_BYTES, MAX_MANIFEST_BYTES) as manifest_file:
+        if not captured:
+            require(root_fd is not None, "feedback trace directory descriptor is absent")
+            _validate_trace_directory_layout(root_fd)
+        manifest_origin = trace_root / "feedback-trace-manifest.tsv"
+        manifest_stream = (
+            CapturedBoundedLines(
+                manifest_origin, "feedback trace manifest", MAX_MANIFEST_BYTES,
+                MAX_MANIFEST_BYTES, captured_view,
+            ) if captured else
+            BoundedLines(root_fd, manifest_origin.name,
+                         "feedback trace manifest", MAX_MANIFEST_BYTES,
+                         MAX_MANIFEST_BYTES)
+        )
+        with manifest_stream as manifest_file:
             manifest_rows = list(manifest_file)
             manifest_sha = manifest_file.finish(root_fd)
             require(manifest_sha == artifact_pins["feedback-trace-manifest.tsv"], "feedback manifest raw SHA-256 differs from caller pin")
             manifest = _parse_manifest(manifest_rows, recipe)
         require(manifest["artifacts"]["feedback-events.jsonl"]["sha256"] == artifact_pins["feedback-events.jsonl"], "manifest event digest differs from separately pinned raw SHA-256")
         require(manifest["artifacts"]["resource-samples.tsv"]["sha256"] == artifact_pins["resource-samples.tsv"], "manifest sample digest differs from separately pinned raw SHA-256")
-        with BoundedLines(root_fd, "feedback-events.jsonl", "feedback events", MAX_EVENT_FILE_BYTES, MAX_EVENT_LINE_BYTES) as events_file:
+        events_origin = trace_root / "feedback-events.jsonl"
+        events_stream = (
+            CapturedBoundedLines(
+                events_origin, "feedback events", MAX_EVENT_FILE_BYTES,
+                MAX_EVENT_LINE_BYTES, captured_view,
+            ) if captured else
+            BoundedLines(root_fd, events_origin.name, "feedback events",
+                         MAX_EVENT_FILE_BYTES, MAX_EVENT_LINE_BYTES)
+        )
+        with events_stream as events_file:
             require(events_file.byte_count == manifest["artifacts"]["feedback-events.jsonl"]["bytes"], "event file size differs from manifest")
             events_sha, model, event_info = _validate_event_stream(
                 events_file, root_fd, recipe, manifest, artifact_pins["feedback-events.jsonl"],
             )
-        with BoundedLines(root_fd, "resource-samples.tsv", "resource samples", MAX_SAMPLE_FILE_BYTES, MAX_SAMPLE_LINE_BYTES) as samples_file:
+        samples_origin = trace_root / "resource-samples.tsv"
+        samples_stream = (
+            CapturedBoundedLines(
+                samples_origin, "resource samples", MAX_SAMPLE_FILE_BYTES,
+                MAX_SAMPLE_LINE_BYTES, captured_view,
+            ) if captured else
+            BoundedLines(root_fd, samples_origin.name, "resource samples",
+                         MAX_SAMPLE_FILE_BYTES, MAX_SAMPLE_LINE_BYTES)
+        )
+        with samples_stream as samples_file:
             require(samples_file.byte_count == manifest["artifacts"]["resource-samples.tsv"]["bytes"], "resource sample file size differs from manifest")
             samples_sha = _validate_resource_sample_rows(
                 samples_file, root_fd, recipe, manifest, artifact_pins["resource-samples.tsv"], model, event_info,
             )
     finally:
-        os.close(root_fd)
+        if root_fd is not None:
+            os.close(root_fd)
 
     production = manifest["production_window"]
     drain = manifest["drain_window"]
@@ -4797,6 +5123,43 @@ def _verify_feedback_replay(
     soak_mode: str | None = None
     release_complete = False
     if recipe["mode"] in ("pressure_validation", "pressure_soak_validation"):
+        pressure_view = None
+        runtime_view = None
+        soak_view = None
+        if captured:
+            pressure_pin = recipe.get("external_pressure_proof")
+            require(type(pressure_pin) is dict and
+                    type(pressure_pin.get("path")) is str,
+                    "captured pressure expectation omits its external proof pin")
+            pressure_view = _required_captured_file_view(
+                replay_context, pressure_pin["path"],
+                "captured external pressure proof",
+            )
+            if recipe["schema"] == EXPECTATION_SCHEMA_V3:
+                binding = exact(
+                    recipe.get("final_runtime_binding"),
+                    {"soak_receipt", "soak_readback"},
+                    "captured final soak bindings",
+                )
+                for name in ("soak_receipt", "soak_readback"):
+                    pin = exact(
+                        binding[name], {"path", "raw_sha256"},
+                        f"captured {name.replace('_', ' ')} pin",
+                    )
+                    _required_captured_file_view(
+                        replay_context, pin["path"],
+                        f"captured {name.replace('_', ' ')}",
+                    )
+                soak_view = replay_context["artifact_view"]
+            else:
+                runtime_pin = recipe.get("final_runtime_binding")
+                require(type(runtime_pin) is dict and
+                        set(runtime_pin) == {"path", "raw_sha256"},
+                        "captured pressure expectation omits its final runtime-binding pin")
+                runtime_view = _required_captured_file_view(
+                    replay_context, runtime_pin["path"],
+                    "captured final runtime binding",
+                )
         if recipe["schema"] == EXPECTATION_SCHEMA_V3:
             harness = source_manifest["value"]["qualification_harness"]
             pressure_validator = exact(harness["pressure_validator"], {"path", "sha256"}, "SourceV5 pressure validator pin")
@@ -4805,9 +5168,12 @@ def _verify_feedback_replay(
             recipe, tuple(production["start_monotonic_ns"]), drain,
             offline_replayed_proof=offline_replayed_proof,
             allow_pressure_v2=offline_replay_context is not None,
+            artifact_view=pressure_view,
         )
         if recipe["schema"] == EXPECTATION_SCHEMA_V3:
-            soak_binding = _verify_soak_final_binding_v3(recipe, source_manifest, manifest)
+            soak_binding = _verify_soak_final_binding_v3(
+                recipe, source_manifest, manifest, artifact_view=soak_view,
+            )
             runtime_ok = soak_binding["validated"]
             runtime_sha = soak_binding["raw_sha256"]
             soak_readback_sha = soak_binding["readback_raw_sha256"]
@@ -4815,7 +5181,10 @@ def _verify_feedback_replay(
             soak_mode = soak_binding["mode"]
             release_complete = runtime_ok
         else:
-            runtime_ok, runtime_sha, release_complete = _verify_runtime_binding(recipe, event_info["final_state"], model.sample_count)
+            runtime_ok, runtime_sha, release_complete = _verify_runtime_binding(
+                recipe, event_info["final_state"], model.sample_count,
+                artifact_view=runtime_view,
+            )
     source_value = source_manifest["value"]
     if recipe["schema"] in (EXPECTATION_SCHEMA_V3, EXPECTATION_SCHEMA_V4, EXPECTATION_SCHEMA_V5, EXPECTATION_SCHEMA_V6):
         feedback_record = _source_v5_regular_record(

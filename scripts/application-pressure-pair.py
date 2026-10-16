@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import hashlib
 import io
 import json
@@ -29,10 +30,13 @@ RECIPE_SCHEMA = "allocatbelt.application-pressure-pair-recipe.v1"
 RECIPE_SCHEMA_V2 = "allocatbelt.application-pressure-pair-recipe.v2"
 POLICY_SCHEMA = "allocatbelt.application-pressure-pair-policy.v1"
 READBACK_SCHEMA = "allocatbelt.application-pressure-pair-readback.v1"
+READBACK_SCHEMA_V2 = "allocatbelt.application-pressure-pair-readback.v2"
 SOURCE5_HELPER_INPUT_SCHEMA = "allocatbelt.application-source5-helper-input.v1"
 SOURCE5_PRESSURE_HELPER_PAYLOAD_SCHEMA_V2 = "allocatbelt.application-source5-pressure-helper-payload.v2"
 SOURCE5_PROBE_CAPTURE_BUNDLE_SCHEMA_V1 = "allocatbelt.application-source5-probe-capture-bundle.v1"
 OFFLINE_CALIBRATION_CONTEXT_SCHEMA = "allocatbelt.application-pressure-calibration-offline-context.v1"
+CAPTURED_PRESSURE_REPLAY_CONTEXT_SCHEMA = \
+    "allocatbelt.application-source5-pressure-captured-replay.v1"
 EXECUTION_OVERLAY_SCHEMA = "allocatbelt.application-pressure-pair-execution-overlay.v1"
 PAIR_PROCESS_FILE = "processes.tsv"
 PAIR_READBACK_FILE = "pressure-pair-readback.json"
@@ -109,6 +113,10 @@ SOURCE5_ROLE_LIMITS = {
     "analysis_artifact": 4 * 1024 * 1024,
     "opaque_trace": MAX_BINARY_BYTES,
 }
+SOURCE5_PRESSURE_CAPTURED_READ_VIEW_SCHEMA = \
+    "allocatbelt.application-source5-archived-job-read-view.v1"
+_PRESSURE_CAPTURED_REPLAY: contextvars.ContextVar[dict[str, Any] | None] = \
+    contextvars.ContextVar("pressure_pair_captured_replay", default=None)
 V5_SOURCE_SCHEMA = "allocatbelt.application-source-manifest.v5"
 V5_SPEC_SCHEMA = "allocatbelt.application-campaign-spec.v3"
 V5_PLAN_SCHEMA = "allocatbelt.application-campaign-plan.v3"
@@ -847,11 +855,242 @@ def exact(value: object, keys: set[str], label: str) -> dict[str, Any]:
     return value
 
 
+class CapturedPressureArtifactView:
+    """Read exact 0400 H-view objects through a private flat stage directory."""
+
+    def __init__(self, stage_root_value: object, references_value: object):
+        stage_root = Path(_source5_absolute_path(
+            stage_root_value, "captured pressure stage root",
+        ))
+        try:
+            root_fd = self._open_directory_tree(stage_root)
+        except OSError as error:
+            raise PressurePairError(
+                f"captured pressure stage root is unavailable or linked: {error}",
+            ) from error
+        try:
+            root_info = os.fstat(root_fd)
+            require(stat.S_ISDIR(root_info.st_mode) and
+                    root_info.st_uid == os.getuid() and
+                    stat.S_IMODE(root_info.st_mode) == 0o700,
+                    "captured pressure stage root is not one owned mode-0700 directory")
+            self._stage_identity = self._local_identity(root_info)
+        finally:
+            os.close(root_fd)
+        require(type(references_value) is dict and
+                0 < len(references_value) <= 16_384,
+                "captured pressure object reference map is malformed")
+        normalized: dict[str, dict[str, Any]] = {}
+        local_names: set[str] = set()
+        for origin_value, reference_value in references_value.items():
+            origin = _source5_absolute_path(
+                origin_value, "captured pressure object origin",
+            )
+            row = exact(reference_value, {
+                "origin_path", "path", "role", "host_id", "raw_sha256",
+                "semantic_sha256", "byte_count", "maximum_bytes",
+            }, "captured pressure object reference")
+            local_text = _source5_absolute_path(
+                row["path"], "captured pressure local object path",
+            )
+            local = Path(local_text)
+            require(origin == row["origin_path"] and origin not in normalized and
+                    local.parent == stage_root and local != Path(origin) and
+                    local.name not in local_names and
+                    type(row["role"]) is str and bool(row["role"]) and
+                    (row["host_id"] is None or
+                     (type(row["host_id"]) is str and bool(row["host_id"]))),
+                    "captured pressure object identity/path is aliased")
+            raw_sha = digest(row["raw_sha256"],
+                             "captured pressure object raw SHA-256")
+            semantic_sha = row["semantic_sha256"]
+            require(semantic_sha is None or
+                    (type(semantic_sha) is str and
+                     re.fullmatch(r"[0-9a-f]{64}", semantic_sha) is not None),
+                    "captured pressure object semantic SHA-256 is malformed")
+            byte_count = uint(row["byte_count"],
+                              "captured pressure object byte count")
+            maximum = uint(row["maximum_bytes"],
+                           "captured pressure object exact byte ceiling")
+            require(byte_count == maximum,
+                    "captured pressure object exceeds its signed row ceiling")
+            normalized[origin] = {
+                **row, "path": local_text, "raw_sha256": raw_sha,
+                "byte_count": byte_count, "maximum_bytes": maximum,
+            }
+            local_names.add(local.name)
+        self.stage_root = stage_root
+        self.objects = normalized
+
+    @staticmethod
+    def _local_identity(info: os.stat_result) -> tuple[int, ...]:
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+                info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    @staticmethod
+    def _open_directory_tree(path: Path) -> int:
+        require(path.is_absolute() and ".." not in path.parts and
+                "\x00" not in str(path),
+                "captured pressure stage root path is malformed")
+        flags = (os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW |
+                 os.O_CLOEXEC)
+        descriptor = os.open("/", flags)
+        try:
+            for component in path.parts[1:]:
+                next_descriptor = os.open(component, flags,
+                                           dir_fd=descriptor)
+                old_descriptor = descriptor
+                descriptor = next_descriptor
+                os.close(old_descriptor)
+            return descriptor
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+
+    def has_file(self, origin: Path | str) -> bool:
+        rendered = str(origin)
+        path = Path(rendered)
+        return path.is_absolute() and str(path) == rendered and \
+            ".." not in path.parts and rendered in self.objects
+
+    @contextlib.contextmanager
+    def open_snapshot(self, origin: Path | str, label: str, maximum: int):
+        origin_text = str(origin)
+        require(self.has_file(origin_text),
+                f"{label} is absent from the exact captured pressure object set")
+        row = self.objects[origin_text]
+        local = Path(row["path"])
+        maximum = uint(maximum, f"{label} captured parser ceiling")
+        require(row["byte_count"] <= maximum,
+                f"{label} captured object exceeds its parser ceiling")
+        root_fd: int | None = None
+        fd: int | None = None
+        stream: io.BufferedReader | None = None
+        try:
+            root_fd = self._open_directory_tree(self.stage_root)
+            require(self._local_identity(os.fstat(root_fd)) ==
+                    self._stage_identity,
+                    f"{label} captured pressure stage root changed")
+            before_path = os.stat(local.name, dir_fd=root_fd,
+                                  follow_symlinks=False)
+            fd = os.open(
+                local.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                dir_fd=root_fd,
+            )
+            before = os.fstat(fd)
+            require(self._local_identity(before) ==
+                    self._local_identity(before_path) and
+                    stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and
+                    before.st_uid == os.getuid() and
+                    stat.S_IMODE(before.st_mode) == 0o400 and
+                    before.st_size == row["byte_count"],
+                    f"{label} is not the exact private mode-0400 staged regular object")
+            hasher = hashlib.sha256()
+            remaining = row["byte_count"]
+            while remaining:
+                block = os.read(fd, min(1024 * 1024, remaining))
+                require(bool(block), f"{label} staged object was truncated")
+                remaining -= len(block)
+                hasher.update(block)
+            require(os.read(fd, 1) == b"" and
+                    hasher.hexdigest() == row["raw_sha256"],
+                    f"{label} staged object differs from its exact raw pin")
+            os.lseek(fd, 0, os.SEEK_SET)
+            stream = os.fdopen(os.dup(fd), "rb")
+            yield stream, row["raw_sha256"], row["byte_count"]
+            after = os.fstat(fd)
+            named_after = os.stat(local.name, dir_fd=root_fd,
+                                  follow_symlinks=False)
+            require(self._local_identity(before) ==
+                    self._local_identity(after) ==
+                    self._local_identity(named_after) and
+                    stat.S_ISREG(named_after.st_mode) and
+                    named_after.st_nlink == 1 and
+                    named_after.st_uid == os.getuid() and
+                    stat.S_IMODE(named_after.st_mode) == 0o400 and
+                    self._local_identity(os.fstat(root_fd)) ==
+                        self._stage_identity,
+                    f"{label} captured object or stage root changed during replay")
+            replacement_root_fd = self._open_directory_tree(self.stage_root)
+            try:
+                require(self._local_identity(os.fstat(replacement_root_fd)) ==
+                        self._stage_identity,
+                        f"{label} captured pressure stage path was replaced during replay")
+            finally:
+                os.close(replacement_root_fd)
+        except OSError as error:
+            raise PressurePairError(
+                f"cannot safely open or verify captured pressure {label}: {error}",
+            ) from error
+        finally:
+            if stream is not None:
+                stream.close()
+            if fd is not None:
+                os.close(fd)
+            if root_fd is not None:
+                os.close(root_fd)
+
+    def read(self, origin: Path | str, label: str,
+             maximum: int) -> tuple[bytes, str]:
+        pieces: list[bytes] = []
+        hasher = hashlib.sha256()
+        total = 0
+        with self.open_snapshot(origin, label, maximum) as (
+                stream, expected_sha, byte_count):
+            while total < byte_count:
+                block = stream.read(min(1024 * 1024, byte_count - total))
+                require(bool(block), f"{label} staged object was truncated")
+                pieces.append(block)
+                hasher.update(block)
+                total += len(block)
+            require(stream.read(1) == b"" and total == byte_count and
+                    hasher.hexdigest() == expected_sha,
+                    f"{label} staged object differs from its exact raw pin")
+        return b"".join(pieces), expected_sha
+
+
+def _captured_read_view(path: Path) -> Any | None:
+    context = _PRESSURE_CAPTURED_REPLAY.get()
+    if context is None:
+        return None
+    rendered = str(path)
+    view = context["artifact_view"]
+    if rendered in context["captured_origin_paths"]:
+        require(view.has_file(rendered),
+                "captured pressure origin is absent from its exact staged view")
+        return view
+    output_root = context["output_root"]
+    if path == output_root or path.is_relative_to(output_root):
+        require(rendered in context["retained_output_paths"],
+                f"reclaimed pressure output is missing from the exact archive view: {rendered}")
+    return None
+
+
+def _captured_output_exists(path: Path) -> bool:
+    context = _PRESSURE_CAPTURED_REPLAY.get()
+    if context is None or not path.is_relative_to(context["output_root"]):
+        return path.exists() or path.is_symlink()
+    rendered = str(path)
+    if rendered in context["captured_origin_paths"]:
+        return context["artifact_view"].has_file(rendered)
+    require(rendered in context["optional_output_paths"],
+            f"pressure output existence was not declared by the captured owner contract: {rendered}")
+    return False
+
+
 def _stat_key(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
     return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def read_stable(path: Path, label: str, maximum: int) -> tuple[bytes, str, os.stat_result]:
+def read_stable(path: Path, label: str, maximum: int) -> tuple[bytes, str, os.stat_result | None]:
+    captured_view = _captured_read_view(path)
+    if captured_view is not None:
+        raw, actual = captured_view.read(path, label, maximum)
+        return raw, actual, None
     try:
         path_before = path.lstat()
         require(stat.S_ISREG(path_before.st_mode), f"{label} is not a regular nonsymlink file")
@@ -980,13 +1219,24 @@ def _inventory_record(source: dict[str, Any], relative: str, label: str) -> dict
 
 
 def _pinned_source_module(source: dict[str, Any], source_root: Path, relative: str, label: str, maximum: int) -> tuple[types.ModuleType, dict[str, str]]:
+    path, raw, inventory_pin = _pinned_source_bytes(
+        source, source_root, relative, label, maximum,
+    )
+    module = _load_module(raw, path, label.replace(" ", "_"))
+    return module, inventory_pin
+
+
+def _pinned_source_bytes(
+    source: dict[str, Any], source_root: Path, relative: str,
+    label: str, maximum: int,
+) -> tuple[Path, bytes, dict[str, str]]:
+    """Verify a SourceV5 module file without necessarily compiling it again."""
     record = _inventory_record(source, relative, label)
     path = safe_child(source_root, relative, f"SourceV5 {label}")
     raw, raw_sha, info = read_stable(path, f"SourceV5 {label}", maximum)
     mode = stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode)
     require(raw_sha == record["sha256"] and len(raw) == record["size"] and mode == int(record["mode"], 8), f"SourceV5 {label} differs from its typed regular-file inventory pin")
-    module = _load_module(raw, path, label.replace(" ", "_"))
-    return module, {"path": relative, "sha256": raw_sha}
+    return path, raw, {"path": relative, "sha256": raw_sha}
 
 
 def _semantic_manifest(manifest: dict[str, Any], raw: bytes, semantic_sha: str, label: str) -> str:
@@ -1695,7 +1945,17 @@ def _load_validators(
     for name, relative in paths.items():
         pin = exact(recipe["validators"][name], {"path", "sha256"}, f"{name} SourceV5 validator")
         require(pin["path"] == relative, f"{name} validator path differs from the SourceV5 contract")
-        module, inventory_pin = _pinned_source_module(source, source_root, relative, name, MAX_SOURCE_BYTES)
+        if name == "campaign_chronology" and chronology_module is not None:
+            path, _source_bytes, inventory_pin = _pinned_source_bytes(
+                source, source_root, relative, name, MAX_SOURCE_BYTES,
+            )
+            active_file = getattr(chronology_module, "__file__", None)
+            require(type(active_file) is str and
+                    Path(active_file).resolve(strict=True) == path,
+                    "Source5 pressure must retain the caller's already-loaded pinned chronology module instance")
+            module = chronology_module
+        else:
+            module, inventory_pin = _pinned_source_module(source, source_root, relative, name, MAX_SOURCE_BYTES)
         require(pin["sha256"] == inventory_pin["sha256"], f"{name} validator differs from its regular SourceV5 inventory pin")
         if name in harness_keys:
             harness = exact(source["qualification_harness"], {
@@ -1707,14 +1967,8 @@ def _load_validators(
         result[f"{name}_pin"] = pin
 
     if chronology_module is not None:
-        relative = paths["campaign_chronology"]
-        expected = recipe["validators"]["campaign_chronology"]
-        active_path = Path(getattr(chronology_module, "__file__", "")).resolve(strict=True)
-        require(active_path == source_root / relative and
-                expected["path"] == relative and
-                expected["sha256"] == result["campaign_chronology_pin"]["sha256"],
-                "Source5 pressure must receive the already-loaded pinned chronology module instance")
-        result["campaign_chronology"] = chronology_module
+        require(result["campaign_chronology"] is chronology_module,
+                "Source5 pressure replaced the caller's chronology module instance")
 
     # The pressure reader validates sealed artifacts, while the separate
     # pressure driver owns the live host/storage/network recheck. Bind and load
@@ -1960,13 +2214,25 @@ def _verify_policy_resolutions(
                 receipt_raw = canonical_bytes(receipt)
                 require(cli_result["policy_sha256"] == resolved["policy_sha256"] and cli_result["receipt_sha256"] == receipt["receipt_sha256"], f"member[{index}] resolver CLI status differs from its output artifacts")
         else:
-            replay = exact(offline_replay_context, {
-                "schema", "evidence_path_map", "capture_members",
-            }, "offline pressure policy replay context")
-            require(replay["schema"] == "allocatbelt.application-pressure-policy-replay.v1" and
+            if (type(offline_replay_context) is dict and
+                    offline_replay_context.get("schema") ==
+                    CAPTURED_PRESSURE_REPLAY_CONTEXT_SCHEMA):
+                replay = exact(offline_replay_context, {
+                    "schema", "artifact_view", "captured_origin_paths",
+                    "evidence_file_paths", "evidence_directory_paths",
+                    "source_symlink_paths", "tree_inventories", "capture_members",
+                }, "captured pressure policy replay context")
+            else:
+                replay = exact(offline_replay_context, {
+                    "schema", "evidence_path_map", "capture_members",
+                }, "offline pressure policy replay context")
+            require(replay["schema"] in {
+                        "allocatbelt.application-pressure-policy-replay.v1",
+                        CAPTURED_PRESSURE_REPLAY_CONTEXT_SCHEMA,
+                    } and
                     type(replay["capture_members"]) is list and
                     len(replay["capture_members"]) == len(recipe["members"]),
-                    "offline pressure policy replay context has the wrong capture-member set")
+                    "pressure policy replay context has the wrong capture-member set")
             capture = exact(replay["capture_members"][index], {
                 "construction_probe", "capture_receipt", "capacity_bundle",
             }, f"offline pressure policy capture member[{index}]")
@@ -1978,12 +2244,25 @@ def _verify_policy_resolutions(
             require(capture["construction_probe"] == probe and
                     capture["capacity_bundle"] == expected_bundle,
                     f"offline pressure policy capture member[{index}] differs from original probe/bundle pins")
-            context = {
-                "schema": composer.FEEDBACK_OFFLINE_CONTEXT_SCHEMA,
-                "evidence_path_map": replay["evidence_path_map"],
-                "probe_capture_pin": capture["capture_receipt"],
-                "capacity_bundle": capture["capacity_bundle"],
-            }
+            if replay["schema"] == CAPTURED_PRESSURE_REPLAY_CONTEXT_SCHEMA:
+                context = {
+                    "schema": composer.FEEDBACK_CAPTURED_OFFLINE_CONTEXT_SCHEMA,
+                    "artifact_view": replay["artifact_view"],
+                    "captured_origin_paths": replay["captured_origin_paths"],
+                    "evidence_file_paths": replay["evidence_file_paths"],
+                    "evidence_directory_paths": replay["evidence_directory_paths"],
+                    "source_symlink_paths": replay["source_symlink_paths"],
+                    "tree_inventories": replay["tree_inventories"],
+                    "probe_capture_pin": capture["capture_receipt"],
+                    "capacity_bundle": capture["capacity_bundle"],
+                }
+            else:
+                context = {
+                    "schema": composer.FEEDBACK_OFFLINE_CONTEXT_SCHEMA,
+                    "evidence_path_map": replay["evidence_path_map"],
+                    "probe_capture_pin": capture["capture_receipt"],
+                    "capacity_bundle": capture["capacity_bundle"],
+                }
             resolved, receipt = composer.compose_calibrated_policy_v5_offline(
                 request, request_sha, replay_context=context,
             )
@@ -2455,22 +2734,36 @@ def _verify_pressure_recipe_host_inputs(
         pressure_reader._validate_calibration(pressure_recipe)
         pressure_driver._verify_live_environment(pressure_recipe)
     else:
-        offline = exact(offline_context, {
-            "schema", "source_root", "evidence_path_map",
-        }, "closed offline pressure calibration context")
-        offline_source_root = _source5_absolute_path(
-            offline["source_root"], "offline pressure calibration SourceRoot",
-        )
-        require(offline["schema"] == OFFLINE_CALIBRATION_CONTEXT_SCHEMA and
-                source_root is not None and source_root.is_absolute() and
-                str(source_root) == offline_source_root,
-                "offline pressure calibration context changed the frozen SourceV5 root")
-        pressure_reader._validate_calibration(
-            pressure_recipe, offline_context={
-                "source_root": offline["source_root"],
-                "evidence_path_map": offline["evidence_path_map"],
-            },
-        )
+        require(source_root is not None and source_root.is_absolute(),
+                "offline pressure replay has no frozen SourceV5 root")
+        if offline_context.get("schema") == CAPTURED_PRESSURE_REPLAY_CONTEXT_SCHEMA:
+            exact(offline_context, {
+                "schema", "artifact_view", "captured_origin_paths",
+                "evidence_file_paths", "evidence_directory_paths",
+                "source_symlink_paths", "tree_inventories",
+            }, "captured pressure calibration context")
+            require(offline_context["artifact_view"] is not None and
+                    str(source_root) in offline_context["evidence_directory_paths"],
+                    "captured pressure calibration context changed the frozen SourceV5 root")
+            # Calibration inputs are premeasurement SourceV5 inputs, not pair
+            # outputs. They remain at their original pinned paths.
+            pressure_reader._validate_calibration(pressure_recipe)
+        else:
+            offline = exact(offline_context, {
+                "schema", "source_root", "evidence_path_map",
+            }, "closed offline pressure calibration context")
+            offline_source_root = _source5_absolute_path(
+                offline["source_root"], "offline pressure calibration SourceRoot",
+            )
+            require(offline["schema"] == OFFLINE_CALIBRATION_CONTEXT_SCHEMA and
+                    str(source_root) == offline_source_root,
+                    "offline pressure calibration context changed the frozen SourceV5 root")
+            pressure_reader._validate_calibration(
+                pressure_recipe, offline_context={
+                    "source_root": offline["source_root"],
+                    "evidence_path_map": offline["evidence_path_map"],
+                },
+            )
         exact(offline_origin, {
             "schema", "host_id", "observed_host_raw_sha256", "before", "after",
             "storage_sha256", "origin_facts_sha256",
@@ -2608,11 +2901,72 @@ def _verify_members(
     return result
 
 
+def _close_reconstructed_fixed_predecessor_receipt(
+    expected_path: Path, rebuilt: dict[str, Any], rebuilt_raw: bytes, *,
+    captured_receipt_pin: object | None, captured_replay: bool,
+) -> str:
+    """Persist the live preflight receipt, or close its archived pin read-only."""
+    rebuilt_sha = sha256_bytes(rebuilt_raw)
+    captured_sha: str | None = None
+    if captured_receipt_pin is not None:
+        pin_value = exact(
+            captured_receipt_pin, {"path", "raw_sha256"},
+            "captured fixed predecessor reconstructed receipt pin",
+        )
+        require(pin_value["path"] == str(expected_path) and
+                digest(pin_value["raw_sha256"],
+                       "captured fixed predecessor receipt raw SHA-256") ==
+                rebuilt_sha,
+                "captured fixed predecessor receipt differs from fresh source/job/metrics reconstruction")
+        captured_sha = pin_value["raw_sha256"]
+
+    if captured_replay:
+        require(captured_sha is not None,
+                "captured fixed predecessor replay lacks its authenticated receipt pin")
+        return captured_sha
+
+    if expected_path.exists():
+        existing, existing_raw, actual_sha = read_json(
+            expected_path,
+            "stored reconstructed fixed-pressure predecessor receipt",
+            MAX_SMALL_BYTES,
+        )
+        require(existing == rebuilt and existing_raw == rebuilt_raw,
+                "stored fixed-pressure predecessor receipt differs from fresh exact reconstruction")
+    else:
+        actual_sha = write_new(
+            expected_path, rebuilt_raw,
+            "reconstructed fixed-pressure predecessor receipt",
+        )
+    require(actual_sha == rebuilt_sha and
+            (captured_sha is None or captured_sha == actual_sha),
+            "persisted fixed predecessor receipt differs from its exact reconstructed pin")
+    return actual_sha
+
+
 def _verify_fixed_predecessor(
     recipe: dict[str, Any], inputs: dict[str, Any], modules: dict[str, Any], output_root: Path,
     *, chronology_module: Any | None = None, lock: Any | None = None,
     authorization_context: dict[str, Any] | None = None,
+    recipe_pin: object | None = None,
+    pressure_predecessor_context: Any | None = None,
+    execution_overlay: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Reconstruct the fixed-policy receipt from the original predecessor facts.
+
+    The additive context path keeps the completed job record local and consumes
+    the prior job's signed archive view through the chronology-issued verifier.
+    It does not reinterpret that one-job view as a full host journal map.
+    """
+    captured_projection = None
+    if pressure_predecessor_context is not None:
+        require(recipe_pin is not None and chronology_module is not None and
+                authorization_context is not None and execution_overlay is not None,
+                "captured Source5 fixed predecessor requires the exact recipe, active authorization, overlay and pinned chronology")
+        captured_projection = _verify_captured_source5_pressure_predecessor_context(
+            pressure_predecessor_context, recipe_pin, output_root, lock,
+            recipe, inputs, modules, authorization_context, execution_overlay,
+        )
     path, raw, raw_sha = read_pin(recipe["fixed_predecessor"]["record"], "original fixed-policy predecessor record", MAX_RECIPE_BYTES)
     try:
         record = json.loads(raw)
@@ -2620,27 +2974,70 @@ def _verify_fixed_predecessor(
         raise PressurePairError(f"fixed predecessor record is invalid JSON: {error}") from error
     require(type(record) is dict and raw == canonical_bytes(record), "fixed predecessor record is not canonical JSON")
     require(record.get("job", {}).get("run_id") == inputs["job"]["predecessor_run_ids"][0], "fixed predecessor record run ID differs from the exact original pressure job reference")
+    require(captured_projection is None or
+            record.get("schema") == "allocatbelt.application-source5-job-record.v1",
+            "captured Source5 predecessor context cannot authorize the legacy fixed-record branch")
     if record.get("schema") == "allocatbelt.application-source5-job-record.v1":
         require(chronology_module is not None and lock is not None and
                 authorization_context is not None,
                 "Source5 fixed predecessor requires the same locked chronology context as its pressure APPs")
-        manifest_ref = _artifact_reference(
-            authorization_context["execution_manifest"],
-            "Source5 execution manifest",
-        )
-        try:
-            chain = chronology_module.verify_source5_completed_job_locked(
-                lock,
-                {"path": manifest_ref["path"],
-                 "sha256": manifest_ref["raw_sha256"]},
-                authorization_context,
-                {"path": str(path), "raw_sha256": raw_sha},
+        if captured_projection is None:
+            manifest_ref = _artifact_reference(
+                authorization_context["execution_manifest"],
+                "Source5 execution manifest",
             )
-        except Exception as error:
-            raise PressurePairError(f"Source5 fixed predecessor chronology replay failed: {error}") from error
-        require(chain["record_sha256"] == record.get("record_sha256") and
-                chain["process_metrics"] == record.get("process_metrics"),
-                "Source5 fixed predecessor record differs from its completed journal metrics")
+            try:
+                chain = chronology_module.verify_source5_completed_job_locked(
+                    lock,
+                    {"path": manifest_ref["path"],
+                     "sha256": manifest_ref["raw_sha256"]},
+                    authorization_context,
+                    {"path": str(path), "raw_sha256": raw_sha},
+                )
+            except Exception as error:
+                raise PressurePairError(f"Source5 fixed predecessor chronology replay failed: {error}") from error
+            require(chain["record_sha256"] == record.get("record_sha256") and
+                    chain["process_metrics"] == record.get("process_metrics"),
+                    "Source5 fixed predecessor record differs from its completed journal metrics")
+        else:
+            exact(record, {
+                "schema", "state", "job", "pair_directory", "process_metrics",
+                "evidence", "chronology", "qualification_eligible",
+                "record_sha256",
+            }, "captured always-local Source5 fixed predecessor record")
+            record_body = {key: value for key, value in record.items()
+                           if key != "record_sha256"}
+            record_chronology = exact(record["chronology"], {
+                "authorization_id", "authorization_head", "app_started_heads",
+                "app_terminal_heads", "job_terminal_head", "component_sha256",
+                "process_metrics_sha256", "app_start_events", "app_terminal_events",
+                "member_processes",
+            }, "captured Source5 fixed predecessor chronology")
+            record_job = record["job"]
+            require(record["record_sha256"] ==
+                        sha256_bytes(canonical_bytes(record_body)) and
+                    record["state"] == "valid_pair" and
+                    record["qualification_eligible"] is False and
+                    type(record_job) is dict and
+                    record_job.get("host_id") == inputs["host_id"] and
+                    record_job.get("phase") == "confirmation" and
+                    record_job.get("run_id") ==
+                        inputs["job"]["predecessor_run_ids"][0] and
+                    type(record["process_metrics"]) is list and
+                    len(record["process_metrics"]) == 2 and
+                    record_chronology["process_metrics_sha256"] ==
+                        sha256_bytes(canonical_bytes(record["process_metrics"])),
+                    "captured fixed predecessor job record/state/metrics digest differs")
+            captured_fixed = captured_projection["fixed_predecessor"]
+            require(captured_fixed["job_record"] == {
+                        "path": str(path), "raw_sha256": raw_sha,
+                    } and
+                    captured_fixed["component_sha256"] ==
+                        record_chronology["component_sha256"] and
+                    captured_fixed["process_metrics_sha256"] ==
+                        record_chronology["process_metrics_sha256"] and
+                    captured_fixed["state"] == record["state"],
+                    "captured fixed predecessor result differs from its always-local record/journal facts")
     else:
         require(record.get("state") == "valid_pair" and
                 record.get("runner_sha256_before") == inputs["spec"].get("runner_sha256") and
@@ -2654,16 +3051,156 @@ def _verify_fixed_predecessor(
         raise PressurePairError(f"captured SourceV5 controller could not reconstruct the fixed-pressure predecessor receipt: {error}") from error
     expected_path = output_root / "preflight" / "fixed-pressure-predecessor.json"
     rebuilt_raw = canonical_bytes(rebuilt)
-    if expected_path.exists():
-        existing, existing_raw, rebuilt_sha = read_json(expected_path, "stored reconstructed fixed-pressure predecessor receipt", MAX_SMALL_BYTES)
-        require(existing == rebuilt and existing_raw == rebuilt_raw, "stored fixed-pressure predecessor receipt differs from fresh exact reconstruction")
-    else:
-        rebuilt_sha = write_new(expected_path, rebuilt_raw, "reconstructed fixed-pressure predecessor receipt")
+    captured_receipt_pin = None
+    if captured_projection is not None:
+        captured_fixed = captured_projection["fixed_predecessor"]
+        captured_receipt_pin = exact(
+            captured_fixed["receipt"], {"path", "raw_sha256"},
+            "captured fixed predecessor reconstructed receipt pin",
+        )
+        require(captured_receipt_pin["path"] == str(expected_path) and
+                captured_fixed["receipt_value"] == rebuilt,
+                "captured fixed predecessor receipt differs from fresh source/job/metrics reconstruction")
+    rebuilt_sha = _close_reconstructed_fixed_predecessor_receipt(
+        expected_path, rebuilt, rebuilt_raw,
+        captured_receipt_pin=captured_receipt_pin,
+        captured_replay=_PRESSURE_CAPTURED_REPLAY.get() is not None,
+    )
+    if captured_projection is not None:
+        captured_fixed = captured_projection["fixed_predecessor"]
+        require(captured_fixed["receipt"] == {
+                    "path": str(expected_path), "raw_sha256": rebuilt_sha,
+                } and captured_fixed["receipt_value"] == rebuilt,
+                "captured fixed predecessor receipt differs from fresh original source/job/metrics reconstruction")
     return {
         "record": {"path": str(path), "raw_sha256": raw_sha},
         "receipt": {"path": str(expected_path), "raw_sha256": rebuilt_sha},
         "value": rebuilt,
     }
+
+
+SOURCE5_PRESSURE_PREREQUISITES_SCHEMA = \
+    "allocatbelt.application-source5-pressure-prerequisites.v1"
+
+
+def _verify_captured_source5_pressure_predecessor_context(
+    context: Any, recipe_pin_value: object, output_root: Path, lock: Any,
+    recipe: dict[str, Any], inputs: dict[str, Any], modules: dict[str, Any],
+    authorization_context: dict[str, Any], execution_overlay: dict[str, Any],
+) -> dict[str, Any]:
+    """Consume a chronology-issued predecessor view without treating it as a host map.
+
+    The context is an opaque non-JSON Source5 capability created by the locked
+    chronology factory. The already-loaded chronology module authenticates its
+    issuer and replays the exact completed fixed predecessor from the bounded
+    captured read view, returning a detached projection. The owner then
+    cross-links that projection to the always-local predecessor job record and
+    reconstructs the pressure receipt from the original source/job/metrics.
+    """
+    require(not isinstance(context, (dict, list, tuple, str, bytes, int, float, bool)) and
+            context is not None,
+            "captured fixed predecessor must be a non-JSON chronology-issued context")
+    recipe_pin = exact(recipe_pin_value, {"path", "raw_sha256"},
+                       "captured predecessor pressure recipe pin")
+    recipe_path = Path(text(recipe_pin["path"],
+                            "captured predecessor recipe path", 4096))
+    digest(recipe_pin["raw_sha256"], "captured predecessor recipe raw SHA-256")
+    require(recipe_path.is_absolute(),
+            "captured predecessor recipe path is not absolute")
+    chronology = modules.get("campaign_chronology")
+    require(chronology is not None and type(getattr(chronology, "__file__", None)) is str,
+            "captured predecessor context has no SourceV5-pinned chronology module")
+    expected_chronology_path = inputs["source_root"] / \
+        "scripts/application-campaign-chronology.py"
+    chronology_path = Path(chronology.__file__)
+    require(chronology_path == expected_chronology_path and
+            chronology_path.is_absolute(),
+            "captured predecessor chronology module is not loaded at its original SourceV5 path")
+    validator = getattr(chronology,
+                        "validate_source5_pressure_predecessor_context", None)
+    require(callable(validator) and
+            getattr(getattr(validator, "__code__", None), "co_filename", None) ==
+                str(chronology_path),
+            "SourceV5-pinned chronology lacks its exact captured predecessor context validator")
+    require(lock is not None and type(authorization_context) is dict,
+            "captured predecessor validation requires the live lock and exact active authorization")
+    try:
+        result = validator(
+            context, lock=lock,
+            authorization_context=authorization_context,
+            recipe_pin=recipe_pin, output_root=output_root,
+        )
+    except Exception as error:
+        raise PressurePairError(
+            f"SourceV5 chronology rejected the locked captured predecessor context: "
+            f"{type(error).__name__}: {error}"
+        ) from error
+    return _validate_captured_source5_pressure_prerequisites(
+        result, recipe, inputs, authorization_context, execution_overlay,
+        output_root,
+    )
+
+
+def _validate_captured_source5_pressure_prerequisites(
+    result_value: object, recipe: dict[str, Any], inputs: dict[str, Any],
+    authorization_context: dict[str, Any], execution_overlay: dict[str, Any],
+    output_root: Path,
+) -> dict[str, Any]:
+    """Close the non-JSON issuer's fixed predecessor projection to this job."""
+    result = exact(result_value, {
+        "schema", "job", "job_index", "helper_input", "authorization_id",
+        "authorization_head", "authorization_record_count", "registration_head",
+        "historical_head", "historical_record_count", "fixed_predecessor",
+        "component_replayed", "qualification_eligible",
+    }, "captured Source5 pressure prerequisites")
+    auth = authorization_context
+    require(result["schema"] == SOURCE5_PRESSURE_PREREQUISITES_SCHEMA and
+            result["job"] == inputs["job"] == auth.get("job") and
+            result["job_index"] == inputs["job_index"] == auth.get("job_index") and
+            result["helper_input"] == auth.get("helper_input") and
+            result["authorization_id"] == auth.get("authorization_id") and
+            result["registration_head"] == auth.get("capacity_registration_head") and
+            result["registration_head"] ==
+                execution_overlay["chronology"]["registration_head"] and
+            result["historical_head"] == execution_overlay["chronology"]["journal_head"] and
+            result["historical_record_count"] ==
+                execution_overlay["chronology"]["journal_record_count"] and
+            type(result["component_replayed"]) is bool and
+            result["component_replayed"] is True and
+            result["qualification_eligible"] is False,
+            "captured Source5 predecessor projection differs from the active pressure authorization/overlay")
+    for field in ("authorization_head", "registration_head", "historical_head"):
+        digest(result[field], f"captured Source5 predecessor {field}")
+    uint(result["authorization_record_count"],
+         "captured Source5 authorization record count", positive=True)
+    uint(result["historical_record_count"],
+         "captured Source5 historical journal record count")
+    predecessor = exact(result["fixed_predecessor"], {
+        "run_id", "job_record", "receipt", "receipt_value",
+        "component_sha256", "process_metrics_sha256", "state",
+    }, "captured Source5 fixed predecessor result")
+    expected_run_ids = inputs["job"].get("predecessor_run_ids")
+    expected_record = exact(recipe["fixed_predecessor"]["record"],
+                            {"path", "raw_sha256"},
+                            "original Source5 fixed predecessor record pin")
+    expected_receipt_path = str(output_root / "preflight" /
+                                "fixed-pressure-predecessor.json")
+    captured_receipt = exact(predecessor["receipt"], {"path", "raw_sha256"},
+                             "captured fixed predecessor receipt pin")
+    expected_run_id = (expected_run_ids[0] if type(expected_run_ids) is list and
+                       len(expected_run_ids) == 1 else None)
+    require(type(expected_run_id) is str and
+            predecessor["run_id"] == expected_run_id and
+            predecessor["job_record"] == expected_record and
+            type(predecessor["receipt_value"]) is dict and
+            captured_receipt["path"] == expected_receipt_path and
+            predecessor["state"] == "valid_pair",
+            "captured predecessor result differs from the exact original pressure-plan edge")
+    for field in ("component_sha256", "process_metrics_sha256"):
+        digest(predecessor[field], f"captured fixed predecessor {field}")
+    digest(captured_receipt["raw_sha256"],
+           "captured fixed predecessor receipt raw SHA-256")
+    return result
 
 
 def _parse_runtime_binding(raw: bytes) -> dict[str, str]:
@@ -3001,7 +3538,7 @@ hwm_after_shutdown_kib shutdown_ns""".split()
             recipe["deadlines"], modules["campaign_controller"], budgets["ids_bytes"],
         )
     else:
-        require(not Path(outputs["ids"]).exists() and not Path(outputs["ids"]).is_symlink(), "capacity APP emitted an open-loop arrival report")
+        require(not _captured_output_exists(Path(outputs["ids"])), "capacity APP emitted an open-loop arrival report")
         require(row["arrival_rate_per_second"] == "" and row["requested_arrivals"] == "", "capacity APP stdout contains open-loop rate/arrival values")
         require(numbers["rejected_full"] == numbers["rejected_resource"] == numbers["lost"] == 0 and numbers["completed_on_time"] > 0, "capacity APP stdout contains missing work or no successful publication")
         require(numbers["response_p50_ns"] == numbers["response_p95_ns"] == numbers["response_p99_ns"] == 0, "capacity APP stdout unexpectedly reports open-loop latencies")
@@ -3034,7 +3571,7 @@ hwm_after_shutdown_kib shutdown_ns""".split()
         capacity_throughput_by_family = family_metrics["capacity_throughput_by_family"]
         capacity_family_pin = {"path": outputs["capacity_families"], "raw_sha256": family_sha}
     else:
-        require(not Path(outputs["capacity_families"]).exists() and not Path(outputs["capacity_families"]).is_symlink(), "normal APP emitted a capacity-family report outside mixed capacity mode")
+        require(not _captured_output_exists(Path(outputs["capacity_families"])), "normal APP emitted a capacity-family report outside mixed capacity mode")
     timing, _timing_raw, timing_sha = read_json(Path(outputs["timing"]), "normal APP direct-launch timing", budgets["supervision_bytes"])
     require(timing.get("schema") == "allocatbelt.application-soak-launch-time.v1" and timing.get("exit_code") == 0 and timing.get("timed_out") is False and timing.get("artifact_budget_exceeded") is False, "normal APP direct-launch timing is not a clean bounded exit")
     require(supervision["status"] == 0 and timing.get("elapsed_ns", U128_MAX + 1) <= recipe["deadlines"]["application_wall_timeout_seconds"] * 1_000_000_000, "normal APP direct launch exceeded its wall bound")
@@ -3092,18 +3629,126 @@ def _prepare_member_directories(
         require(not pressure_dir.exists() and not pressure_dir.is_symlink(), "member pressure artifact directory already exists")
 
 
+def _source5_application_tmp_budget(
+    authorization_context: dict[str, Any] | None, fixed_owner: Any,
+) -> dict[str, int] | None:
+    if authorization_context is None or "tmpdir_budget" not in authorization_context:
+        return None
+    value = exact(authorization_context["tmpdir_budget"], {
+        "resource_budget_pin", "maximum_tmpdir_bytes", "maximum_tmpdir_inodes",
+    }, "Source5 prepared normal-APP TMP budget")
+    pin = exact(value["resource_budget_pin"], {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "Source5 prepared normal-APP TMP budget pin")
+    require(Path(pin["path"]).is_absolute() and
+            str(Path(pin["path"])) == os.path.normpath(pin["path"]),
+            "Source5 prepared normal-APP TMP budget path is malformed")
+    digest(pin["raw_sha256"], "Source5 prepared normal-APP TMP budget raw SHA-256")
+    digest(pin["semantic_sha256"], "Source5 prepared normal-APP TMP budget semantic SHA-256")
+    byte_limit = uint(
+        value["maximum_tmpdir_bytes"],
+        "Source5 prepared normal-APP TMP byte ceiling", positive=True,
+        maximum=fixed_owner.MAX_TMPDIR_BYTES,
+    )
+    inode_limit = uint(
+        value["maximum_tmpdir_inodes"],
+        "Source5 prepared normal-APP TMP inode ceiling", positive=True,
+        maximum=fixed_owner.MAX_TMPDIR_INODES,
+    )
+    return {"bytes_limit": byte_limit, "inode_limit": inode_limit}
+
+
+def _prepare_source5_application_tmpdir(
+    fixed_owner: Any, path: Path, output_root: Path,
+    budget: dict[str, int],
+) -> dict[str, Any]:
+    """Capture the exact original TMP root identity before the pair owner runs."""
+    require(path.is_absolute() and ".." not in path.parts,
+            "Source5 normal-APP TMPDIR is not a normalized absolute path")
+    if path.exists() or path.is_symlink():
+        require(path.resolve(strict=True) == path,
+                "Source5 existing normal-APP TMPDIR traverses an alias")
+    else:
+        require(path.parent.resolve(strict=True) == path.parent,
+                "Source5 normal-APP TMPDIR parent traverses an alias")
+    if not path.exists() and not path.is_symlink():
+        # FixedPair's preparation contract names these inputs tmpdir_bytes/
+        # tmpdir_inodes, while its returned proof uses bytes_limit/inode_limit.
+        initial = fixed_owner._prepare_member_tmpdir(
+            path, output_root,
+            {"tmpdir_bytes": budget["bytes_limit"],
+             "tmpdir_inodes": budget["inode_limit"]},
+        )
+    else:
+        try:
+            info = path.lstat()
+        except OSError as error:
+            raise PressurePairError(
+                f"Source5 normal-APP TMPDIR is unavailable: {error}",
+            ) from error
+        require(stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and
+                info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700,
+                "Source5 preexisting normal-APP TMPDIR is not an owned private directory")
+        mount = fixed_owner._mount_static(fixed_owner._mount_identity(path))
+        output_mount = fixed_owner._mount_static(
+            fixed_owner._mount_identity(output_root),
+        )
+        require(mount == output_mount,
+                "Source5 normal-APP TMPDIR mount differs from its reserved output domain")
+        usage = fixed_owner._tmpdir_usage(path, budget)
+        require(usage["bytes_used"] == usage["file_count"] ==
+                usage["directory_count"] == 0,
+                "Source5 preexisting normal-APP TMPDIR is not empty before launch")
+        stats = os.statvfs(path)
+        initial = {
+            "path": str(path), "device": info.st_dev, "inode": info.st_ino,
+            "mode": stat.S_IMODE(info.st_mode), "mount": mount,
+            "available_bytes": stats.f_bavail * stats.f_frsize,
+            "available_inodes": stats.f_favail,
+            "bytes_limit": budget["bytes_limit"],
+            "inode_limit": budget["inode_limit"],
+        }
+        require(initial["available_bytes"] >= budget["bytes_limit"] and
+                initial["available_inodes"] >= budget["inode_limit"],
+                "Source5 normal-APP TMPDIR cannot satisfy its caller-frozen reservation")
+    require(initial["path"] == str(path) and
+            initial["bytes_limit"] == budget["bytes_limit"] and
+            initial["inode_limit"] == budget["inode_limit"],
+            "Source5 normal-APP TMPDIR initial proof differs from its selected budget")
+    return initial
+
+
 def _prepare_prerequisites(
     recipe: dict[str, Any], output_root: Path, *, chronology_module: Any | None = None,
     lock: Any | None = None, authorization_context: dict[str, Any] | None = None,
+    recipe_pin: object | None = None,
+    pressure_predecessor_context: Any | None = None,
 ) -> dict[str, Any]:
     inputs = _load_campaign_inputs(recipe, output_root)
     output_root = _private_output_root(output_root, inputs)
+    if pressure_predecessor_context is not None:
+        captured_recipe_pin = exact(
+            recipe_pin, {"path", "raw_sha256"},
+            "captured predecessor pressure recipe pin",
+        )
+        raw, actual_sha, _info = read_stable(
+            Path(text(captured_recipe_pin["path"],
+                    "captured predecessor recipe path", 4096)),
+            "captured predecessor pressure recipe", MAX_RECIPE_BYTES,
+        )
+        require(actual_sha == digest(captured_recipe_pin["raw_sha256"],
+                                     "captured predecessor recipe raw SHA-256") and
+                raw == canonical_bytes(recipe),
+                "captured predecessor context recipe differs from its exact original bytes")
     preflight_dir = output_root / "preflight"
     if preflight_dir.exists():
         require(preflight_dir.is_dir() and not preflight_dir.is_symlink() and stat.S_IMODE(preflight_dir.stat().st_mode) == 0o700 and preflight_dir.stat().st_uid == os.getuid(), "pressure-pair preflight directory has unsafe ownership or mode")
     else:
         os.mkdir(preflight_dir, 0o700)
     modules = _load_validators(recipe, inputs, chronology_module)
+    tmp_budget = _source5_application_tmp_budget(
+        authorization_context, modules["fixed_pair"],
+    )
     overlay = _verify_execution_overlay(
         recipe, inputs, modules["campaign_chronology"],
         lock=lock, authorization_context=authorization_context,
@@ -3121,6 +3766,9 @@ def _prepare_prerequisites(
         recipe, inputs, modules, output_root,
         chronology_module=modules["campaign_chronology"], lock=lock,
         authorization_context=authorization_context,
+        recipe_pin=recipe_pin,
+        pressure_predecessor_context=pressure_predecessor_context,
+        execution_overlay=overlay,
     )
     members = _verify_members(recipe, inputs, condition, capacity, shared, modules, output_root)
     return {
@@ -3130,6 +3778,9 @@ def _prepare_prerequisites(
         "predecessor": predecessor, "members": members,
         "chronology_module": chronology_module, "chronology_lock": lock,
         "authorization_context": authorization_context,
+        "pressure_predecessor_context": pressure_predecessor_context,
+        **({"application_tmpdir_budget": tmp_budget}
+           if tmp_budget is not None else {}),
     }
 
 
@@ -3185,6 +3836,11 @@ def _run_one_member(
     require(callable(getattr(soak, "supervise_pressure_application", None)), "pinned SourceV5 soak reader has no exported shared pressure supervisor")
     cleanup_state: dict[str, Any] = {"value": None}
     launch_state: dict[str, Any] = {"value": None}
+    tmpdir_budget = prepared.get("application_tmpdir_budget")
+    tmpdir_initial = None
+    tmpdir_final_state: dict[str, Any] = {"value": None}
+    if tmpdir_budget is not None:
+        tmpdir_initial = prepared["application_tmpdir_initials"][member["ordinal"]]
     interruption_path = output_root / "supervision-interruption.json"
 
     def on_started(attestation: dict[str, Any]) -> None:
@@ -3229,6 +3885,25 @@ def _run_one_member(
                 "terminal_monotonic_ns": time.monotonic_ns(),
             })
 
+    def on_owner_return(details: dict[str, Any]) -> None:
+        require(tmpdir_budget is not None and type(tmpdir_initial) is dict and
+                type(details) is dict and type(details.get("status")) is int,
+                "bounded pressure APP owner-return callback lacks its exact TMP/status facts")
+        fixed_owner = modules["fixed_pair"]
+        final_proof = fixed_owner._tmpdir_usage(
+            Path(member["tmpdir_path"]), tmpdir_budget,
+        )
+        fixed_owner._verify_tmpdir_storage(
+            tmpdir_initial, final_proof, member["tmpdir_path"],
+            tmpdir_budget["bytes_limit"], tmpdir_budget["inode_limit"],
+            f"pressure APP member {member['ordinal']}",
+        )
+        if details["status"] == 0:
+            require(final_proof["bytes_used"] == final_proof["file_count"] ==
+                    final_proof["directory_count"] == 0,
+                    "successful pressure APP owner returned with nonempty TMPDIR inventory")
+        tmpdir_final_state["value"] = final_proof
+
     def on_interrupted(value: dict[str, Any]) -> int:
         interruption = {
             "schema": "allocatbelt.application-pressure-pair-member-interruption.v1",
@@ -3251,13 +3926,23 @@ def _run_one_member(
     app_descriptor = _member_supervision_descriptor(member_context, recipe)
     app_descriptor["on_interrupted"] = on_interrupted
     try:
-        receipt = soak.supervise_pressure_application(
-            app_descriptor,
-            member_context["pressure_info"],
-            output_root,
-            on_started,
-            on_cleanup,
-        )
+        if tmpdir_budget is None:
+            receipt = soak.supervise_pressure_application(
+                app_descriptor,
+                member_context["pressure_info"],
+                output_root,
+                on_started,
+                on_cleanup,
+            )
+        else:
+            receipt = soak.supervise_pressure_application(
+                app_descriptor,
+                member_context["pressure_info"],
+                output_root,
+                on_started,
+                on_cleanup,
+                on_owner_return=on_owner_return,
+            )
     except BaseException as error:
         failure = {
             "schema": "allocatbelt.application-pressure-pair-member-failure.v1",
@@ -3284,7 +3969,7 @@ def _run_one_member(
     pressure_stderr_path = output_root / "pressure-driver.stderr.log"
     _pressure_stdout_raw, pressure_stdout_sha, _stdout_info = read_stable(pressure_stdout_path, "pressure driver stdout log", recipe["artifact_budgets"]["supervision_bytes"])
     _pressure_stderr_raw, pressure_stderr_sha, _stderr_info = read_stable(pressure_stderr_path, "pressure driver stderr log", recipe["artifact_budgets"]["supervision_bytes"])
-    return {
+    result = {
         "receipt": receipt,
         "supervision_receipt": {"path": outputs["supervision_receipt"], "raw_sha256": supervision_sha},
         "application_launch_attestation": {"path": outputs["app_launch_attestation"], "raw_sha256": sha256_bytes(canonical_bytes(launch_state["value"]))},
@@ -3300,6 +3985,12 @@ def _run_one_member(
         "application_binding": receipt["application_binding"],
         "application_attestation": receipt["application_attestation"],
     }
+    if tmpdir_budget is not None:
+        require(type(tmpdir_final_state["value"]) is dict,
+                "bounded pressure APP owner returned without an immediate final TMPDIR proof")
+        result["tmpdir_initial"] = tmpdir_initial
+        result["tmpdir_final"] = tmpdir_final_state["value"]
+    return result
 
 
 def _finalize_feedback(
@@ -3528,6 +4219,67 @@ def _pressure_artifact_pins(pressure_dir: Path, pressure_recipe: dict[str, Any])
     return result
 
 
+def _validate_pressure_tmpdir_owner_proof(
+    initial_value: object, final_value: object, path_value: object,
+    budget: dict[str, int], label: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    initial = exact(initial_value, {
+        "path", "device", "inode", "mode", "mount", "available_bytes",
+        "available_inodes", "bytes_limit", "inode_limit",
+    }, f"{label} initial TMPDIR proof")
+    final = exact(final_value, {
+        "path", "device", "inode", "mode", "mount", "bytes_used",
+        "file_count", "directory_count", "bytes_limit", "inode_limit",
+        "available_bytes", "available_inodes",
+    }, f"{label} final TMPDIR proof")
+    path = _source5_absolute_path(path_value, f"{label} original TMPDIR path")
+    mount_fields = {
+        "mount_id", "major_minor", "mount_root", "mount_point",
+        "filesystem_type", "mount_source", "device",
+    }
+    initial_mount = exact(initial["mount"], mount_fields,
+                          f"{label} initial mount identity")
+    final_mount = exact(final["mount"], mount_fields,
+                        f"{label} final mount identity")
+    for index, mount in enumerate((initial_mount, final_mount)):
+        require(uint(mount["mount_id"], f"{label} mount[{index}] id", positive=True) > 0 and
+                type(mount["major_minor"]) is str and
+                re.fullmatch(r"[0-9]+:[0-9]+", mount["major_minor"]) is not None and
+                type(mount["mount_root"]) is str and
+                Path(mount["mount_root"]).is_absolute() and
+                type(mount["mount_point"]) is str and
+                Path(mount["mount_point"]).is_absolute() and
+                type(mount["filesystem_type"]) is str and
+                mount["filesystem_type"] not in {"tmpfs", "ramfs", "devtmpfs"} and
+                type(mount["mount_source"]) is str,
+                f"{label} mount[{index}] identity is malformed or memory-backed")
+    for proof_name, proof in (("initial", initial), ("final", final)):
+        for field in ("device", "inode", "mode", "bytes_limit", "inode_limit",
+                      "available_bytes", "available_inodes"):
+            uint(proof[field], f"{label} {proof_name} {field}")
+        require(proof["mode"] == 0o700 and
+                proof["bytes_limit"] == budget["bytes_limit"] and
+                proof["inode_limit"] == budget["inode_limit"],
+                f"{label} {proof_name} TMPDIR limits differ from the caller budget")
+        if proof_name == "initial":
+            require(proof["available_bytes"] >= budget["bytes_limit"] and
+                    proof["available_inodes"] >= budget["inode_limit"],
+                    f"{label} initial TMPDIR cannot satisfy the caller's reservation")
+    for field in ("bytes_used", "file_count", "directory_count"):
+        uint(final[field], f"{label} final {field}")
+    require(initial["path"] == final["path"] == path and
+            initial["mount"] == final["mount"] and
+            initial_mount["device"] == initial["device"] and
+            final_mount["device"] == final["device"] and
+            (initial["device"], initial["inode"]) ==
+                (final["device"], final["inode"]) and
+            final["inode"] > 0 and
+            final["bytes_used"] == final["file_count"] ==
+                final["directory_count"] == 0,
+            f"{label} final TMPDIR is not the exact empty original owner-return inventory")
+    return initial, final
+
+
 def _member_evidence(
     member_context: dict[str, Any], member_run: dict[str, Any], app_result: dict[str, Any],
     feedback: dict[str, Any], process_row: dict[str, str], prepared: dict[str, Any],
@@ -3536,7 +4288,7 @@ def _member_evidence(
     outputs = member["outputs"]
     pressure_dir = Path(outputs["root"]) / "pressure"
     pressure_pins = _pressure_artifact_pins(pressure_dir, member_context["pressure_info"]["value"])
-    return {
+    result = {
         "descriptor": member["descriptor"],
         "identity": member["identity"],
         "feedback_template": member["feedback_template"],
@@ -3589,6 +4341,10 @@ def _member_evidence(
             "reason": "per-job evidence is valid; campaign qualification gates remain open",
         },
     }
+    if prepared.get("application_tmpdir_budget") is not None:
+        result["tmpdir_initial"] = member_run["tmpdir_initial"]
+        result["tmpdir_final"] = member_run["tmpdir_final"]
+    return result
 
 
 def _write_process_ledger(path: Path, rows: list[dict[str, str]], controller: Any) -> str:
@@ -3633,6 +4389,9 @@ def _validate_pair_member_artifacts(
         "runtime_expectation", "runtime_finalization_request", "runtime_finalization_receipt",
         "feedback_trace", "numeric_runtime_snapshot", "process_row", "validation_outcome",
     }
+    bounded_tmp = prepared.get("application_tmpdir_budget") is not None
+    if bounded_tmp:
+        evidence_fields |= {"tmpdir_initial", "tmpdir_final"}
     exact(stored, evidence_fields, "pressure-pair member readback")
     require(stored["descriptor"] == descriptor and stored["identity"] == identity, "pressure-pair member sidecar identity differs from the original plan descriptor")
     require(stored["feedback_template"] == member["feedback_template"], "pressure-pair member sidecar feedback template pin differs")
@@ -3640,6 +4399,12 @@ def _validate_pair_member_artifacts(
     require(stored["construction_probe"] == member["construction_probe"] and stored["application_binary"] == member["application_binary"], "pressure-pair member sidecar probe/binary pin differs")
     require(stored["argv_sha256"] == sha256_bytes(canonical_bytes(member["argv"])) and stored["environment_sha256"] == sha256_bytes(canonical_bytes(member["environment"])), "pressure-pair member argv/environment digest differs")
     require(stored["cwd"] == member["cwd"] and stored["tmpdir_path"] == member["tmpdir_path"] and stored["cpu_affinity"] == member["cpu_affinity"] and stored["network_namespace_inode"] == member["network_namespace_inode"], "pressure-pair member host/process binding differs")
+    if bounded_tmp:
+        _validate_pressure_tmpdir_owner_proof(
+            stored["tmpdir_initial"], stored["tmpdir_final"],
+            member["tmpdir_path"], prepared["application_tmpdir_budget"],
+            f"pressure APP member {member['ordinal']}",
+        )
     require(stored["oracle"] == member_context["oracle"], "pressure-pair member oracle pin differs")
     require(stored["validation_outcome"] == {
         "validated": True, "qualification_eligible": False,
@@ -4191,8 +4956,11 @@ def _verify_offline_normal_app_member(
 def _pair_readback_body(prepared: dict[str, Any], processes_pin: dict[str, str], members: list[dict[str, Any]]) -> dict[str, Any]:
     inputs = prepared["inputs"]
     recipe = prepared["recipe"]
+    bounded_tmp = all(type(member) is dict and
+                      "tmpdir_initial" in member and "tmpdir_final" in member
+                      for member in members)
     return {
-        "schema": READBACK_SCHEMA,
+        "schema": READBACK_SCHEMA_V2 if bounded_tmp else READBACK_SCHEMA,
         "validated": True,
         "job_evidence_complete": True,
         "qualification_eligible": False,
@@ -4272,13 +5040,47 @@ def validate_pressure_pair_artifacts(
     expected_readback_sha256: str | None = None,
     *, chronology_module: Any | None = None, lock: Any | None = None,
     authorization_context: dict[str, Any] | None = None,
+    recipe_pin: object | None = None,
+    pressure_predecessor_context: Any | None = None,
+    captured_evidence: object | None = None,
+    host_verification_pin: object | None = None,
 ) -> dict[str, Any]:
-    """Replay a pair sidecar and all raw normal-APP, V5, pressure, and V2 artifacts."""
+    """Replay a pair sidecar and all raw normal-APP, V5, pressure, and V2 artifacts.
+
+    Source5 may pass the additive runtime-only captured predecessor context when
+    that fixed job's payload has been offloaded. The default strict API remains
+    unchanged.
+    """
     recipe = _validate_recipe_shape(recipe)
     output_root = Path(output_root)
+    if captured_evidence is not None:
+        require(chronology_module is not None and lock is not None and
+                type(authorization_context) is dict,
+                "captured Source5 pressure replay requires the original locked chronology context")
+        if host_verification_pin is None:
+            require(type(captured_evidence) is dict,
+                    "captured pressure H-view is malformed")
+            host_verification_pin = captured_evidence.get(
+                "owner_host_receipt_pin",
+            )
+        require(readback_path is not None and
+                expected_readback_sha256 is not None,
+                "captured pressure replay requires the exact component readback pin")
+        return validate_pressure_pair_artifacts_captured_outputs(
+            recipe, output_root,
+            {"path": str(readback_path),
+             "raw_sha256": expected_readback_sha256},
+            host_verification_pin,
+            chronology_module=chronology_module, lock=lock,
+            authorization_context=authorization_context,
+            captured_evidence=captured_evidence,
+            pressure_predecessor_context=pressure_predecessor_context,
+        )
     prepared = _prepare_prerequisites(
         recipe, output_root, chronology_module=chronology_module,
         lock=lock, authorization_context=authorization_context,
+        recipe_pin=recipe_pin,
+        pressure_predecessor_context=pressure_predecessor_context,
     )
     output_root = prepared["output_root"]
     readback_path = output_root / PAIR_READBACK_FILE if readback_path is None else Path(readback_path)
@@ -4293,7 +5095,12 @@ def validate_pressure_pair_artifacts(
         "pressure_condition", "processes", "members", "readback_sha256",
     }
     exact(sidecar, sidecar_fields, "pressure-pair readback sidecar")
-    require(sidecar["schema"] == READBACK_SCHEMA and sidecar["validated"] is True and sidecar["job_evidence_complete"] is True, "pressure-pair readback sidecar is not a complete per-job result")
+    bounded_tmp = prepared.get("application_tmpdir_budget") is not None
+    expected_sidecar_schema = READBACK_SCHEMA_V2 if bounded_tmp else READBACK_SCHEMA
+    require(sidecar["schema"] == expected_sidecar_schema and
+            sidecar["validated"] is True and
+            sidecar["job_evidence_complete"] is True,
+            "pressure-pair readback sidecar is not a complete per-job result for its pinned resource profile")
     require(sidecar["qualification_eligible"] is False and sidecar["execution_ready"] is False and sidecar["campaign_readiness"] is False and sidecar["controller_chronology_proven"] is False, "per-job pressure readback attempts to set overall readiness")
     _verify_self_digest(sidecar, "readback_sha256", "pressure-pair readback")
     require(sidecar_raw == canonical_bytes(sidecar), "pressure-pair readback sidecar is not canonical")
@@ -4367,7 +5174,7 @@ def validate_pressure_pair_artifacts(
         member_results.append(checked)
     require(all(row["exit_code"] == "0" and row["row_validation"] == "valid" and row["p99_qualification"] == "not_applicable" for row in rows), "pressure base rows claim a failed APP or open-loop P99 qualification")
     return {
-        "schema": READBACK_SCHEMA,
+        "schema": READBACK_SCHEMA_V2 if bounded_tmp else READBACK_SCHEMA,
         "validated": True,
         "qualification_eligible": False,
         "execution_ready": False,
@@ -4385,6 +5192,7 @@ def validate_pressure_pair_artifacts(
 
 
 HOST_VERIFICATION_SCHEMA = "allocatbelt.application-pressure-pair-host-verification.v1"
+HOST_VERIFICATION_SCHEMA_V2 = "allocatbelt.application-pressure-pair-host-verification.v2"
 ORIGIN_FACTS_SCHEMA = "allocatbelt.application-pressure-pair-origin-facts.v1"
 
 
@@ -4647,6 +5455,7 @@ def _find_raw_path_pin(value: object, path: str) -> str | None:
 
 def _pair_member_origin_fact(
     index: int, member_value: dict[str, Any], pressure_reader: Any,
+    tmpdir_budget: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     pressure_recipe_pin = member_value["pressure_recipe"]
     pressure_artifacts = member_value["pressure_artifacts"]
@@ -4711,12 +5520,30 @@ def _pair_member_origin_fact(
         "application_tmpdir_path": pressure_recipe["process"]["application_tmpdir_path"],
         "pressure_scratch_path": pressure_recipe["storage"]["pressure_scratch_path"],
         "application_mount_id": pressure_recipe["storage"]["application_mount_id"],
-        "storage_sha256": digest_object({
+    }
+    storage_body = {
             "application_storage": pressure_recipe["host"]["application_storage"],
             "pressure_scratch": pressure_recipe["host"]["pressure_scratch"],
             "storage": pressure_recipe["storage"],
-        }),
     }
+    if "tmpdir_initial" in member_value or "tmpdir_final" in member_value:
+        require(tmpdir_budget is not None,
+                "strict host TMPDIR proof has no source-pinned caller budget")
+        initial, final = _validate_pressure_tmpdir_owner_proof(
+            member_value.get("tmpdir_initial"),
+            member_value.get("tmpdir_final"),
+            pressure_recipe["process"]["application_tmpdir_path"],
+            tmpdir_budget,
+            f"strict host pressure member {index}",
+        )
+        require(final["mount"]["mount_id"] ==
+                storage["application_mount_id"],
+                "strict host TMPDIR proof differs from its original recipe mount")
+        storage["application_tmpdir_initial"] = initial
+        storage["application_tmpdir_final"] = final
+        storage_body["application_tmpdir_initial"] = initial
+        storage_body["application_tmpdir_final"] = final
+    storage["storage_sha256"] = digest_object(storage_body)
     return {
         "ordinal": index,
         "descriptor": member_value["descriptor"],
@@ -4758,10 +5585,30 @@ def _write_pressure_host_receipt(path_value: object, body: dict[str, Any]) -> di
         "qualification_eligible", "execution_ready",
     }
     exact(body, receipt_keys, "pressure-pair strict host receipt body")
-    require(body["schema"] == HOST_VERIFICATION_SCHEMA and
+    require(body["schema"] in {HOST_VERIFICATION_SCHEMA,
+                                HOST_VERIFICATION_SCHEMA_V2} and
             body["qualification_eligible"] is False and body["execution_ready"] is False and
             type(body["member_facts"]) is list and len(body["member_facts"]) == 2,
             "pressure-pair strict host receipt body is incomplete or claims readiness")
+    bounded_tmp = body["schema"] == HOST_VERIFICATION_SCHEMA_V2
+    for index, member in enumerate(body["member_facts"]):
+        require(type(member) is dict,
+                f"pressure-pair host receipt member[{index}] is malformed")
+        storage = exact(member.get("storage_proof"), {
+            "application_tmpdir_path", "pressure_scratch_path",
+            "application_mount_id", "storage_sha256",
+            *({"application_tmpdir_initial", "application_tmpdir_final"}
+              if bounded_tmp else set()),
+        }, f"pressure-pair host receipt member[{index}] storage proof")
+        if bounded_tmp:
+            final = storage["application_tmpdir_final"]
+            _validate_pressure_tmpdir_owner_proof(
+                storage["application_tmpdir_initial"], final,
+                storage["application_tmpdir_path"],
+                {"bytes_limit": final["bytes_limit"],
+                 "inode_limit": final["inode_limit"]},
+                f"pressure-pair host receipt member[{index}]",
+            )
     semantic_sha = digest_object(body)
     raw = canonical_bytes({**body, "receipt_sha256": semantic_sha})
     raw_sha = write_new(path, raw, "pressure-pair strict host-verification receipt", 0o600)
@@ -4783,12 +5630,15 @@ def verify_pressure_pair_with_host_receipt(
     *, chronology_module: Any,
     lock: Any,
     authorization_context: dict[str, Any],
+    pressure_predecessor_context: Any | None = None,
 ) -> dict[str, Any]:
     """Strictly replay one completed pair on its origin host and pin host facts.
 
     This additive API preserves the existing strict v1 pair verifier. The new
     receipt is emitted only after full pair replay, live environment/storage
-    checks and post-cleanup PID/start absence checks succeed.
+    checks and post-cleanup PID/start absence checks succeed. If the original
+    fixed predecessor payload was offloaded, ``pressure_predecessor_context``
+    carries the locked chronology-issued one-job replay capability.
     """
     recipe_file = exact(recipe_pin, {"path", "raw_sha256"}, "strict pressure-pair recipe pin")
     recipe_path = Path(text(recipe_file["path"], "strict pressure-pair recipe path", 4096))
@@ -4849,6 +5699,8 @@ def verify_pressure_pair_with_host_receipt(
         recipe, output_path, readback_path, readback_sha,
         chronology_module=chronology_module, lock=lock,
         authorization_context=authorization_context,
+        recipe_pin=recipe_file,
+        pressure_predecessor_context=pressure_predecessor_context,
     )
     after = _capture_pair_origin_facts(inputs["host_id"], origin_observed_host,
                                        pressure_recipes, modules["pressure_driver"])
@@ -5051,10 +5903,14 @@ def verify_pressure_pair_with_host_receipt(
     }, "strict Source5 execution chronology")
     observed_pin = origin_observed_pin
     observed_sha = observed_pin["raw_sha256"]
+    tmpdir_budget = _source5_application_tmp_budget(
+        authorization_context, modules["fixed_pair"],
+    )
     member_facts = []
     for index, sidecar_member in enumerate(sidecar["members"]):
         member_fact = _pair_member_origin_fact(
             index, sidecar_member, modules["pressure_validator"],
+            tmpdir_budget,
         )
         member_fact["probe_capture"] = {
             "construction_probe": capture_rows[index]["construction_probe"],
@@ -5062,8 +5918,11 @@ def verify_pressure_pair_with_host_receipt(
             "capacity_bundle": capture_rows[index]["capacity_bundle"],
         }
         member_facts.append(member_fact)
+    bounded_tmp = authorization_context.get("tmpdir_budget") is not None
+    require((readback_value.get("schema") == READBACK_SCHEMA_V2) == bounded_tmp,
+            "strict pressure host receipt bounded profile differs from its caller-pinned TMP budget")
     receipt_body = {
-        "schema": HOST_VERIFICATION_SCHEMA,
+        "schema": HOST_VERIFICATION_SCHEMA_V2 if bounded_tmp else HOST_VERIFICATION_SCHEMA,
         "campaign_id": inputs["spec"]["campaign_id"],
         "host_id": inputs["host_id"],
         "job": {
@@ -5138,6 +5997,414 @@ def _preflight_pair_json_path_closure(
         for raw_path in paths:
             require(raw_path in mapped,
                     f"offline pressure evidence map omits an exact nested original dependency: {raw_path}")
+
+
+def _decode_captured_archive_json(raw: object, label: str,
+                                  maximum: int) -> tuple[dict[str, Any], str]:
+    require(type(raw) is bytes and len(raw) <= maximum,
+            f"{label} is absent or exceeds its exact bounded raw input")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise PressurePairError(f"{label} is malformed canonical JSON: {error}") from error
+    require(type(value) is dict and raw == canonical_bytes(value),
+            f"{label} is not one canonical JSON object")
+    return value, sha256_bytes(raw)
+
+
+def _load_source5_archive_validator(inputs: dict[str, Any]) -> Any:
+    relative = "scripts/application-source5-evidence-archive.py"
+    module, _pin = _pinned_source_module(
+        inputs["source"], inputs["source_root"], relative,
+        "Source5 evidence archive validator", MAX_SOURCE_BYTES,
+    )
+    for name in ("_validate_checkpoint_request", "_validate_checkpoint",
+                 "_validate_manifest"):
+        validator = getattr(module, name, None)
+        require(callable(validator) and
+                getattr(getattr(validator, "__code__", None), "co_filename", None) ==
+                    str(inputs["source_root"] / relative),
+                f"Source5 archive validator lacks its exact {name} API")
+    return module
+
+
+def _validate_pressure_archived_job_view(
+    value: object, inputs: dict[str, Any], recipe: dict[str, Any],
+    authorization_context: dict[str, Any], host_receipt_pin_value: object,
+    archive: Any,
+) -> dict[str, Any]:
+    """Close one Root-authenticated H-view to this exact pressure job."""
+    view = exact(value, {
+        "schema", "campaign_id", "host_id", "phase", "job_index", "ordinal",
+        "run_id", "job_sha256", "checkpoint_pin", "checkpoint_raw",
+        "manifest_pin", "manifest_raw", "archive_ack_pin", "signature_pin",
+        "archive_request_pin", "archive_request_raw", "fixed_host_receipt_pin",
+        "owner_host_receipt_pin", "readback_request_pin",
+        "readback_response_pin", "readback_bundle_pin", "stage_root",
+        "objects", "qualification_eligible", "may_reclaim",
+    }, "authenticated Source5 pressure archive read view")
+    job = inputs["job"]
+    job_sha = sha256_bytes(canonical_bytes(job))
+    job_index = uint(view["job_index"],
+                     "captured pressure original job index")
+    require(view["schema"] == SOURCE5_PRESSURE_CAPTURED_READ_VIEW_SCHEMA and
+            view["campaign_id"] == inputs["spec"]["campaign_id"] and
+            view["host_id"] == inputs["host_id"] and
+            view["phase"] == "pressure" == job.get("phase") and
+            view["ordinal"] == job.get("ordinal") and
+            view["run_id"] == job["run_id"] and
+            view["job_sha256"] == job_sha and
+            view["qualification_eligible"] is False and
+            view["may_reclaim"] is False and
+            authorization_context.get("phase") == "pressure" and
+            authorization_context.get("job") == job and
+            authorization_context.get("job_index") == job_index ==
+                inputs["job_index"],
+            "authenticated pressure archive view names another original job/authorization")
+    owner_pin = exact(host_receipt_pin_value, {
+        "path", "raw_sha256", "receipt_sha256",
+    }, "strict Source5 pressure host-receipt pin")
+    require(view["fixed_host_receipt_pin"] is None and
+            view["owner_host_receipt_pin"] == owner_pin,
+            "pressure H-view changed its strict owner host-receipt pin")
+    exact(view["archive_ack_pin"], {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "captured pressure durable ACK pin")
+    exact(view["signature_pin"], {
+        "path", "raw_sha256", "signer_fingerprint",
+    }, "captured pressure detached signature pin")
+
+    request_pin = exact(view["archive_request_pin"], {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "captured pressure checkpoint-request pin")
+    request_raw = view["archive_request_raw"]
+    request, request_sha = _decode_captured_archive_json(
+        request_raw, "captured pressure checkpoint request",
+        128 * 1024 * 1024,
+    )
+    require(request_sha == digest(request_pin["raw_sha256"],
+                                  "captured pressure request raw SHA-256"),
+            "captured pressure request bytes differ from their raw pin")
+    try:
+        request = archive._validate_checkpoint_request(request)
+    except Exception as error:
+        raise PressurePairError(
+            f"SourceV5 archive rejected the pressure request/tree closure: {error}"
+        ) from error
+    require(request.get("request_sha256") == request_pin["semantic_sha256"],
+            "captured pressure request semantic digest differs")
+
+    checkpoint_pin = exact(view["checkpoint_pin"], {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "captured pressure checkpoint pin")
+    checkpoint, checkpoint_sha = _decode_captured_archive_json(
+        view["checkpoint_raw"], "captured pressure checkpoint",
+        128 * 1024 * 1024,
+    )
+    require(checkpoint_sha == digest(checkpoint_pin["raw_sha256"],
+                                     "captured pressure checkpoint raw SHA-256"),
+            "captured pressure checkpoint bytes differ from their raw pin")
+    manifest_pin = exact(view["manifest_pin"], {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "captured pressure object-manifest pin")
+    manifest, manifest_sha = _decode_captured_archive_json(
+        view["manifest_raw"], "captured pressure object manifest",
+        128 * 1024 * 1024,
+    )
+    require(manifest_sha == digest(manifest_pin["raw_sha256"],
+                                   "captured pressure manifest raw SHA-256"),
+            "captured pressure manifest bytes differ from their raw pin")
+    identity = {
+        "job": job, "job_index": job_index,
+        "job_ordinal": job["ordinal"], "job_sha256": job_sha,
+        "run_id": job["run_id"],
+    }
+    try:
+        checkpoint = archive._validate_checkpoint(checkpoint)
+        manifest = archive._validate_manifest(manifest, checkpoint, identity)
+    except Exception as error:
+        raise PressurePairError(
+            f"Source5 archive rejected the pressure checkpoint/manifest: {error}"
+        ) from error
+    require(checkpoint_pin["semantic_sha256"] ==
+                checkpoint["checkpoint_sha256"] and
+            manifest_pin["semantic_sha256"] == manifest["manifest_sha256"] and
+            checkpoint["request_pin"] == request_pin and
+            checkpoint["object_manifest_pin"] == manifest_pin and
+            checkpoint.get("tree_inventories") == request.get("tree_inventories") and
+            all(checkpoint.get(key) == item for key, item in request.items()
+                if key not in {"schema", "request_sha256"}),
+            "captured pressure archive documents are not one exact signed closure")
+    owner_role_pins = [
+        role for role, pin in checkpoint["owner_receipt_pins"].items()
+        if pin == {
+            "path": owner_pin["path"], "raw_sha256": owner_pin["raw_sha256"],
+            "semantic_sha256": owner_pin["receipt_sha256"],
+        }
+    ]
+    require(owner_role_pins == ["component_receipt"] and
+            type(request.get("tree_inventories")) is list and
+            len(request["tree_inventories"]) == 2 and
+            all(tree.get("role") == "opaque_trace" and
+                tree.get("owner_job_sha256") == job_sha
+                for tree in request["tree_inventories"]),
+            "pressure archive request does not pin its strict host receipt and two ProbeV2 trees")
+
+    source_pin = {
+        "path": str(inputs["manifest_path"]),
+        "raw_sha256": inputs["manifest_raw_sha256"],
+        "semantic_sha256": inputs["manifest_semantic_sha256"],
+    }
+    plan_pin = {
+        "path": str(inputs["plan_path"]),
+        "raw_sha256": inputs["plan_raw_sha256"],
+        "semantic_sha256": recipe["plan"]["semantic_sha256"],
+    }
+    execution_ref = _artifact_reference(
+        authorization_context.get("execution_manifest"),
+        "captured pressure execution manifest",
+    )
+    execution_value, execution_raw, execution_sha = read_json(
+        Path(execution_ref["path"]), "captured pressure execution manifest",
+        MAX_PLAN_BYTES, execution_ref["raw_sha256"],
+    )
+    execution_manifest_pin = {
+        "path": execution_ref["path"], "raw_sha256": execution_sha,
+        "semantic_sha256": execution_value.get("manifest_sha256"),
+    }
+    require(type(execution_value.get("manifest_sha256")) is str and
+            execution_value["manifest_sha256"] == digest_object({
+                key: item for key, item in execution_value.items()
+                if key != "manifest_sha256"
+            }),
+            "captured pressure execution-manifest semantic digest differs")
+    require(execution_value.get("schema") ==
+                "allocatbelt.application-source5-campaign-execution.v4",
+            "captured pressure execution manifest is outside the exact bounded Source5 profile")
+    budget_pin = exact(authorization_context.get("host_evidence_budget"), {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "captured pressure host evidence budget pin")
+    context = checkpoint["context"]
+    require(context["campaign_id"] == inputs["spec"]["campaign_id"] and
+            context["host_id"] == inputs["host_id"] and
+            context["phase"] == "pressure" and
+            context["job_index"] == job_index and
+            context["source_manifest_pin"] == source_pin and
+            context["plan_pin"] == plan_pin and
+            context["execution_manifest_pin"] == execution_manifest_pin and
+            context["resource_budget_pin"] == budget_pin,
+            "captured pressure checkpoint differs from the original Source5 generation/budget")
+    signer_map = execution_value.get("archive_signer_contexts")
+    signer_wrapper = (signer_map.get(inputs["host_id"])
+                      if type(signer_map) is dict else None)
+    signer_wrapper = exact(signer_wrapper, {"artifact", "semantic_sha256"},
+                           "captured pressure signer-context manifest wrapper")
+    signer_artifact = exact(signer_wrapper["artifact"], {"path", "raw_sha256"},
+                            "captured pressure signer-context artifact pin")
+    signer_value, signer_raw, signer_raw_sha = read_json(
+        Path(signer_artifact["path"]), "captured pressure signer context",
+        MAX_SMALL_BYTES, signer_artifact["raw_sha256"],
+    )
+    signer_body = {key: item for key, item in signer_value.items()
+                   if key != "signer_context_sha256"}
+    require(signer_value.get("schema") ==
+                "allocatbelt.application-source5-archive-signer-context.v1" and
+            signer_value.get("campaign_id") == inputs["spec"]["campaign_id"] and
+            signer_value.get("host_id") == inputs["host_id"] and
+            signer_value.get("signer_context_sha256") ==
+                signer_wrapper["semantic_sha256"] == digest_object(signer_body) and
+            signer_raw_sha == signer_artifact["raw_sha256"] and
+            context["authorized_signer_fingerprint"] ==
+                signer_value.get("authorized_primary_fingerprint"),
+            "captured pressure authorized signer context differs from its execution manifest pin")
+    host_budget, budget_raw, budget_raw_sha = read_json(
+        Path(budget_pin["path"]), "captured pressure host evidence budget",
+        MAX_PLAN_BYTES, budget_pin["raw_sha256"],
+    )
+    budget_body = {key: item for key, item in host_budget.items()
+                   if key != "budget_sha256"}
+    require(budget_raw_sha == budget_pin["raw_sha256"] and
+            host_budget.get("schema") ==
+                "allocatbelt.application-source5-host-evidence-budget.v2" and
+            host_budget.get("campaign_id") == inputs["spec"]["campaign_id"] and
+            host_budget.get("host_id") == inputs["host_id"] and
+            host_budget.get("budget_sha256") ==
+                budget_pin["semantic_sha256"] == digest_object(budget_body),
+            "captured pressure host budget differs from its exact raw/semantic pin")
+    retention = host_budget.get("path_catalogue", {}).get("retention_policy")
+    require(type(retention) is dict and
+            signer_value.get("maximum_signature_bytes") ==
+                retention.get("maximum_signature_bytes") and
+            retention.get("maximum_signature_bytes") == 4096,
+            "captured pressure signer signature ceiling differs from its pinned host budget")
+    width_wrapper = execution_value.get("journal_width_contracts", {}).get(
+        inputs["host_id"],
+    )
+    width_wrapper = exact(width_wrapper, {"artifact", "semantic_sha256"},
+                          "captured pressure journal-width execution pin")
+    width_artifact = exact(width_wrapper["artifact"], {"path", "raw_sha256"},
+                           "captured pressure journal-width artifact pin")
+    width_pin = {
+        "path": width_artifact["path"],
+        "raw_sha256": width_artifact["raw_sha256"],
+        "semantic_sha256": width_wrapper["semantic_sha256"],
+    }
+    require(host_budget.get("execution_manifest_schema") == execution_value["schema"] and
+            host_budget.get("journal_width_contract_pin") == width_pin,
+            "captured pressure width-bound host budget differs from the sealed execution manifest")
+
+    object_rows = manifest["objects"]
+    refs_value = view["objects"]
+    require(type(refs_value) is dict and
+            set(refs_value) == {row["origin_path"] for row in object_rows},
+            "captured pressure object refs do not close the exact signed object manifest")
+    refs: dict[str, dict[str, Any]] = {}
+    for row in object_rows:
+        origin = row["origin_path"]
+        ref = exact(refs_value[origin], {
+            "origin_path", "path", "role", "host_id", "raw_sha256",
+            "semantic_sha256", "byte_count", "maximum_bytes",
+        }, "captured pressure staged object ref")
+        require(all(ref[key] == row[key] for key in (
+                    "origin_path", "role", "raw_sha256", "semantic_sha256",
+                    "byte_count")) and
+                ref["host_id"] == inputs["host_id"] and
+                ref["maximum_bytes"] == ref["byte_count"],
+                "captured pressure staged object differs from its signed manifest row")
+        refs[origin] = ref
+    artifact_view = CapturedPressureArtifactView(view["stage_root"], refs)
+    return {
+        "view": view, "request": request, "checkpoint": checkpoint,
+        "manifest": manifest, "archive": archive,
+        "artifact_view": artifact_view, "captured_origin_paths": sorted(refs),
+        "request_pin": request_pin, "checkpoint_pin": checkpoint_pin,
+        "manifest_pin": manifest_pin, "owner_receipt_pin": owner_pin,
+        "tree_inventories": request.get("tree_inventories") or [],
+        "execution_manifest": execution_value,
+        "execution_manifest_pin": execution_manifest_pin,
+        "budget": host_budget, "budget_pin": budget_pin,
+        "signer_context": signer_value,
+        "authorization_context": authorization_context,
+    }
+
+
+def _pressure_pair_file_pins(value: object) -> set[str]:
+    paths: set[str] = set()
+
+    def visit(item: object) -> None:
+        if type(item) is dict:
+            path = item.get("path")
+            if type(path) is str and Path(path).is_absolute() and any(
+                    type(item.get(key)) is str for key in
+                    ("raw_sha256", "sha256", "semantic_sha256")):
+                paths.add(path)
+            for child in item.values():
+                visit(child)
+        elif type(item) is list:
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return paths
+
+
+def _pressure_captured_tree_paths(
+    inputs: dict[str, Any], recipe: dict[str, Any],
+    hview: dict[str, Any], output_root: Path,
+) -> tuple[dict[str, Any], list[str], list[str], list[str],
+           dict[str, tuple[int, ...]], dict[str, dict[str, Any]]]:
+    """Build only path sets supported by captured objects or original pinned inputs."""
+    artifact_view = hview["artifact_view"]
+    captured = set(hview["captured_origin_paths"])
+    source_inventory, source_by_path = _source5_source_inventory(
+        inputs["source"], "captured pressure selected SourceV5 manifest",
+    )
+    source_files = {
+        str(inputs["source_root"].joinpath(*PurePosixPath(row["path"]).parts))
+        for row in source_inventory if row["kind"] == "file"
+    }
+    source_links = {
+        row["path"]: row for row in source_inventory
+        if row["kind"] == "symlink"
+    }
+    source_artifacts = {
+        str(inputs["source_root"].joinpath(*PurePosixPath(relative).parts))
+        for relative, _role, _sha in _source5_manifest_artifacts(
+            inputs["source"], source_by_path,
+            "captured pressure SourceV5 artifact set",
+        )
+    }
+    resident_files = set(source_files) | source_artifacts | {
+        str(inputs["manifest_path"]), str(inputs["spec_path"]),
+        str(inputs["plan_path"]),
+    }
+    resident_files.update(_pressure_pair_file_pins(recipe))
+    resident_files.update(_pressure_pair_file_pins(inputs["spec"]))
+    resident_files.update(_pressure_pair_file_pins(inputs["plan"]))
+    resident_files.update(_pressure_pair_file_pins(hview["authorization_context"]))
+    files = resident_files | captured
+    directories: set[str] = {
+        str(inputs["source_root"]), str(inputs["input_root"]),
+        str(output_root),
+    }
+    for path_text in files:
+        path = Path(path_text)
+        parent = path.parent
+        while parent != Path("/"):
+            directories.add(str(parent))
+            if parent in (inputs["source_root"], inputs["input_root"],
+                          output_root):
+                break
+            parent = parent.parent
+    for tree in hview["tree_inventories"]:
+        directories.add(tree["root_path"])
+        for row in tree["entries"]:
+            if row["kind"] == "directory":
+                directories.add(row["path"])
+
+    symlink_rows: dict[str, dict[str, Any]] = {}
+    symlink_snapshots: dict[str, tuple[int, ...]] = {}
+    for relative, row in source_links.items():
+        path = inputs["source_root"].joinpath(*PurePosixPath(relative).parts)
+        try:
+            before = path.lstat()
+            target = os.readlink(path)
+            target_raw = target.encode("utf-8", "strict")
+            after = path.lstat()
+        except (OSError, UnicodeError) as error:
+            raise PressurePairError(
+                f"cannot snapshot original SourceV5 literal symlink {path}: {error}",
+            ) from error
+        require(stat.S_ISLNK(before.st_mode) and
+                target_raw == row["target"].encode("utf-8") and
+                len(target_raw) == row["size"] and
+                sha256_bytes(target_raw) == row["sha256"] and
+                _stat_key(before) == _stat_key(after),
+                f"original SourceV5 literal symlink differs from its typed pin: {path}")
+        signature = (
+            before.st_dev, before.st_ino, before.st_uid, before.st_gid,
+            before.st_mode, before.st_size, before.st_mtime_ns,
+            before.st_ctime_ns,
+            int.from_bytes(hashlib.sha256(target_raw).digest(), "big"),
+        )
+        symlink_snapshots[str(path)] = signature
+        symlink_rows[str(path)] = {
+            "role": "typed_source_symlink", "host_id": inputs["host_id"],
+            "origin_path": str(path), "local_path": str(path),
+            "raw_sha256": row["sha256"], "semantic_sha256": None,
+            "byte_count": row["size"], "raw_bytes": target_raw,
+        }
+    context = {
+        "schema": CAPTURED_PRESSURE_REPLAY_CONTEXT_SCHEMA,
+        "artifact_view": artifact_view,
+        "captured_origin_paths": sorted(captured),
+        "evidence_file_paths": sorted(files),
+        "evidence_directory_paths": sorted(directories),
+        "source_symlink_paths": sorted(symlink_rows),
+        "tree_inventories": hview["tree_inventories"],
+    }
+    return (context, sorted(files), sorted(directories), sorted(captured),
+            symlink_snapshots, symlink_rows)
 
 
 def validate_pressure_pair_artifacts_offline(
@@ -5746,6 +7013,599 @@ def validate_pressure_pair_artifacts_offline(
     return result
 
 
+def validate_pressure_pair_artifacts_captured_outputs(
+    recipe_value: object, output_root: object, readback_pin_value: object,
+    host_receipt_pin_value: object, *, chronology_module: Any, lock: Any,
+    authorization_context: dict[str, Any], captured_evidence: object,
+    pressure_predecessor_context: Any | None = None,
+) -> dict[str, Any]:
+    """Replay a complete two-APP pressure result from one authenticated H-view.
+
+    The old full-v3 identity-map reader remains separate. Captured bytes are
+    accessed only through the exact Root-stage object view; SourceV5 source,
+    Spec, Plan, binaries, and original oracle inputs remain at their pinned
+    resident paths.
+    """
+    recipe = _validate_recipe_shape(recipe_value)
+    output_path = Path(text(output_root, "captured pressure original output root", 4096))
+    require(output_path.is_absolute() and str(output_path) ==
+            os.path.normpath(str(output_path)),
+            "captured pressure output root is not normalized absolute")
+    readback_pin = exact(readback_pin_value, {"path", "raw_sha256"},
+                         "captured pressure readback pin")
+    readback_path = Path(text(readback_pin["path"],
+                              "captured pressure readback path", 4096))
+    require(readback_path == output_path / PAIR_READBACK_FILE,
+            "captured pressure readback path differs from its original pair layout")
+
+    # Source/Spec/Plan and their binaries/oracles are deliberately read from
+    # their original pinned roots, not reconstructed from the one-job H-view.
+    inputs = _load_campaign_inputs(recipe, output_path)
+    require(not output_path.is_relative_to(inputs["source_root"]) and
+            not output_path.is_relative_to(inputs["input_root"]),
+            "captured pressure output root overlaps resident SourceV5 inputs")
+    modules = _load_validators(recipe, inputs, chronology_module)
+    require(modules["campaign_chronology"] is chronology_module,
+            "captured pressure replay replaced the caller's SourceV5 chronology module")
+    archive = _load_source5_archive_validator(inputs)
+    host_pin = exact(host_receipt_pin_value, {
+        "path", "raw_sha256", "receipt_sha256",
+    }, "captured pressure strict host-receipt pin")
+    hview = _validate_pressure_archived_job_view(
+        captured_evidence, inputs, recipe, authorization_context, host_pin,
+        archive,
+    )
+    captured_context, evidence_files, evidence_directories, captured_paths, \
+        source_symlink_snapshots, source_symlink_rows = \
+        _pressure_captured_tree_paths(inputs, recipe, hview, output_path)
+    artifact_view = hview["artifact_view"]
+
+    optional_output_paths: set[str] = set()
+    for member in recipe["members"]:
+        if inputs["job"]["mode"] == "capacity":
+            optional_output_paths.add(member["outputs"]["ids"])
+        if not (inputs["job"]["mode"] == "capacity" and
+                inputs["job"]["workload"] == "mixed"):
+            optional_output_paths.add(member["outputs"]["capacity_families"])
+    pinned_local_inputs = {
+        recipe["execution_overlay"]["artifact"]["path"],
+        recipe["capacity_completion"]["artifact"]["path"],
+        recipe["shared_policy"]["artifact"]["path"],
+        *(pin["path"] for pin in recipe["capacity_bundle"].values()),
+        recipe["fixed_predecessor"]["record"]["path"],
+    }
+    retained_output_paths = {
+        path for path in pinned_local_inputs
+        if Path(path) == output_path or Path(path).is_relative_to(output_path)
+    }
+    io_context = {
+        "artifact_view": artifact_view,
+        "captured_origin_paths": frozenset(captured_paths),
+        "output_root": output_path,
+        "retained_output_paths": frozenset(retained_output_paths),
+        "optional_output_paths": frozenset(optional_output_paths),
+    }
+    io_token = _PRESSURE_CAPTURED_REPLAY.set(io_context)
+    try:
+        receipt, receipt_raw_sha, checked_host_pin = \
+            modules["pressure_validator"]._validate_pressure_pair_host_receipt(
+                host_pin, artifact_view=artifact_view,
+            )
+        require(checked_host_pin == host_pin and
+                receipt_raw_sha == host_pin["raw_sha256"] and
+                receipt.get("schema") == HOST_VERIFICATION_SCHEMA_V2 and
+                receipt["campaign_id"] == inputs["spec"]["campaign_id"] and
+                receipt["host_id"] == inputs["host_id"] and
+                receipt["qualification_eligible"] is False and
+                receipt["execution_ready"] is False,
+                "captured strict pressure receipt differs from the exact original owner pin/job")
+        receipt_owner_pin = {
+            "path": host_pin["path"],
+            "raw_sha256": host_pin["raw_sha256"],
+            "semantic_sha256": host_pin["receipt_sha256"],
+        }
+        try:
+            expected_tmp_proofs = archive._zero_pressure_tmp_proofs(
+                receipt, receipt_owner_pin, "component_receipt",
+            )
+        except Exception as error:
+            raise PressurePairError(
+                f"SourceV5 archive rejected pressure owner-return TMPDIR proof: {error}"
+            ) from error
+        require(len(expected_tmp_proofs) == 2 and
+                hview["request"].get("empty_tmp_proofs") == expected_tmp_proofs,
+                "captured pressure request does not close the two exact owner-return empty TMPDIR proofs")
+        tmpdir_roots = [row["path"] for row in expected_tmp_proofs]
+        require(len(set(tmpdir_roots)) == 2,
+                "pressure owner receipt repeats an original APP TMPDIR root")
+        for root in tmpdir_roots:
+            evidence_directories.append(root)
+            captured_context["evidence_directory_paths"].append(root)
+        evidence_directories[:] = sorted(set(evidence_directories))
+        captured_context["evidence_directory_paths"] = list(evidence_directories)
+        require(receipt["job"] == {
+                    "run_id": inputs["job"]["run_id"],
+                    "ordinal": inputs["job"]["ordinal"],
+                    "job_index": inputs["job_index"],
+                    "semantic_sha256": sha256_bytes(canonical_bytes(inputs["job"])),
+                } and
+                receipt["spec"] == {
+                    "path": str(inputs["spec_path"]),
+                    "raw_sha256": inputs["spec_raw_sha256"],
+                    "semantic_sha256": recipe["spec"]["semantic_sha256"],
+                } and
+                receipt["plan"] == {
+                    "path": str(inputs["plan_path"]),
+                    "raw_sha256": inputs["plan_raw_sha256"],
+                    "semantic_sha256": recipe["plan"]["semantic_sha256"],
+                } and
+                receipt["source_manifest"] == {
+                    "path": str(inputs["manifest_path"]),
+                    "raw_sha256": inputs["manifest_raw_sha256"],
+                    "semantic_sha256": inputs["manifest_semantic_sha256"],
+                    "source_tree_sha256":
+                        inputs["source"]["source"]["source_tree_sha256"],
+                }, "captured pressure receipt changed the original Source/Spec/Plan/job pins")
+        require(receipt["execution_manifest"] ==
+                    hview["execution_manifest_pin"] and
+                receipt["authorization_id"] ==
+                    authorization_context.get("authorization_id") and
+                receipt["job"]["job_index"] ==
+                    authorization_context.get("job_index") and
+                receipt["job"]["semantic_sha256"] ==
+                    authorization_context.get("job_sha256"),
+                "captured pressure receipt differs from the locked original authorization")
+
+        recipe_receipt_pin = exact(receipt["recipe"], {
+            "path", "raw_sha256", "semantic_sha256",
+        }, "captured pressure receipt recipe pin")
+        require(recipe_receipt_pin["semantic_sha256"] ==
+                    recipe.get("recipe_sha256") and
+                readback_pin["path"] == receipt["readback"]["path"] and
+                readback_pin["raw_sha256"] == receipt["readback"]["raw_sha256"],
+                "captured pressure recipe/readback pins differ from the strict receipt")
+        recipe_raw, recipe_raw_sha, _recipe_info = read_stable(
+            Path(recipe_receipt_pin["path"]), "captured original pressure recipe",
+            MAX_RECIPE_BYTES,
+        )
+        require(recipe_raw_sha == recipe_receipt_pin["raw_sha256"] and
+                recipe_raw == canonical_bytes(recipe),
+                "captured pressure recipe bytes differ from the caller's validated recipe")
+
+        expected_dependencies = {
+            name: {"path": item["path"], "raw_sha256": item["sha256"]}
+            for name, item in recipe["validators"].items()
+        }
+        for name, relative in (
+            ("pressure_pair", "scripts/application-pressure-pair.py"),
+            ("pressure_driver", "scripts/application-pressure-driver.py"),
+            ("source_inventory", "scripts/application-source-inventory.py"),
+            ("fixed_pair", "scripts/application-fixed-pair.py"),
+        ):
+            source_entry = _inventory_record(
+                inputs["source"], relative,
+                f"captured pressure {name} dependency",
+            )
+            expected_dependencies[name] = {
+                "path": relative, "raw_sha256": source_entry["sha256"],
+            }
+        helper_pin = _artifact_reference(
+            authorization_context.get("helper_input"),
+            "captured pressure locked helper input",
+        )
+        helper_module_record = _inventory_record(
+            inputs["source"], "scripts/application-pressure-pair.py",
+            "captured pressure pair helper module",
+        )
+        expected_dependencies.update({
+            "source5_helper_input": helper_pin,
+            "source5_helper_module": {
+                "path": "scripts/application-pressure-pair.py",
+                "raw_sha256": helper_module_record["sha256"],
+            },
+        })
+        driver_pin = exact(
+            inputs["source"]["qualification_harness"]["pressure_driver"],
+            {"path", "sha256"}, "captured SourceV5 pressure driver pin",
+        )
+        require(expected_dependencies["pressure_driver"] == {
+                    "path": driver_pin["path"],
+                    "raw_sha256": driver_pin["sha256"],
+                } and receipt["dependency_pins"] == expected_dependencies,
+                "captured pressure receipt dependencies differ from its complete SourceV5 harness")
+
+        helper_input, helper_raw, helper_sha = read_json(
+            Path(helper_pin["path"]), "captured locked Source5 pressure helper input",
+            MAX_PLAN_BYTES, helper_pin["raw_sha256"],
+        )
+        exact(helper_input, {
+            "schema", "scope", "campaign_id", "host_id", "phase", "job_index",
+            "job", "job_sha256", "members", "helper", "payload",
+            "prerequisites", "outer_deadline_seconds",
+            "effective_timeout_seconds", "input_snapshot_sha256",
+            "qualification_eligible",
+        }, "captured locked Source5 pressure helper input")
+        helper_body = {key: value for key, value in helper_input.items()
+                       if key not in {"input_snapshot_sha256",
+                                      "qualification_eligible"}}
+        helper_payload = exact(helper_input["payload"], {
+            "schema", "recipe_pin", "output_root", "probe_capture_bundle",
+        }, "captured pressure helper payload")
+        helper_binding = exact(helper_input["helper"], {
+            "path", "sha256", "entrypoint",
+        }, "captured pressure helper binding")
+        capture_bundle = exact(helper_payload["probe_capture_bundle"], {
+            "schema", "members",
+        }, "captured pressure ProbeV2 helper bundle")
+        require(helper_sha == helper_pin["raw_sha256"] and
+                helper_input["schema"] == SOURCE5_HELPER_INPUT_SCHEMA and
+                helper_input["scope"] == "final_frozen" and
+                helper_input["phase"] == "pressure" and
+                helper_input["campaign_id"] == inputs["spec"]["campaign_id"] and
+                helper_input["host_id"] == inputs["host_id"] and
+                helper_input["job_index"] == inputs["job_index"] and
+                helper_input["job"] == inputs["job"] and
+                helper_input["job_sha256"] ==
+                    sha256_bytes(canonical_bytes(inputs["job"])) and
+                helper_input["members"] == [
+                    member["descriptor"] for member in recipe["members"]
+                ] and
+                helper_input["outer_deadline_seconds"] ==
+                    inputs["spec"]["deadlines"]["outer_seconds"] and
+                helper_input["effective_timeout_seconds"] ==
+                    inputs["spec"]["deadlines"]["outer_seconds"] and
+                helper_input["qualification_eligible"] is False and
+                helper_input["input_snapshot_sha256"] ==
+                    sha256_bytes(canonical_bytes(helper_body)) and
+                helper_binding == {
+                    "path": "scripts/application-pressure-pair.py",
+                    "sha256": helper_module_record["sha256"],
+                    "entrypoint": "run_pressure_pair_locked",
+                } and
+                helper_payload["schema"] ==
+                    SOURCE5_PRESSURE_HELPER_PAYLOAD_SCHEMA_V2 and
+                helper_payload["recipe_pin"] == {
+                    "path": recipe_receipt_pin["path"],
+                    "raw_sha256": recipe_receipt_pin["raw_sha256"],
+                } and
+                helper_payload["output_root"] == str(output_path) and
+                capture_bundle["schema"] ==
+                    SOURCE5_PROBE_CAPTURE_BUNDLE_SCHEMA_V1 and
+                type(capture_bundle["members"]) is list and
+                len(capture_bundle["members"]) == 2,
+                "captured pressure helper generation differs from its original Source5 authorization")
+        for index, bundle_value in enumerate(capture_bundle["members"]):
+            bundle_row = exact(bundle_value, {
+                "ordinal", "construction_probe", "capture_receipt",
+                "capacity_bundle",
+            }, f"captured pressure ProbeV2 helper member[{index}]")
+            host_capture = receipt["member_facts"][index]["probe_capture"]
+            require(bundle_row == {"ordinal": index, **host_capture},
+                    "captured pressure ProbeV2 helper member differs from its strict host receipt")
+
+        overlay = _verify_execution_overlay(
+            recipe, inputs, modules["campaign_chronology"], lock=lock,
+            authorization_context=authorization_context,
+        )
+        require(receipt["journal_head"] == overlay["chronology"]["journal_head"] and
+                receipt["registration_head"] ==
+                    overlay["chronology"]["registration_head"] and
+                overlay["value"]["chronology"]["journal_head"] ==
+                    receipt["journal_head"],
+                "captured strict pressure receipt differs from its original chronology overlay")
+
+        predecessor = _verify_fixed_predecessor(
+            recipe, inputs, modules, output_path,
+            chronology_module=chronology_module, lock=lock,
+            authorization_context=authorization_context,
+            recipe_pin={"path": recipe_receipt_pin["path"],
+                        "raw_sha256": recipe_receipt_pin["raw_sha256"]},
+            pressure_predecessor_context=pressure_predecessor_context,
+            execution_overlay=overlay,
+        )
+        predecessor_expected = {
+            "record": predecessor["record"],
+            "receipt": predecessor["receipt"],
+            "receipt_value": predecessor["value"],
+        }
+        sidecar, sidecar_raw, sidecar_sha = read_json(
+            readback_path, "captured pressure-pair readback",
+            recipe["artifact_budgets"]["pair_sidecar_bytes"],
+            digest(readback_pin["raw_sha256"],
+                   "captured pressure readback raw SHA-256"),
+        )
+        exact(sidecar, {
+            "schema", "validated", "job_evidence_complete",
+            "qualification_eligible", "execution_ready", "campaign_readiness",
+            "controller_chronology_proven", "source_manifest", "spec", "plan",
+            "job", "execution_overlay", "capacity_completion", "capacity_bundle",
+            "shared_policy", "fixed_predecessor", "pressure_condition",
+            "processes", "members", "readback_sha256",
+        }, "captured pressure-pair readback")
+        require(sidecar["schema"] == READBACK_SCHEMA_V2 and
+                sidecar["validated"] is True and
+                sidecar["job_evidence_complete"] is True and
+                sidecar["qualification_eligible"] is False and
+                sidecar["execution_ready"] is False and
+                sidecar["campaign_readiness"] is False and
+                sidecar["controller_chronology_proven"] is False,
+                "captured pressure sidecar is partial or attempts to set readiness")
+        _verify_self_digest(sidecar, "readback_sha256",
+                            "captured pressure-pair readback")
+        require(sidecar_raw == canonical_bytes(sidecar) and
+                sidecar_sha == readback_pin["raw_sha256"] and
+                receipt["readback"] == {
+                    "path": str(readback_path),
+                    "raw_sha256": readback_pin["raw_sha256"],
+                    "semantic_sha256": sidecar["readback_sha256"],
+                } and
+                sidecar["source_manifest"] == {
+                    "path": str(inputs["manifest_path"]),
+                    "raw_sha256": inputs["manifest_raw_sha256"],
+                    "semantic_sha256": inputs["manifest_semantic_sha256"],
+                    "source_tree_sha256":
+                        inputs["source"]["source"]["source_tree_sha256"],
+                } and sidecar["spec"] == {
+                    "path": str(inputs["spec_path"]),
+                    "raw_sha256": inputs["spec_raw_sha256"],
+                    "semantic_sha256": recipe["spec"]["semantic_sha256"],
+                } and sidecar["plan"] == {
+                    "path": str(inputs["plan_path"]),
+                    "raw_sha256": inputs["plan_raw_sha256"],
+                    "semantic_sha256": recipe["plan"]["semantic_sha256"],
+                } and sidecar["job"] == {
+                    "run_id": inputs["job"]["run_id"],
+                    "ordinal": inputs["job"]["ordinal"],
+                    "job_index": inputs["job_index"],
+                    "semantic_sha256": sha256_bytes(canonical_bytes(inputs["job"])),
+                }, "captured pressure readback changed its original input generation")
+        expected_overlay = {
+            "path": overlay["path"], "raw_sha256": overlay["raw_sha256"],
+            "overlay_sha256": overlay["value"]["overlay_sha256"],
+            "journal_head": overlay["chronology"]["journal_head"],
+            "registration_head": overlay["chronology"]["registration_head"],
+        }
+        require(sidecar["execution_overlay"] == expected_overlay and
+                sidecar["capacity_completion"] == {
+                    **recipe["capacity_completion"]["artifact"],
+                    "schedule_sha256": recipe["capacity_completion"]["schedule_sha256"],
+                    "registration_head":
+                        recipe["capacity_completion"]["registration_head"],
+                } and sidecar["capacity_bundle"] == recipe["capacity_bundle"] and
+                sidecar["fixed_predecessor"] == predecessor_expected and
+                sidecar["pressure_condition"] ==
+                    _pressure_condition_sidecar_value(recipe),
+                "captured pressure readback differs from the replayed overlay/capacity/predecessor")
+        require(type(sidecar["members"]) is list and len(sidecar["members"]) == 2 and
+                type(receipt["member_facts"]) is list and
+                len(receipt["member_facts"]) == 2,
+                "captured pressure replay does not contain exactly two original APP members")
+        process_pin = exact(sidecar["processes"], {"path", "raw_sha256"},
+                            "captured pressure process ledger pin")
+        require(process_pin["path"] == str(output_path / PAIR_PROCESS_FILE),
+                "captured pressure process ledger path differs from the original pair layout")
+
+        capture_members = [row["probe_capture"] for row in receipt["member_facts"]]
+        policy_context = {
+            **captured_context, "capture_members": capture_members,
+        }
+        condition = _verify_pressure_condition(recipe, inputs, modules)
+        capacity = _verify_capacity_bundle(recipe, inputs, modules)
+        shared = _verify_policy_resolutions(
+            recipe, inputs, modules, output_path, capacity,
+            offline_replay_context=policy_context,
+        )
+        members = _verify_members(
+            recipe, inputs, condition, capacity, shared, modules, output_path,
+            offline_origin=receipt["origin_facts"],
+            offline_context=captured_context,
+        )
+        prepared = {
+            "recipe": recipe, "output_root": output_path, "inputs": inputs,
+            "modules": modules, "overlay": overlay,
+            "condition": condition, "capacity": capacity,
+            "shared_policy": shared, "predecessor": predecessor,
+            "members": members,
+        }
+        tmpdir_budget = _source5_application_tmp_budget(
+            authorization_context, modules["fixed_pair"],
+        )
+        require(tmpdir_budget is not None,
+                "captured pressure replay has no pinned application TMPDIR budget")
+        prepared["application_tmpdir_budget"] = tmpdir_budget
+        process_rows = _read_process_ledger(
+            Path(process_pin["path"]), process_pin["raw_sha256"],
+            modules["campaign_controller"],
+        )
+        expected_order = [
+            (item["descriptor"]["pair"], item["descriptor"]["executor"],
+             item["descriptor"]["allocator"])
+            for item in recipe["members"]
+        ]
+        require(len(process_rows) == 2 and
+                [(row["pair"], row["executor"], row["allocator"])
+                 for row in process_rows] == expected_order,
+                "captured pressure process ledger differs from its exact two-member original order")
+
+        member_results = []
+        seen_processes: set[tuple[int, int]] = set()
+        for index, stored in enumerate(sidecar["members"]):
+            host_fact = receipt["member_facts"][index]
+            original_member = recipe["members"][index]
+            require(host_fact["ordinal"] == index and
+                    host_fact["descriptor"] == original_member["descriptor"] and
+                    host_fact["identity"] == original_member["identity"] and
+                    type(stored["application_identity"]) is dict and
+                    stored["application_identity"].get("pid") ==
+                        host_fact["application_identity"]["pid"] and
+                    stored["application_identity"].get("start_ticks") ==
+                        host_fact["application_identity"]["start_ticks"] and
+                    stored["application_launch_attestation"] ==
+                        host_fact["application_launch_attestation"] and
+                    stored["application_cleanup"] == host_fact["application_cleanup"] and
+                    stored["supervision_receipt"] == host_fact["supervision_receipt"] and
+                    stored["pressure_recipe"] == host_fact["pressure_recipe"] and
+                    stored["pressure_artifacts"] == host_fact["pressure_artifacts"],
+                    "captured pressure member differs from its strict origin-host facts")
+            capture = exact(host_fact["probe_capture"], {
+                "construction_probe", "capture_receipt", "capacity_bundle",
+            }, "captured pressure ProbeV2 member binding")
+            _verify_probe_capture_budget_receipt(
+                modules["feedback_validator"], capture["capture_receipt"],
+                recipe["probe_capture"], index,
+            )
+            expected_bundle = {
+                name: {"path": recipe["capacity_bundle"][name]["path"],
+                       "raw_sha256": recipe["capacity_bundle"][name]["raw_sha256"]}
+                for name in ("request", "artifact", "receipt")
+            }
+            require(capture["construction_probe"] ==
+                        original_member["construction_probe"] and
+                    capture["capacity_bundle"] == expected_bundle,
+                    "captured pressure ProbeV2 binding differs from the original probe/capacity bundle")
+            policy_pin = exact(original_member["composition"]["policy"],
+                               {"path", "raw_sha256"},
+                               "captured pressure resolved policy pin")
+            policy_value, _policy_raw, _policy_sha = read_json(
+                Path(policy_pin["path"]), "captured pressure resolved policy",
+                MAX_SMALL_BYTES, policy_pin["raw_sha256"],
+            )
+            pressure_recipe_pin = exact(host_fact["pressure_recipe"], {
+                "path", "raw_sha256", "semantic_sha256", "condition_sha256",
+            }, "captured pressure member recipe pin")
+            pressure_artifacts = exact(host_fact["pressure_artifacts"], {
+                "directory", "pins", "proof", "ready_sha256", "driver",
+                "worker_sessions", "driver_logs",
+            }, "captured pressure member artifacts")
+            pressure_result = modules["pressure_validator"].verify_pressure_offline(
+                pressure_recipe_pin, pressure_artifacts, host_pin,
+                evidence_path_map=None,
+                source_root=inputs["source_root"],
+                artifact_view=artifact_view,
+                captured_origin_paths=captured_context["captured_origin_paths"],
+                evidence_file_paths=captured_context["evidence_file_paths"],
+                evidence_directory_paths=captured_context["evidence_directory_paths"],
+            )
+            feedback_context = {
+                **captured_context,
+                "probe_capture_pin": capture["capture_receipt"],
+                "capacity_bundle": expected_bundle,
+            }
+            probe_sha = modules["feedback_validator"].validate_calibrated_construction_probe_v2_offline(
+                capture["construction_probe"],
+                {"path": str(inputs["manifest_path"]),
+                 "raw_sha256": inputs["manifest_raw_sha256"]},
+                expected_bundle["artifact"], original_member["identity"],
+                replay_context=feedback_context,
+                expected_policy=policy_value["policy"],
+            )
+            require(probe_sha == capture["construction_probe"]["raw_sha256"],
+                    "captured pressure ProbeV2 differs from original construction bytes")
+            trace = exact(stored["feedback_trace"], {
+                "directory", "manifest", "events", "samples", "validation",
+            }, "captured pressure feedback trace pins")
+            feedback_hashes = {}
+            for label in ("manifest", "events", "samples"):
+                trace_pin = exact(trace[label], {"path", "raw_sha256"},
+                                  f"captured pressure feedback {label} pin")
+                feedback_hashes[label] = trace_pin["raw_sha256"]
+            expectation_pin = exact(stored["runtime_expectation"], {
+                "path", "raw_sha256",
+            }, "captured pressure final expectation pin")
+            feedback_result = modules["feedback_validator"]._verify_feedback_replay(
+                Path(expectation_pin["path"]), expectation_pin["raw_sha256"],
+                Path(trace["directory"]), feedback_hashes,
+                offline_replay_context=feedback_context,
+                offline_replayed_proof=pressure_result,
+            )
+            validation_pin = exact(trace["validation"], {
+                "path", "raw_sha256",
+            }, "captured pressure feedback validation pin")
+            validation_value, _validation_raw, validation_sha = read_json(
+                Path(validation_pin["path"]),
+                "captured pressure stored feedback validation",
+                recipe["artifact_budgets"]["feedback_validation_bytes"],
+                validation_pin["raw_sha256"],
+            )
+            require(validation_sha == validation_pin["raw_sha256"] and
+                    validation_value == feedback_result and
+                    feedback_result["validated"] is True and
+                    feedback_result["qualification_eligible"] is False,
+                    "captured pressure feedback stream differs from its original validation")
+            replayed_member = _verify_offline_normal_app_member(
+                stored, host_fact, members[index], prepared, pressure_result,
+                feedback_result, validation_pin, feedback_context,
+            )
+            process_identity = (
+                replayed_member["application_pid"],
+                replayed_member["application_start_ticks"],
+            )
+            require(process_identity not in seen_processes,
+                    "captured pressure pair repeats a normal-APP PID/start identity")
+            seen_processes.add(process_identity)
+            require(process_rows[index] == replayed_member["process_row"],
+                    "captured pressure process ledger row differs from full APP replay")
+            member_results.append({
+                "ordinal": index, "identity": original_member["identity"],
+                "pressure_recipe": host_fact["pressure_recipe"],
+                "proof_pin": host_fact["pressure_artifacts"]["proof"],
+                "readback": pressure_result, **replayed_member,
+            })
+        require(all(row["exit_code"] == "0" and
+                    row["row_validation"] == "valid" and
+                    row["p99_qualification"] == "not_applicable"
+                    for row in process_rows),
+                "captured pressure process ledger claims APP failure or P99 qualification")
+        result = {
+            "schema": (READBACK_SCHEMA_V2
+                       if prepared.get("application_tmpdir_budget") is not None
+                       else READBACK_SCHEMA),
+            "validated": True,
+            "qualification_eligible": False, "execution_ready": False,
+            "campaign_readiness": False, "controller_chronology_proven": False,
+            "readback_sha256": sidecar_sha,
+            "processes_sha256": process_pin["raw_sha256"],
+            "member_count": 2,
+            "application_identities": [
+                {"pid": row["application_pid"],
+                 "start_ticks": row["application_start_ticks"]}
+                for row in member_results
+            ],
+            "pressure_metrics": [row["pressure_metric"]
+                                 for row in member_results],
+        }
+        require(receipt["strict_result_sha256"] == digest_object(result),
+                "captured pressure replay differs from the strict origin-host result digest")
+        _verify_source5_local_symlinks(
+            rows=source_symlink_rows, snapshots=source_symlink_snapshots,
+        )
+        return result
+    finally:
+        _PRESSURE_CAPTURED_REPLAY.reset(io_token)
+
+
+def verify_pressure_pair_with_captured_outputs(
+    recipe_value: object, output_root: object, readback_pin: object,
+    host_receipt_pin: object | None = None, *, chronology_module: Any,
+    lock: Any, authorization_context: dict[str, Any],
+    captured_evidence: object,
+    pressure_predecessor_context: Any | None = None,
+) -> dict[str, Any]:
+    """Public additive H-view entry point for a completed original pair."""
+    view_value = captured_evidence
+    if host_receipt_pin is None:
+        require(type(view_value) is dict,
+                "captured pressure H-view is malformed")
+        host_receipt_pin = view_value.get("owner_host_receipt_pin")
+    return validate_pressure_pair_artifacts_captured_outputs(
+        recipe_value, output_root, readback_pin, host_receipt_pin,
+        chronology_module=chronology_module, lock=lock,
+        authorization_context=authorization_context,
+        captured_evidence=captured_evidence,
+        pressure_predecessor_context=pressure_predecessor_context,
+    )
+
+
 def _pair_absolute_paths(value: object) -> set[str]:
     result: set[str] = set()
     path_keys = {
@@ -5782,6 +7642,7 @@ def _run_pressure_pair_component(
     recipe_path: Path, expected_recipe_sha256: str, output_root: Path, *,
     chronology_module: Any | None = None, lock: Any | None = None,
     authorization_context: dict[str, Any] | None = None,
+    pressure_predecessor_context: Any | None = None,
     on_app_started: Any | None = None, on_app_terminal: Any | None = None,
 ) -> dict[str, Any]:
     require(Path(recipe_path).resolve(strict=True) == Path(recipe_path), "private pressure-pair recipe path traverses a symlink or alias")
@@ -5794,8 +7655,21 @@ def _run_pressure_pair_component(
     prepared = _prepare_prerequisites(
         recipe, output_root, chronology_module=chronology_module,
         lock=lock, authorization_context=authorization_context,
+        recipe_pin={"path": str(Path(recipe_path)),
+                    "raw_sha256": recipe_sha},
+        pressure_predecessor_context=pressure_predecessor_context,
     )
     _prepare_member_directories(recipe, prepared["output_root"])
+    if prepared.get("application_tmpdir_budget") is not None:
+        fixed_owner = prepared["modules"]["fixed_pair"]
+        prepared["application_tmpdir_initials"] = [
+            _prepare_source5_application_tmpdir(
+                fixed_owner, Path(member_context["member"]["tmpdir_path"]),
+                Path(member_context["member"]["outputs"]["root"]),
+                prepared["application_tmpdir_budget"],
+            )
+            for member_context in prepared["members"]
+        ]
     member_evidence: list[dict[str, Any]] = []
     rows: list[dict[str, str]] = []
     active_member_index: int | None = None
@@ -5824,6 +7698,9 @@ def _run_pressure_pair_component(
             recipe, prepared["output_root"], readback_path, readback_sha,
             chronology_module=chronology_module, lock=lock,
             authorization_context=authorization_context,
+            recipe_pin={"path": str(Path(recipe_path)),
+                        "raw_sha256": recipe_sha},
+            pressure_predecessor_context=pressure_predecessor_context,
         )
         return {
             "schema": READBACK_SCHEMA,
@@ -5867,8 +7744,15 @@ def run_pressure_pair_locked(
     recipe_path: Path, expected_recipe_sha256: str, output_root: Path,
     chronology_module: Any, lock: Any, authorization_context: dict[str, Any],
     on_app_started: Any, on_app_terminal: Any,
+    *, pressure_predecessor_context: Any | None = None,
 ) -> dict[str, Any]:
-    """Run a pressure pair under its caller's already-owned Source5 lock."""
+    """Run a pressure pair under its caller's already-owned Source5 lock.
+
+    ``pressure_predecessor_context`` is optional and exists only for Source5
+    jobs whose fixed predecessor payload has been offloaded. The chronology
+    factory binds it to this lock, the active authorization, the prepared
+    generation, and one exact archived predecessor replay.
+    """
     require(type(authorization_context) is dict and callable(on_app_started) and
             callable(on_app_terminal),
             "locked Source5 pressure execution needs its durable authorization and APP callbacks")
@@ -5879,6 +7763,7 @@ def run_pressure_pair_locked(
         recipe_path, expected_recipe_sha256, output_root,
         chronology_module=chronology_module, lock=lock,
         authorization_context=authorization_context,
+        pressure_predecessor_context=pressure_predecessor_context,
         on_app_started=on_app_started, on_app_terminal=on_app_terminal,
     )
     recipe, _recipe_raw, recipe_sha = read_json(

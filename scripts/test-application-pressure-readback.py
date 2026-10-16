@@ -7,7 +7,9 @@ import ast
 import inspect
 import importlib.util
 import builtins
+import contextlib
 import json
+import io
 import stat
 import sys
 import tempfile
@@ -1054,6 +1056,36 @@ class PressurePairHostReceiptSchemaTests(unittest.TestCase):
             self.assertEqual(actual_raw, pin["raw_sha256"])
             self.assertEqual(checked_pin["receipt_sha256"], receipt["receipt_sha256"])
 
+            archived_path = Path("/reclaimed/pressure-host-receipt.json")
+
+            class CapturedReceiptView:
+                def has_file(self, origin):
+                    return str(origin) == str(archived_path)
+
+                def read(self, origin, label, maximum):
+                    if str(origin) != str(archived_path) or len(raw) > maximum:
+                        raise AssertionError(f"unexpected captured receipt read: {label}")
+                    return raw, readback.sha256_bytes(raw)
+
+            with patch.object(
+                    Path, "lstat",
+                    side_effect=AssertionError("captured receipt consulted its origin path")):
+                captured, captured_sha, captured_pin = \
+                    readback._validate_pressure_pair_host_receipt(
+                        {**pin, "path": str(archived_path)},
+                        artifact_view=CapturedReceiptView(),
+                    )
+            self.assertEqual(captured, receipt)
+            self.assertEqual(captured_sha, pin["raw_sha256"])
+            self.assertEqual(captured_pin["path"], str(archived_path))
+            with self.assertRaisesRegex(readback.ReadbackError,
+                                        "captured pressure-pair host receipt"):
+                readback._validate_pressure_pair_host_receipt(
+                    {**pin, "path": str(archived_path),
+                     "raw_sha256": "0" * 64},
+                    artifact_view=CapturedReceiptView(),
+                )
+
             wrong_role = dict(pin, receipt_sha256=pin["raw_sha256"])
             with self.assertRaisesRegex(readback.ReadbackError, "raw/semantic digest roles"):
                 readback._validate_pressure_pair_host_receipt(wrong_role)
@@ -1066,6 +1098,79 @@ class PressurePairHostReceiptSchemaTests(unittest.TestCase):
                 readback._validate_pressure_pair_host_receipt({
                     "path": str(path), "raw_sha256": readback.sha256_bytes(path.read_bytes()),
                     "receipt_sha256": mutated["receipt_sha256"],
+                })
+
+    def test_bounded_v2_receipt_requires_immediate_zero_tmpdir_owner_return(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-host-tmpdir-v2-") as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            path = root / "host-receipt.json"
+            receipt = self._receipt()
+            receipt["schema"] = readback.PRESSURE_PAIR_HOST_VERIFICATION_SCHEMA_V2
+            for index, row in enumerate(receipt["member_facts"]):
+                tmp_path = row["storage_proof"]["application_tmpdir_path"]
+                mount = {
+                    "mount_id": 3, "major_minor": "8:1", "mount_root": "/",
+                    "mount_point": "/tmp", "filesystem_type": "ext4",
+                    "mount_source": "/dev/sda", "device": 8,
+                }
+                initial = {
+                    "path": tmp_path, "device": 8, "inode": 100 + index,
+                    "mode": 0o700, "mount": mount,
+                    "available_bytes": 8192, "available_inodes": 1024,
+                    "bytes_limit": 4096, "inode_limit": 64,
+                }
+                final = {
+                    "path": tmp_path, "device": 8, "inode": 100 + index,
+                    "mode": 0o700, "mount": mount,
+                    "bytes_used": 0, "file_count": 0, "directory_count": 0,
+                    "bytes_limit": 4096, "inode_limit": 64,
+                    "available_bytes": 4096, "available_inodes": 100,
+                }
+                storage = row["storage_proof"]
+                storage["application_tmpdir_initial"] = initial
+                storage["application_tmpdir_final"] = final
+                storage["storage_sha256"] = readback.digest_object({
+                    "application_tmpdir_initial": initial,
+                    "application_tmpdir_final": final,
+                    "prior_storage_sha256": "d" * 64,
+                })
+            origin = receipt["origin_facts"]
+            origin["storage_sha256"] = readback.digest_object([
+                row["storage_proof"]["storage_sha256"]
+                for row in receipt["member_facts"]
+            ])
+            origin_body = {key: value for key, value in origin.items()
+                           if key != "origin_facts_sha256"}
+            origin["origin_facts_sha256"] = readback.digest_object(origin_body)
+            receipt_body = {key: value for key, value in receipt.items()
+                            if key != "receipt_sha256"}
+            receipt["receipt_sha256"] = readback.digest_object(receipt_body)
+            raw = readback.canonical_bytes(receipt)
+            path.write_bytes(raw)
+            path.chmod(0o600)
+            pin = {"path": str(path),
+                   "raw_sha256": readback.sha256_bytes(raw),
+                   "receipt_sha256": receipt["receipt_sha256"]}
+            checked, actual_raw, _checked_pin = \
+                readback._validate_pressure_pair_host_receipt(pin)
+            self.assertEqual(checked, receipt)
+            self.assertEqual(actual_raw, pin["raw_sha256"])
+
+            receipt["member_facts"][0]["storage_proof"][
+                "application_tmpdir_final"]["file_count"] = 1
+            changed_body = {key: value for key, value in receipt.items()
+                            if key != "receipt_sha256"}
+            receipt["receipt_sha256"] = readback.digest_object(changed_body)
+            changed_raw = readback.canonical_bytes(receipt)
+            path.write_bytes(changed_raw)
+            with self.assertRaisesRegex(
+                    readback.ReadbackError,
+                    "not the exact empty original directory"):
+                readback._validate_pressure_pair_host_receipt({
+                    "path": str(path),
+                    "raw_sha256": readback.sha256_bytes(changed_raw),
+                    "receipt_sha256": receipt["receipt_sha256"],
                 })
 
     def test_soak_single_app_api_has_its_own_three_pin_boundary(self) -> None:
@@ -1082,7 +1187,61 @@ class PressurePairHostReceiptSchemaTests(unittest.TestCase):
             "pressure_recipe_pin", "pressure_artifacts",
             "soak_host_verification_pin",
         ])
-        self.assertEqual(keyword_only, {"evidence_path_map", "source_root"})
+        self.assertEqual(keyword_only, {
+            "evidence_path_map", "source_root", "artifact_view",
+            "captured_origin_paths", "evidence_file_paths",
+            "evidence_directory_paths",
+        })
+
+    def test_captured_pressure_event_stream_uses_pinned_snapshot_without_origin_stat(self) -> None:
+        origin = Path("/reclaimed/source5/soak/pressure/events.jsonl")
+        raw = readback.canonical_bytes({"kind": "captured-event-fixture"})
+        raw_sha = readback.sha256_bytes(raw)
+
+        class MemoryView:
+            def has_file(self, path):
+                return path == origin
+
+            @contextlib.contextmanager
+            def open_snapshot(self, path, label, maximum):
+                self.calls = getattr(self, "calls", []) + [(path, label, maximum)]
+                if len(raw) > maximum:
+                    raise ValueError("capture ceiling")
+                yield io.BytesIO(raw), raw_sha, len(raw)
+
+        view = MemoryView()
+        state = {"event_count": 0}
+        with patch.object(
+                readback.Path, "lstat",
+                side_effect=AssertionError("captured origin path was statted")):
+            events = list(readback._iter_events(
+                origin, raw_sha, len(raw), len(raw), state,
+                artifact_view=view,
+            ))
+        self.assertEqual(events, [{"kind": "captured-event-fixture"}])
+        self.assertEqual(state["event_count"], 1)
+        self.assertEqual(state["events_sha256"], raw_sha)
+        self.assertEqual(state["events_bytes"], len(raw))
+        self.assertEqual(view.calls, [(origin, "pressure events", len(raw))])
+
+    def test_captured_pressure_event_stream_rejects_mismatched_archive_pin(self) -> None:
+        origin = Path("/reclaimed/source5/soak/pressure/events.jsonl")
+        raw = readback.canonical_bytes({"kind": "captured-event-fixture"})
+
+        class MemoryView:
+            def has_file(self, path):
+                return path == origin
+
+            @contextlib.contextmanager
+            def open_snapshot(self, path, label, maximum):
+                yield io.BytesIO(raw), "0" * 64, len(raw)
+
+        with self.assertRaisesRegex(readback.ReadbackError,
+                                    "captured pressure event size/raw pin"):
+            list(readback._iter_events(
+                origin, readback.sha256_bytes(raw), len(raw), len(raw),
+                {"event_count": 0}, artifact_view=MemoryView(),
+            ))
 
     def test_soak_pressure_calls_match_the_actual_reader_api_signatures(self) -> None:
         """Bind new direct calls to parsed definitions and loaded functions."""
@@ -1205,6 +1364,9 @@ class PressurePairHostReceiptSchemaTests(unittest.TestCase):
                 self.assertIs(public(*arguments, **keywords), marker)
                 implementation.assert_called_once_with(
                     *arguments, **keywords, bounded_v3=bounded_v3,
+                    artifact_view=None, captured_origin_paths=None,
+                    evidence_file_paths=None,
+                    evidence_directory_paths=None,
                 )
 
         test_tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))

@@ -34,6 +34,7 @@ RECIPE_SCHEMA = "allocatbelt.application-soak-parent-recipe.v2"
 BUILD_RECEIPT_SCHEMA = "allocatbelt.application-soak-recipe-build-receipt.v2"
 HOST_VERIFICATION_SCHEMA = "allocatbelt.application-source5-soak-host-verification.v2"
 HOST_VERIFICATION_SCHEMA_V3 = "allocatbelt.application-source5-soak-host-verification.v3"
+SOURCE5_SOAK_CAPTURED_CONTEXT_SCHEMA = "allocatbelt.application-source5-soak-captured-replay-context.v1"
 PROBE_CAPTURE_SCHEMA = "allocatbelt.application-source5-soak-probe-capture.v1"
 PROBE_CAPTURE_SCHEMA_V2 = "allocatbelt.application-feedback-probe-capture.v2"
 SOAK_OFFLINE_CONTEXT_SCHEMA = "allocatbelt.application-source5-soak-offline-replay-context.v1"
@@ -205,8 +206,14 @@ def read_stable(path: Path, label: str, maximum: int) -> tuple[bytes, str, os.st
 
 
 def read_json(path: Path, expected_sha256: str, label: str,
-              maximum: int = MAX_ARTIFACT_BYTES) -> tuple[dict[str, Any], bytes, str]:
-    raw, raw_sha, _info = read_stable(path, label, maximum)
+              maximum: int = MAX_ARTIFACT_BYTES, *,
+              artifact_view: Any = None) -> tuple[dict[str, Any], bytes, str]:
+    if artifact_view is None:
+        raw, raw_sha, _info = read_stable(path, label, maximum)
+    else:
+        require(artifact_view.has_file(path),
+                f"{label} is absent from the exact captured owner refs")
+        raw, raw_sha = artifact_view.read(path, label, maximum)
     require(raw_sha == digest(expected_sha256, f"{label} raw SHA-256"),
             f"{label} differs from its raw pin")
     try:
@@ -834,6 +841,295 @@ def _load_readback_module(prepared: dict[str, Any]) -> types.ModuleType:
     return module
 
 
+def _read_soak_origin_json(
+    path: Path, expected_sha256: str, label: str, maximum: int,
+    readback: types.ModuleType, captured_view: Any,
+    captured_origins: frozenset[str], *, required_capture: bool = False,
+) -> tuple[dict[str, Any], bytes, str]:
+    """Read a pinned output through H-view or an explicitly resident input."""
+    origin = str(path)
+    captured = captured_view is not None and origin in captured_origins
+    require(not required_capture or captured,
+            f"{label} is absent from the authenticated archived output closure")
+    if captured:
+        value, checksum, raw = readback.read_json(
+            path, label, maximum, artifact_view=captured_view,
+        )
+    else:
+        value, raw, checksum = read_json(
+            path, expected_sha256, label, maximum,
+        )
+    require(checksum == digest(expected_sha256, f"{label} raw SHA-256") and
+            raw == canonical_bytes(value),
+            f"{label} differs from its pinned canonical raw bytes")
+    return value, raw, checksum
+
+
+def _read_soak_origin_stable(
+    path: Path, label: str, maximum: int,
+    readback: types.ModuleType, captured_view: Any,
+    captured_origins: frozenset[str], *, required_capture: bool = False,
+) -> tuple[bytes, str, os.stat_result | None]:
+    origin = str(path)
+    captured = captured_view is not None and origin in captured_origins
+    require(not required_capture or captured,
+            f"{label} is absent from the authenticated archived output closure")
+    if captured:
+        raw, checksum = readback.read_stable_bytes(
+            path, label, maximum, artifact_view=captured_view,
+        )
+        return raw, checksum, None
+    return read_stable(path, label, maximum)
+
+
+def _hash_soak_captured_object(
+    captured_view: Any, path: Path, label: str, maximum: int,
+) -> tuple[int, str]:
+    require(captured_view.has_file(path),
+            f"{label} is absent from the exact captured Soak objects")
+    total = 0
+    hasher = hashlib.sha256()
+    with captured_view.open_snapshot(path, label, maximum) as (
+            stream, expected_sha, byte_count):
+        require(type(byte_count) is int and 0 <= byte_count <= maximum,
+                f"{label} exceeds its finite captured byte bound")
+        while total < byte_count:
+            block = stream.read(min(1024 * 1024, byte_count - total))
+            require(bool(block), f"{label} captured object was truncated")
+            total += len(block)
+            hasher.update(block)
+        actual = hasher.hexdigest()
+        require(stream.read(1) == b"" and total == byte_count and
+                actual == expected_sha,
+                f"{label} captured object differs from its exact raw pin")
+    return total, actual
+
+
+def _load_source5_archive_module(prepared: dict[str, Any]) -> types.ModuleType:
+    """Load the exact SourceV5 archive validator used by the signed H-view."""
+    relative = "scripts/application-source5-evidence-archive.py"
+    source = prepared["source"]
+    files = source.get("source", {}).get("files")
+    require(type(files) is list,
+            "Source5 source lacks its typed archive-validator inventory")
+    matches = [row for row in files if type(row) is dict and
+               row.get("path") == relative]
+    require(len(matches) == 1,
+            "Source5 source inventory omits the accepted evidence archive")
+    record = exact(matches[0], {
+        "path", "kind", "mode", "sha256", "size",
+    }, "Source5 evidence archive inventory entry")
+    require(record["kind"] == "file" and
+            record["mode"] in {"100644", "100755"} and
+            type(record["size"]) is int and
+            0 <= record["size"] <= MAX_SCRIPT_BYTES,
+            "Source5 evidence archive inventory entry is malformed")
+    path = Path(prepared["source_root"]) / relative
+    raw, actual, info = read_stable(
+        path, "Source5 captured evidence archive validator", MAX_SCRIPT_BYTES,
+    )
+    mode = f"{stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode):06o}"
+    require(actual == record["sha256"] and len(raw) == record["size"] and
+            mode == record["mode"],
+            "Source5 evidence archive validator differs from its typed inventory")
+    module = types.ModuleType(f"source5_soak_archive_{actual}")
+    module.__file__ = str(path)
+    module.__package__ = ""
+    try:
+        exec(compile(raw, str(path), "exec", dont_inherit=True),
+             module.__dict__)
+    except (SyntaxError, TypeError, ValueError) as error:
+        raise Source5SoakError(
+            f"Source5 captured evidence archive cannot be compiled: {error}",
+        ) from error
+    require(callable(getattr(module, "_validate_checkpoint_request", None)) and
+            callable(getattr(module, "_validate_checkpoint", None)) and
+            callable(getattr(module, "_validate_manifest", None)),
+            "Source5 evidence archive lacks its exact request/checkpoint/manifest validators")
+    return module
+
+
+def _validate_soak_archived_job_view(
+    value: object, prepared: dict[str, Any], job: dict[str, Any],
+    authorization_context: dict[str, Any], component: dict[str, Any],
+    host_receipt_pin: dict[str, str], readback: types.ModuleType,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]],
+           types.ModuleType, Any]:
+    """Close Root's authenticated archive H-view to one original Soak job."""
+    view = exact(value, {
+        "schema", "campaign_id", "host_id", "phase", "job_index", "ordinal",
+        "run_id", "job_sha256", "checkpoint_pin", "checkpoint_raw",
+        "manifest_pin", "manifest_raw", "archive_ack_pin", "signature_pin",
+        "archive_request_pin", "archive_request_raw", "fixed_host_receipt_pin",
+        "owner_host_receipt_pin", "readback_request_pin",
+        "readback_response_pin", "readback_bundle_pin", "stage_root",
+        "objects", "qualification_eligible", "may_reclaim",
+    }, "authenticated Source5 archive read view")
+    job_sha = sha256(canonical_bytes(job))
+    job_index = view["job_index"]
+    require(type(job_index) is int and 0 <= job_index <= (1 << 64) - 1,
+            "captured Soak original job index is outside its finite unsigned bound")
+    require(view["schema"] ==
+                "allocatbelt.application-source5-archived-job-read-view.v1" and
+            view["campaign_id"] == prepared["campaign_id"] ==
+                component["campaign_id"] and
+            view["host_id"] == prepared["host_id"] == component["host_id"] and
+            view["phase"] == "soak" == job.get("phase") and
+            view["ordinal"] == job.get("ordinal") and
+            view["run_id"] == job["run_id"] == component["run_id"] and
+            view["job_sha256"] == job_sha and
+            view["qualification_eligible"] is False and
+            view["may_reclaim"] is False and
+            authorization_context.get("job") == job and
+            authorization_context.get("job_index") == job_index,
+            "authenticated Soak archive view names a different original job/authorization")
+    require(view["fixed_host_receipt_pin"] is None and
+            view["owner_host_receipt_pin"] == host_receipt_pin,
+            "Soak archive view changed its separate owner host-receipt pin")
+    raw_request_pin = exact(view["archive_request_pin"], {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "captured Soak archive request pin")
+    request_raw = view["archive_request_raw"]
+    require(type(request_raw) is bytes and
+            len(request_raw) <= 128 * 1024 * 1024 and
+            sha256(request_raw) == digest(raw_request_pin["raw_sha256"],
+                                          "captured Soak archive request raw SHA-256"),
+            "captured Soak archive request bytes differ from their bounded raw pin")
+    request = readback._read_json_raw(request_raw,
+                                      "captured Soak archive request")
+    archive = _load_source5_archive_module(prepared)
+    try:
+        request = archive._validate_checkpoint_request(request)
+    except Exception as error:
+        raise Source5SoakError(
+            f"SourceV5 archive rejected the captured Soak request/tree closure: {error}",
+        ) from error
+    require(request["request_sha256"] ==
+                raw_request_pin["semantic_sha256"],
+            "captured Soak archive request semantic pin differs")
+
+    raw_checkpoint_pin = exact(view["checkpoint_pin"], {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "captured Soak checkpoint pin")
+    checkpoint_raw = view["checkpoint_raw"]
+    require(type(checkpoint_raw) is bytes and
+            len(checkpoint_raw) <= 128 * 1024 * 1024 and
+            sha256(checkpoint_raw) == digest(raw_checkpoint_pin["raw_sha256"],
+                                             "captured Soak checkpoint raw SHA-256"),
+            "captured Soak checkpoint bytes differ from their raw pin")
+    checkpoint = readback._read_json_raw(checkpoint_raw,
+                                         "captured Soak checkpoint")
+    raw_manifest_pin = exact(view["manifest_pin"], {
+        "path", "raw_sha256", "semantic_sha256",
+    }, "captured Soak object-manifest pin")
+    manifest_raw = view["manifest_raw"]
+    require(type(manifest_raw) is bytes and
+            len(manifest_raw) <= 128 * 1024 * 1024 and
+            sha256(manifest_raw) == digest(raw_manifest_pin["raw_sha256"],
+                                           "captured Soak manifest raw SHA-256"),
+            "captured Soak object-manifest bytes differ from their raw pin")
+    manifest = readback._read_json_raw(manifest_raw,
+                                       "captured Soak object manifest")
+    identity = {
+        "job": job, "job_index": job_index,
+        "job_ordinal": job["ordinal"], "job_sha256": job_sha,
+        "run_id": job["run_id"],
+    }
+    try:
+        checkpoint = archive._validate_checkpoint(checkpoint)
+        manifest = archive._validate_manifest(manifest, checkpoint, identity)
+    except Exception as error:
+        raise Source5SoakError(
+            f"SourceV5 archive rejected the captured Soak checkpoint/manifest: {error}",
+        ) from error
+    require(checkpoint["checkpoint_sha256"] ==
+                raw_checkpoint_pin["semantic_sha256"] and
+            manifest["manifest_sha256"] ==
+                raw_manifest_pin["semantic_sha256"] and
+            checkpoint["request_pin"] == raw_request_pin and
+            checkpoint["object_manifest_pin"] == raw_manifest_pin and
+            checkpoint.get("tree_inventories") ==
+                request.get("tree_inventories") and
+            all(checkpoint.get(key) == item for key, item in request.items()
+                if key not in {"schema", "request_sha256"}),
+            "captured Soak archive documents are not one exact request/checkpoint/manifest closure")
+
+    context = checkpoint["context"]
+    original = prepared["source5_execution_manifest"]["original_inputs"]
+    source_ref = exact(
+        prepared["source_manifest_raw_refs"][prepared["host_id"]], {
+            "host_id", "path", "raw_sha256", "semantic_sha256",
+            "source_tree_sha256",
+        }, "captured Soak selected source pin",
+    )
+    expected_source = {key: source_ref[key] for key in (
+        "path", "raw_sha256", "semantic_sha256",
+    )}
+    expected_plan = {
+        "path": str(prepared["prepared"]["plan_path"]),
+        "raw_sha256": prepared["prepared"]["plan_raw_sha256"],
+        "semantic_sha256": prepared["prepared"]["plan_semantic_sha256"],
+    }
+    manifest_pin = raw_pin(prepared["source5_execution_manifest_pin"],
+                           "captured Soak execution-manifest pin")
+    expected_execution = {
+        **manifest_pin,
+        "semantic_sha256": prepared["source5_execution_manifest"][
+            "manifest_sha256"],
+    }
+    require(context["campaign_id"] == prepared["campaign_id"] and
+            context["host_id"] == prepared["host_id"] and
+            context["phase"] == "soak" and
+            context["job_index"] == job_index and
+            context["source_manifest_pin"] == expected_source and
+            context["plan_pin"] == expected_plan and
+            context["execution_manifest_pin"] == expected_execution and
+            (component.get("schema") != COMPONENT_SCHEMA_V2 or
+             context["resource_budget_pin"] == component["resource_budget"]),
+            "captured Soak archive context differs from the original prepared generation")
+    owner_pin = view["owner_host_receipt_pin"]
+    require(type(owner_pin) is dict and set(owner_pin) == {
+                "path", "raw_sha256", "receipt_sha256",
+            } and
+            owner_pin["path"] == host_receipt_pin["path"] and
+            owner_pin["raw_sha256"] == host_receipt_pin["raw_sha256"] and
+            owner_pin["receipt_sha256"] == host_receipt_pin["receipt_sha256"],
+            "Soak H-view owner receipt pin differs from the requested strict host receipt")
+    owner_roles = [role for role, pin in checkpoint["owner_receipt_pins"].items()
+                   if pin == {
+                       "path": owner_pin["path"],
+                       "raw_sha256": owner_pin["raw_sha256"],
+                       "semantic_sha256": owner_pin["receipt_sha256"],
+                   }]
+    require(owner_roles == ["soak_host_receipt"],
+            "Soak archive request does not pin its exact strict owner host receipt role")
+
+    refs = view["objects"]
+    require(type(refs) is dict and
+            set(refs) == {item["origin_path"] for item in manifest["objects"]},
+            "captured Soak refs do not close the exact signed object manifest")
+    stage_root = view["stage_root"]
+    captured_view = readback.CapturedSoakArtifactView(stage_root, refs)
+    for obj in manifest["objects"]:
+        ref = exact(refs[obj["origin_path"]], {
+            "origin_path", "path", "role", "host_id", "raw_sha256",
+            "semantic_sha256", "byte_count", "maximum_bytes",
+        }, "captured Soak object reference")
+        require(all(ref[key] == obj[key] for key in (
+                    "origin_path", "role", "raw_sha256", "semantic_sha256",
+                    "byte_count",
+                )) and ref["host_id"] == prepared["host_id"] and
+                ref["maximum_bytes"] == ref["byte_count"],
+                "captured Soak local object ref differs from its signed manifest row")
+    owner_object = refs.get(owner_pin["path"])
+    require(type(owner_object) is dict and
+            owner_object["role"] == "soak_host_receipt" and
+            owner_object["raw_sha256"] == owner_pin["raw_sha256"] and
+            owner_object["semantic_sha256"] == owner_pin["receipt_sha256"],
+            "captured Soak manifest omits the exact owner host receipt")
+    return view, request, (request.get("tree_inventories") or []), archive, captured_view
+
+
 def make_material_index(
     campaign_id: str, host_id: str, job: dict[str, Any],
     parent_recipe_pin: object, build_receipt_pin: object,
@@ -1102,7 +1398,9 @@ def _load_source5_recipe_builder(prepared: dict[str, Any]) -> types.ModuleType:
 
 def _verify_build_receipt(
     material_index: dict[str, Any], prepared: dict[str, Any], job: dict[str, Any],
-    binding: dict[str, Any], readback: types.ModuleType,
+    binding: dict[str, Any], readback: types.ModuleType, *,
+    artifact_view: Any = None,
+    captured_origins: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
     material_index = validate_material_index(
         material_index, prepared["campaign_id"], prepared["host_id"], job,
@@ -1110,14 +1408,21 @@ def _verify_build_receipt(
     )
     recipe_pin = raw_pin(material_index["parent_recipe"], "Source5 parent Soak recipe")
     receipt_pin = raw_pin(material_index["build_receipt"], "Source5 recipe-build receipt")
-    recipe, _recipe_raw, recipe_sha = read_json(
+    recipe, _recipe_raw, recipe_sha = _read_soak_origin_json(
         Path(recipe_pin["path"]), recipe_pin["raw_sha256"],
-        "Source5 parent Soak recipe", MAX_RECIPE_BYTES,
+        "Source5 parent Soak recipe",
+        MAX_RECIPE_BYTES,
+        readback, artifact_view, captured_origins,
     )
-    receipt, _receipt_raw, receipt_sha = read_json(
+    receipt, _receipt_raw, receipt_sha = _read_soak_origin_json(
         Path(receipt_pin["path"]), receipt_pin["raw_sha256"],
-        "Source5 Soak recipe-build receipt", MAX_RECEIPT_BYTES,
+        "Source5 Soak recipe-build receipt",
+        MAX_RECEIPT_BYTES,
+        readback, artifact_view, captured_origins,
     )
+    require(recipe_sha == recipe_pin["raw_sha256"] and
+            receipt_sha == receipt_pin["raw_sha256"],
+            "Source5 parent/build recipe bytes differ from their raw pins")
     completion = prepared.get("source5_prepared_input_completion")
     if type(completion) is dict and completion.get("schema") == \
             "allocatbelt.application-source5-preparation-completion.v2":
@@ -1287,6 +1592,9 @@ def _validate_pressure_binding_recipe_roles(
     parent_recipe_raw_sha256: object,
     pressure_recipe_pin: object,
     pressure_recipe_info: object,
+    *, readback: types.ModuleType | None = None,
+    artifact_view: Any = None,
+    captured_origins: frozenset[str] = frozenset(),
 ) -> dict[str, str]:
     """Keep parent raw, pressure raw, and pressure semantic recipe hashes distinct."""
     parent_pin = raw_pin(parent_recipe_pin, "Source5 parent Soak recipe")
@@ -1306,14 +1614,28 @@ def _validate_pressure_binding_recipe_roles(
         pressure_pin["semantic_sha256"],
         "Source5 pressure recipe semantic SHA-256",
     )
-    parent_raw, parent_actual_sha, _parent_info = read_stable(
-        Path(parent_pin["path"]), "Source5 parent Soak recipe",
-        MAX_RECIPE_BYTES,
-    )
-    pressure_raw, pressure_actual_sha, _pressure_info = read_stable(
-        Path(pressure_pin["path"]), "Source5 pressure recipe",
-        MAX_RECIPE_BYTES,
-    )
+    if readback is not None:
+        parent_raw, parent_actual_sha, _parent_info = \
+            _read_soak_origin_stable(
+                Path(parent_pin["path"]), "Source5 parent Soak recipe",
+                MAX_RECIPE_BYTES, readback, artifact_view,
+                captured_origins,
+            )
+        pressure_raw, pressure_actual_sha, _pressure_info = \
+            _read_soak_origin_stable(
+                Path(pressure_pin["path"]), "Source5 pressure recipe",
+                MAX_RECIPE_BYTES, readback, artifact_view,
+                captured_origins,
+            )
+    else:
+        parent_raw, parent_actual_sha, _parent_info = read_stable(
+            Path(parent_pin["path"]), "Source5 parent Soak recipe",
+            MAX_RECIPE_BYTES,
+        )
+        pressure_raw, pressure_actual_sha, _pressure_info = read_stable(
+            Path(pressure_pin["path"]), "Source5 pressure recipe",
+            MAX_RECIPE_BYTES,
+        )
     require(parent_raw and
             parent_actual_sha == parent_pin["raw_sha256"] == parent_identity_sha and
             pressure_raw and pressure_actual_sha == pressure_raw_pin,
@@ -2882,6 +3204,11 @@ def _source5_probe_v2_audit_context(
     prepared: dict[str, Any], recipe: dict[str, Any],
     capture_pin_value: object,
     *, evidence_path_map: object | None = None,
+    artifact_view: Any = None,
+    captured_origin_paths: object | None = None,
+    evidence_file_paths: object | None = None,
+    evidence_directory_paths: object | None = None,
+    tree_inventories: object | None = None,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """Reconstruct the bounded ProbeV2 audit context from its pinned receipt."""
     capture_pin = exact(capture_pin_value, {
@@ -2890,6 +3217,8 @@ def _source5_probe_v2_audit_context(
     capture, _capture_raw, capture_sha = read_json(
         Path(capture_pin["path"]), capture_pin["raw_sha256"],
         "Source5 ProbeV2 captured receipt", MAX_RECEIPT_BYTES,
+        artifact_view=(artifact_view if artifact_view is not None and
+                       artifact_view.has_file(capture_pin["path"]) else None),
     )
     require(capture_sha == capture_pin["raw_sha256"] and
             capture.get("schema") ==
@@ -2902,6 +3231,8 @@ def _source5_probe_v2_audit_context(
     probe, probe_raw, probe_sha = read_json(
         Path(probe_pin["path"]), probe_pin["raw_sha256"],
         "Source5 selected ProbeV2 source", 512 * 1024,
+        artifact_view=(artifact_view if artifact_view is not None and
+                       artifact_view.has_file(probe_pin["path"]) else None),
     )
     capacity_bundle = _source5_soak_capacity_bundle(prepared, recipe)
     composition, _composition_pin = _load_feedback_composition_module(prepared)
@@ -2942,20 +3273,44 @@ def _source5_probe_v2_audit_context(
         "normal_binary_sha256": probe_pin["binary_sha256"],
         "request": request,
     }
-    if evidence_path_map is not None:
+    if artifact_view is not None or evidence_path_map is not None:
         require(callable(getattr(composition,
                                  "compose_calibrated_policy_v5_offline", None)),
                 "captured SourceV5 Composer lacks offline ProbeV2 policy replay")
+        if artifact_view is not None:
+            require(type(captured_origin_paths) is list and
+                    type(evidence_file_paths) is list and
+                    type(evidence_directory_paths) is list and
+                    type(tree_inventories) is list,
+                    "captured Source5 ProbeV2 replay lacks its authenticated path/tree closure")
+            source_symlinks = sorted(
+                str(Path(prepared["source_root"]).joinpath(*PurePosixPath(row["path"]).parts))
+                for row in prepared["source"].get("source", {}).get("files", [])
+                if type(row) is dict and row.get("kind") == "symlink"
+            )
+            replay_context = {
+                "schema": composition.FEEDBACK_CAPTURED_OFFLINE_CONTEXT_SCHEMA,
+                "artifact_view": artifact_view,
+                "captured_origin_paths": captured_origin_paths,
+                "evidence_file_paths": evidence_file_paths,
+                "evidence_directory_paths": evidence_directory_paths,
+                "source_symlink_paths": source_symlinks,
+                "tree_inventories": tree_inventories,
+                "probe_capture_pin": capture_pin,
+                "capacity_bundle": capacity_bundle,
+            }
+        else:
+            replay_context = {
+                "schema": "allocatbelt.application-feedback-offline-replay-context.v1",
+                "evidence_path_map": evidence_path_map,
+                "probe_capture_pin": capture_pin,
+                "capacity_bundle": capacity_bundle,
+            }
         try:
             policy_document, composition_receipt = \
                 composition.compose_calibrated_policy_v5_offline(
                     request, sha256(canonical_bytes(request)),
-                    replay_context={
-                        "schema": "allocatbelt.application-feedback-offline-replay-context.v1",
-                        "evidence_path_map": evidence_path_map,
-                        "probe_capture_pin": capture_pin,
-                        "capacity_bundle": capacity_bundle,
-                    },
+                    replay_context=replay_context,
                 )
         except Exception as error:
             raise Source5SoakError(
@@ -4002,6 +4357,8 @@ def _verify_source5_soak_component_replay(
     job: dict[str, Any], authorization_context: dict[str, Any],
     readback: types.ModuleType, *,
     offline_context: dict[str, Any] | None = None,
+    artifact_view: Any = None,
+    captured_origins: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Replay the raw false legacy audit, Soak-only authorization and full V2 gate."""
     require(type(component) is dict,
@@ -4035,10 +4392,13 @@ def _verify_source5_soak_component_replay(
         }
     pins = exact(component["pins"], pin_fields, "Source5 Soak component pins")
     materials_pin = raw_pin(pins["materials_index"], "Source5 Soak materials index")
-    material_index, _index_raw, _index_sha = read_json(
+    material_index, _index_raw, _index_sha = _read_soak_origin_json(
         Path(materials_pin["path"]), materials_pin["raw_sha256"],
-        "Source5 Soak materials index", MAX_ARTIFACT_BYTES,
+        "Source5 Soak materials index",
+        MAX_ARTIFACT_BYTES, readback, artifact_view, captured_origins,
     )
+    require(_index_sha == materials_pin["raw_sha256"],
+            "Source5 Soak materials index differs from its raw pin")
     binding = _selected_prepared_host_binding(
         prepared["source5_prepared_input_completion"], prepared["host_id"],
     )
@@ -4064,20 +4424,27 @@ def _verify_source5_soak_component_replay(
         launch_pin_preview = raw_pin(
             pins["launch"], "Source5 bounded launch receipt prefix source",
         )
-        launch_preview, _launch_preview_raw, _launch_preview_sha = read_json(
-            Path(launch_pin_preview["path"]), launch_pin_preview["raw_sha256"],
+        launch_preview, _launch_preview_raw, _launch_preview_sha = \
+            _read_soak_origin_json(
+            Path(launch_pin_preview["path"]),
+            launch_pin_preview["raw_sha256"],
             "Source5 bounded launch receipt prefix source",
             budget_document["artifact_limits"]["launch_receipt_bytes"],
+            readback, artifact_view, captured_origins,
+            required_capture=artifact_view is not None,
         )
         require(launch_preview.get("schema") == LAUNCH_SCHEMA_V3,
                 "Source5 bounded component launch receipt lacks the v3 live-prefix binding")
         monitor_replay = _verify_source5_resource_monitor_stream(
             budget_document, budget_pin, component["resource_monitor"],
             launch_preview.get("resource_monitor_prefix"),
+            artifact_view=artifact_view,
         )
         recipe_for_probe, _receipt_for_probe, _identities_for_probe = \
             _verify_build_receipt(
                 material_index, prepared, job, binding, readback,
+                artifact_view=artifact_view,
+                captured_origins=captured_origins,
             )
         if recipe_for_probe["feedback_expectation"]["policy"].get(
                 "capacity_floor_policy_id") is not None:
@@ -4085,6 +4452,28 @@ def _verify_source5_soak_component_replay(
                 probe_capture_context, _probe_pin = _source5_probe_v2_audit_context(
                     prepared, recipe_for_probe, component["probe_capture"],
                 )
+            elif offline_context.get("schema") == \
+                    SOURCE5_SOAK_CAPTURED_CONTEXT_SCHEMA:
+                probe_capture_pin = exact(component["probe_capture"], {
+                    "path", "raw_sha256", "receipt_sha256",
+                }, "Source5 captured ProbeV2 receipt pin")
+                owner_receipt_path = offline_context[
+                    "host_verification_pin"]["path"]
+                composer_capture_paths = sorted(
+                    path for path in artifact_view.objects
+                    if path != owner_receipt_path
+                )
+                probe_capture_context, _probe_pin = \
+                    _source5_probe_v2_audit_context(
+                        prepared, recipe_for_probe, probe_capture_pin,
+                        artifact_view=artifact_view,
+                        captured_origin_paths=composer_capture_paths,
+                        evidence_file_paths=offline_context[
+                            "evidence_file_paths"],
+                        evidence_directory_paths=offline_context[
+                            "evidence_directory_paths"],
+                        tree_inventories=offline_context["tree_inventories"],
+                    )
             else:
                 probe_capture_context = exact(
                     offline_context.get("construction_probe_capture"), {
@@ -4095,10 +4484,12 @@ def _verify_source5_soak_component_replay(
                 )
         else:
             probe_pin = component["probe_capture"]
-            probe_capture, _probe_raw, _probe_sha = read_json(
+            probe_capture, _probe_raw, _probe_sha = _read_soak_origin_json(
                 Path(probe_pin["path"]), probe_pin["raw_sha256"],
                 "Source5 bounded original ProbeV1 receipt",
                 budget_document["artifact_limits"]["probe_capture_receipt_bytes"],
+                readback, artifact_view, captured_origins,
+                required_capture=artifact_view is not None,
             )
             probe_capture_context = {
                 "capture": probe_capture, "capture_pin": probe_pin,
@@ -4111,13 +4502,22 @@ def _verify_source5_soak_component_replay(
         )
     _, recipe, identities = _verify_build_receipt(
         material_index, prepared, job, binding, readback,
+        artifact_view=artifact_view,
+        captured_origins=captured_origins,
     )
     require(identities["prepared_host_binding_sha256"] ==
             component["prepared_host_binding_sha256"] and
             pins["parent_recipe"] == material_index["parent_recipe"] and
             pins["build_receipt"] == material_index["build_receipt"],
             "Source5 Soak recipe/preparation pins differ from the full completion replay")
-    output_dir = Path(pins["supervisor"]["path"]).parent.resolve(strict=True)
+    output_dir = Path(pins["supervisor"]["path"]).parent
+    if artifact_view is None:
+        output_dir = output_dir.resolve(strict=True)
+    else:
+        require(output_dir.is_absolute() and
+                str(output_dir) == os.path.normpath(str(output_dir)) and
+                ".." not in output_dir.parts,
+                "captured Soak output root is not a normalized original path")
     args = _readback_args(recipe, pins["parent_recipe"], output_dir)
     if offline_context is None:
         base_audit, base_preflight = (
@@ -4165,9 +4565,11 @@ def _verify_source5_soak_component_replay(
     overlay_pin = raw_pin(pins["launch_authorization"],
                           "Source5 Soak launch authorization")
     overlay_path = Path(overlay_pin["path"])
-    stored_overlay, overlay_raw, overlay_sha = read_json(
+    stored_overlay, overlay_raw, overlay_sha = _read_soak_origin_json(
         overlay_path, overlay_pin["raw_sha256"],
-        "Source5 Soak launch authorization", MAX_RECEIPT_BYTES,
+        "Source5 Soak launch authorization",
+        MAX_RECEIPT_BYTES, readback, artifact_view, captured_origins,
+        required_capture=artifact_view is not None,
     )
     require(overlay_path == output_dir / "source5-soak-launch-authorization.json" and
             overlay_sha == overlay_pin["raw_sha256"] and
@@ -4179,8 +4581,10 @@ def _verify_source5_soak_component_replay(
             overlay["base_audit_sha256"] == _base_readback_audit_sha256(base_audit),
             "Source5 Soak baseline audit/preflight pin differs from its launch overlay")
     launch_receipt, launch_sha = readback._verify_launch_receipt(
-        readback._check_private_output_directory(output_dir),
+        (readback._check_private_output_directory(output_dir)
+         if artifact_view is None else output_dir),
         overlay_audit, overlay_preflight, require_success=True,
+        artifact_view=artifact_view,
     )
     if bounded:
         require(launch_receipt["resource_budget"] == budget_pin and
@@ -4196,14 +4600,17 @@ def _verify_source5_soak_component_replay(
                 "Source5 bounded launch receipt differs from the component monitor prefix")
     readback._verify_verify_inputs_postflight(
         overlay_audit, overlay_preflight, output_dir, launch_sha,
+        artifact_view=artifact_view,
     )
     require(pins["launch"] == {
         "path": str(output_dir / "soak-launch.json"), "raw_sha256": launch_sha,
     }, "Source5 Soak launch receipt differs from its raw pin")
     postflight_pin = raw_pin(pins["postflight"], "Source5 Soak-only postflight")
-    postflight, postflight_raw, _postflight_sha = read_json(
+    postflight, postflight_raw, _postflight_sha = _read_soak_origin_json(
         Path(postflight_pin["path"]), postflight_pin["raw_sha256"],
-        "Source5 Soak-only postflight", MAX_RECEIPT_BYTES,
+        "Source5 Soak-only postflight",
+        MAX_RECEIPT_BYTES, readback, artifact_view, captured_origins,
+        required_capture=artifact_view is not None,
     )
     postflight_fields = {
         "schema", "campaign_id", "host_id", "run_id",
@@ -4244,13 +4651,15 @@ def _verify_source5_soak_component_replay(
         )
     else:
         fresh = readback._validate_artifacts_offline(
-            readback._check_private_output_directory(output_dir), overlay_audit,
-            offline_context,
+            (readback._check_private_output_directory(output_dir)
+             if artifact_view is None else output_dir),
+            overlay_audit, offline_context,
         )
     readback_pin = raw_pin(pins["readback"], "Source5 V2 readback result")
     readback_value, _readback_raw, readback_sha = read_json(
         Path(readback_pin["path"]), readback_pin["raw_sha256"],
         "Source5 V2 readback result", MAX_RECEIPT_BYTES,
+        artifact_view=(artifact_view if artifact_view is not None else None),
     )
     require(readback_pin == {
                 "path": str(output_dir / "soak-readback.json"),
@@ -4265,6 +4674,7 @@ def _verify_source5_soak_component_replay(
     supervisor, _supervisor_raw, supervisor_sha = read_json(
         Path(pins["supervisor"]["path"]), pins["supervisor"]["raw_sha256"],
         "Source5 Soak supervisor receipt", MAX_RECEIPT_BYTES,
+        artifact_view=(artifact_view if artifact_view is not None else None),
     )
     cleanup = exact(component["application_cleanup"], {
         "schema", "status", "pid", "return_code", "received_signal", "cleanup_error",
@@ -4301,11 +4711,13 @@ def _verify_source5_soak_component_replay(
             Path(app_owner_pin["path"]), app_owner_pin["raw_sha256"],
             "Source5 bounded original APP owner result",
             budget_document["artifact_limits"]["owner_return_receipt_bytes"],
+            artifact_view=artifact_view,
         )
         pressure_owner, _pressure_owner_raw, _pressure_owner_sha = read_json(
             Path(pressure_owner_pin["path"]), pressure_owner_pin["raw_sha256"],
             "Source5 bounded original pressure owner result",
             budget_document["artifact_limits"]["owner_return_receipt_bytes"],
+            artifact_view=artifact_view,
         )
         expected_pressure_owner = exact(pressure_owner, {
             "schema", "pid", "start_ticks", "return_code",
@@ -4361,6 +4773,8 @@ def _verify_source5_soak_component_replay(
         material_index["parent_recipe"], identities["recipe_sha256"],
         recipe["pressure"]["recipe"],
         overlay_audit["source"].get("pressure_recipe"),
+        readback=readback, artifact_view=artifact_view,
+        captured_origins=captured_origins,
     )
     require(type(binding_receipt["nonce"]) is str and
             re.fullmatch(r"[0-9a-f]{32}", binding_receipt["nonce"]) is not None and
@@ -5199,6 +5613,7 @@ def _verify_source5_resource_monitor_stream(
     budget: dict[str, Any], budget_pin: dict[str, str],
     summary_value: object,
     launch_prefix_value: object | None = None,
+    *, artifact_view: Any = None,
 ) -> dict[str, Any]:
     summary = exact(summary_value, {
         "schema", "budget", "stream", "row_count", "high_water",
@@ -5219,20 +5634,43 @@ def _verify_source5_resource_monitor_stream(
     digest(stream_pin["raw_sha256"],
            "Source5 Soak resource-monitor stream raw SHA-256")
     maximum = budget["ceilings"]["maximum_monitor_stream_bytes"]
-    try:
-        require(path.resolve(strict=True) == path,
-                "Source5 resource-monitor path traverses an alias")
-        before_path = path.lstat()
-        require(stat.S_ISREG(before_path.st_mode) and before_path.st_uid == os.getuid() and
-                stat.S_IMODE(before_path.st_mode) == 0o600 and
-                before_path.st_nlink == 1 and 0 <= before_path.st_size <= maximum,
-                "Source5 resource-monitor stream is not a bounded private regular file")
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
-                     getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
-    except OSError as error:
-        raise Source5SoakError(
-            f"Source5 resource-monitor stream is unavailable: {error}",
-        ) from error
+    fd: int | None = None
+    stream = None
+    capture_manager = None
+    capture_entered = False
+    before_path = None
+    if artifact_view is None:
+        try:
+            require(path.resolve(strict=True) == path,
+                    "Source5 resource-monitor path traverses an alias")
+            before_path = path.lstat()
+            require(stat.S_ISREG(before_path.st_mode) and before_path.st_uid == os.getuid() and
+                    stat.S_IMODE(before_path.st_mode) == 0o600 and
+                    before_path.st_nlink == 1 and 0 <= before_path.st_size <= maximum,
+                    "Source5 resource-monitor stream is not a bounded private regular file")
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+                         getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        except OSError as error:
+            raise Source5SoakError(
+                f"Source5 resource-monitor stream is unavailable: {error}",
+            ) from error
+        total_size = before_path.st_size
+    else:
+        require(artifact_view.has_file(path),
+                "Source5 resource-monitor stream is absent from captured refs")
+        try:
+            capture_manager = artifact_view.open_snapshot(
+                path, "Source5 resource-monitor stream", maximum,
+            )
+            stream, captured_sha, total_size = capture_manager.__enter__()
+            capture_entered = True
+        except BaseException as error:
+            raise Source5SoakError(
+                f"Source5 captured resource-monitor stream is unavailable: {error}",
+            ) from error
+        require(type(total_size) is int and 0 <= total_size <= maximum and
+                captured_sha == stream_pin["raw_sha256"],
+                "captured Source5 resource-monitor size/raw pin differs")
     digest_state = hashlib.sha256()
     line = bytearray()
     header: dict[str, Any] | None = None
@@ -5395,18 +5833,26 @@ def _verify_source5_resource_monitor_stream(
             prefix_checked = True
 
     try:
-        before = os.fstat(fd)
         signature = lambda item: (
             item.st_dev, item.st_ino, item.st_mode, item.st_size,
             item.st_mtime_ns, item.st_ctime_ns,
         )
-        require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and
-                signature(before) == signature(before_path) and
-                0 <= before.st_size <= maximum,
-                "Source5 resource-monitor stream changed while opening")
+        if artifact_view is None:
+            before = os.fstat(fd)
+            require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and
+                    signature(before) == signature(before_path) and
+                    0 <= before.st_size <= maximum and
+                    before.st_size == total_size,
+                    "Source5 resource-monitor stream changed while opening")
+
+        def read_block(count: int) -> bytes:
+            if artifact_view is None:
+                return os.read(fd, count)
+            return stream.read(count)
+
         consumed = 0
-        while consumed < before.st_size:
-            block = os.read(fd, min(64 * 1024, before.st_size - consumed))
+        while consumed < total_size:
+            block = read_block(min(64 * 1024, total_size - consumed))
             require(bool(block), "Source5 resource-monitor stream was truncated")
             consumed += len(block)
             digest_state.update(block)
@@ -5418,14 +5864,21 @@ def _verify_source5_resource_monitor_stream(
                 else:
                     require(len(line) <= row_limit,
                             "Source5 resource-monitor line exceeds its prospective bound")
-        after = os.fstat(fd)
-        after_path = path.lstat()
-        require(not line and signature(before) == signature(after) ==
-                signature(after_path) and
+        if artifact_view is None:
+            after = os.fstat(fd)
+            after_path = path.lstat()
+            stable = (signature(before) == signature(after) ==
+                      signature(after_path))
+        else:
+            stable = stream.read(1) == b"" and consumed == total_size
+        require(not line and stable and
                 digest_state.hexdigest() == stream_pin["raw_sha256"],
                 "Source5 resource-monitor stream changed during its replay")
     finally:
-        os.close(fd)
+        if capture_entered:
+            capture_manager.__exit__(None, None, None)
+        if fd is not None:
+            os.close(fd)
     require(header is not None and footer is not None and
             rows == summary["row_count"] and
             previous_phase == "postflight" and
@@ -6067,7 +6520,16 @@ def _current_tree_entries_without_hash(
 
 
 def _verify_evidence_inventory(
-    receipt: dict[str, Any], mapped: dict[str, str],
+    receipt: dict[str, Any], mapped: dict[str, str] | None = None, *,
+    artifact_view: Any = None,
+    tree_inventories: list[dict[str, Any]] | None = None,
+    captured_origin_paths: list[str] | None = None,
+    evidence_file_paths: list[str] | None = None,
+    evidence_directory_paths: list[str] | None = None,
+    source_root: Path | None = None, input_root: Path | None = None,
+    output_root: Path | None = None, probe_capture_root: Path | None = None,
+    host_receipt_path: str | None = None,
+    readback: types.ModuleType | None = None,
 ) -> None:
     entries = receipt["evidence_inventory"]
     require(type(entries) is list and 0 < len(entries) <= MAX_EVIDENCE_ENTRIES,
@@ -6129,10 +6591,27 @@ def _verify_evidence_inventory(
             budget["layout"]["pressure_scratch"],
             budget["layout"]["probe_tmpdir"],
         })
+    captured_tree_roots = {
+        row.get("root_path") for row in (tree_inventories or [])
+        if type(row) is dict and type(row.get("root_path")) is str
+    }
+    retained_recursive_roots: set[str] = set()
+    if receipt.get("schema") == HOST_VERIFICATION_SCHEMA_V3:
+        retained_recursive_roots.update({
+            budget["layout"]["application_tmpdir"],
+            budget["layout"]["pressure_scratch"],
+        })
     for root_text in sorted(recursive_roots):
         root = Path(root_text)
         require(root_text in expected and expected[root_text]["kind"] == "directory",
                 f"offline Source5 Soak receipt omits recursive evidence root: {root_text}")
+        if artifact_view is not None and root_text not in retained_recursive_roots:
+            require(root_text in set(evidence_directory_paths or []) and
+                    (root_text in captured_tree_roots or
+                     root_text in {str(output_root), str(probe_capture_root)} or
+                     root_text == str(budget["layout"]["probe_tmpdir"])),
+                    f"captured Source5 Soak omits typed owner directory facts: {root_text}")
+            continue
         actual = _current_tree_entries_without_hash(root, set(expected))
         declared = [entry for entry in entries
                     if entry["path"] == str(root) or
@@ -6151,6 +6630,195 @@ def _verify_evidence_inventory(
                 })
         require(actual == sorted(declared_projection, key=lambda item: item["path"]),
                 f"offline Source5 Soak recursive tree membership/modes differ: {root}")
+    if artifact_view is not None:
+        require(readback is not None and type(tree_inventories) is list and
+                type(captured_origin_paths) is list and
+                type(evidence_file_paths) is list and
+                type(evidence_directory_paths) is list and
+                type(host_receipt_path) is str,
+                "captured Source5 Soak inventory lacks its strict typed-tree inputs")
+        evidence_files = set(evidence_file_paths)
+        evidence_directories = set(evidence_directory_paths)
+        captured = set(captured_origin_paths)
+        inventory_files = {
+            path for path, row in expected.items()
+            if row["kind"] in {"file", "symlink"}
+        }
+        inventory_directories = {
+            path for path, row in expected.items()
+            if row["kind"] == "directory"
+        }
+        require(evidence_files == inventory_files and
+                evidence_directories == inventory_directories and
+                set(receipt["evidence_bases"]) <= inventory_directories and
+                host_receipt_path in captured and
+                (captured - {host_receipt_path}) <= inventory_files and
+                all(artifact_view.has_file(path)
+                    for path in captured),
+                "captured Source5 Soak objects differ from the exact host inventory")
+
+        roots = exact(receipt["tree_roots"], {
+            "source", "input", "output", "probe_capture",
+        }, "captured Source5 Soak evidence roots")
+        require(source_root is not None and input_root is not None and
+                output_root is not None and probe_capture_root is not None and
+                roots["source"] == str(source_root.resolve(strict=True)) and
+                roots["input"] == str(input_root.resolve(strict=True)) and
+                roots["output"] == str(output_root) and
+                roots["probe_capture"] == str(probe_capture_root) and
+                str(output_root) in inventory_directories and
+                str(probe_capture_root) in inventory_directories and
+                expected[str(output_root)]["mode"] == "0700" and
+                expected[str(probe_capture_root)]["mode"] == "0700",
+                "captured Source5 Soak inventory roots differ from their original owner receipt")
+
+        for path_text, row in expected.items():
+            path = Path(path_text)
+            archived = (path == output_root or output_root in path.parents or
+                        path == probe_capture_root or probe_capture_root in path.parents)
+            if row["kind"] in {"file", "symlink"}:
+                if archived:
+                    require(path_text in captured,
+                            f"captured Soak output file is absent from the signed archive: {path_text}")
+                if path_text in captured:
+                    if row["kind"] == "symlink":
+                        raw, raw_sha = artifact_view.read(
+                            path_text, "captured Source5 Soak typed symlink",
+                            row["size"],
+                        )
+                        try:
+                            target = row["target"].encode("utf-8")
+                        except UnicodeEncodeError as error:
+                            raise Source5SoakError(
+                                f"captured typed symlink target is not UTF-8: {path_text}",
+                            ) from error
+                        require(len(raw) == row["size"] and
+                                raw_sha == row["raw_sha256"] and raw == target,
+                                f"captured typed symlink literal differs: {path_text}")
+                    else:
+                        size, raw_sha = _hash_soak_captured_object(
+                            artifact_view, path,
+                            "captured Source5 Soak evidence object",
+                            row["size"],
+                        )
+                        require(size == row["size"] and
+                                raw_sha == row["raw_sha256"],
+                                f"captured Source5 Soak object differs from its owner inventory: {path_text}")
+                else:
+                    if row["kind"] == "symlink":
+                        info = path.lstat()
+                        parent_info = path.parent.lstat()
+                        target = os.readlink(path)
+                        target_raw = target.encode("utf-8")
+                        require(stat.S_ISLNK(info.st_mode) and
+                                stat.S_ISDIR(parent_info.st_mode) and
+                                not stat.S_ISLNK(parent_info.st_mode) and
+                                target == row["target"] and
+                                len(target_raw) == row["size"] and
+                                sha256(target_raw) == row["raw_sha256"],
+                                f"retained typed Source5 symlink changed: {path_text}")
+                    else:
+                        actual = _stable_file_inventory(
+                            path, "retained Source5 Soak evidence file",
+                            32 * 1024 * 1024 * 1024,
+                        )
+                        require(actual == row,
+                                f"retained Source5 Soak evidence differs from its owner inventory: {path_text}")
+            elif not archived:
+                info = path.lstat()
+                require(stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and
+                        f"{stat.S_IMODE(info.st_mode):04o}" == row["mode"],
+                        f"retained Source5 Soak evidence directory changed: {path_text}")
+
+        for directory in receipt["evidence_bases"]:
+            path = Path(directory)
+            archived = (path == output_root or output_root in path.parents or
+                        path == probe_capture_root or probe_capture_root in path.parents)
+            if not archived:
+                info = path.lstat()
+                require(stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode),
+                        f"retained Source5 Soak evidence base changed: {directory}")
+
+        probe_projection = receipt["construction_probe"]
+        if probe_projection.get("schema") == PROBE_CAPTURE_SCHEMA_V2:
+            capture_pin = exact(probe_projection["receipt_pin"], {
+                "path", "raw_sha256", "receipt_sha256",
+            }, "captured ProbeV2 owner receipt pin")
+            capture, capture_raw_sha, _capture_raw = readback.read_json(
+                Path(capture_pin["path"]),
+                "captured ProbeV2 owner receipt",
+                MAX_RECEIPT_BYTES, artifact_view=artifact_view,
+            )
+            require(capture_raw_sha == capture_pin["raw_sha256"] and
+                    capture.get("schema") == PROBE_CAPTURE_SCHEMA_V2 and
+                    capture.get("receipt_sha256") == capture_pin["receipt_sha256"],
+                    "captured ProbeV2 receipt differs from its strict host projection")
+            initial = exact(capture["tmpdir_initial"], {
+                "path", "device", "inode", "mode", "mount", "available_bytes",
+                "available_inodes", "bytes_limit", "inode_limit",
+            }, "captured ProbeV2 TMPDIR initial proof")
+            final = exact(capture["tmpdir_final"], {
+                "path", "device", "inode", "mode", "mount", "bytes_used",
+                "file_count", "directory_count", "bytes_limit", "inode_limit",
+                "available_bytes", "available_inodes",
+            }, "captured ProbeV2 TMPDIR final proof")
+            inventory_pin = exact(capture["tmpdir_inventory_pin"], {
+                "path", "raw_sha256", "inventory_sha256",
+            }, "captured ProbeV2 inventory pin")
+            root = Path(initial["path"])
+            matching = [row for row in tree_inventories
+                        if type(row) is dict and row.get("root_path") == str(root)]
+            require(len(matching) == 1 and initial["path"] == final["path"] and
+                    root.parent == probe_capture_root and
+                    initial["device"] == final["device"] and
+                    initial["inode"] == final["inode"] and
+                    initial["mode"] == final["mode"] and
+                    initial["mount"] == final["mount"],
+                    "captured ProbeV2 root identity differs from its original owner receipt")
+            tree = matching[0]
+            inventory_doc, inventory_raw_sha, _inventory_raw = readback.read_json(
+                Path(inventory_pin["path"]),
+                "captured ProbeV2 typed TMPDIR inventory",
+                MAX_RECEIPT_BYTES, artifact_view=artifact_view,
+            )
+            inventory_entries = inventory_doc.get("entries")
+            require(type(inventory_entries) is list and
+                    inventory_doc.get("schema") ==
+                        "allocatbelt.application-feedback-probe-tmpdir-inventory.v1" and
+                    inventory_raw_sha == inventory_pin["raw_sha256"] and
+                    inventory_doc.get("inventory_sha256") ==
+                        inventory_pin["inventory_sha256"] and
+                    tree.get("owner_receipt_pin") == {
+                        "path": capture_pin["path"],
+                        "raw_sha256": capture_pin["raw_sha256"],
+                        "semantic_sha256": capture_pin["receipt_sha256"],
+                    } and tree.get("inventory_pin") == {
+                        "path": inventory_pin["path"],
+                        "raw_sha256": inventory_pin["raw_sha256"],
+                        "semantic_sha256": inventory_pin["inventory_sha256"],
+                    } and tree.get("inventory_sha256") ==
+                        inventory_pin["inventory_sha256"] and
+                    tree.get("entries") == inventory_entries and
+                    tree.get("entry_count") == len(inventory_entries) and
+                    tree.get("byte_count") == sum(
+                        row["size"] for row in inventory_entries
+                        if type(row) is dict and row.get("kind") == "file"
+                    ),
+                    "captured ProbeV2 tree row differs from its owner receipt/inventory bytes")
+            expected_tree_paths = {str(root)} | {
+                entry["path"] for entry in inventory_entries
+            }
+            actual_tree_paths = {
+                path for path in expected
+                if path == str(root) or root in Path(path).parents
+            }
+            require(expected_tree_paths == actual_tree_paths and
+                    str(root) in inventory_directories,
+                    "captured ProbeV2 typed tree differs from the host receipt inventory closure")
+        else:
+            require(not tree_inventories,
+                    "captured Soak has an unexpected ProbeV2 typed tree")
+        return
     _require_evidence_paths(mapped, set(expected), "typed inventory")
     _require_evidence_paths(mapped, set(receipt["evidence_bases"]),
                             "evidence-base directory")
@@ -6273,6 +6941,7 @@ def _offline_probe_context(
     receipt: dict[str, Any], prepared: dict[str, Any],
     readback: types.ModuleType,
     *, resource_budget: dict[str, Any] | None = None,
+    artifact_view: Any = None,
 ) -> dict[str, Any]:
     probe = exact(receipt["construction_probe"], {
         "receipt_pin", "capture_sha256", "probe_raw_sha256",
@@ -6283,6 +6952,7 @@ def _offline_probe_context(
     capture, _capture_raw, capture_sha = read_json(
         Path(capture_pin["path"]), capture_pin["raw_sha256"],
         "Source5 Soak ProbeV1 capture receipt", MAX_RECEIPT_BYTES,
+        artifact_view=artifact_view,
     )
     exact(capture, {
         "schema", "source_manifest_raw_sha256", "source_tree_sha256",
@@ -6312,6 +6982,7 @@ def _offline_probe_context(
     owner_result, _owner_raw, _owner_sha = read_json(
         Path(owner_pin["path"]), owner_pin["raw_sha256"],
         "Source5 ProbeV1 direct process owner result", MAX_RECEIPT_BYTES,
+        artifact_view=artifact_view,
     )
     absence = exact(capture["process_absence"], {
         "pid", "start_ticks", "original_identity_absent",
@@ -6388,19 +7059,60 @@ def verify_source5_soak_component_offline(
     job: dict[str, Any], authorization_context: dict[str, Any],
     host_receipt_pin: object, *, replay_context: object,
 ) -> dict[str, Any]:
-    """Freshly replay the original Source5 Soak from identity-mapped evidence."""
+    """Replay the legacy explicit identity-map offline Soak API unchanged."""
+    return _verify_source5_soak_component_offline_impl(
+        component, prepared, job, authorization_context, host_receipt_pin,
+        replay_context=replay_context, captured_evidence=None,
+    )
+
+
+def verify_source5_soak_component_captured_outputs(
+    component: dict[str, Any], prepared: dict[str, Any],
+    job: dict[str, Any], authorization_context: dict[str, Any],
+    host_receipt_pin: object, *, captured_evidence: object,
+) -> dict[str, Any]:
+    """Replay reclaimed Soak outputs through one authenticated Source5 H-view."""
+    return _verify_source5_soak_component_offline_impl(
+        component, prepared, job, authorization_context, host_receipt_pin,
+        replay_context=None, captured_evidence=captured_evidence,
+    )
+
+
+def _verify_source5_soak_component_offline_impl(
+    component: dict[str, Any], prepared: dict[str, Any],
+    job: dict[str, Any], authorization_context: dict[str, Any],
+    host_receipt_pin: object, *, replay_context: object | None,
+    captured_evidence: object | None,
+) -> dict[str, Any]:
+    """Share strict Soak replay gates between identity-map and H-view APIs."""
+    require((replay_context is None) != (captured_evidence is None),
+            "Source5 Soak replay must select exactly one explicit evidence reader")
     receipt_pin = exact(host_receipt_pin, {
         "path", "raw_sha256", "receipt_sha256",
     }, "Source5 Soak host-verification receipt pin")
     host_path_pin = raw_pin({"path": receipt_pin["path"],
                              "raw_sha256": receipt_pin["raw_sha256"]},
                             "Source5 Soak host-verification receipt")
-    context = exact(replay_context, {
-        "schema", "evidence_path_map",
-    }, "Source5 Soak offline replay context")
-    require(context["schema"] == SOAK_OFFLINE_CONTEXT_SCHEMA,
-            "Source5 Soak offline replay context schema differs")
-    mapped = _validate_evidence_path_map(context["evidence_path_map"])
+    captured_view = None
+    captured_request: dict[str, Any] | None = None
+    tree_inventories: list[dict[str, Any]] = []
+    archive_module = None
+    readback = None
+    if captured_evidence is None:
+        context = exact(replay_context, {
+            "schema", "evidence_path_map",
+        }, "Source5 Soak offline replay context")
+        require(context["schema"] == SOAK_OFFLINE_CONTEXT_SCHEMA,
+                "Source5 Soak offline replay context schema differs")
+        mapped = _validate_evidence_path_map(context["evidence_path_map"])
+    else:
+        readback = _load_readback_module(prepared)
+        context, captured_request, tree_inventories, archive_module, \
+            captured_view = _validate_soak_archived_job_view(
+                captured_evidence, prepared, job, authorization_context,
+                component, receipt_pin, readback,
+            )
+        mapped = None
     direct_paths = set(_raw_pins_in((
         component, prepared, job, authorization_context,
     )))
@@ -6413,20 +7125,39 @@ def verify_source5_soak_component_offline(
         str(source_root_input), str(input_root_input),
         str(output_root_input), str(output_root_input.parent),
     })
-    _require_evidence_paths(mapped, direct_paths,
-                            "top-level Source5 Soak replay")
-    raw, receipt_raw_sha, receipt_info = read_stable(
-        Path(host_path_pin["path"]), "Source5 Soak host-verification receipt",
-        MAX_RECEIPT_BYTES,
-    )
-    require(receipt_info.st_uid == os.getuid() and
-            stat.S_IMODE(receipt_info.st_mode) == 0o600 and
-            receipt_raw_sha == host_path_pin["raw_sha256"],
-            "Source5 Soak host-verification receipt mode/owner/raw pin differs")
-    try:
-        receipt = json.loads(raw)
-    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
-        raise Source5SoakError(f"Source5 Soak host receipt is not bounded JSON: {error}") from error
+    if captured_view is None:
+        _require_evidence_paths(mapped, direct_paths,
+                                "top-level Source5 Soak replay")
+        raw, receipt_raw_sha, receipt_info = read_stable(
+            Path(host_path_pin["path"]),
+            "Source5 Soak host-verification receipt", MAX_RECEIPT_BYTES,
+        )
+        require(receipt_info.st_uid == os.getuid() and
+                stat.S_IMODE(receipt_info.st_mode) == 0o600 and
+                receipt_raw_sha == host_path_pin["raw_sha256"],
+                "Source5 Soak host-verification receipt mode/owner/raw pin differs")
+        try:
+            receipt = json.loads(raw)
+        except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+            raise Source5SoakError(
+                f"Source5 Soak host receipt is not bounded JSON: {error}",
+            ) from error
+    else:
+        require(host_path_pin["path"] in captured_view.objects and
+                all(str(pin["path"]) in captured_view.objects
+                    for name, pin in component["pins"].items()
+                    if name not in {
+                        "materials_index", "parent_recipe", "build_receipt",
+                        "resource_budget",
+                    }),
+                "captured Soak view omits a strict component output pin")
+        receipt, receipt_raw_sha, raw = readback.read_json(
+            Path(host_path_pin["path"]),
+            "Source5 Soak captured host-verification receipt",
+            MAX_RECEIPT_BYTES, artifact_view=captured_view,
+        )
+        require(receipt_raw_sha == host_path_pin["raw_sha256"],
+                "captured Source5 Soak host receipt raw pin differs")
     require(type(receipt) is dict and raw == canonical_bytes(receipt),
             "Source5 Soak host-verification receipt is not canonical JSON")
     expected_fields = {
@@ -6506,18 +7237,56 @@ def verify_source5_soak_component_offline(
     inventory_paths = {entry["path"] for entry in receipt["evidence_inventory"]
                        if type(entry) is dict and type(entry.get("path")) is str}
     base_paths = set(receipt["evidence_bases"])
-    _require_evidence_paths(mapped, inventory_paths | base_paths,
-                            "complete Source5 Soak dependency inventory")
+    if captured_view is None:
+        _require_evidence_paths(mapped, inventory_paths | base_paths,
+                                "complete Source5 Soak dependency inventory")
+    else:
+        inventory_files = {
+            entry["path"] for entry in receipt["evidence_inventory"]
+            if type(entry) is dict and entry.get("kind") in {"file", "symlink"}
+        }
+        inventory_directories = {
+            entry["path"] for entry in receipt["evidence_inventory"]
+            if type(entry) is dict and entry.get("kind") == "directory"
+        }
+        captured_paths = set(captured_view.objects)
+        allowed_captured = inventory_files | {host_path_pin["path"]}
+        require(captured_paths <= allowed_captured and
+                captured_paths <= inventory_paths | {host_path_pin["path"]},
+                "captured Soak object refs extend beyond the original strict owner inventory")
     tree_roots = exact(receipt["tree_roots"], {
         "source", "input", "output", "probe_capture",
     }, "Source5 Soak evidence tree roots")
-    require(tree_roots["source"] == str(source_root_input.resolve(strict=True)) and
-            tree_roots["input"] == str(input_root_input.resolve(strict=True)) and
-            tree_roots["output"] == str(output_root_input.resolve(strict=True)) and
-            tree_roots["probe_capture"] ==
-                str(Path(receipt["construction_probe"]["receipt_pin"]["path"]).parent.resolve(strict=True)),
-            "Source5 Soak host receipt tree roots differ from the original evidence")
-    _verify_evidence_inventory(receipt, mapped)
+    if captured_view is None:
+        require(tree_roots["source"] == str(source_root_input.resolve(strict=True)) and
+                tree_roots["input"] == str(input_root_input.resolve(strict=True)) and
+                tree_roots["output"] == str(output_root_input.resolve(strict=True)) and
+                tree_roots["probe_capture"] ==
+                    str(Path(receipt["construction_probe"]["receipt_pin"]["path"]).parent.resolve(strict=True)),
+                "Source5 Soak host receipt tree roots differ from the original evidence")
+        _verify_evidence_inventory(receipt, mapped)
+    else:
+        capture_root = Path(receipt["construction_probe"]["receipt_pin"]["path"]).parent
+        require(tree_roots["source"] == str(source_root_input.resolve(strict=True)) and
+                tree_roots["input"] == str(input_root_input.resolve(strict=True)) and
+                tree_roots["output"] == str(output_root_input) and
+                tree_roots["probe_capture"] == str(capture_root) and
+                Path(tree_roots["output"]).is_absolute() and
+                Path(tree_roots["probe_capture"]).is_absolute(),
+                "captured Soak host receipt tree roots differ from original owner paths")
+        captured_file_paths = sorted(captured_paths - {host_path_pin["path"]})
+        captured_dir_paths = sorted(inventory_directories | base_paths)
+        _verify_evidence_inventory(
+            receipt, None, artifact_view=captured_view,
+            tree_inventories=tree_inventories,
+            captured_origin_paths=captured_file_paths,
+            evidence_file_paths=sorted(inventory_files),
+            evidence_directory_paths=captured_dir_paths,
+            source_root=source_root_input, input_root=input_root_input,
+            output_root=output_root_input, probe_capture_root=capture_root,
+            host_receipt_path=host_path_pin["path"],
+            readback=readback,
+        )
     if bounded:
         final_usage = _source5_resource_final_usage(
             budget_document, receipt["evidence_inventory"],
@@ -6576,6 +7345,10 @@ def verify_source5_soak_component_offline(
         material_index, _material_raw, _material_sha = read_json(
             Path(material_pin["path"]), material_pin["raw_sha256"],
             "Source5 bounded materials index", MAX_ARTIFACT_BYTES,
+            artifact_view=(captured_view
+                           if captured_view is not None and
+                           captured_view.has_file(material_pin["path"])
+                           else None),
         )
         offline_binding = _selected_prepared_host_binding(
             offline_prepared["source5_prepared_input_completion"],
@@ -6584,16 +7357,33 @@ def verify_source5_soak_component_offline(
         offline_recipe, _offline_receipt, _offline_identities = \
             _verify_build_receipt(
                 material_index, offline_prepared, job, offline_binding,
-                readback,
+                readback, artifact_view=captured_view,
+                captured_origins=(frozenset(captured_view.objects)
+                                  if captured_view is not None else frozenset()),
             )
         if offline_recipe["feedback_expectation"]["policy"].get(
                 "capacity_floor_policy_id") is not None:
-            construction_probe_capture, _offline_probe_pin = \
-                _source5_probe_v2_audit_context(
-                    offline_prepared, offline_recipe,
-                    component["probe_capture"],
-                    evidence_path_map=context["evidence_path_map"],
-                )
+            if captured_view is None:
+                construction_probe_capture, _offline_probe_pin = \
+                    _source5_probe_v2_audit_context(
+                        offline_prepared, offline_recipe,
+                        component["probe_capture"],
+                        evidence_path_map=context["evidence_path_map"],
+                    )
+            else:
+                construction_probe_capture, _offline_probe_pin = \
+                    _source5_probe_v2_audit_context(
+                        offline_prepared, offline_recipe,
+                        component["probe_capture"],
+                        artifact_view=captured_view,
+                        captured_origin_paths=sorted(
+                            path for path in captured_view.objects
+                            if path != host_path_pin["path"]
+                        ),
+                        evidence_file_paths=sorted(inventory_files),
+                        evidence_directory_paths=sorted(captured_dir_paths),
+                        tree_inventories=tree_inventories,
+                    )
             _verify_source5_probe_resource_budget(
                 budget_document, offline_prepared,
                 construction_probe_capture,
@@ -6623,24 +7413,44 @@ def verify_source5_soak_component_offline(
             construction_probe_capture = _offline_probe_context(
                 receipt, offline_prepared, readback,
                 resource_budget=budget_document,
+                artifact_view=captured_view,
             )
     else:
         construction_probe_capture = _offline_probe_context(
             receipt, offline_prepared, readback,
+            artifact_view=captured_view,
         )
-    offline_readback_context = {
-        "schema": (SOAK_OFFLINE_CONTEXT_SCHEMA_V2 if bounded else
-                   SOAK_OFFLINE_CONTEXT_SCHEMA),
-        "evidence_path_map": context["evidence_path_map"],
-        "construction_probe_capture": construction_probe_capture,
-        "application_environment": supervisor["details"]["environment"],
-        "pressure_origin": receipt["pressure_origin"],
-        "host_verification_pin": {
-            "path": host_path_pin["path"],
-            "raw_sha256": host_path_pin["raw_sha256"],
-            "receipt_sha256": receipt_pin["receipt_sha256"],
-        },
-    }
+    if captured_view is None:
+        offline_readback_context = {
+            "schema": (SOAK_OFFLINE_CONTEXT_SCHEMA_V2 if bounded else
+                       SOAK_OFFLINE_CONTEXT_SCHEMA),
+            "evidence_path_map": context["evidence_path_map"],
+            "construction_probe_capture": construction_probe_capture,
+            "application_environment": supervisor["details"]["environment"],
+            "pressure_origin": receipt["pressure_origin"],
+            "host_verification_pin": {
+                "path": host_path_pin["path"],
+                "raw_sha256": host_path_pin["raw_sha256"],
+                "receipt_sha256": receipt_pin["receipt_sha256"],
+            },
+        }
+    else:
+        offline_readback_context = {
+            "schema": SOURCE5_SOAK_CAPTURED_CONTEXT_SCHEMA,
+            "artifact_view": captured_view,
+            "captured_origin_paths": sorted(captured_view.objects),
+            "evidence_file_paths": sorted(inventory_files),
+            "evidence_directory_paths": sorted(captured_dir_paths),
+            "tree_inventories": tree_inventories,
+            "construction_probe_capture": construction_probe_capture,
+            "host_verification_pin": {
+                "path": host_path_pin["path"],
+                "raw_sha256": host_path_pin["raw_sha256"],
+                "receipt_sha256": receipt_pin["receipt_sha256"],
+            },
+            "application_environment": supervisor["details"]["environment"],
+            "pressure_origin": receipt["pressure_origin"],
+        }
     result = _verify_source5_soak_component_replay(
         component, offline_prepared, job, authorization_context, readback,
         offline_context=offline_readback_context,

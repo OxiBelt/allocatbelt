@@ -41,6 +41,11 @@ MAX_SYMLINK_BYTES = 4 * 1024
 MAX_PATH_BYTES = 4096
 MAX_U64 = (1 << 64) - 1
 MAX_EVENT_BYTES = 4 * 1024 * 1024
+MAX_ARCHIVE_JSON_BYTES = 32 * 1024 * 1024
+MAX_ARCHIVE_REQUEST_CHECKPOINT_BYTES = 128 * 1024 * 1024
+MAX_ARCHIVE_READ_METADATA_BYTES = 16 * 1024 * 1024
+MAX_ARCHIVE_TOTAL_BYTES = 1 << 48
+ARCHIVE_ESCAPED_MAX_PATH = "/" + "\u00e9" * ((MAX_PATH_BYTES - 1) // 2)
 LEGACY_EVENT_CAP = 100_000
 CORE_EVIDENCE_ENTRY_CAP = 6_400_000
 DISPATCH_ENTRY_CAP = 800_000
@@ -58,7 +63,7 @@ SOAK_SAMPLE_BYTES_CAP = 96 * 1024 * 1024
 PATH_CATALOGUE_SCHEMA_V2 = "allocatbelt.application-source5-host-path-catalogue.v2"
 RETENTION_POLICY_SCHEMA_V2 = "allocatbelt.application-source5-between-pair-retention.v2"
 RETENTION_POLICY_MODE_V2 = "verified_between_pair_offload_v1"
-SUCCESS_EMPTY_TMP_TREE_ROLES = frozenset({"normal_app_output", "opaque_trace"})
+SUCCESS_EMPTY_TMP_TREE_ROLES = frozenset({"normal_app_output"})
 ARCHIVE_SIGNATURE_QUOTA_BYTES = 4096
 ACK_BUNDLE_ALTERNATIVE_ROLES = frozenset({
     "source5_ack_bundle", "source5_ack_bundle_incoming",
@@ -66,7 +71,45 @@ ACK_BUNDLE_ALTERNATIVE_ROLES = frozenset({
 TRANSIENT_JOB_EVIDENCE_ROLES = frozenset({
     "source5_transfer_packet", *ACK_BUNDLE_ALTERNATIVE_ROLES,
 })
-FAILURE_WINDOW_ONLY_ROLES = frozenset({"source5_job_disposition"})
+SOURCE5_ARCHIVE_READ_CONTROL_ROLE = "source5_archive_read_control_ledger"
+SOURCE5_ANALYZER_SPOOL_ROLE = "source5_analyzer_spool"
+SOURCE5_ARCHIVE_READ_TRANSIENT_ROLES = frozenset({
+    "source5_archive_read_request_slot",
+    "source5_archive_read_response_slot",
+    "source5_archive_read_response_incoming",
+    "source5_archive_read_bundle",
+    "source5_archive_read_bundle_incoming",
+    "source5_archive_read_stage",
+})
+SOURCE5_NON_INDEX_TRANSIENT_ROLES = frozenset({
+    *SOURCE5_ARCHIVE_READ_TRANSIENT_ROLES,
+    SOURCE5_ANALYZER_SPOOL_ROLE,
+})
+SOURCE5_ARCHIVE_READ_RESPONSE_ALTERNATIVES = frozenset({
+    "source5_archive_read_response_slot",
+    "source5_archive_read_response_incoming",
+})
+SOURCE5_ARCHIVE_READ_BUNDLE_ALTERNATIVES = frozenset({
+    "source5_archive_read_bundle",
+    "source5_archive_read_bundle_incoming",
+})
+SOURCE5_CLEANUP_SIDECAR_ROLE = "source5_cleanup_sidecar"
+SOURCE5_CLEANUP_SIDECAR_REFUSAL_ROLE = "source5_cleanup_sidecar_refusal"
+SOURCE5_CLEANUP_ERROR_TEXT_BYTES = 8192
+SOURCE5_CLEANUP_SIGNAL_SNAPSHOT_COUNT = 5
+SOURCE5_CLEANUP_ERROR_ENTRY_COUNT = 1348
+SOURCE5_CLEANUP_REFUSAL_BYTES = 65_536
+SOURCE5_CLEANUP_SESSION_MEMBER_LIMIT = 262_144
+SOURCE5_CLEANUP_TERM_GRACE_SECONDS = 3.0
+SOURCE5_CLEANUP_KILL_REAP_SECONDS = 1.0
+SOURCE5_CLEANUP_POLL_INTERVAL_SECONDS = 0.01
+CLEANUP_SIDECAR_ALTERNATIVE_ROLES = frozenset({
+    SOURCE5_CLEANUP_SIDECAR_ROLE,
+    SOURCE5_CLEANUP_SIDECAR_REFUSAL_ROLE,
+})
+FAILURE_WINDOW_ONLY_ROLES = frozenset({
+    "source5_job_disposition", *CLEANUP_SIDECAR_ALTERNATIVE_ROLES,
+})
 NON_EXPORTABLE_JOB_RECORD_ROLES = frozenset({
     "source5_job_record", "source5_job_disposition",
 })
@@ -93,7 +136,12 @@ INDEX_DATA_CHUNK_BYTES = 8 * 1024 * 1024
 INDEX_MANIFEST_FANOUT = 128
 MAX_CAPTURED_STORE_ROOT_BYTES = 16 * 1024 * 1024
 HOST_BUDGET_SCHEMA_V2 = "allocatbelt.application-source5-host-evidence-budget.v2"
+HOST_BUDGET_SCHEMA_V3 = "allocatbelt.application-source5-host-evidence-budget.v3"
+SOURCE5_V3_ADMISSION_PROFILE = "source5_width_v4_captured_replay_v1"
 STORAGE_RESERVATION_SCHEMA_V1 = "allocatbelt.application-source5-evidence-storage-reservation.v1"
+JOURNAL_WIDTH_CONTRACT_SCHEMA = \
+    "allocatbelt.application-source5-journal-width-contract.v1"
+MAX_JOURNAL_WIDTH_CONTRACT_BYTES = 16 * 1024 * 1024
 
 
 class BudgetPlanError(ValueError):
@@ -117,6 +165,102 @@ def _canonical(value: Any) -> bytes:
                            ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
     except (TypeError, ValueError) as error:
         raise BudgetPlanError(f"{type(value).__name__} is not canonical JSON: {error}") from error
+
+
+def _cleanup_sidecar_source_bound(maximum_session_members: int) -> int:
+    """Compute a raw cleanup-object bound without materializing huge arrays."""
+    _uint(maximum_session_members,
+          "Source5 cleanup session-member source bound", positive=True)
+    normal_polls = int((SOURCE5_CLEANUP_TERM_GRACE_SECONDS +
+                        SOURCE5_CLEANUP_KILL_REAP_SECONDS) /
+                       SOURCE5_CLEANUP_POLL_INTERVAL_SECONDS) + 4
+    emergency_polls = int(SOURCE5_CLEANUP_KILL_REAP_SECONDS /
+                          SOURCE5_CLEANUP_POLL_INTERVAL_SECONDS) + 4
+    _require(3 * normal_polls + emergency_polls + 32 ==
+             SOURCE5_CLEANUP_ERROR_ENTRY_COUNT,
+             "Source5 cleanup error-entry contract differs from the fixed-owner bounded poll formula")
+    maximum_u64 = MAX_U64
+    maximum_pid = (1 << 31) - 1
+    error_text = "\x01" * SOURCE5_CLEANUP_ERROR_TEXT_BYTES
+
+    def array_bytes(item_bytes: int, count: int) -> int:
+        return 2 + item_bytes * count + max(0, count - 1)
+
+    member = {
+        "pid": maximum_pid, "state": "Z",
+        "parent_pid": maximum_pid, "process_group": maximum_pid,
+        "session_id": maximum_pid, "start_ticks": maximum_u64,
+    }
+    pidfd_signal = {
+        "pid": maximum_pid, "start_ticks": maximum_u64,
+        "signal": 255, "sent": False,
+    }
+    signal_row = {
+        "group_signal": {
+            "signal": 255, "leader_pid": maximum_pid,
+            "leader_start_ticks": maximum_u64, "leader_unreaped": True,
+        },
+        "group_error": error_text, "pidfd_signals": [],
+        "scan_error": error_text, "members": [],
+    }
+    signal_row_bytes = len(_canonical(signal_row)) - 1
+    signal_row_bytes += (
+        array_bytes(len(_canonical(pidfd_signal)) - 1,
+                    maximum_session_members) - 2
+    )
+    signal_row_bytes += (
+        array_bytes(len(_canonical(member)) - 1,
+                    maximum_session_members) - 2
+    )
+    cleanup = {
+        "leader_info": {"si_code": 255, "si_status": 255,
+                        "si_pid": maximum_pid},
+        "child_return_code": -255, "timed_out": False,
+        "artifact_budget_exceeded": False, "received_signal": None,
+        "term_grace_seconds": SOURCE5_CLEANUP_TERM_GRACE_SECONDS,
+        "kill_reap_seconds": SOURCE5_CLEANUP_KILL_REAP_SECONDS,
+        "signals": [], "leader_unreaped_during_group_signals": False,
+        "group_signal_after_leader_reap_count":
+            SOURCE5_CLEANUP_SIGNAL_SNAPSHOT_COUNT,
+        "leader_reaped": False, "remaining_session_members": [],
+        "cleanup_errors": [], "cleanup_status": "not_started",
+    }
+    result = len(_canonical(cleanup)) - 1
+    result += array_bytes(signal_row_bytes,
+                          SOURCE5_CLEANUP_SIGNAL_SNAPSHOT_COUNT) - 2
+    result += array_bytes(len(_canonical(member)) - 1,
+                          maximum_session_members) - 2
+    result += array_bytes(len(_canonical(error_text)) - 1,
+                          SOURCE5_CLEANUP_ERROR_ENTRY_COUNT) - 2
+    return result + 1  # canonical trailing LF
+
+
+def _cleanup_source_shape(maximum_session_members: int) -> dict[str, Any]:
+    source_bytes = _cleanup_sidecar_source_bound(maximum_session_members)
+    refusal_window = 2 * SOURCE5_CLEANUP_REFUSAL_BYTES
+    return {
+        "maximum_session_members_per_snapshot": maximum_session_members,
+        "maximum_pidfd_signal_entries_per_snapshot": maximum_session_members,
+        "maximum_signal_snapshots": SOURCE5_CLEANUP_SIGNAL_SNAPSHOT_COUNT,
+        "maximum_cleanup_errors": SOURCE5_CLEANUP_ERROR_ENTRY_COUNT,
+        "maximum_error_text_bytes": SOURCE5_CLEANUP_ERROR_TEXT_BYTES,
+        "normal_cleanup_poll_count": int((
+            SOURCE5_CLEANUP_TERM_GRACE_SECONDS +
+            SOURCE5_CLEANUP_KILL_REAP_SECONDS
+        ) / SOURCE5_CLEANUP_POLL_INTERVAL_SECONDS) + 4,
+        "emergency_cleanup_poll_count": int(
+            SOURCE5_CLEANUP_KILL_REAP_SECONDS /
+            SOURCE5_CLEANUP_POLL_INTERVAL_SECONDS
+        ) + 4,
+        "term_grace_seconds": SOURCE5_CLEANUP_TERM_GRACE_SECONDS,
+        "kill_reap_seconds": SOURCE5_CLEANUP_KILL_REAP_SECONDS,
+        "cleanup_poll_interval_seconds": SOURCE5_CLEANUP_POLL_INTERVAL_SECONDS,
+        "source_maximum_bytes": source_bytes,
+        "admission_maximum_bytes": source_bytes,
+        "maximum_window_bytes": 2 * source_bytes,
+        "refusal_file_bytes": SOURCE5_CLEANUP_REFUSAL_BYTES,
+        "maximum_refusal_window_bytes": refusal_window,
+    }
 
 
 def _sha(raw: bytes) -> str:
@@ -870,9 +1014,11 @@ def _archive_pin_bound(path: str | None = None) -> dict[str, str]:
     }
 
 
-def _archive_empty_tmp_proof_bounds() -> list[dict[str, Any]]:
-    maximum_path = "/" + ("x" * (MAX_PATH_BYTES - 1))
-    return [{
+def _archive_empty_tmp_proof_bounds(
+    phase: str, *, archive_v2: bool,
+) -> list[dict[str, Any]]:
+    maximum_path = ARCHIVE_ESCAPED_MAX_PATH
+    base = [{
         "role": "x" * 96, "path": maximum_path,
         "owner_receipt_pin": {
             "path": maximum_path, "raw_sha256": "f" * 64,
@@ -889,10 +1035,33 @@ def _archive_empty_tmp_proof_bounds() -> list[dict[str, Any]]:
         "bytes_used": 0, "file_count": 0, "directory_count": 0,
         "bytes_limit": MAX_U64, "inode_limit": MAX_U64,
     } for ordinal in range(2)]
+    if not archive_v2:
+        return base
+    if phase in {"exploration", "aa", "confirmation"}:
+        probe = [{**item, "domain": "probe_tmpdir"} for item in base]
+        return sorted([*base, *probe],
+                      key=lambda item: (item["role"],
+                                        item["member_ordinal"],
+                                        item.get("domain", "")))
+    if phase == "pressure":
+        return base
+    if phase == "soak":
+        return [{
+            "role": "x" * 96, "path": maximum_path,
+            "owner_receipt_pin": {
+                "path": maximum_path, "raw_sha256": "f" * 64,
+                "semantic_sha256": "f" * 64,
+            },
+            "member_ordinal": 0, "domain": "application_tmpdir",
+            "bytes_used": 0, "inode_count": 0,
+            "inventory_sha256": "f" * 64,
+        }]
+    raise BudgetPlanError("archive TMP proof phase is outside the original Source5 schedule")
 
 
 def _archive_fixed_request_value(
-    phase: str, receipt_roles: Iterable[str],
+    phase: str, receipt_roles: Iterable[str], *, archive_v2: bool = False,
+    tree_inventory_count: int = 0,
 ) -> dict[str, Any]:
     """Maximum accepted request envelope outside its exact object entries."""
     maximum_pin = _archive_pin_bound()
@@ -914,8 +1083,12 @@ def _archive_fixed_request_value(
         }
         for role in sorted(set(receipt_roles))
     }
-    return {
-        "schema": "allocatbelt.application-source5-evidence-checkpoint-request.v1",
+    body = {
+        "schema": (
+            "allocatbelt.application-source5-evidence-checkpoint-request.v2"
+            if archive_v2 else
+            "allocatbelt.application-source5-evidence-checkpoint-request.v1"
+        ),
         "context": context,
         "job_record_pin": {"path": maximum_path, "raw_sha256": "f" * 64},
         "authorization": {
@@ -926,15 +1099,29 @@ def _archive_fixed_request_value(
         },
         "predecessor_ack_pin": maximum_pin,
         "owner_receipt_pins": receipt_pins,
-        "empty_tmp_proofs": _archive_empty_tmp_proof_bounds(),
+        "empty_tmp_proofs": _archive_empty_tmp_proof_bounds(
+            phase, archive_v2=archive_v2,
+        ),
         "entries": [], "request_sha256": "f" * 64,
     }
+    if archive_v2:
+        body["tree_inventories"] = []
+    return body
 
 
 def _archive_fixed_request_bound(
-    phase: str, receipt_roles: Iterable[str],
+    phase: str, receipt_roles: Iterable[str], *, archive_v2: bool = False,
+    tree_inventory_bytes: int = 0, tree_inventory_count: int = 0,
 ) -> int:
-    return len(_canonical(_archive_fixed_request_value(phase, receipt_roles)))
+    _require(archive_v2 or
+             (tree_inventory_bytes == 0 and tree_inventory_count == 0),
+             "Source5 v1 request cannot carry typed tree inventory rows")
+    body_bytes = len(_canonical(_archive_fixed_request_value(
+        phase, receipt_roles, archive_v2=archive_v2,
+        tree_inventory_count=tree_inventory_count,
+    )))
+    return (body_bytes + tree_inventory_bytes +
+            max(0, tree_inventory_count - 1))
 
 
 def _archive_manifest_entry_bound(row: dict[str, Any]) -> bytes:
@@ -973,6 +1160,52 @@ def _archive_stage_entry_bound(row: dict[str, Any]) -> bytes:
     })
 
 
+def _archive_dynamic_tree_file_bounds(
+    tree: dict[str, Any],
+) -> tuple[bytes, bytes, bytes, int, int, int]:
+    """Bound every possible ProbeV2 file descendant from its exact owner caps."""
+    child_count = tree["max_inodes"] - 1
+    maximum_object = tree["max_file_bytes"]
+    row = {
+        "path": ARCHIVE_ESCAPED_MAX_PATH,
+        "role": "opaque_trace",
+        "max_file_bytes": maximum_object,
+    }
+    request_entry = _archive_request_entry_bound(row) * child_count
+    manifest_entry = _archive_manifest_entry_bound(row) * child_count
+    stage_entry = _archive_stage_entry_bound(row) * child_count
+    readback_descriptor = len(_canonical({
+        "owner_job_sha256": "f" * 64,
+        "origin_path": ARCHIVE_ESCAPED_MAX_PATH,
+        "raw_sha256": "f" * 64,
+        "byte_count": maximum_object,
+    })) * child_count
+    return (
+        request_entry, manifest_entry, stage_entry,
+        readback_descriptor, child_count,
+        tree["max_bytes"] + child_count * 1023,
+    )
+
+
+def _archive_tree_inventory_entry_bound(
+    tree: dict[str, Any], inventory_byte_cap: int,
+) -> int:
+    """Bound one v2 typed-tree proof using its pinned inventory file ceiling."""
+    maximum_pin = _archive_pin_bound(ARCHIVE_ESCAPED_MAX_PATH)
+    row = {
+        "owner_job_sha256": "f" * 64,
+        "root_path": ARCHIVE_ESCAPED_MAX_PATH,
+        "role": "opaque_trace",
+        "owner_receipt_pin": maximum_pin,
+        "inventory_pin": maximum_pin,
+        "inventory_sha256": "f" * 64,
+        "entry_count": MAX_U64,
+        "byte_count": MAX_U64,
+        "entries": [],
+    }
+    return len(_canonical(row)) - 2 + inventory_byte_cap
+
+
 def _archive_tar_size(member_sizes: Iterable[int]) -> int:
     content = 0
     for size in member_sizes:
@@ -997,14 +1230,20 @@ def _archive_tar_member_size(size: int) -> int:
 
 def _archive_ack_bundle_bounds(
     phase: str, run_id: str, receipt_roles: Iterable[str], entry_count: int,
-    checkpoint_entry_bytes: int, manifest_entry_bytes: int,
+    checkpoint_entry_bytes: int, manifest_entry_bytes: int, *,
+    archive_v2: bool = False, tree_inventory_bytes: int = 0,
+    tree_inventory_count: int = 0,
 ) -> dict[str, int]:
     """Bound each canonical response member and the four-file PAX envelope."""
     maximum_pin = _archive_pin_bound()
     maximum_path = "/" + ("x" * (MAX_PATH_BYTES - 1))
     request_pin = maximum_pin
     checkpoint = {
-        "schema": "allocatbelt.application-source5-evidence-job-checkpoint.v1",
+        "schema": (
+            "allocatbelt.application-source5-evidence-job-checkpoint.v2"
+            if archive_v2 else
+            "allocatbelt.application-source5-evidence-job-checkpoint.v1"
+        ),
         "request_pin": request_pin,
         "context": {
             "schema": "allocatbelt.application-source5-evidence-archive-context.v1",
@@ -1027,10 +1266,14 @@ def _archive_ack_bundle_bounds(
         "owner_receipt_pins": _archive_fixed_request_value(
             phase, receipt_roles,
         )["owner_receipt_pins"],
-        "empty_tmp_proofs": _archive_empty_tmp_proof_bounds(),
+        "empty_tmp_proofs": _archive_empty_tmp_proof_bounds(
+            phase, archive_v2=archive_v2,
+        ),
         "object_manifest_pin": maximum_pin,
         "entries": [], "checkpoint_sha256": "f" * 64,
     }
+    if archive_v2:
+        checkpoint["tree_inventories"] = []
     manifest = {
         "schema": "allocatbelt.application-source5-evidence-object-manifest.v1",
         "campaign_id": "x" * 96, "host_id": "x" * 96,
@@ -1066,7 +1309,8 @@ def _archive_ack_bundle_bounds(
         "ack_sha256": "f" * 64,
     }
     checkpoint_bytes = (len(_canonical(checkpoint)) + checkpoint_entry_bytes +
-                        max(0, entry_count - 1))
+                        max(0, entry_count - 1) + tree_inventory_bytes +
+                        max(0, tree_inventory_count - 1))
     manifest_bytes = (len(_canonical(manifest)) + manifest_entry_bytes +
                       max(0, entry_count - 1))
     ack_bytes = len(_canonical(ack))
@@ -1085,7 +1329,8 @@ def _archive_ack_bundle_bounds(
 def _archive_job_stats_add(
     groups: dict[tuple[str, str], dict[str, Any]], row: dict[str, Any],
 ) -> None:
-    if row["role"] in NON_EXPORTABLE_JOB_RECORD_ROLES:
+    if row["role"] in (NON_EXPORTABLE_JOB_RECORD_ROLES |
+                        FAILURE_WINDOW_ONLY_ROLES):
         if row["role"] == "source5_job_record":
             _require(row["kind"] == "file" and
                      row["path"].endswith(".json") and
@@ -1097,6 +1342,14 @@ def _archive_job_stats_add(
                 "phase": row["phase"], "file_count": 0,
                 "request_entry_bytes": 0, "manifest_entry_bytes": 0,
                 "stage_entry_bytes": 0, "packet_members_tar_bytes": 0,
+                "payload_bytes": 0,
+                "readback_descriptor_bytes": 0,
+                "readback_payload_bytes": 0,
+                "readback_member_tar_bytes": 0,
+                "readback_maximum_object_bytes": 0,
+                "dynamic_tree_rows": [],
+                "probe_inventory_caps": {},
+                "archive_v2": False,
                 "validation_record_count": 0,
                 "validation_record_tar_bytes": 0,
                 "receipt_roles": set(),
@@ -1106,17 +1359,80 @@ def _archive_job_stats_add(
             stats["validation_record_tar_bytes"] += _archive_tar_member_size(
                 row["max_file_bytes"],
             )
+        elif row["role"] in CLEANUP_SIDECAR_ALTERNATIVE_ROLES:
+            if row["phase"] is not None and row["run_id"] is not None:
+                groups.setdefault((row["phase"], row["run_id"]), {
+                    "phase": row["phase"], "file_count": 0,
+                    "request_entry_bytes": 0, "manifest_entry_bytes": 0,
+                    "stage_entry_bytes": 0, "packet_members_tar_bytes": 0,
+                    "payload_bytes": 0, "readback_descriptor_bytes": 0,
+                    "readback_payload_bytes": 0,
+                    "readback_member_tar_bytes": 0,
+                    "readback_maximum_object_bytes": 0,
+                    "dynamic_tree_rows": [], "probe_inventory_caps": {},
+                    "archive_v2": False,
+                    "validation_record_count": 0,
+                    "validation_record_tar_bytes": 0,
+                    "validation_record_bytes": 0, "receipt_roles": set(),
+                })
         return
     if (row["phase"] is None or row["run_id"] is None or
-            row["kind"] != "file" or
-            row["role"] in ALWAYS_LOCAL_EVIDENCE_ROLES or
+            row["role"] in (ALWAYS_LOCAL_EVIDENCE_ROLES |
+                            {"journal_width_contract"}) or
             row["role"] in TRANSIENT_JOB_EVIDENCE_ROLES or
             row["role"] in ARCHIVE_LOCAL_METADATA_ROLES):
         return
-    stats = groups.setdefault((row["phase"], row["run_id"]), {
+    group_key = (row["phase"], row["run_id"])
+    if row["kind"] == "tree":
+        if row["role"] in SUCCESS_EMPTY_TMP_TREE_ROLES:
+            return
+        _require(row["role"] == "opaque_trace" and
+                 row["max_inodes"] > 1 and row["max_bytes"] > 0 and
+                 row["max_file_bytes"] > 0,
+                 "Source5 archive cannot project an unsupported dynamic tree role")
+        stats = groups.setdefault(group_key, {
+            "phase": row["phase"], "file_count": 0,
+            "request_entry_bytes": 0, "manifest_entry_bytes": 0,
+            "stage_entry_bytes": 0, "packet_members_tar_bytes": 0,
+            "payload_bytes": 0,
+            "readback_descriptor_bytes": 0,
+            "readback_payload_bytes": 0,
+            "readback_member_tar_bytes": 0,
+            "readback_maximum_object_bytes": 0,
+            "dynamic_tree_rows": [], "probe_inventory_caps": {},
+            "archive_v2": False,
+            "validation_record_count": 0, "validation_record_tar_bytes": 0,
+            "validation_record_bytes": 0,
+            "receipt_roles": set(),
+        })
+        member_index = row["member_index"]
+        _require((type(member_index) is int and member_index in {0, 1}) or
+                 (row["phase"] == "soak" and member_index is None),
+                 "Source5 dynamic ProbeV2 tree lacks its exact original member index")
+        _require(not any(item["member_index"] == member_index
+                         for item in stats["dynamic_tree_rows"]),
+                 f"Source5 {group_key} repeats a ProbeV2 dynamic tree member")
+        stats["dynamic_tree_rows"].append({
+            "path": row["path"], "member_index": member_index,
+            "max_bytes": row["max_bytes"],
+            "max_file_bytes": row["max_file_bytes"],
+            "max_inodes": row["max_inodes"],
+        })
+        stats["archive_v2"] = True
+        return
+    if row["kind"] != "file":
+        return
+    stats = groups.setdefault(group_key, {
         "phase": row["phase"], "file_count": 0,
         "request_entry_bytes": 0, "manifest_entry_bytes": 0,
         "stage_entry_bytes": 0, "packet_members_tar_bytes": 0,
+        "payload_bytes": 0,
+        "readback_descriptor_bytes": 0,
+        "readback_payload_bytes": 0,
+        "readback_member_tar_bytes": 0,
+        "readback_maximum_object_bytes": 0,
+        "dynamic_tree_rows": [], "probe_inventory_caps": {},
+        "archive_v2": False,
         "validation_record_count": 0, "validation_record_tar_bytes": 0,
         "validation_record_bytes": 0,
         "receipt_roles": set(),
@@ -1128,6 +1444,29 @@ def _archive_job_stats_add(
     stats["packet_members_tar_bytes"] += _archive_tar_member_size(
         row["max_file_bytes"],
     )
+    stats["payload_bytes"] += row["max_file_bytes"]
+    stats["readback_descriptor_bytes"] += len(_canonical({
+        "owner_job_sha256": "f" * 64,
+        "origin_path": row["path"],
+        "raw_sha256": "f" * 64,
+        "byte_count": row["max_file_bytes"],
+    }))
+    stats["readback_payload_bytes"] += row["max_file_bytes"]
+    stats["readback_member_tar_bytes"] += _archive_tar_member_size(
+        row["max_file_bytes"],
+    )
+    stats["readback_maximum_object_bytes"] = max(
+        stats["readback_maximum_object_bytes"], row["max_file_bytes"],
+    )
+    if row["role"].startswith("probe_capture_inventory"):
+        member_index = row["member_index"]
+        valid_member = ((type(member_index) is int and member_index in {0, 1}) or
+                        (row["phase"] == "soak" and member_index is None))
+        _require(valid_member and
+                 member_index not in stats["probe_inventory_caps"],
+                 f"Source5 {group_key} ProbeV2 inventory role has a duplicate or unknown member")
+        stats["probe_inventory_caps"][member_index] = row["max_file_bytes"]
+        stats["archive_v2"] = True
     if "receipt" in row["role"].lower():
         _require(row["role"] not in stats["receipt_roles"],
                  "Source5 job has duplicate owner receipt roles")
@@ -1141,32 +1480,84 @@ def _archive_caps_from_stats(
     for group, stats in groups.items():
         _require(stats["validation_record_count"] <= 1,
                  f"Source5 {group} has duplicate always-local validation records")
+        archive_v2 = bool(stats.get("archive_v2") or
+                          stats["dynamic_tree_rows"])
+        request_entry_bytes = stats["request_entry_bytes"]
+        manifest_entry_bytes = stats["manifest_entry_bytes"]
+        stage_entry_bytes = stats["stage_entry_bytes"]
+        readback_descriptor_bytes = stats["readback_descriptor_bytes"]
+        readback_payload_bytes = stats["readback_payload_bytes"]
+        readback_member_tar_bytes = stats["readback_member_tar_bytes"]
+        readback_maximum_object_bytes = stats["readback_maximum_object_bytes"]
+        packet_members_tar_bytes = stats["packet_members_tar_bytes"]
+        payload_bytes = stats["payload_bytes"]
+        file_count = stats["file_count"]
+        dynamic_tree_rows = sorted(
+            stats["dynamic_tree_rows"], key=lambda item: item["path"],
+        )
+        tree_inventory_bytes = 0
+        if dynamic_tree_rows:
+            members = {row["member_index"] for row in dynamic_tree_rows}
+            _require(set(stats["probe_inventory_caps"]) == members and
+                     len(members) == len(dynamic_tree_rows),
+                     f"Source5 {group} ProbeV2 tree and inventory role rows do not close")
+            for tree in dynamic_tree_rows:
+                inventory_cap = stats["probe_inventory_caps"][tree["member_index"]]
+                _require(0 < inventory_cap <= MAX_ARCHIVE_JSON_BYTES,
+                         f"Source5 {group} ProbeV2 inventory cap exceeds its closed owner parser bound")
+                tree_inventory_bytes += _archive_tree_inventory_entry_bound(
+                    tree, inventory_cap,
+                )
+                (request_extra, manifest_extra, stage_extra,
+                 readback_extra, child_count, member_tar_extra) = \
+                    _archive_dynamic_tree_file_bounds(tree)
+                request_entry_bytes += len(request_extra)
+                manifest_entry_bytes += len(manifest_extra)
+                stage_entry_bytes += len(stage_extra)
+                readback_descriptor_bytes += readback_extra
+                readback_payload_bytes += tree["max_bytes"]
+                readback_member_tar_bytes += member_tar_extra
+                readback_maximum_object_bytes = max(
+                    readback_maximum_object_bytes, tree["max_file_bytes"],
+                )
+                packet_members_tar_bytes += member_tar_extra
+                payload_bytes += tree["max_bytes"]
+                file_count += child_count
+        else:
+            _require(not stats["probe_inventory_caps"],
+                     f"Source5 {group} has a ProbeV2 inventory without its dynamic tree")
+        _require(file_count > 0 and payload_bytes <= MAX_ARCHIVE_TOTAL_BYTES and
+                 request_entry_bytes >= stats["request_entry_bytes"],
+                 f"Source5 {group} archive closure exceeds its finite entry or payload budget")
         request_bytes = (_archive_fixed_request_bound(
-            stats["phase"], stats["receipt_roles"],
-        ) + stats["request_entry_bytes"] +
-            max(0, stats["file_count"] - 1))
+            stats["phase"], stats["receipt_roles"], archive_v2=archive_v2,
+            tree_inventory_bytes=tree_inventory_bytes,
+            tree_inventory_count=len(dynamic_tree_rows),
+        ) + request_entry_bytes + max(0, file_count - 1))
         # The source-pinned PAX encoder adds a 512-byte header and 512-byte
         # block padding per member, a size extension for files beyond USTAR,
         # and its fixed trailer. Use exact path/role row widths plus the exact
         # raw owner byte ceilings for this original job.
         packet_content = (_archive_tar_member_size(request_bytes) +
-                          stats["packet_members_tar_bytes"] +
+                          packet_members_tar_bytes +
                           stats["validation_record_tar_bytes"])
         packet_size = ((packet_content + 1024 + 10239) // 10240) * 10240
         metadata_caps = _archive_ack_bundle_bounds(
             stats["phase"], group[1], stats["receipt_roles"],
-            stats["file_count"],
-            stats["request_entry_bytes"], stats["manifest_entry_bytes"],
+            file_count, request_entry_bytes, manifest_entry_bytes,
+            archive_v2=archive_v2,
+            tree_inventory_bytes=tree_inventory_bytes,
+            tree_inventory_count=len(dynamic_tree_rows),
         )
         stage_map_bytes = (
-            stats["stage_entry_bytes"] + max(0, stats["file_count"] - 1) +
+            stage_entry_bytes + max(0, file_count - 1) +
             len(_canonical({
             "schema": "allocatbelt.application-source5-evidence-stage-map.v1",
             "checkpoint_pin": _archive_pin_bound(),
             "object_manifest_pin": _archive_pin_bound(),
             "rows": [], "stage_map_sha256": "f" * 64,
         })))
-        maximum_path = "/" + ("x" * (MAX_PATH_BYTES - 1))
+        maximum_path = ARCHIVE_ESCAPED_MAX_PATH
         offer_body = {
             "schema": "allocatbelt.application-source5-archive-transfer-offer.v1",
             "checkpoint_request_pin": _archive_pin_bound(),
@@ -1181,23 +1572,159 @@ def _archive_caps_from_stats(
             "offer_sha256": "f" * 64,
         }
         offer_bytes = len(_canonical(offer_body))
+        request_checkpoint_limit = (
+            MAX_ARCHIVE_REQUEST_CHECKPOINT_BYTES
+            if archive_v2 else MAX_ARCHIVE_JSON_BYTES
+        )
+        _require(
+            request_bytes <= request_checkpoint_limit and
+            metadata_caps["checkpoint_bytes"] <= request_checkpoint_limit and
+            metadata_caps["object_manifest_bytes"] <= MAX_ARCHIVE_JSON_BYTES and
+            metadata_caps["archive_ack_bytes"] <= MAX_ARCHIVE_JSON_BYTES and
+            stage_map_bytes <= MAX_ARCHIVE_JSON_BYTES and
+            offer_bytes <= MAX_ARCHIVE_JSON_BYTES and
+            packet_size <= MAX_ARCHIVE_TOTAL_BYTES,
+            f"Source5 {group} archive metadata exceeds its exact parser or transport ceiling",
+        )
         result[group] = {
             "checkpoint_request_bytes": request_bytes,
             "transfer_packet_bytes": packet_size,
             "validation_record_bytes": stats["validation_record_bytes"],
+            "archive_v2": int(archive_v2),
+            "file_count": file_count,
+            "payload_bytes": payload_bytes,
             **metadata_caps,
             "stage_map_bytes": stage_map_bytes,
             "transfer_offer_bytes": offer_bytes,
         }
+        result[group]["readback_request_bytes"] = (
+            len(_canonical({
+                "schema": "allocatbelt.application-source5-archive-read-request.v1",
+                "campaign_id": "x" * 96, "host_id": "x" * 96,
+                "analysis_phase": "host_evidence_finalization",
+                "request_ordinal": MAX_U64, "objects": [],
+                "maximum_response_bytes": MAX_U64,
+                "request_sha256": "f" * 64,
+            })) - 2 + readback_descriptor_bytes + max(0, file_count - 1)
+        )
+        result[group]["readback_response_bytes"] = (
+            len(_canonical({
+                "schema": "allocatbelt.application-source5-archive-read-response.v1",
+                "campaign_id": "x" * 96, "host_id": "x" * 96,
+                "analysis_phase": "host_evidence_finalization",
+                "request_ordinal": MAX_U64,
+                "request_pin": {"raw_sha256": "f" * 64,
+                                "semantic_sha256": "f" * 64},
+                "objects": [],
+                "body_tar_pin": {"raw_sha256": "f" * 64,
+                                 "byte_count": MAX_U64},
+                "response_sha256": "f" * 64,
+            })) - 2 + readback_descriptor_bytes + max(0, file_count - 1)
+        )
+        bundle_content_bytes = readback_member_tar_bytes
+        result[group]["readback_bundle_bytes"] = (
+            (bundle_content_bytes + 1024 + 10239) // 10240
+        ) * 10240
+        result[group]["readback_stage_bytes"] = readback_payload_bytes
+        result[group]["readback_stage_inodes"] = file_count + 1
+        result[group]["readback_object_count"] = file_count
+        result[group]["readback_maximum_object_bytes"] = readback_maximum_object_bytes
+        result[group]["readback_window_bytes"] = sum(result[group][key] for key in (
+            "readback_request_bytes", "readback_response_bytes",
+            "readback_bundle_bytes", "readback_stage_bytes",
+        ))
+        result[group]["readback_window_inodes"] = file_count + 4
     return result
 
 
 def project_archive_job_caps(rows: Iterable[dict[str, Any]]) -> dict[tuple[str, str], dict[str, int]]:
-    """Derive each original job's request/packet/ACK caps from exact rows."""
+    """Derive the exact nine transport rows for each original job."""
     groups: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows:
         _archive_job_stats_add(groups, row)
-    return _archive_caps_from_stats(groups)
+    projected = _archive_caps_from_stats(groups)
+    public_fields = (
+        "checkpoint_request_bytes", "transfer_packet_bytes",
+        "checkpoint_bytes", "object_manifest_bytes", "archive_ack_bytes",
+        "signature_bytes", "ack_bundle_bytes", "stage_map_bytes",
+        "transfer_offer_bytes",
+    )
+    return {
+        group: {field: caps[field] for field in public_fields}
+        for group, caps in projected.items()
+    }
+
+
+def project_archive_readback_caps(
+    rows: Iterable[dict[str, Any]],
+) -> dict[tuple[str, str], dict[str, int]]:
+    """Derive reusable readback request, response, tar and stage ceilings."""
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        _archive_job_stats_add(groups, row)
+    _require(bool(groups),
+             "Source5 archive readback has no exact per-job owner objects")
+    projected = _archive_caps_from_stats(groups)
+    result: dict[tuple[str, str], dict[str, int]] = {}
+    maximum_request_bytes = 0
+    maximum_response_bytes = 0
+    maximum_bundle_bytes = 0
+    maximum_stage_bytes = 0
+    maximum_stage_inodes = 0
+    maximum_object_count = 0
+    maximum_object_bytes = 0
+    maximum_live_window_bytes = 0
+    maximum_live_window_inodes = 0
+    for key, caps in projected.items():
+        request_bytes = caps["readback_request_bytes"]
+        response_bytes = caps["readback_response_bytes"]
+        bundle_bytes = caps["readback_bundle_bytes"]
+        stage_bytes = caps["readback_stage_bytes"]
+        stage_inodes = caps["readback_stage_inodes"]
+        object_count = caps["readback_object_count"]
+        per_job_maximum_object_bytes = caps["readback_maximum_object_bytes"]
+        live_window_bytes = caps["readback_window_bytes"]
+        live_window_inodes = caps["readback_window_inodes"]
+        _require(request_bytes <= MAX_ARCHIVE_READ_METADATA_BYTES and
+                 response_bytes <= MAX_ARCHIVE_READ_METADATA_BYTES and
+                 bundle_bytes <= MAX_ARCHIVE_TOTAL_BYTES and
+                 stage_bytes <= MAX_ARCHIVE_TOTAL_BYTES,
+                 f"Source5 readback {key} exceeds the closed transfer bounds")
+        result[key] = {
+            "request_bytes": request_bytes,
+            "response_bytes": response_bytes,
+            "bundle_bytes": bundle_bytes,
+            "stage_bytes": stage_bytes,
+            "stage_inodes": stage_inodes,
+            "object_count": object_count,
+            "maximum_object_bytes": per_job_maximum_object_bytes,
+            "live_window_bytes": live_window_bytes,
+            "live_window_inodes": live_window_inodes,
+        }
+        maximum_request_bytes = max(maximum_request_bytes, request_bytes)
+        maximum_response_bytes = max(maximum_response_bytes, response_bytes)
+        maximum_bundle_bytes = max(maximum_bundle_bytes, bundle_bytes)
+        maximum_stage_bytes = max(maximum_stage_bytes, stage_bytes)
+        maximum_stage_inodes = max(maximum_stage_inodes, stage_inodes)
+        maximum_object_count = max(maximum_object_count, object_count)
+        maximum_object_bytes = max(
+            maximum_object_bytes, per_job_maximum_object_bytes,
+        )
+        maximum_live_window_bytes = max(maximum_live_window_bytes,
+                                        live_window_bytes)
+        maximum_live_window_inodes = max(maximum_live_window_inodes,
+                                         live_window_inodes)
+    for key, caps in result.items():
+        caps["maximum_request_bytes"] = maximum_request_bytes
+        caps["maximum_response_bytes"] = maximum_response_bytes
+        caps["maximum_bundle_bytes"] = maximum_bundle_bytes
+        caps["maximum_stage_bytes"] = maximum_stage_bytes
+        caps["maximum_stage_inodes"] = maximum_stage_inodes
+        caps["maximum_object_count"] = maximum_object_count
+        caps["maximum_object_bytes"] = maximum_object_bytes
+        caps["maximum_live_window_bytes"] = maximum_live_window_bytes
+        caps["maximum_live_window_inodes"] = maximum_live_window_inodes
+    return result
 
 
 def _retention_projection(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -1231,23 +1758,125 @@ def _retention_projection(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
     failure_suffix_inodes_by_phase: dict[str, dict[str, int]] = {}
     failure_job_bytes_by_phase: dict[str, int] = {}
     ack_bundle_window_rows: dict[tuple[str, str], tuple[int, int, str]] = {}
+    cleanup_sidecar_alternatives: dict[
+        tuple[tuple[str, str], int], dict[str, tuple[int, int, str]]
+    ] = {}
+    fixed_job_record_groups: set[tuple[str, str]] = set()
+    has_journal_width_contract = False
+    has_archive_read_control = False
+    has_analyzer_scratch = False
+    analyzer_scratch_root: str | None = None
+    archive_read_window_bytes: dict[str, int] = {}
+    archive_read_window_inodes: dict[str, int] = {}
+    archive_read_roles_seen: set[str] = set()
+    archive_read_slot_roots: set[str | None] = set()
+    archive_read_alternative_rows: dict[
+        str, dict[str, tuple[int, int, str | None]]
+    ] = {"response": {}, "bundle": {}}
     files = 0
     file_index_data_bytes = 0
     non_tmp_tree_entries = 0
     non_tmp_tree_data_bytes = 0
     for row in rows:
         root = row["storage_root"]
+        if row["role"] == "journal_width_contract":
+            has_journal_width_contract = True
+        if row["role"] == SOURCE5_ARCHIVE_READ_CONTROL_ROLE:
+            has_archive_read_control = True
+        is_archive_read_transient = (
+            row["role"] in SOURCE5_ARCHIVE_READ_TRANSIENT_ROLES
+        )
+        is_analyzer_scratch = row["role"] == SOURCE5_ANALYZER_SPOOL_ROLE
+        if is_analyzer_scratch:
+            _require(not has_analyzer_scratch and row["kind"] == "tree" and
+                     row["phase"] is None and row["run_id"] is None and
+                     row["member_index"] is None and
+                     row["aggregate_id"] is None and
+                     row["host_id"] is not None and
+                     row["owner"] == "source5_controller" and
+                     row["max_bytes"] > 0 and
+                     row["max_file_bytes"] > 0 and
+                     row["max_inodes"] > 1 and
+                     row["storage_root"] is not None,
+                     "Source5 analyzer scratch is not one bounded global v4 tree")
+            has_analyzer_scratch = True
+            analyzer_scratch_root = row["storage_root"]
+        if row["role"] in SOURCE5_ARCHIVE_READ_TRANSIENT_ROLES | {
+                SOURCE5_ARCHIVE_READ_CONTROL_ROLE}:
+            _require(row["role"] not in archive_read_roles_seen and
+                     row["phase"] is None and row["run_id"] is None and
+                     row["member_index"] is None and
+                     row["aggregate_id"] is None,
+                     "Source5 archive readback path is duplicated or has job-group identity")
+            archive_read_roles_seen.add(row["role"])
+            _require(row["host_id"] is not None and row["owner"] ==
+                     "source5_controller",
+                     "Source5 archive readback path lost its exact host/controller owner")
+            if is_archive_read_transient:
+                expected_kind = ("tree" if row["role"] ==
+                                 "source5_archive_read_stage" else "file")
+                _require(row["kind"] == expected_kind and
+                         (row["kind"] != "file" or row["max_inodes"] == 1) and
+                         row["max_bytes"] > 0,
+                         "Source5 archive readback slot type or finite ceiling differs")
+                archive_read_slot_roots.add(row["storage_root"])
+            else:
+                _require(row["kind"] == "file" and row["max_inodes"] == 1 and
+                         row["max_bytes"] > 0,
+                         "Source5 archive read-control ledger is not one bounded regular file")
         failure_suffix = (
             row["role"] in FAILURE_WINDOW_ONLY_ROLES and
             row["phase"] is not None and row["run_id"] is None
         )
+        always_local = ALWAYS_LOCAL_EVIDENCE_ROLES | {
+            "journal_width_contract", SOURCE5_ARCHIVE_READ_CONTROL_ROLE,
+        }
         group = ((row["phase"], row["run_id"])
                  if row["phase"] is not None and row["run_id"] is not None and
-                 row["role"] not in ALWAYS_LOCAL_EVIDENCE_ROLES
+                 row["role"] not in always_local
                  else None)
+        if row["role"] in CLEANUP_SIDECAR_ALTERNATIVE_ROLES:
+            _require(group is not None and row["kind"] == "file" and
+                     row["phase"] in {"exploration", "aa", "confirmation"} and
+                     row["member_index"] in {0, 1},
+                     "Source5 cleanup sidecar alternative lacks one original fixed job/member")
+            member_key = (group, row["member_index"])
+            alternatives = cleanup_sidecar_alternatives.setdefault(
+                member_key, {},
+            )
+            _require(row["role"] not in alternatives,
+                     "Source5 cleanup sidecar/refusal alternative repeats a role")
+            alternatives[row["role"]] = (
+                row["max_file_bytes"], row["max_inodes"], root,
+            )
         if root is not None:
             roots.add(root)
-            if failure_suffix:
+            if is_analyzer_scratch:
+                archive_read_window_bytes[root] = (
+                    archive_read_window_bytes.get(root, 0) + row["max_bytes"]
+                )
+                archive_read_window_inodes[root] = (
+                    archive_read_window_inodes.get(root, 0) + row["max_inodes"]
+                )
+            elif is_archive_read_transient:
+                _require(row["phase"] is None and row["run_id"] is None,
+                         "Source5 archive readback slot must be one reusable host window")
+                if row["role"] in SOURCE5_ARCHIVE_READ_RESPONSE_ALTERNATIVES:
+                    archive_read_alternative_rows["response"][row["role"]] = (
+                        row["max_bytes"], row["max_inodes"], root,
+                    )
+                elif row["role"] in SOURCE5_ARCHIVE_READ_BUNDLE_ALTERNATIVES:
+                    archive_read_alternative_rows["bundle"][row["role"]] = (
+                        row["max_bytes"], row["max_inodes"], root,
+                    )
+                else:
+                    archive_read_window_bytes[root] = (
+                        archive_read_window_bytes.get(root, 0) + row["max_bytes"]
+                    )
+                    archive_read_window_inodes[root] = (
+                        archive_read_window_inodes.get(root, 0) + row["max_inodes"]
+                    )
+            elif failure_suffix:
                 failure_suffix_bytes_by_phase.setdefault(row["phase"], {})[root] = (
                     failure_suffix_bytes_by_phase.setdefault(row["phase"], {}).get(root, 0) +
                     row["max_bytes"]
@@ -1268,6 +1897,9 @@ def _retention_projection(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 ack_bundle_window_rows[group] = (
                     row["max_bytes"], row["max_inodes"], root,
                 )
+            elif (group is not None and
+                  row["role"] in CLEANUP_SIDECAR_ALTERNATIVE_ROLES):
+                pass  # one of the two same-member alternatives is retained
             elif group is not None:
                 byte_rows = group_bytes.setdefault(group, {})
                 inode_rows = group_inodes.setdefault(group, {})
@@ -1312,10 +1944,14 @@ def _retention_projection(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
                      "Source5 local job record lacks its original phase/run binding")
             key = (row["phase"], row["run_id"])
             local_job_record_rows[key] = local_job_record_rows.get(key, 0) + 1
+            if row["phase"] in {"exploration", "aa", "confirmation"}:
+                fixed_job_record_groups.add(key)
         if row["kind"] == "file":
-            is_transient = row["role"] in TRANSIENT_JOB_EVIDENCE_ROLES
+            is_transient = (row["role"] in TRANSIENT_JOB_EVIDENCE_ROLES or
+                            is_archive_read_transient)
             is_success_indexed = row["role"] not in (
-                TRANSIENT_JOB_EVIDENCE_ROLES | FAILURE_WINDOW_ONLY_ROLES
+                TRANSIENT_JOB_EVIDENCE_ROLES | FAILURE_WINDOW_ONLY_ROLES |
+                SOURCE5_ARCHIVE_READ_TRANSIENT_ROLES
             )
             if is_success_indexed:
                 files += 1
@@ -1325,12 +1961,20 @@ def _retention_projection(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 window_index_data_bytes[group] = (
                     window_index_data_bytes.get(group, 0) + _index_row_bound(row)
                 )
-            if row["role"] in FAILURE_WINDOW_ONLY_ROLES and row["run_id"] is not None:
+            if (row["role"] == "source5_job_disposition" and
+                    row["run_id"] is not None):
                 failure_job_bytes_by_phase[row["phase"]] = max(
                     failure_job_bytes_by_phase.get(row["phase"], 0),
                     row["max_bytes"],
                 )
             _archive_job_stats_add(archive_job_stats, row)
+            continue
+        if is_analyzer_scratch:
+            continue
+        if is_archive_read_transient:
+            _require(row["kind"] == "tree" and
+                     row["role"] == "source5_archive_read_stage",
+                     "Source5 archive readback stage is not a bounded private tree")
             continue
         if _is_success_empty_tmp_tree(row):
             _require(group is not None,
@@ -1377,6 +2021,68 @@ def _retention_projection(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         inode_rows = group_inodes.setdefault(group, {})
         byte_rows[root] = byte_rows.get(root, 0) + amount
         inode_rows[root] = inode_rows.get(root, 0) + inodes
+    expected_cleanup_roles = CLEANUP_SIDECAR_ALTERNATIVE_ROLES
+    cleanup_shape = _cleanup_source_shape(SOURCE5_CLEANUP_SESSION_MEMBER_LIMIT)
+    sidecar_source_max = cleanup_shape["source_maximum_bytes"]
+    cleanup_group_members: dict[tuple[str, str], set[int]] = {}
+    for (group, member_index), alternatives in cleanup_sidecar_alternatives.items():
+        _require(set(alternatives) == expected_cleanup_roles,
+                 f"Source5 {group}/member{member_index} cleanup alternatives are incomplete")
+        sidecar_cap = alternatives[SOURCE5_CLEANUP_SIDECAR_ROLE]
+        refusal_cap = alternatives[SOURCE5_CLEANUP_SIDECAR_REFUSAL_ROLE]
+        _require(sidecar_cap == (sidecar_source_max, 1, sidecar_cap[2]) and
+                 refusal_cap == (SOURCE5_CLEANUP_REFUSAL_BYTES, 1,
+                                 refusal_cap[2]) and
+                 sidecar_cap[2] == refusal_cap[2],
+                 f"Source5 {group}/member{member_index} cleanup cap/root differs from the source-derived contract")
+        cleanup_group_members.setdefault(group, set()).add(member_index)
+        root = sidecar_cap[2]
+        byte_rows = group_bytes.setdefault(group, {})
+        inode_rows = group_inodes.setdefault(group, {})
+        byte_rows[root] = byte_rows.get(root, 0) + max(
+            sidecar_cap[0], refusal_cap[0],
+        )
+        inode_rows[root] = inode_rows.get(root, 0) + max(
+            sidecar_cap[1], refusal_cap[1],
+        )
+    _require(all(members == {0, 1} for members in cleanup_group_members.values()),
+             "Source5 cleanup sidecar alternatives do not cover both exact fixed members")
+    if cleanup_sidecar_alternatives:
+        _require(set(cleanup_group_members) == fixed_job_record_groups,
+                 "Source5 cleanup sidecar/refusal alternatives do not cover every original fixed job")
+    if has_archive_read_control or archive_read_roles_seen:
+        _require(has_archive_read_control and archive_read_roles_seen ==
+                 (SOURCE5_ARCHIVE_READ_TRANSIENT_ROLES |
+                  {SOURCE5_ARCHIVE_READ_CONTROL_ROLE}),
+                 "Source5 archive readback catalogue does not close every reusable slot and control ledger")
+        for family, roles in (
+            ("response", SOURCE5_ARCHIVE_READ_RESPONSE_ALTERNATIVES),
+            ("bundle", SOURCE5_ARCHIVE_READ_BUNDLE_ALTERNATIVES),
+        ):
+            alternatives = archive_read_alternative_rows[family]
+            _require(set(alternatives) == roles and
+                     len(set(alternatives.values())) == 1,
+                     f"Source5 archive read {family} incoming/final slots are not exact same-filesystem alternatives")
+            amount, inodes, root = next(iter(alternatives.values()))
+            _require(root is not None,
+                     f"Source5 archive read {family} alternatives have no reserved storage root")
+            archive_read_window_bytes[root] = (
+                archive_read_window_bytes.get(root, 0) + amount
+            )
+            archive_read_window_inodes[root] = (
+                archive_read_window_inodes.get(root, 0) + inodes
+            )
+        _require(len(archive_read_slot_roots) == 1 and
+                 None not in archive_read_slot_roots,
+                 "Source5 archive readback slots do not share one caller-reserved storage root")
+    _require(has_analyzer_scratch == has_journal_width_contract,
+             "Source5 v4 journal-width contract and analyzer scratch tree do not close together")
+    if has_analyzer_scratch:
+        _require(has_archive_read_control and archive_read_roles_seen ==
+                 SOURCE5_ARCHIVE_READ_TRANSIENT_ROLES | {
+                     SOURCE5_ARCHIVE_READ_CONTROL_ROLE,
+                 } and analyzer_scratch_root in archive_read_slot_roots,
+                 "Source5 analyzer scratch does not share the v4 archive-readback window root")
     for root in roots:
         byte_peaks = [(values.get(root, 0), group)
                       for group, values in group_bytes.items()]
@@ -1384,10 +2090,14 @@ def _retention_projection(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
                        for group, values in group_inodes.items()]
         peak_bytes, _ = max(byte_peaks, default=(0, None))
         peak_inodes, _ = max(inode_peaks, default=(0, None))
-        window_bytes[root] = peak_bytes
-        window_inodes[root] = peak_inodes
-        live_bytes[root] = base_bytes.get(root, 0) + peak_bytes
-        live_inodes[root] = base_inodes.get(root, 0) + peak_inodes
+        window_bytes[root] = max(
+            peak_bytes, archive_read_window_bytes.get(root, 0),
+        )
+        window_inodes[root] = max(
+            peak_inodes, archive_read_window_inodes.get(root, 0),
+        )
+        live_bytes[root] = base_bytes.get(root, 0) + window_bytes[root]
+        live_inodes[root] = base_inodes.get(root, 0) + window_inodes[root]
     failure_window_group = max(
         tmp_tree_payload_bytes,
         key=lambda group: tmp_tree_payload_bytes[group],
@@ -1440,22 +2150,37 @@ def _retention_projection(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
             "transfer_offer_bytes",
         )
     }
-    maximum_window_total_bytes = max(
+    maximum_job_window_bytes = max(
         (sum(amounts.values()) for amounts in group_bytes.values()), default=0,
     )
-    maximum_window_total_inodes = max(
+    maximum_job_window_inodes = max(
         (sum(amounts.values()) for amounts in group_inodes.values()), default=0,
     )
+    if has_analyzer_scratch:
+        maximum_window_total_bytes = max(
+            maximum_job_window_bytes, sum(archive_read_window_bytes.values()),
+        )
+        maximum_window_total_inodes = max(
+            maximum_job_window_inodes, sum(archive_read_window_inodes.values()),
+        )
+    else:
+        maximum_window_total_bytes = maximum_job_window_bytes
+        maximum_window_total_inodes = maximum_job_window_inodes
     maximum_window_index_entries = max(window_index_entries.values(), default=0)
     maximum_window_index_data_bytes = max(
         window_index_data_bytes.values(), default=0,
     )
     maximum_transfer_packet_bytes = maximum_archive_caps["transfer_packet_bytes"]
-    return {
+    retention = {
         "schema": RETENTION_POLICY_SCHEMA_V2,
         "mode": RETENTION_POLICY_MODE_V2,
         "success_empty_tree_roles": sorted(SUCCESS_EMPTY_TMP_TREE_ROLES),
-        "always_local_roles": sorted(ALWAYS_LOCAL_EVIDENCE_ROLES),
+        "always_local_roles": sorted(
+            ALWAYS_LOCAL_EVIDENCE_ROLES |
+            ({"journal_width_contract"} if has_journal_width_contract else set()) |
+            ({SOURCE5_ARCHIVE_READ_CONTROL_ROLE}
+             if has_archive_read_control else set())
+        ),
         "max_live_job_windows": 1,
         "max_retained_failure_windows": 1,
         "stop_before_next_authorization_on": [
@@ -1517,6 +2242,23 @@ def _retention_projection(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
             file_index_data_bytes + non_tmp_tree_data_bytes + failure_data_bytes
         ),
     }
+    if cleanup_sidecar_alternatives:
+        retention.update({
+            "cleanup_source_shape": cleanup_shape,
+            "maximum_cleanup_sidecar_source_bytes":
+                cleanup_shape["source_maximum_bytes"],
+            "maximum_cleanup_sidecar_bytes":
+                cleanup_shape["admission_maximum_bytes"],
+            "maximum_failed_cleanup_window_bytes":
+                cleanup_shape["maximum_window_bytes"],
+            "maximum_failed_cleanup_window_inodes": 2,
+            "maximum_cleanup_sidecar_refusal_bytes":
+                cleanup_shape["refusal_file_bytes"],
+            "maximum_failed_cleanup_refusal_window_bytes":
+                cleanup_shape["maximum_refusal_window_bytes"],
+            "maximum_failed_cleanup_refusal_window_inodes": 2,
+        })
+    return retention
 
 
 def _index_manifest_tree_bound(data_chunk_count: int) -> tuple[int, int]:
@@ -1741,6 +2483,11 @@ def write_path_catalogue_chunks(
             elif row["role"] in FAILURE_WINDOW_ONLY_ROLES:
                 # The first failed owner stops the horizon; only one failure
                 # disposition window can be retained.
+                pass
+            elif row["role"] == SOURCE5_ANALYZER_SPOOL_ROLE:
+                # Analyzer spools are controller scratch. Their bytes and
+                # inodes are charged to the live scratch window above, but
+                # these files are not source evidence or archive payload.
                 pass
             elif _is_success_empty_tmp_tree(row):
                 # Successful owner receipts prove zero retained bytes. The
@@ -1985,7 +2732,7 @@ def validate_path_catalogue_manifest(value: object) -> dict[str, Any]:
     _require(set(manifest["root_byte_bounds"]) ==
              set(manifest["root_inode_bounds"]),
              "Source5 path catalogue root byte/inode domain sets differ")
-    retention = _exact(manifest["retention_policy"], {
+    retention_base_fields = {
         "schema", "mode", "success_empty_tree_roles", "always_local_roles",
         "max_live_job_windows", "max_retained_failure_windows",
         "stop_before_next_authorization_on", "reclaim_after",
@@ -2013,13 +2760,44 @@ def validate_path_catalogue_manifest(value: object) -> dict[str, Any]:
         "maximum_failure_window_tmp_index_entries",
         "maximum_failure_window_tmp_index_data_bytes",
         "maximum_full_index_entries", "maximum_full_index_data_bytes",
-    }, "Source5 path catalogue between-pair retention policy")
+    }
+    cleanup_policy_fields = {
+        "cleanup_source_shape", "maximum_cleanup_sidecar_source_bytes",
+        "maximum_cleanup_sidecar_bytes",
+        "maximum_failed_cleanup_window_bytes",
+        "maximum_failed_cleanup_window_inodes",
+        "maximum_cleanup_sidecar_refusal_bytes",
+        "maximum_failed_cleanup_refusal_window_bytes",
+        "maximum_failed_cleanup_refusal_window_inodes",
+    }
+    _require(type(manifest["retention_policy"]) is dict,
+             "Source5 path catalogue retention policy is not an object")
+    retention_has_cleanup = (
+        set(manifest["retention_policy"]) ==
+        retention_base_fields | cleanup_policy_fields
+    )
+    _require(retention_has_cleanup or
+             set(manifest["retention_policy"]) == retention_base_fields,
+             "Source5 path catalogue retention policy field set differs")
+    retention = _exact(
+        manifest["retention_policy"],
+        retention_base_fields | (cleanup_policy_fields
+                                 if retention_has_cleanup else set()),
+        "Source5 path catalogue between-pair retention policy",
+    )
+    _require(type(manifest["role_byte_bounds"]) is dict,
+             "Source5 path catalogue role-byte projection is malformed")
+    expected_always_local_roles = ALWAYS_LOCAL_EVIDENCE_ROLES
+    if "journal_width_contract" in manifest["role_byte_bounds"]:
+        expected_always_local_roles |= {"journal_width_contract"}
+    if SOURCE5_ARCHIVE_READ_CONTROL_ROLE in manifest["role_byte_bounds"]:
+        expected_always_local_roles |= {SOURCE5_ARCHIVE_READ_CONTROL_ROLE}
     _require(retention["schema"] == RETENTION_POLICY_SCHEMA_V2 and
              retention["mode"] == RETENTION_POLICY_MODE_V2 and
              retention["success_empty_tree_roles"] ==
                 sorted(SUCCESS_EMPTY_TMP_TREE_ROLES) and
              retention["always_local_roles"] ==
-                sorted(ALWAYS_LOCAL_EVIDENCE_ROLES) and
+                 sorted(expected_always_local_roles) and
              retention["max_live_job_windows"] == 1 and
              retention["max_retained_failure_windows"] == 1 and
              retention["stop_before_next_authorization_on"] == [
@@ -2031,8 +2809,37 @@ def validate_path_catalogue_manifest(value: object) -> dict[str, Any]:
              retention["archive_io_lane"] ==
                 "outside_timed_application_and_pressure_lanes",
              "Source5 path catalogue retention policy weakens the owner stop/reclaim contract")
+    if retention_has_cleanup:
+        _require(retention["cleanup_source_shape"] ==
+                    _cleanup_source_shape(SOURCE5_CLEANUP_SESSION_MEMBER_LIMIT) and
+                 retention["maximum_cleanup_sidecar_source_bytes"] ==
+                    retention["cleanup_source_shape"]["source_maximum_bytes"] and
+                 retention["maximum_cleanup_sidecar_bytes"] ==
+                    retention["cleanup_source_shape"]["admission_maximum_bytes"] and
+                 retention["maximum_failed_cleanup_window_bytes"] ==
+                    retention["cleanup_source_shape"]["maximum_window_bytes"] and
+                 retention["maximum_failed_cleanup_window_inodes"] == 2 and
+                 retention["maximum_cleanup_sidecar_refusal_bytes"] ==
+                    retention["cleanup_source_shape"]["refusal_file_bytes"] and
+                 retention["maximum_failed_cleanup_refusal_window_bytes"] ==
+                    retention["cleanup_source_shape"]["maximum_refusal_window_bytes"] and
+                 retention["maximum_failed_cleanup_refusal_window_inodes"] == 2,
+                 "Source5 cleanup sidecar retention bounds differ from the source contract")
     _uint(retention["job_group_count"],
           "Source5 retention original phase/run group count")
+    if retention_has_cleanup:
+        cleanup_shape = retention["cleanup_source_shape"]
+        _exact(cleanup_shape, {
+            "maximum_session_members_per_snapshot",
+            "maximum_pidfd_signal_entries_per_snapshot",
+            "maximum_signal_snapshots", "maximum_cleanup_errors",
+            "maximum_error_text_bytes", "normal_cleanup_poll_count",
+            "emergency_cleanup_poll_count", "term_grace_seconds",
+            "kill_reap_seconds", "cleanup_poll_interval_seconds",
+            "source_maximum_bytes", "admission_maximum_bytes",
+            "maximum_window_bytes", "refusal_file_bytes",
+            "maximum_refusal_window_bytes",
+        }, "Source5 retention cleanup source shape")
     for field in (
         "persistent_root_byte_bounds", "persistent_root_inode_bounds",
         "maximum_window_root_byte_bounds", "maximum_window_root_inode_bounds",
@@ -2080,6 +2887,17 @@ def validate_path_catalogue_manifest(value: object) -> dict[str, Any]:
         "maximum_transfer_packet_bytes", "maximum_transfer_packet_inodes",
     ):
         _uint(retention[field], f"Source5 retention {field}")
+    if retention_has_cleanup:
+        for field in (
+            "maximum_cleanup_sidecar_source_bytes",
+            "maximum_cleanup_sidecar_bytes",
+            "maximum_failed_cleanup_window_bytes",
+            "maximum_failed_cleanup_window_inodes",
+            "maximum_cleanup_sidecar_refusal_bytes",
+            "maximum_failed_cleanup_refusal_window_bytes",
+            "maximum_failed_cleanup_refusal_window_inodes",
+        ):
+            _uint(retention[field], f"Source5 retention {field}")
     _require(retention["maximum_signature_bytes"] ==
              ARCHIVE_SIGNATURE_QUOTA_BYTES,
              "Source5 retention signature quota differs from the pinned campaign policy")
@@ -2225,6 +3043,8 @@ def _catalogue_derived_bounds(
             pass
         elif _is_success_empty_tmp_tree(row):
             pass
+        elif row["role"] == SOURCE5_ANALYZER_SPOOL_ROLE:
+            pass
         elif aggregate is None:
             ungrouped_bytes += row["max_bytes"]
         else:
@@ -2245,12 +3065,14 @@ def _catalogue_derived_bounds(
             ):
                 maximum_index_entries += 1
                 maximum_index_data_bytes += _index_row_bound(row)
-        else:
+        elif row["role"] != SOURCE5_ANALYZER_SPOOL_ROLE:
             trees += 1
             maximum_index_entries += row["max_inodes"] - 1
             maximum_index_data_bytes += (
                 row["max_inodes"] - 1
             ) * _index_row_bound(row, path_length=MAX_PATH_BYTES)
+        else:
+            trees += 1
     grouped_bytes = 0
     for aggregate, amount in aggregate_bytes.items():
         maximum, root = aggregate_limits[aggregate]
@@ -2475,12 +3297,309 @@ def build_storage_reservation_value(
     return {**body, "reservation_sha256": _sha(_canonical(body))}
 
 
-def build_host_evidence_budget_v2(
+def _verify_captured_journal_width_contract(
+    pin_value: object, raw_value: object,
+) -> tuple[dict[str, Any], bytes, dict[str, Any]]:
+    pin = _exact(pin_value, {"path", "raw_sha256", "semantic_sha256"},
+                 "Source5 journal-width contract pin")
+    path_text = pin["path"]
+    _require(type(path_text) is str and path_text.startswith("/") and
+             len(path_text.encode("utf-8", "strict")) <= MAX_PATH_BYTES and
+             PurePosixPath(path_text).as_posix() == path_text and
+             ".." not in PurePosixPath(path_text).parts,
+             "Source5 journal-width contract path is not normalized")
+    _digest(pin["raw_sha256"], "Source5 journal-width contract raw digest")
+    _digest(pin["semantic_sha256"],
+            "Source5 journal-width contract semantic digest")
+    _require(type(raw_value) is bytes and
+             0 < len(raw_value) <= MAX_JOURNAL_WIDTH_CONTRACT_BYTES,
+             "Source5 journal-width contract captured bytes are not bounded")
+    raw = raw_value
+    _require(_sha(raw) == pin["raw_sha256"],
+             "Source5 journal-width contract raw pin differs")
+    try:
+        value = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise BudgetPlanError("Source5 journal-width contract is malformed") from error
+    _require(type(value) is dict and raw == _canonical(value) and
+             value.get("schema") == JOURNAL_WIDTH_CONTRACT_SCHEMA and
+             type(value.get("contract_sha256")) is str and
+             value["contract_sha256"] == pin["semantic_sha256"] ==
+                 _sha(_canonical({key: item for key, item in value.items()
+                                  if key != "contract_sha256"})),
+             "Source5 journal-width contract canonical/semantic pin differs")
+    return value, raw, pin
+
+
+def _validate_journal_width_contract_summary(
+    contract_value: object, audit: dict[str, Any], owner_contract: dict[str, Any],
+) -> tuple[dict[str, Any], int, int]:
+    contract = _exact(contract_value, {
+        "schema", "campaign_id", "host_id", "original_pins_sha256",
+        "plan_pin", "source_manifest_pin", "owner_pins", "job_rows",
+        "phase_totals", "fixed_event_widths", "total_event_count",
+        "total_event_bytes", "failed_owner_window", "contract_sha256",
+    }, "Source5 journal-width contract")
+    body = {key: item for key, item in contract.items()
+            if key != "contract_sha256"}
+    host_id = audit["host_id"]
+    original = audit["original_pins"]
+    catalogue_owner_pins = owner_contract.get("owner_source_pins")
+    catalogue_owner_roles = {
+        "fixed_pair", "pressure_pair", "source5_controller", "source5_soak",
+        "soak_reader", "offline_dispatcher", "chronology",
+        "evidence_transport",
+    }
+    audit_owner_pins = audit.get("producer_catalogue", {}).get(
+        "owner_schema_pins",
+    )
+    audit_owner_roles = {
+        "fixed_pair", "pressure_pair", "source5_controller", "source5_soak",
+        "soak_reader", "feedback_composer", "feedback_reader",
+        "pressure_reader", "evidence_transport",
+    }
+    _require(type(catalogue_owner_pins) is dict and
+             set(catalogue_owner_pins) == catalogue_owner_roles and
+             (audit_owner_pins is None or
+              (type(audit_owner_pins) is dict and
+               set(audit_owner_pins) == audit_owner_roles)),
+             "Source5 width owner profiles do not match their exact catalogue/budget role sets")
+    expected_owner_pins: dict[str, dict[str, Any]] = {}
+    for role, row_value in catalogue_owner_pins.items():
+        row = _exact(row_value, {"path", "raw_sha256", "byte_count"},
+                     f"Source5 catalogue width owner pin {role}")
+        _require(type(row["path"]) is str and bool(row["path"]) and
+                 _digest(row["raw_sha256"],
+                         f"Source5 catalogue width owner pin {role} raw SHA-256") ==
+                     row["raw_sha256"] and
+                 type(row["byte_count"]) is int and row["byte_count"] > 0,
+                 f"Source5 catalogue width owner pin {role} is malformed")
+        expected_owner_pins[role] = dict(row)
+    expected_roles = catalogue_owner_roles | audit_owner_roles
+    contract_owner_pins = _exact(
+        contract["owner_pins"], expected_roles,
+        "Source5 journal-width union owner pins",
+    )
+    if audit_owner_pins is None:
+        # The persisted host budget intentionally retains the catalogue's
+        # eight-role pin profile, not a second copy of the budget audit's
+        # nine-role profile. At replay, only the catalogue profile can be
+        # independently reconstructed here; the controller and chronology
+        # compare all eleven contract pins against the captured typed Source.
+        for role in sorted(audit_owner_roles - catalogue_owner_roles):
+            row = _exact(
+                contract_owner_pins[role],
+                {"path", "raw_sha256", "byte_count"},
+                f"Source5 journal-width budget-only owner pin {role}",
+            )
+            _require(type(row["path"]) is str and bool(row["path"]) and
+                     _digest(row["raw_sha256"],
+                             f"Source5 budget width owner pin {role} raw SHA-256") ==
+                         row["raw_sha256"] and
+                     type(row["byte_count"]) is int and row["byte_count"] > 0,
+                     f"Source5 journal-width budget-only owner pin {role} is malformed")
+            expected_owner_pins[role] = dict(row)
+    else:
+        for role, row_value in audit_owner_pins.items():
+            row = _exact(row_value, {"path", "mode", "sha256", "size"},
+                         f"Source5 budget width owner pin {role}")
+            normalized = {
+                "path": row["path"], "raw_sha256": row["sha256"],
+                "byte_count": row["size"],
+            }
+            _require(type(normalized["path"]) is str and bool(normalized["path"]) and
+                     _digest(normalized["raw_sha256"],
+                             f"Source5 budget width owner pin {role} raw SHA-256") ==
+                         normalized["raw_sha256"] and
+                     type(normalized["byte_count"]) is int and
+                     normalized["byte_count"] > 0 and
+                     row["mode"] in {"100644", "100755"},
+                     f"Source5 budget width owner pin {role} is malformed")
+            prior = expected_owner_pins.get(role)
+            _require(prior is None or prior == normalized,
+                     f"Source5 shared width owner role {role} has divergent source pins")
+            expected_owner_pins[role] = normalized
+    _require(set(expected_owner_pins) == expected_roles and
+             len(expected_owner_pins) == 11,
+             "Source5 width owner pin union does not close over eleven source roles")
+    expected_owner_pins = {
+        role: expected_owner_pins[role] for role in sorted(expected_owner_pins)
+    }
+    _require(contract["schema"] == JOURNAL_WIDTH_CONTRACT_SCHEMA and
+             contract["campaign_id"] == audit["campaign_id"] and
+             contract["host_id"] == host_id and
+             type(contract["original_pins_sha256"]) is str and
+             re.fullmatch(r"[0-9a-f]{64}", contract["original_pins_sha256"]) and
+             contract["contract_sha256"] == _sha(_canonical(body)) and
+             contract["plan_pin"] == original["plan"] and
+             contract["source_manifest_pin"] == original["source_manifests"][host_id] and
+             contract_owner_pins == expected_owner_pins,
+             "Source5 journal-width contract changed its exact campaign/host/input/source pins")
+    phases = PHASES
+    counts = audit["schedule"]["job_counts"]
+    _require(type(contract["job_rows"]) is list and
+             type(contract["phase_totals"]) is list and
+             type(contract["fixed_event_widths"]) is list,
+             "Source5 journal-width contract rows/totals are malformed")
+    event_names = (
+        "source5_authorized", "source5_app_started",
+        "source5_app_terminal", "source5_job_terminal",
+    )
+    row_fields = {
+        "phase", "job_index", "ordinal", "run_id", "job_sha256",
+        "event_counts", "maximum_event_bytes_by_kind",
+        "failed_event_counts", "failed_event_bytes_by_kind",
+        "success_job_bytes", "failed_window_bytes", "failed_event_count",
+        "failed_event_count_uplift", "byte_uplift",
+    }
+    expected_row_count = sum(counts[phase] for phase in phases)
+    _require(len(contract["job_rows"]) == expected_row_count and
+             len(contract["phase_totals"]) == len(phases),
+             "Source5 journal-width contract does not contain every original job row")
+    row_position = 0
+    phase_totals = []
+    successful_count = 0
+    successful_bytes = 0
+    winner = None
+    for phase in phases:
+        phase_count = 0
+        phase_bytes = 0
+        member_count = 1 if phase == "soak" else 2
+        expected_counts = {
+            "source5_authorized": 1,
+            "source5_app_started": member_count,
+            "source5_app_terminal": member_count,
+            "source5_job_terminal": 1,
+        }
+        for job_index in range(counts[phase]):
+            row = _exact(contract["job_rows"][row_position], row_fields,
+                         f"Source5 journal-width {phase} row[{job_index}]")
+            row_position += 1
+            _require(row["phase"] == phase and row["job_index"] == job_index and
+                     type(row["ordinal"]) is int and row["ordinal"] > 0 and
+                     type(row["run_id"]) is str and bool(row["run_id"]) and
+                     type(row["job_sha256"]) is str and
+                     re.fullmatch(r"[0-9a-f]{64}", row["job_sha256"]) and
+                     row["event_counts"] == expected_counts and
+                     row["failed_event_counts"] == expected_counts,
+                     f"Source5 journal-width {phase} row changed original ordinal/index/callback shape")
+            success_widths = _exact(row["maximum_event_bytes_by_kind"],
+                                    set(event_names),
+                                    "Source5 journal-width success line widths")
+            failed_widths = _exact(row["failed_event_bytes_by_kind"],
+                                   set(event_names),
+                                   "Source5 journal-width failed line widths")
+            for event in event_names:
+                _uint(success_widths[event],
+                      f"Source5 journal-width {phase}.{event} success width",
+                      positive=True)
+                _uint(failed_widths[event],
+                      f"Source5 journal-width {phase}.{event} failed width",
+                      positive=True)
+                _require(success_widths[event] <= MAX_EVENT_BYTES and
+                         failed_widths[event] <= MAX_EVENT_BYTES,
+                         "Source5 journal-width event line exceeds its source ceiling")
+            success_job_bytes = sum(
+                expected_counts[event] * success_widths[event]
+                for event in event_names
+            )
+            failed_window_bytes = sum(
+                expected_counts[event] * failed_widths[event]
+                for event in event_names
+            )
+            failed_event_count = sum(expected_counts.values())
+            _require(row["success_job_bytes"] == success_job_bytes and
+                     row["failed_window_bytes"] == failed_window_bytes and
+                     row["failed_event_count"] == failed_event_count and
+                     row["failed_event_count_uplift"] == 0 and
+                     row["byte_uplift"] ==
+                         max(0, failed_window_bytes - success_job_bytes),
+                     f"Source5 journal-width {phase} row bytes/counts do not close")
+            phase_count += failed_event_count
+            phase_bytes += success_job_bytes
+            candidate = {
+                "phase": phase, "job_index": job_index,
+                "ordinal": row["ordinal"], "run_id": row["run_id"],
+                "job_sha256": row["job_sha256"],
+                "failed_event_count": row["failed_event_count"],
+                "failed_event_count_uplift": row["failed_event_count_uplift"],
+                "failed_window_bytes": row["failed_window_bytes"],
+                "success_job_bytes": row["success_job_bytes"],
+                "byte_uplift": row["byte_uplift"],
+            }
+            if (winner is None or
+                    (candidate["byte_uplift"],
+                     candidate["failed_event_count_uplift"]) >
+                    (winner["byte_uplift"],
+                     winner["failed_event_count_uplift"])):
+                winner = candidate
+        phase_totals.append({
+            "phase": phase, "job_count": counts[phase],
+            "event_count": phase_count,
+            "success_event_bytes": phase_bytes,
+        })
+        successful_count += phase_count
+        successful_bytes += phase_bytes
+    _require(contract["phase_totals"] == phase_totals,
+             "Source5 journal-width contract phase totals differ from original job rows")
+    expected_fixed = [
+        ("source5_prepared_capacity_registered", "registration"),
+        *(("source5_analysis", phase) for phase in (
+            "exploration", "aa", "fixed_analysis", "pressure_analysis",
+            "soak", "final_analysis",
+        )),
+    ]
+    _require(len(contract["fixed_event_widths"]) == len(expected_fixed),
+             "Source5 journal-width contract fixed events omit an original event")
+    fixed_count = 0
+    fixed_bytes = 0
+    maximum_line_bytes = 0
+    for index, (row_value, identity) in enumerate(zip(
+        contract["fixed_event_widths"], expected_fixed, strict=True,
+    )):
+        row = _exact(row_value, {
+            "event", "phase", "count", "maximum_line_bytes",
+        }, f"Source5 journal-width fixed row[{index}]")
+        _uint(row["maximum_line_bytes"],
+              f"Source5 journal-width fixed line[{index}]", positive=True)
+        _require((row["event"], row["phase"]) == identity and
+                 row["count"] == 1 and row["maximum_line_bytes"] <= MAX_EVENT_BYTES,
+                 "Source5 journal-width fixed event identity/width differs")
+        fixed_count += row["count"]
+        fixed_bytes += row["count"] * row["maximum_line_bytes"]
+        maximum_line_bytes = max(maximum_line_bytes, row["maximum_line_bytes"])
+    for row in contract["job_rows"]:
+        maximum_line_bytes = max(
+            maximum_line_bytes,
+            *row["maximum_event_bytes_by_kind"].values(),
+            *row["failed_event_bytes_by_kind"].values(),
+        )
+    expected_total_count = fixed_count + successful_count
+    expected_total_bytes = fixed_bytes + successful_bytes + max(
+        0, winner["byte_uplift"] if winner is not None else 0,
+    )
+    _require(winner is not None and
+             contract["failed_owner_window"] == winner and
+             contract["total_event_count"] == expected_total_count ==
+                audit["schedule"]["maximum_callback_events"] and
+             contract["total_event_bytes"] == expected_total_bytes,
+             "Source5 journal-width contract winner or campaign totals differ")
+    _uint(contract["total_event_bytes"],
+          "Source5 journal-width total journal bytes", positive=True)
+    return contract, expected_total_count, maximum_line_bytes
+
+
+def _build_host_evidence_budget_projection(
     audit_value: object, contract_value: object,
     catalogue_value: object, reservation_value: object,
-    reservation_pin_value: object,
+    reservation_pin_value: object, *,
+    journal_width_contract_value: object | None = None,
+    journal_width_contract_pin_value: object | None = None,
+    journal_width_contract_raw: bytes | None = None,
+    budget_schema: str = HOST_BUDGET_SCHEMA_V2,
+    admission_profile: str | None = None,
 ) -> dict[str, Any]:
-    """Bind the original schedule, exact catalogue and caller storage ceiling."""
+    """Build the shared source-derived body, then size one closed schema."""
     audit = audit_value
     contract = contract_value
     _require(type(audit) is dict and audit.get("schema") == AUDIT_SCHEMA and
@@ -2514,6 +3633,26 @@ def build_host_evidence_budget_v2(
                 audit["original_pins"]["source_manifests"][audit["host_id"]][
                     "semantic_sha256"],
              "Source5 v2 owner contract differs from the selected typed source")
+    cleanup_policy_bound = "cleanup_source_shape" in retention
+    if cleanup_policy_bound:
+        owner_cleanup_fields = {
+            "maximum_session_members_per_snapshot",
+            "maximum_pidfd_signal_entries_per_snapshot",
+            "maximum_signal_snapshots", "maximum_cleanup_errors",
+            "maximum_error_text_bytes", "normal_cleanup_poll_count",
+            "emergency_cleanup_poll_count", "term_grace_seconds",
+            "kill_reap_seconds", "cleanup_poll_interval_seconds",
+        }
+        owner_cleanup_shape = _exact(
+            contract.get("cleanup_source_shape"), owner_cleanup_fields,
+            "Source5 source-pinned cleanup limits",
+        )
+        expected_cleanup_shape = _cleanup_source_shape(
+            SOURCE5_CLEANUP_SESSION_MEMBER_LIMIT,
+        )
+        _require(owner_cleanup_shape == {
+            key: expected_cleanup_shape[key] for key in owner_cleanup_fields
+        }, "Source5 cleanup limits differ from their pinned owner-source profile")
     reservation = reservation_value
     _require(type(reservation) is dict and
              reservation.get("schema") == STORAGE_RESERVATION_SCHEMA_V1 and
@@ -2574,15 +3713,80 @@ def build_host_evidence_budget_v2(
              all(roles[path] in {"artifact", "output", "scratch"}
                  for path in catalogue_roots),
              "Source5 owner catalogue writable roots lack caller-pinned storage domains")
-    schedule = audit["schedule"]
+    execution_schema = audit.get("execution_manifest_schema")
+    width_inputs = (
+        journal_width_contract_value is not None,
+        journal_width_contract_pin_value is not None,
+        journal_width_contract_raw is not None,
+    )
+    _require(len(set(width_inputs)) == 1 and
+             (execution_schema ==
+              "allocatbelt.application-source5-campaign-execution.v4" or
+              not any(width_inputs)),
+             "Source5 journal-width contract inputs are partial or outside execution v4")
+    width_contract_bound = all(width_inputs)
+    _require(budget_schema in {HOST_BUDGET_SCHEMA_V2, HOST_BUDGET_SCHEMA_V3},
+             "Source5 budget projection schema is unsupported")
+    if budget_schema == HOST_BUDGET_SCHEMA_V2:
+        _require(admission_profile is None,
+                 "legacy Source5 v2 budget cannot carry an admission profile")
+    else:
+        _require(admission_profile == SOURCE5_V3_ADMISSION_PROFILE and
+                 execution_schema ==
+                    "allocatbelt.application-source5-campaign-execution.v4" and
+                 width_contract_bound,
+                 "Source5 ready v3 requires its exact v4 admission profile and width contract")
+    if width_contract_bound:
+        _require(cleanup_policy_bound,
+                 "Source5 v4 catalogue omits exact failed-cleanup retention rows")
+    _require(execution_schema in EXECUTION_SCHEMAS,
+             "Source5 v2 budget lacks its exact execution-manifest schema")
+    schedule = dict(audit["schedule"])
+    journal_width_contract_pin = None
+    journal_width_contract = None
+    if width_contract_bound:
+        journal_width_contract, width_event_count, maximum_line_bytes = \
+            _validate_journal_width_contract_summary(
+                journal_width_contract_value, audit, contract,
+            )
+        journal_width_contract_pin = _exact(
+            journal_width_contract_pin_value,
+            {"path", "raw_sha256", "semantic_sha256"},
+            "Source5 journal-width contract raw/semantic pin",
+        )
+        _pin(journal_width_contract_pin,
+             "Source5 journal-width contract raw/semantic pin")
+        pinned_contract, _width_raw, _width_pin = \
+            _verify_captured_journal_width_contract(
+                journal_width_contract_pin, journal_width_contract_raw,
+            )
+        _require(pinned_contract == journal_width_contract and
+                 journal_width_contract_pin["semantic_sha256"] ==
+                    journal_width_contract["contract_sha256"] and
+                 width_event_count == schedule["maximum_callback_events"],
+                 "Source5 v4 journal-width contract body/pin differs from the original Plan audit")
+        schedule["maximum_callback_events"] = width_event_count
+        schedule["maximum_callback_event_bytes"] = maximum_line_bytes
+        schedule["worst_case_journal_bytes"] = \
+            journal_width_contract["total_event_bytes"]
+    else:
+        _require(not any(width_inputs),
+                 "Source5 legacy budget cannot bind a partial journal-width contract")
     event_count = _uint(schedule["maximum_callback_events"],
                          "Source5 v2 callback event bound", positive=True)
     event_bytes = _uint(schedule["maximum_callback_event_bytes"],
                          "Source5 v2 callback event width", positive=True)
-    _require(schedule["worst_case_journal_bytes"] == min(
-                 CORE_ROLE_BYTES_CAP, event_count * event_bytes,
-             ),
-             "Source5 v2 journal byte formula differs from the original plan projection")
+    if journal_width_contract is None:
+        _require(schedule["worst_case_journal_bytes"] == min(
+                     CORE_ROLE_BYTES_CAP, event_count * event_bytes,
+                 ),
+                 "Source5 legacy v2 journal audit formula differs from its original Plan projection")
+    else:
+        _require(schedule["maximum_callback_events"] ==
+                    journal_width_contract["total_event_count"] and
+                 schedule["worst_case_journal_bytes"] ==
+                    journal_width_contract["total_event_bytes"],
+                 "Source5 v4 journal reservation differs from the complete width contract")
     maximum_store_metadata_chunks = max(
         1, (catalogue["maximum_index_bytes"] +
             (INDEX_DATA_CHUNK_BYTES - PATH_CATALOGUE_ROW_BYTES) - 1) //
@@ -2688,6 +3892,68 @@ def build_host_evidence_budget_v2(
             required_bytes[path] += catalogue_chunk_bytes
             required_inodes[path] += len(catalogue["chunks"]) + 1
     base_required_bytes = dict(required_bytes)
+    body_projection = {
+        "schema": budget_schema,
+        "campaign_id": audit["campaign_id"], "host_id": audit["host_id"],
+        "original_pins": audit["original_pins"], "schedule": schedule,
+        "owner_contract": contract, "path_catalogue": catalogue,
+        "storage_reservation": {
+            "pin": reservation_pin, "roots": roots,
+            "required_bytes_by_root": base_required_bytes,
+            "required_inodes_by_root": required_inodes,
+        },
+        "role_byte_reservations": catalogue["role_byte_bounds"],
+        "transport": transport,
+    }
+    if budget_schema == HOST_BUDGET_SCHEMA_V2:
+        body_projection["execution_blockers"] = ([
+            "source_derived_journal_width_not_bound",
+            "verified_between_pair_archive_ack_reclaim_not_integrated",
+        ] if journal_width_contract_pin is None else [
+            "verified_between_pair_archive_ack_reclaim_not_integrated",
+        ])
+        body_projection["readiness"] = {
+            "budget_complete": False, "execution_ready": False,
+            "component_gate_ready": False, "qualification_eligible": False,
+        }
+    else:
+        body_projection["admission_profile"] = admission_profile
+        body_projection["execution_blockers"] = []
+        body_projection["readiness"] = {
+            "budget_complete": True, "execution_ready": True,
+            "component_gate_ready": False, "qualification_eligible": False,
+        }
+    if journal_width_contract_pin is not None:
+        body_projection["execution_manifest_schema"] = execution_schema
+        body_projection["journal_width_contract_pin"] = journal_width_contract_pin
+    if budget_schema == HOST_BUDGET_SCHEMA_V3:
+        expected_counts = {
+            "exploration": 360, "aa": 48, "confirmation": 8100,
+            "pressure": 8100, "soak": 1,
+        }
+        expected_phase_events = {
+            "exploration": (360, 2160), "aa": (48, 288),
+            "confirmation": (8100, 48600), "pressure": (8100, 48600),
+            "soak": (1, 4),
+        }
+        _require(schedule["job_counts"] == expected_counts and
+                 schedule["total_job_count"] == 16609 and
+                 schedule["maximum_callback_events"] == 99659 and
+                 journal_width_contract is not None and
+                 journal_width_contract["total_event_count"] == 99659 and
+                 len(journal_width_contract["job_rows"]) == 16609 and
+                 type(journal_width_contract["phase_totals"]) is list and
+                 [(row.get("phase"), row.get("job_count"), row.get("event_count"))
+                  for row in journal_width_contract["phase_totals"]] ==
+                    [(phase, *expected_phase_events[phase])
+                     for phase in PHASES],
+                 "Source5 ready v3 requires the exact original 16,609-job/99,659-callback horizon")
+        all_counts = schedule.get("all_host_job_counts")
+        _require(type(all_counts) is dict and len(all_counts) == 3 and
+                 all(type(row) is dict and
+                     {phase: row.get(phase) for phase in PHASES} == expected_counts
+                     for row in all_counts.values()),
+                 "Source5 ready v3 requires all three hosts' complete original Plan schedule")
     budget_bytes = 0
     result: dict[str, Any] = {}
     for _ in range(32):
@@ -2695,27 +3961,11 @@ def build_host_evidence_budget_v2(
         for path, role in roles.items():
             if role in {"artifact", "evidence_store"}:
                 required_bytes[path] += budget_bytes
-        body = {
-            "schema": HOST_BUDGET_SCHEMA_V2,
-            "campaign_id": audit["campaign_id"], "host_id": audit["host_id"],
-            "original_pins": audit["original_pins"], "schedule": schedule,
-            "owner_contract": contract, "path_catalogue": catalogue,
-            "storage_reservation": {
-                "pin": reservation_pin, "roots": roots,
-                "required_bytes_by_root": required_bytes,
-                "required_inodes_by_root": required_inodes,
-            },
-            "role_byte_reservations": catalogue["role_byte_bounds"],
-            "transport": transport,
-            "execution_blockers": [
-                "source_derived_journal_width_not_bound",
-                "verified_between_pair_archive_ack_reclaim_not_integrated",
-            ],
-            "readiness": {
-                "budget_complete": False, "execution_ready": False,
-                "component_gate_ready": False, "qualification_eligible": False,
-            },
-        }
+        body = dict(body_projection)
+        storage = dict(body_projection["storage_reservation"])
+        storage["required_bytes_by_root"] = required_bytes
+        storage["required_inodes_by_root"] = required_inodes
+        body["storage_reservation"] = storage
         result = {**body, "budget_sha256": _sha(_canonical(body))}
         measured_budget_bytes = len(_canonical(result))
         if measured_budget_bytes == budget_bytes:
@@ -2730,29 +3980,226 @@ def build_host_evidence_budget_v2(
     return result
 
 
-def validate_host_evidence_budget_v2(value: object) -> dict[str, Any]:
-    """Validate the canonical v2 budget and exact pre-execution readiness state."""
-    budget = _exact(value, {
+
+def build_host_evidence_budget_v2(
+    audit_value: object, contract_value: object,
+    catalogue_value: object, reservation_value: object,
+    reservation_pin_value: object, *,
+    journal_width_contract_value: object | None = None,
+    journal_width_contract_pin_value: object | None = None,
+    journal_width_contract_raw: bytes | None = None,
+) -> dict[str, Any]:
+    """Build the legacy non-ready v2 budget with its original exact fields."""
+    return _build_host_evidence_budget_projection(
+        audit_value, contract_value, catalogue_value, reservation_value,
+        reservation_pin_value,
+        journal_width_contract_value=journal_width_contract_value,
+        journal_width_contract_pin_value=journal_width_contract_pin_value,
+        journal_width_contract_raw=journal_width_contract_raw,
+        budget_schema=HOST_BUDGET_SCHEMA_V2,
+    )
+
+
+def build_host_evidence_budget_v3(
+    audit_value: object, contract_value: object,
+    catalogue_value: object, reservation_value: object,
+    reservation_pin_value: object, *,
+    journal_width_contract_value: object,
+    journal_width_contract_pin_value: object,
+    journal_width_contract_raw: bytes,
+) -> dict[str, Any]:
+    """Build the SourceH-admitted ready budget for a complete original v4 plan."""
+    _require(type(audit_value) is dict and
+             audit_value.get("execution_manifest_schema") ==
+                "allocatbelt.application-source5-campaign-execution.v4",
+             "Source5 ready v3 accepts only an execution-v4 source-owned audit")
+    _require(type(journal_width_contract_value) is dict and
+             type(journal_width_contract_pin_value) is dict and
+             type(journal_width_contract_raw) is bytes,
+             "Source5 ready v3 requires the exact raw-pinned width contract")
+    return _build_host_evidence_budget_projection(
+        audit_value, contract_value, catalogue_value, reservation_value,
+        reservation_pin_value,
+        journal_width_contract_value=journal_width_contract_value,
+        journal_width_contract_pin_value=journal_width_contract_pin_value,
+        journal_width_contract_raw=journal_width_contract_raw,
+        budget_schema=HOST_BUDGET_SCHEMA_V3,
+        admission_profile=SOURCE5_V3_ADMISSION_PROFILE,
+    )
+
+
+def _validate_source5_v3_ready_state(value: object) -> None:
+    """Require literal JSON booleans in the ready-but-unqualified v3 flags."""
+    readiness = _exact(value, {
+        "budget_complete", "execution_ready", "component_gate_ready",
+        "qualification_eligible",
+    }, "Source5 v3 readiness")
+    expected = {
+        "budget_complete": True, "execution_ready": True,
+        "component_gate_ready": False, "qualification_eligible": False,
+    }
+    _require(all(type(readiness[field]) is bool and
+                 readiness[field] is expected[field]
+                 for field in expected),
+             "Source5 v3 readiness flags are not the exact literal ready/unqualified booleans")
+
+
+def _validate_host_evidence_budget_common(
+    value: object, *, expected_schema: str,
+    journal_width_contract_raw: bytes | None = None,
+    catalogue_row_reader=None,
+) -> dict[str, Any]:
+    """Validate either closed budget version without changing its body."""
+    legacy_fields = {
         "schema", "campaign_id", "host_id", "original_pins", "schedule",
         "owner_contract", "path_catalogue", "storage_reservation",
         "role_byte_reservations", "transport", "execution_blockers",
         "readiness", "budget_sha256",
-    }, "Source5 host evidence budget v2")
-    _require(budget["schema"] == HOST_BUDGET_SCHEMA_V2 and
-             budget["execution_blockers"] == [
-                 "source_derived_journal_width_not_bound",
-                 "verified_between_pair_archive_ack_reclaim_not_integrated",
-             ] and
-             budget["readiness"] == {
-                 "budget_complete": False, "execution_ready": False,
-                 "component_gate_ready": False, "qualification_eligible": False,
-             }, "Source5 v2 budget readiness differs from the pre-execution state")
+    }
+    v4_fields = legacy_fields | {
+        "execution_manifest_schema", "journal_width_contract_pin",
+    }
+    ready_v3_fields = v4_fields | {"admission_profile"}
+    _require(type(value) is dict,
+             "Source5 host evidence budget is not an object")
+    if expected_schema == HOST_BUDGET_SCHEMA_V2:
+        if set(value) == v4_fields:
+            budget = _exact(value, v4_fields,
+                            "Source5 v4 host evidence budget v2")
+            width_is_bound = True
+            _require(budget["execution_manifest_schema"] ==
+                     "allocatbelt.application-source5-campaign-execution.v4",
+                     "Source5 extended v2 budget is not bound to execution v4")
+        else:
+            budget = _exact(value, legacy_fields,
+                            "legacy Source5 host evidence budget v2")
+            width_is_bound = False
+            _require(journal_width_contract_raw is None,
+                     "legacy Source5 v2 budget cannot consume v4 width-contract bytes")
+        expected_blockers = ([
+            "verified_between_pair_archive_ack_reclaim_not_integrated",
+        ] if width_is_bound else [
+            "source_derived_journal_width_not_bound",
+            "verified_between_pair_archive_ack_reclaim_not_integrated",
+        ])
+        expected_readiness = {
+            "budget_complete": False, "execution_ready": False,
+            "component_gate_ready": False, "qualification_eligible": False,
+        }
+        _require(budget["schema"] == HOST_BUDGET_SCHEMA_V2 and
+                 budget["execution_blockers"] == expected_blockers and
+                 budget["readiness"] == expected_readiness,
+                 "Source5 v2 budget readiness differs from the pre-execution state")
+    elif expected_schema == HOST_BUDGET_SCHEMA_V3:
+        budget = _exact(value, ready_v3_fields,
+                        "Source5 ready host evidence budget v3")
+        width_is_bound = True
+        _validate_source5_v3_ready_state(budget.get("readiness"))
+        _require(budget["schema"] == HOST_BUDGET_SCHEMA_V3 and
+                 budget["admission_profile"] ==
+                    SOURCE5_V3_ADMISSION_PROFILE and
+                 budget["execution_manifest_schema"] ==
+                    "allocatbelt.application-source5-campaign-execution.v4" and
+                 budget["execution_blockers"] == [] and
+                 journal_width_contract_raw is not None,
+                 "Source5 v3 admission profile or ready-but-unqualified state differs")
+    else:
+        raise BudgetPlanError("unsupported Source5 host evidence budget validator")
+
     _token(budget["campaign_id"], "Source5 v2 campaign ID")
     _token(budget["host_id"], "Source5 v2 host ID")
     _require(type(budget["original_pins"]) is dict and
              type(budget["schedule"]) is dict,
              "Source5 v2 provenance or schedule is malformed")
     catalogue = validate_path_catalogue_manifest(budget["path_catalogue"])
+    if width_is_bound:
+        if catalogue_row_reader is None:
+            catalogue = verify_path_catalogue_chunks(catalogue)
+        else:
+            catalogue = verify_path_catalogue_chunks_with_reader(
+                catalogue, catalogue_row_reader,
+            )
+    width_pin_value = budget.get("journal_width_contract_pin")
+    if width_is_bound:
+        width_pin = _exact(width_pin_value, {
+            "path", "raw_sha256", "semantic_sha256",
+        }, "Source5 v2 journal-width contract pin")
+        width_contract, width_raw, _width_pin = \
+            _verify_captured_journal_width_contract(
+                width_pin, journal_width_contract_raw,
+            )
+        audit_projection = {
+            "campaign_id": budget["campaign_id"],
+            "host_id": budget["host_id"],
+            "original_pins": budget["original_pins"],
+            "schedule": budget["schedule"],
+        }
+        width_contract, width_event_count, width_maximum_line = \
+            _validate_journal_width_contract_summary(
+            width_contract, audit_projection, budget["owner_contract"],
+        )
+        _require(budget["schedule"].get("maximum_callback_events") ==
+                    width_event_count and
+                 budget["schedule"].get("maximum_callback_event_bytes") ==
+                    width_maximum_line and
+                 budget["schedule"].get("worst_case_journal_bytes") ==
+                    width_contract["total_event_bytes"],
+                 "Source5 v4 schedule does not consume its pinned exact width contract")
+        if expected_schema == HOST_BUDGET_SCHEMA_V3:
+            expected_counts = {
+                "exploration": 360, "aa": 48, "confirmation": 8100,
+                "pressure": 8100, "soak": 1,
+            }
+            expected_phase_events = {
+                "exploration": (360, 2160), "aa": (48, 288),
+                "confirmation": (8100, 48600), "pressure": (8100, 48600),
+                "soak": (1, 4),
+            }
+            counts = budget["schedule"].get("job_counts")
+            all_counts = budget["schedule"].get("all_host_job_counts")
+            _require(counts == expected_counts and
+                     budget["schedule"].get("total_job_count") == 16609 and
+                     width_event_count == 99659 and
+                     len(width_contract["job_rows"]) == 16609 and
+                     type(width_contract.get("phase_totals")) is list and
+                     [(row.get("phase"), row.get("job_count"), row.get("event_count"))
+                      for row in width_contract["phase_totals"]] ==
+                        [(phase, *expected_phase_events[phase])
+                         for phase in PHASES] and
+                     type(all_counts) is dict and len(all_counts) == 3 and
+                     all(type(row) is dict and
+                         {phase: row.get(phase) for phase in PHASES} == expected_counts
+                         for row in all_counts.values()),
+                     "Source5 v3 does not preserve all three complete original Plan schedules")
+        width_row = None
+        width_row_count = 0
+        rows = (iter_path_catalogue_rows(catalogue)
+                if catalogue_row_reader is None else
+                iter_path_catalogue_rows_with_reader(catalogue, catalogue_row_reader))
+        for row in rows:
+            if row["path"] == width_pin["path"]:
+                width_row = row
+                width_row_count += 1
+        _require(width_row_count == 1 and width_row is not None and
+                 width_row["role"] == "journal_width_contract" and
+                 width_row["kind"] == "file" and
+                 width_row["phase"] is None and
+                 width_row["run_id"] is None and
+                 width_row["member_index"] is None and
+                 width_row["origin_pin"] == {
+                     "raw_sha256": width_pin["raw_sha256"],
+                     "semantic_sha256": width_pin["semantic_sha256"],
+                 } and width_row["max_file_bytes"] >= len(width_raw),
+                 "Source5 v2 path catalogue omits its raw-pinned journal-width contract")
+    else:
+        _require(width_pin_value is None,
+                 "legacy Source5 budget carries an unregistered v4 journal-width pin")
+        legacy_schedule = budget["schedule"]
+        _require(legacy_schedule.get("worst_case_journal_bytes") == min(
+                     CORE_ROLE_BYTES_CAP,
+                     legacy_schedule.get("maximum_callback_events", 0) *
+                     legacy_schedule.get("maximum_callback_event_bytes", 0),
+                 ), "legacy Source5 v2 schedule journal formula differs")
     reservation = _exact(budget["storage_reservation"], {
         "pin", "roots", "required_bytes_by_root", "required_inodes_by_root",
     }, "Source5 v2 storage reservation binding")
@@ -2940,3 +4387,47 @@ def validate_host_evidence_budget_v2(value: object) -> dict[str, Any]:
              _sha(_canonical(body)),
              "Source5 v2 budget raw/semantic identity differs")
     return budget
+
+
+def validate_host_evidence_budget_v2(
+    value: object, *, journal_width_contract_raw: bytes | None = None,
+    catalogue_row_reader=None,
+) -> dict[str, Any]:
+    """Validate legacy false-ready v2 bytes with their frozen exact field sets."""
+    return _validate_host_evidence_budget_common(
+        value, expected_schema=HOST_BUDGET_SCHEMA_V2,
+        journal_width_contract_raw=journal_width_contract_raw,
+        catalogue_row_reader=catalogue_row_reader,
+    )
+
+
+def validate_host_evidence_budget_v3(
+    value: object, *, journal_width_contract_raw: bytes,
+    catalogue_row_reader=None,
+) -> dict[str, Any]:
+    """Validate SourceH's exact ready-but-unqualified v3 admission bytes."""
+    return _validate_host_evidence_budget_common(
+        value, expected_schema=HOST_BUDGET_SCHEMA_V3,
+        journal_width_contract_raw=journal_width_contract_raw,
+        catalogue_row_reader=catalogue_row_reader,
+    )
+
+
+def validate_host_evidence_budget(
+    value: object, *, journal_width_contract_raw: bytes | None = None,
+    catalogue_row_reader=None,
+) -> dict[str, Any]:
+    """Closed-version dispatch for SourceH, archive and packet consumers."""
+    _require(type(value) is dict,
+             "Source5 host evidence budget is not an object")
+    if value.get("schema") == HOST_BUDGET_SCHEMA_V2:
+        return validate_host_evidence_budget_v2(
+            value, journal_width_contract_raw=journal_width_contract_raw,
+            catalogue_row_reader=catalogue_row_reader,
+        )
+    if value.get("schema") == HOST_BUDGET_SCHEMA_V3:
+        return validate_host_evidence_budget_v3(
+            value, journal_width_contract_raw=journal_width_contract_raw,
+            catalogue_row_reader=catalogue_row_reader,
+        )
+    raise BudgetPlanError("unsupported Source5 host evidence budget schema")

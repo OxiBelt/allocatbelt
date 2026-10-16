@@ -42,6 +42,7 @@ CALIBRATION_SCOPE_RECEIPT_SCHEMA_V2 = "allocatbelt.application-pressure-calibrat
 CALIBRATION_HOST_VERIFICATION_SCHEMA_V2 = "allocatbelt.application-pressure-calibration-host-verification.v1"
 EVIDENCE_PATH_MAP_SCHEMA_V1 = "allocatbelt.application-pressure-evidence-path-map.v1"
 PRESSURE_PAIR_HOST_VERIFICATION_SCHEMA = "allocatbelt.application-pressure-pair-host-verification.v1"
+PRESSURE_PAIR_HOST_VERIFICATION_SCHEMA_V2 = "allocatbelt.application-pressure-pair-host-verification.v2"
 SOURCE5_SOAK_HOST_VERIFICATION_SCHEMA_V2 = "allocatbelt.application-source5-soak-host-verification.v2"
 SOURCE5_SOAK_HOST_VERIFICATION_SCHEMA_V3 = "allocatbelt.application-source5-soak-host-verification.v3"
 PRESSURE_PAIR_ORIGIN_FACTS_SCHEMA = "allocatbelt.application-pressure-pair-origin-facts.v1"
@@ -2813,25 +2814,88 @@ def _verify_raw_inputs(recipe_info: dict[str, Any]) -> None:
 def verify_pressure(
     recipe_path: Path, expected_recipe_sha: str, artifacts: Path,
     expected: dict[str, str],
+    *, artifact_view: Any = None,
+    captured_origin_paths: object | None = None,
+    captured_directory_paths: object | None = None,
 ) -> dict[str, Any]:
-    recipe_value, _, recipe_raw_sha = read_canonical(recipe_path, "frozen pressure recipe", MAX_RECIPE_BYTES)
+    if artifact_view is None:
+        require(captured_origin_paths is None and
+                captured_directory_paths is None,
+                "captured pressure paths require their explicit artifact view")
+        captured_files: frozenset[str] = frozenset()
+        captured_directories: frozenset[str] = frozenset()
+    else:
+        def normalized_paths(value: object, label: str) -> frozenset[str]:
+            require(type(value) is list and len(value) <=
+                    MAX_SOURCE5_SOAK_INVENTORY_ENTRIES,
+                    f"{label} is malformed or oversized")
+            paths: list[str] = []
+            for index, item in enumerate(value):
+                paths.append(str(absolute_path(item, f"{label}[{index}]")))
+            require(paths == sorted(set(paths)),
+                    f"{label} is not sorted and unique")
+            return frozenset(paths)
+
+        captured_files = normalized_paths(
+            captured_origin_paths, "captured pressure object origins",
+        )
+        captured_directories = normalized_paths(
+            captured_directory_paths, "captured pressure directory origins",
+        )
+        require(all(artifact_view.has_file(path) for path in captured_files),
+                "captured pressure object set differs from its authenticated view")
+
+    def read_origin_canonical(
+        path: Path, label: str, maximum: int, *, required_capture: bool = False,
+    ) -> tuple[dict[str, Any], bytes, str]:
+        origin = str(path)
+        captured = origin in captured_files
+        require(not required_capture or captured,
+                f"{label} is not in the exact captured pressure object set")
+        return read_canonical(
+            path, label, maximum,
+            artifact_view=(artifact_view if captured else None),
+        )
+
+    recipe_value, _, recipe_raw_sha = read_origin_canonical(
+        recipe_path, "frozen pressure recipe", MAX_RECIPE_BYTES,
+        required_capture=False,
+    )
     recipe_info = _validate_recipe(recipe_value, expected_recipe_sha)
     recipe = recipe_value
     _verify_script_hashes(recipe_info)
     _verify_raw_inputs(recipe_info)
     calibration_scope_readback = _validate_calibration(recipe, offline_context=_PRESSURE_OFFLINE_REPLAY_CONTEXT.get())
-    try:
-        dir_info = artifacts.lstat()
-        require(stat.S_ISDIR(dir_info.st_mode) and artifacts.resolve(strict=True) == artifacts, "artifact directory is a symlink or alias")
-    except OSError as error:
-        raise ReadbackError(f"artifact directory is unavailable: {error}") from error
     required = {"events.jsonl", "process-binding.json", "launch-record.json", "run.json", "pressure-ready.json"}
-    names = {path.name for path in artifacts.iterdir()}
+    if artifact_view is None:
+        try:
+            dir_info = artifacts.lstat()
+            require(stat.S_ISDIR(dir_info.st_mode) and artifacts.resolve(strict=True) == artifacts, "artifact directory is a symlink or alias")
+        except OSError as error:
+            raise ReadbackError(f"artifact directory is unavailable: {error}") from error
+        names = {path.name for path in artifacts.iterdir()}
+    else:
+        artifact_root = str(artifacts)
+        require(artifact_root in captured_directories,
+                "captured pressure view omits the original pressure artifact directory fact")
+        root_prefix = artifact_root.rstrip("/") + "/"
+        names = {Path(path).name for path in captured_files
+                 if path.startswith(root_prefix) and
+                 Path(path).parent == artifacts}
     require(names == required, "pressure artifact directory has missing or unexpected files")
-    launch, _, launch_sha = read_canonical(artifacts / "launch-record.json", "launch record", MAX_LAUNCH_BYTES)
+    if artifact_view is not None:
+        require(all(str(artifacts / name) in captured_files for name in required),
+                "captured pressure view omits an exact direct artifact")
+    launch, _, launch_sha = read_origin_canonical(
+        artifacts / "launch-record.json", "launch record", MAX_LAUNCH_BYTES,
+        required_capture=artifact_view is not None,
+    )
     require(launch_sha == expected["launch"], "launch record raw digest differs from the separately supplied expected hash")
     process = _validate_launch(launch, recipe, expected["launch"])
-    process_binding, _, process_binding_sha = read_canonical(artifacts / "process-binding.json", "process binding", MAX_LAUNCH_BYTES)
+    process_binding, _, process_binding_sha = read_origin_canonical(
+        artifacts / "process-binding.json", "process binding", MAX_LAUNCH_BYTES,
+        required_capture=artifact_view is not None,
+    )
     require(process_binding_sha == expected["process_binding"], "process binding raw digest differs from the separately supplied expected hash")
     binding = exact(process_binding, {
         "schema", "recipe_sha256", "launch_record_sha256", "identity", "observed_monotonic_ns",
@@ -2852,7 +2916,10 @@ def verify_pressure(
     uint(binding["observed_monotonic_ns"], "application observation time", positive=True)
     ready_at = uint(binding["pressure_ready_monotonic_ns"], "pressure ready time", positive=True)
     require(ready_at <= binding["observed_monotonic_ns"], "application was observed before measured readiness")
-    ready, _, ready_sha = read_canonical(artifacts / "pressure-ready.json", "pressure ready marker", 64 * 1024)
+    ready, _, ready_sha = read_origin_canonical(
+        artifacts / "pressure-ready.json", "pressure ready marker", 64 * 1024,
+        required_capture=artifact_view is not None,
+    )
     require(ready_sha == expected["ready"], "pressure ready marker raw digest differs from separately supplied expected hash")
     ready_keys = {
         "schema", "recipe_sha256", "condition_sha256", "nonce", "pressure_ready_monotonic_ns", "readiness", "ready_sha256",
@@ -2869,7 +2936,10 @@ def verify_pressure(
         sha256(ready["worker_ownership_sha256"], "ready worker ownership journal digest")
         sha256(ready["worker_authorization_sha256"], "ready worker authorization journal digest")
     require(ready["pressure_ready_monotonic_ns"] == ready_at and ready["readiness"] == binding["readiness_snapshot"], "pressure ready marker differs from the process binding")
-    run_value, _, run_sha = read_canonical(artifacts / "run.json", "pressure run receipt", MAX_MANIFEST_BYTES)
+    run_value, _, run_sha = read_origin_canonical(
+        artifacts / "run.json", "pressure run receipt", MAX_MANIFEST_BYTES,
+        required_capture=artifact_view is not None,
+    )
     require(run_sha == expected["run"], "run receipt raw digest differs from separately supplied expected hash")
     run = _validate_run(run_value, {**expected, "recipe": expected_recipe_sha})
     require(run["condition_sha256"] == recipe_info["condition_sha256"], "run receipt condition differs from frozen recipe")
@@ -2877,6 +2947,7 @@ def verify_pressure(
     events = _iter_events(
         artifacts / "events.jsonl", expected["events"], run["events_bytes"],
         recipe_info["artifact_budget"]["maximum_event_bytes"], event_state,
+        artifact_view=artifact_view,
     )
     first_event = next(events, None)
     require(type(first_event) is dict, "pressure event stream is empty")
@@ -3161,6 +3232,8 @@ def _pressure_absolute_json_paths(value: object) -> set[str]:
 def _preflight_pressure_json_path_closure(
     documents: list[dict[str, Any]], mapped_paths: frozenset[str],
     mapped_directories: set[str],
+    *, artifact_view: Any = None,
+    captured_origin_paths: frozenset[str] = frozenset(),
 ) -> None:
     """Walk every mapped JSON dependency before any validator module is executed."""
     pending: list[dict[str, Any]] = list(documents)
@@ -3178,27 +3251,95 @@ def _preflight_pressure_json_path_closure(
             queued.add(raw_path)
             require(raw_path in mapped_paths and raw_path not in mapped_directories,
                     f"offline pressure JSON dependency is not an explicitly mapped file: {raw_path}")
+            use_view = (artifact_view if raw_path in captured_origin_paths
+                        else None)
             child, _raw, _raw_sha = read_canonical(
-                Path(raw_path), "offline pressure nested JSON dependency", MAX_OFFLINE_JSON_BYTES,
+                Path(raw_path), "offline pressure nested JSON dependency",
+                MAX_OFFLINE_JSON_BYTES, artifact_view=use_view,
             )
             pending.append(child)
             require(len(queued) <= 4096,
                     "offline pressure nested JSON dependency set exceeds its finite limit")
 
 
+def _validate_pressure_application_tmpdir_owner_proof(
+    initial_value: object, final_value: object, label: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    initial = exact(initial_value, {
+        "path", "device", "inode", "mode", "mount", "available_bytes",
+        "available_inodes", "bytes_limit", "inode_limit",
+    }, f"{label} initial TMPDIR proof")
+    final = exact(final_value, {
+        "path", "device", "inode", "mode", "mount", "bytes_used",
+        "file_count", "directory_count", "bytes_limit", "inode_limit",
+        "available_bytes", "available_inodes",
+    }, f"{label} final TMPDIR proof")
+    mount_fields = {
+        "mount_id", "major_minor", "mount_root", "mount_point",
+        "filesystem_type", "mount_source", "device",
+    }
+    initial_mount = exact(initial["mount"], mount_fields,
+                          f"{label} initial mount identity")
+    final_mount = exact(final["mount"], mount_fields,
+                        f"{label} final mount identity")
+    for index, mount in enumerate((initial_mount, final_mount)):
+        uint(mount["mount_id"], f"{label} mount[{index}] id", positive=True)
+        require(type(mount["major_minor"]) is str and
+                re.fullmatch(r"[0-9]+:[0-9]+", mount["major_minor"]) is not None and
+                type(mount["mount_root"]) is str and mount["mount_root"].startswith("/") and
+                type(mount["mount_point"]) is str and mount["mount_point"].startswith("/") and
+                type(mount["filesystem_type"]) is str and
+                mount["filesystem_type"] not in {"tmpfs", "ramfs", "devtmpfs"} and
+                type(mount["mount_source"]) is str,
+                f"{label} mount[{index}] identity is malformed or memory-backed")
+        uint(mount["device"], f"{label} mount[{index}] device")
+    for kind, proof in (("initial", initial), ("final", final)):
+        for field in ("device", "inode", "mode", "available_bytes",
+                      "available_inodes", "bytes_limit", "inode_limit"):
+            uint(proof[field], f"{label} {kind} {field}")
+        require(proof["mode"] == 0o700 and proof["inode"] > 0 and
+                proof["bytes_limit"] > 0 and proof["inode_limit"] > 0 and
+                proof["mount"]["device"] == proof["device"],
+                f"{label} {kind} TMPDIR identity or limits are invalid")
+        absolute_path(proof["path"], f"{label} {kind} TMPDIR path")
+    require(initial["available_bytes"] >= initial["bytes_limit"] and
+            initial["available_inodes"] >= initial["inode_limit"],
+            f"{label} initial TMPDIR does not prove its reserved capacity")
+    for field in ("bytes_used", "file_count", "directory_count"):
+        uint(final[field], f"{label} final {field}")
+    require(initial["path"] == final["path"] and
+            initial["device"] == final["device"] and
+            initial["inode"] == final["inode"] and
+            initial["mount"] == final["mount"] and
+            initial["bytes_limit"] == final["bytes_limit"] and
+            initial["inode_limit"] == final["inode_limit"] and
+            final["bytes_used"] == final["file_count"] ==
+                final["directory_count"] == 0,
+            f"{label} owner-return TMPDIR proof is not the exact empty original directory")
+    return initial, final
+
+
 def _validate_pressure_pair_host_receipt(
     pin_value: object,
+    *, artifact_view: Any = None,
 ) -> tuple[dict[str, Any], str, dict[str, Any]]:
     pin = exact(pin_value, {"path", "raw_sha256", "receipt_sha256"},
                 "pressure-pair host-verification receipt pin")
     path = absolute_path(pin["path"], "pressure-pair host-verification receipt path")
     raw_sha = sha256(pin["raw_sha256"], "pressure-pair host receipt raw SHA-256")
     receipt_sha = sha256(pin["receipt_sha256"], "pressure-pair host receipt semantic SHA-256")
-    receipt, raw, actual_raw = read_canonical(path, "pressure-pair host-verification receipt", 16 * 1024 * 1024)
-    info = path.lstat()
-    require(actual_raw == raw_sha and stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
-            stat.S_IMODE(info.st_mode) == 0o600,
-            "pressure-pair host receipt is not the exact owned mode-0600 pinned file")
+    receipt, raw, actual_raw = read_canonical(
+        path, "pressure-pair host-verification receipt", 16 * 1024 * 1024,
+        artifact_view=artifact_view,
+    )
+    if artifact_view is None:
+        info = path.lstat()
+        require(actual_raw == raw_sha and stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o600,
+                "pressure-pair host receipt is not the exact owned mode-0600 pinned file")
+    else:
+        require(artifact_view.has_file(path) and actual_raw == raw_sha,
+                "captured pressure-pair host receipt is absent or differs from its raw pin")
     exact(receipt, {
         "schema", "campaign_id", "host_id", "job", "recipe", "readback",
         "source_manifest", "spec", "plan", "execution_manifest", "authorization_id",
@@ -3207,8 +3348,11 @@ def _validate_pressure_pair_host_receipt(
         "qualification_eligible", "execution_ready", "receipt_sha256",
     }, "pressure-pair host-verification receipt")
     body = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
-    require(receipt["schema"] == PRESSURE_PAIR_HOST_VERIFICATION_SCHEMA and
-            raw == canonical_bytes(receipt),
+    bounded_v2 = receipt.get("schema") == PRESSURE_PAIR_HOST_VERIFICATION_SCHEMA_V2
+    require(receipt["schema"] in {
+                PRESSURE_PAIR_HOST_VERIFICATION_SCHEMA,
+                PRESSURE_PAIR_HOST_VERIFICATION_SCHEMA_V2,
+            } and raw == canonical_bytes(receipt),
             "pressure-pair host receipt schema or canonical bytes differ")
     require(receipt_sha == receipt["receipt_sha256"] == digest_object(body),
             "pressure-pair host receipt raw/semantic digest roles differ")
@@ -3384,14 +3528,28 @@ def _validate_pressure_pair_host_receipt(
             artifact = exact(row[name], {"path", "raw_sha256"}, f"pressure-pair member {name} pin")
             absolute_path(artifact["path"], f"pressure-pair member {name} path")
             sha256(artifact["raw_sha256"], f"pressure-pair member {name} raw SHA-256")
-        storage = exact(row["storage_proof"], {
-            "application_tmpdir_path", "pressure_scratch_path", "application_mount_id",
-            "storage_sha256",
-        }, "pressure-pair member storage proof")
+        storage_fields = {
+            "application_tmpdir_path", "pressure_scratch_path",
+            "application_mount_id", "storage_sha256",
+        }
+        if bounded_v2:
+            storage_fields |= {"application_tmpdir_initial",
+                               "application_tmpdir_final"}
+        storage = exact(row["storage_proof"], storage_fields,
+                        "pressure-pair member storage proof")
         absolute_path(storage["application_tmpdir_path"], "pressure-pair member TMPDIR")
         absolute_path(storage["pressure_scratch_path"], "pressure-pair member scratch path")
         uint(storage["application_mount_id"], "pressure-pair member application mount", positive=True)
         sha256(storage["storage_sha256"], "pressure-pair member storage digest")
+        if bounded_v2:
+            initial, final = _validate_pressure_application_tmpdir_owner_proof(
+                storage["application_tmpdir_initial"],
+                storage["application_tmpdir_final"],
+                f"pressure-pair member[{index}]")
+            require(initial["path"] == final["path"] ==
+                    storage["application_tmpdir_path"] and
+                    final["mount"]["mount_id"] == storage["application_mount_id"],
+                    "pressure-pair TMPDIR proof differs from its owner storage facts")
     require(len(seen_identities) == sum(1 + len(row["worker_identities"]) for row in receipt["member_facts"]),
             "pressure-pair host receipt repeats a process identity across members")
     require(origin["storage_sha256"] == digest_object([
@@ -3404,8 +3562,12 @@ def verify_pressure_offline(
     pressure_recipe_pin: object,
     pressure_artifacts: object,
     host_verification_pin: object,
-    *, evidence_path_map: object,
+    *, evidence_path_map: object | None,
     source_root: object,
+    artifact_view: Any = None,
+    captured_origin_paths: object | None = None,
+    evidence_file_paths: object | None = None,
+    evidence_directory_paths: object | None = None,
 ) -> dict[str, Any]:
     """Replay one pressure run off-host using its exact member of a strict pair receipt.
 
@@ -3440,9 +3602,65 @@ def verify_pressure_offline(
     proof_path = absolute_path(proof_pin["path"], "offline pressure proof path")
     sha256(proof_pin["raw_sha256"], "offline pressure proof raw SHA-256")
     source_root_path = absolute_path(source_root, "offline pressure SourceV5 root")
-    mapping, directories = _normalize_evidence_path_map(evidence_path_map, source_root_path)
-    mapped_paths = frozenset(mapping)
-    mapped_files = frozenset(path for path in mapping if path not in directories)
+    if artifact_view is None:
+        require(captured_origin_paths is None and evidence_file_paths is None and
+                evidence_directory_paths is None,
+                "captured pressure paths require their explicit artifact view")
+        mapping, directories = _normalize_evidence_path_map(
+            evidence_path_map, source_root_path,
+        )
+        mapped_paths = frozenset(mapping)
+        mapped_files = frozenset(path for path in mapping if path not in directories)
+        captured_files: frozenset[str] = frozenset()
+        captured_directories: frozenset[str] = frozenset()
+    else:
+        require(evidence_path_map is None,
+                "captured pressure replay cannot use an identity or stage-path map")
+
+        def normalized_paths(value: object, label: str) -> frozenset[str]:
+            require(type(value) is list and
+                    len(value) <= MAX_SOURCE5_SOAK_INVENTORY_ENTRIES,
+                    f"{label} is malformed or oversized")
+            paths: list[str] = []
+            for index, item in enumerate(value):
+                paths.append(str(absolute_path(item, f"{label}[{index}]")))
+            require(paths == sorted(set(paths)),
+                    f"{label} is not sorted and unique")
+            return frozenset(paths)
+
+        captured_files = normalized_paths(
+            captured_origin_paths, "captured pressure object origins",
+        )
+        mapped_files = normalized_paths(
+            evidence_file_paths, "captured pressure evidence files",
+        )
+        captured_directories = normalized_paths(
+            evidence_directory_paths, "captured pressure evidence directories",
+        )
+        directories = set(captured_directories)
+        require(captured_files and captured_files <= mapped_files and
+                not captured_files.intersection(captured_directories) and
+                str(source_root_path) in captured_directories and
+                all(artifact_view.has_file(path) for path in captured_files),
+                "captured pressure object/file/directory sets differ from the authenticated H-view")
+        mapping = {path: path for path in mapped_files | captured_directories}
+        mapped_paths = frozenset(mapping)
+
+    def read_origin_stable(path: Path, label: str,
+                           maximum: int) -> tuple[bytes, str]:
+        captured = str(path) in captured_files
+        return read_stable(
+            path, label, maximum,
+            artifact_view=(artifact_view if captured else None),
+        )
+
+    def read_origin_canonical(path: Path, label: str, maximum: int,
+                              expected_sha256: str | None = None) -> tuple[dict[str, Any], bytes, str]:
+        captured = str(path) in captured_files
+        return read_canonical(
+            path, label, maximum, expected_sha256,
+            artifact_view=(artifact_view if captured else None),
+        )
     raw_host_pin = exact(host_verification_pin, {
         "path", "raw_sha256", "receipt_sha256",
     }, "offline pressure-pair host receipt pin")
@@ -3454,6 +3672,17 @@ def verify_pressure_offline(
     require(str(recipe_path) in mapped_files and str(artifact_root) in directories and
             str(proof_path) in mapped_files,
             "offline pressure evidence map omits a top-level pinned input")
+    if artifact_view is not None:
+        required_capture = {
+            raw_host_pin["path"], str(recipe_path), str(proof_path),
+            *(str(artifact_root / name) for name in (
+                "events.jsonl", "process-binding.json", "launch-record.json",
+                "run.json", "pressure-ready.json",
+            )),
+            *(pin["path"] for pin in driver_logs.values()),
+        }
+        require(required_capture <= captured_files,
+                "captured pressure H-view omits a strict receipt or pressure output object")
     for log_value in driver_logs.values():
         log_pin = exact(log_value, {"path", "raw_sha256"}, "offline pressure driver log pin")
         require(log_pin["path"] in mapped_files,
@@ -3467,7 +3696,9 @@ def verify_pressure_offline(
         log_pin = exact(log_value, {"path", "raw_sha256"}, "offline pressure driver log pin")
         require(log_pin["path"] in mapped_files,
                 "offline pressure evidence map omits an exact driver log")
-    raw_recipe, recipe_raw_sha = read_stable(recipe_path, "offline frozen pressure recipe", MAX_RECIPE_BYTES)
+    raw_recipe, recipe_raw_sha = read_origin_stable(
+        recipe_path, "offline frozen pressure recipe", MAX_RECIPE_BYTES,
+    )
     require(recipe_raw_sha == recipe_pin["raw_sha256"],
             "offline pressure recipe raw SHA-256 differs from its strict member pin")
     recipe_value = parse_object(raw_recipe, "offline frozen pressure recipe", MAX_RECIPE_BYTES)
@@ -3483,7 +3714,7 @@ def verify_pressure_offline(
                        {"path", "raw_sha256"}, "offline pressure SourceV5 manifest pin")
     require(source_pin["path"] in mapped_files,
             "offline pressure path map omits the typed SourceV5 manifest")
-    source_manifest, _source_raw, source_raw_sha = read_canonical(
+    source_manifest, _source_raw, source_raw_sha = read_origin_canonical(
         Path(source_pin["path"]), "offline pressure SourceV5 manifest", MAX_SOURCE_BYTES,
     )
     require(source_raw_sha == source_pin["raw_sha256"],
@@ -3517,8 +3748,11 @@ def verify_pressure_offline(
     require(inventory_paths | artifact_paths <= mapped_files,
             "offline pressure evidence map omits a typed SourceV5 source or artifact member")
     host_receipt, host_receipt_raw_sha, host_pin = _validate_pressure_pair_host_receipt(
-        raw_host_pin,
+        raw_host_pin, artifact_view=artifact_view,
     )
+    require(artifact_view is None or
+            host_receipt["schema"] == PRESSURE_PAIR_HOST_VERIFICATION_SCHEMA_V2,
+            "captured bounded pressure replay requires host receipt v2 with owner-return TMPDIR facts")
     _preflight_pressure_json_path_closure(
         [recipe_value, host_receipt], mapped_paths, directories,
     )
@@ -3533,7 +3767,7 @@ def verify_pressure_offline(
     for label, log_value in driver_logs.items():
         log_pin = exact(log_value, {"path", "raw_sha256"},
                         f"strict host pressure driver {label} log pin")
-        log_raw, log_sha = read_stable(
+        log_raw, log_sha = read_origin_stable(
             Path(log_pin["path"]), f"offline pressure driver {label} log", MAX_EVENTS_BYTES,
         )
         require(log_sha == log_pin["raw_sha256"] and len(log_raw) <= MAX_EVENTS_BYTES,
@@ -3553,26 +3787,46 @@ def verify_pressure_offline(
             member["descriptor"]["allocator"] == recipe["identity"]["allocator"],
             "offline pressure recipe differs from its original normal-APP pair descriptor")
     storage_proof = member["storage_proof"]
-    require(storage_proof == {
-        "application_tmpdir_path": recipe["process"]["application_tmpdir_path"],
-        "pressure_scratch_path": recipe["storage"]["pressure_scratch_path"],
-        "application_mount_id": recipe["storage"]["application_mount_id"],
-        "storage_sha256": digest_object({
+    storage_body = {
             "application_storage": recipe["host"]["application_storage"],
             "pressure_scratch": recipe["host"]["pressure_scratch"],
             "storage": recipe["storage"],
-        }),
-    }, "strict pair storage/TMPDIR proof differs from the pressure recipe")
+    }
+    expected_storage = {
+        "application_tmpdir_path": recipe["process"]["application_tmpdir_path"],
+        "pressure_scratch_path": recipe["storage"]["pressure_scratch_path"],
+        "application_mount_id": recipe["storage"]["application_mount_id"],
+    }
+    if host_receipt["schema"] == PRESSURE_PAIR_HOST_VERIFICATION_SCHEMA_V2:
+        initial, final = _validate_pressure_application_tmpdir_owner_proof(
+            storage_proof.get("application_tmpdir_initial"),
+            storage_proof.get("application_tmpdir_final"),
+            "offline pressure owner-return",
+        )
+        require(initial["path"] == final["path"] ==
+                recipe["process"]["application_tmpdir_path"] and
+                final["mount"]["mount_id"] ==
+                    recipe["storage"]["application_mount_id"],
+                "pressure owner-return proof differs from its original recipe")
+        storage_body["application_tmpdir_initial"] = initial
+        storage_body["application_tmpdir_final"] = final
+        expected_storage["application_tmpdir_initial"] = initial
+        expected_storage["application_tmpdir_final"] = final
+    expected_storage["storage_sha256"] = digest_object(storage_body)
+    require(storage_proof == expected_storage,
+            "strict pair storage/TMPDIR proof differs from the pressure recipe")
     expected = {"recipe": pressure_semantic, **pins}
-    launch, _launch_raw, _launch_sha = read_canonical(
+    launch, _launch_raw, _launch_sha = read_origin_canonical(
         artifact_root / "launch-record.json", "offline pressure launch record", MAX_LAUNCH_BYTES,
-        pins["launch"],
     )
+    require(_launch_sha == pins["launch"],
+            "offline pressure launch record raw digest differs from its pin")
     process = _validate_launch(launch, recipe, pins["launch"])
-    run_value, _run_raw, _run_sha = read_canonical(
+    run_value, _run_raw, _run_sha = read_origin_canonical(
         artifact_root / "run.json", "offline pressure run receipt", MAX_MANIFEST_BYTES,
-        pins["run"],
     )
+    require(_run_sha == pins["run"],
+            "offline pressure run receipt raw digest differs from its pin")
     run = _validate_run(run_value, expected)
     require(member["application_identity"] == {
         "pid": process["pid"], "start_ticks": process["start_ticks"],
@@ -3608,13 +3862,24 @@ def verify_pressure_offline(
         "host_receipt_pin": types.MappingProxyType(dict(host_pin)),
         "host_receipt_raw_sha256": host_receipt_raw_sha,
     })
-    token_value = _EVIDENCE_PATH_MAP_CONTEXT.set((mapping, directories))
-    replay_token = _PRESSURE_OFFLINE_REPLAY_CONTEXT.set(dict(offline_context))
+    token_value = _EVIDENCE_PATH_MAP_CONTEXT.set(None)
+    replay_token = _PRESSURE_OFFLINE_REPLAY_CONTEXT.set(None)
+    if artifact_view is None:
+        _EVIDENCE_PATH_MAP_CONTEXT.reset(token_value)
+        _PRESSURE_OFFLINE_REPLAY_CONTEXT.reset(replay_token)
+        token_value = _EVIDENCE_PATH_MAP_CONTEXT.set((mapping, directories))
+        replay_token = _PRESSURE_OFFLINE_REPLAY_CONTEXT.set(dict(offline_context))
     try:
-        result = verify_pressure(recipe_path, pressure_semantic, artifact_root, expected)
-        proof_value, proof_raw, proof_raw_sha = read_canonical(
+        result = verify_pressure(
+            recipe_path, pressure_semantic, artifact_root, expected,
+            artifact_view=artifact_view,
+            captured_origin_paths=(sorted(captured_files)
+                                   if artifact_view is not None else None),
+            captured_directory_paths=(sorted(captured_directories)
+                                      if artifact_view is not None else None),
+        )
+        proof_value, proof_raw, proof_raw_sha = read_origin_canonical(
             proof_path, "offline pressure proof output", MAX_PRESSURE_PROOF_BYTES,
-            proof_pin["raw_sha256"],
         )
         require(proof_raw_sha == proof_pin["raw_sha256"] and proof_raw == canonical_bytes(result) and
                 proof_value == result,
@@ -3651,12 +3916,15 @@ def verify_pressure_offline(
                 "strict pair host facts differ from the independent calibration host receipt")
         return result
     finally:
-        _PRESSURE_OFFLINE_REPLAY_CONTEXT.reset(replay_token)
-        _EVIDENCE_PATH_MAP_CONTEXT.reset(token_value)
+        if replay_token is not None:
+            _PRESSURE_OFFLINE_REPLAY_CONTEXT.reset(replay_token)
+        if token_value is not None:
+            _EVIDENCE_PATH_MAP_CONTEXT.reset(token_value)
 
 
 def _validate_source5_soak_host_receipt_v2(
     pin_value: object, *, allow_v3: bool = False,
+    artifact_view: Any = None,
 ) -> tuple[dict[str, Any], str, dict[str, str]]:
     """Validate the separate single-APP Soak host receipt without pair coercion."""
     pin = exact(pin_value, {"path", "raw_sha256", "receipt_sha256"},
@@ -3667,11 +3935,16 @@ def _validate_source5_soak_host_receipt_v2(
     receipt, raw, actual_raw = read_canonical(
         path, "Source5 Soak host-verification receipt",
         MAX_SOURCE5_SOAK_HOST_RECEIPT_BYTES,
+        artifact_view=artifact_view,
     )
-    info = path.lstat()
-    require(actual_raw == raw_sha and stat.S_ISREG(info.st_mode) and
-            info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600,
-            "Source5 Soak host receipt is not the exact owned mode-0600 pinned file")
+    if artifact_view is None:
+        info = path.lstat()
+        require(actual_raw == raw_sha and stat.S_ISREG(info.st_mode) and
+                info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600,
+                "Source5 Soak host receipt is not the exact owned mode-0600 pinned file")
+    else:
+        require(artifact_view.has_file(path) and actual_raw == raw_sha,
+                "captured Source5 Soak host receipt is absent or differs from its raw pin")
     bounded_v3 = receipt.get("schema") == SOURCE5_SOAK_HOST_VERIFICATION_SCHEMA_V3
     require(not bounded_v3 or allow_v3,
             "Source5 host-v3 receipt requires the bounded single-APP pressure API")
@@ -3935,7 +4208,10 @@ def _validate_source5_soak_host_receipt_v2(
 def _verify_source5_soak_pressure_offline_impl(
     pressure_recipe_pin: object, pressure_artifacts: object,
     soak_host_verification_pin: object, *, evidence_path_map: object,
-    source_root: object, bounded_v3: bool,
+    source_root: object, bounded_v3: bool, artifact_view: Any = None,
+    captured_origin_paths: object | None = None,
+    evidence_file_paths: object | None = None,
+    evidence_directory_paths: object | None = None,
 ) -> dict[str, Any]:
     """Replay the one original Soak APP pressure run from its own strict facts.
 
@@ -3976,17 +4252,55 @@ def _verify_source5_soak_pressure_offline_impl(
         sha256(log_pin["raw_sha256"],
                f"Source5 Soak pressure {label} log raw SHA-256")
     source_root_path = absolute_path(source_root, "Source5 Soak pressure SourceV5 root")
-    mapping, directories = _normalize_evidence_path_map(
-        evidence_path_map, source_root_path,
-    )
-    mapped_paths = frozenset(mapping)
-    mapped_files = frozenset(path for path in mapping if path not in directories)
     host_pin = exact(soak_host_verification_pin, {
         "path", "raw_sha256", "receipt_sha256",
     }, "Source5 Soak host receipt pin")
     absolute_path(host_pin["path"], "Source5 Soak host receipt path")
     sha256(host_pin["raw_sha256"], "Source5 Soak host receipt raw SHA-256")
     sha256(host_pin["receipt_sha256"], "Source5 Soak host receipt semantic SHA-256")
+    if artifact_view is None:
+        require(captured_origin_paths is None and evidence_file_paths is None and
+                evidence_directory_paths is None,
+                "captured pressure path metadata requires its explicit artifact view")
+        mapping, directories = _normalize_evidence_path_map(
+            evidence_path_map, source_root_path,
+        )
+        captured_files: frozenset[str] = frozenset()
+    else:
+        require(evidence_path_map is None,
+                "captured pressure replay cannot use an identity or stage-path map")
+
+        def normalized_paths(value: object, label: str) -> set[str]:
+            require(type(value) is list and
+                    len(value) <= MAX_SOURCE5_SOAK_INVENTORY_ENTRIES,
+                    f"{label} is malformed or oversized")
+            result: set[str] = set()
+            previous = ""
+            for index, item in enumerate(value):
+                path = str(absolute_path(item, f"{label}[{index}]"))
+                require(path > previous and path not in result,
+                        f"{label} is not sorted and unique")
+                previous = path
+                result.add(path)
+            return result
+
+        captured = normalized_paths(captured_origin_paths,
+                                    "captured pressure object origins")
+        resident_files = normalized_paths(evidence_file_paths,
+                                          "Source5 Soak evidence file origins")
+        directories = normalized_paths(evidence_directory_paths,
+                                       "Source5 Soak evidence directory origins")
+        require(str(source_root_path) in directories and
+                (captured - {host_pin["path"]}) <= resident_files and
+                host_pin["path"] in captured and
+                not captured.intersection(directories) and
+                all(artifact_view.has_file(path) for path in captured),
+                "captured pressure object set differs from the authenticated owner inventory")
+        mapping = {path: path for path in resident_files | directories}
+        mapping[host_pin["path"]] = host_pin["path"]
+        captured_files = frozenset(captured)
+    mapped_paths = frozenset(mapping)
+    mapped_files = frozenset(path for path in mapping if path not in directories)
     direct_files = {
         str(recipe_path), str(proof_path), host_pin["path"],
         str(artifact_root / "events.jsonl"),
@@ -3999,6 +4313,35 @@ def _verify_source5_soak_pressure_offline_impl(
     require(direct_files <= mapped_files and str(artifact_root) in directories and
             str(source_root_path) in directories,
             "Source5 Soak pressure path map omits a direct pinned input")
+    if artifact_view is not None:
+        required_archive_files = {
+            host_pin["path"], str(proof_path),
+            *(path for path in direct_files
+              if Path(path).parent == artifact_root or
+              artifact_root in Path(path).parents),
+        }
+        require(required_archive_files <= captured_files,
+                "captured pressure replay omits a pinned Soak/pressure output object")
+
+    def read_origin_canonical(
+        path: Path, label: str, maximum: int, *, required_capture: bool = False,
+    ) -> tuple[dict[str, Any], bytes, str]:
+        origin = str(path)
+        captured = origin in captured_files
+        require(not required_capture or captured,
+                f"{label} is not in the exact captured pressure object set")
+        view = artifact_view if captured else None
+        return read_canonical(path, label, maximum, artifact_view=view)
+
+    def read_origin_stable(
+        path: Path, label: str, maximum: int, *, required_capture: bool = False,
+    ) -> tuple[bytes, str]:
+        origin = str(path)
+        captured = origin in captured_files
+        require(not required_capture or captured,
+                f"{label} is not in the exact captured pressure object set")
+        view = artifact_view if captured else None
+        return read_stable(path, label, maximum, artifact_view=view)
 
     token_value = _EVIDENCE_PATH_MAP_CONTEXT.set((mapping, directories))
     replay_token: contextvars.Token[dict[str, Any] | None] | None = None
@@ -4006,6 +4349,7 @@ def _verify_source5_soak_pressure_offline_impl(
         raw_host_receipt, host_receipt_raw_sha, _host_pin = \
             _validate_source5_soak_host_receipt_v2(
                 host_pin, allow_v3=bounded_v3,
+                artifact_view=artifact_view,
             )
         origin = raw_host_receipt["pressure_origin"]
         recorded_recipe_pin = origin["recipe_pin"]
@@ -4015,8 +4359,9 @@ def _verify_source5_soak_pressure_offline_impl(
         recorded_artifacts = origin["storage_after"].get("pressure_artifacts")
         require(recorded_artifacts == artifacts,
                 "Source5 Soak pressure artifacts differ from its strict host receipt")
-        recipe_value, recipe_raw, recipe_raw_sha = read_canonical(
+        recipe_value, recipe_raw, recipe_raw_sha = read_origin_canonical(
             recipe_path, "Source5 Soak frozen pressure recipe", MAX_RECIPE_BYTES,
+            required_capture=False,
         )
         require(recipe_raw_sha == recipe_pin["raw_sha256"] and
                 recipe_raw == canonical_bytes(recipe_value) and
@@ -4052,9 +4397,9 @@ def _verify_source5_soak_pressure_offline_impl(
         )
         require(supervisor_pin["path"] in mapped_files,
                 "Source5 Soak pressure map omits its pinned supervisor")
-        supervisor, _supervisor_raw, supervisor_sha = read_canonical(
+        supervisor, _supervisor_raw, supervisor_sha = read_origin_canonical(
             Path(supervisor_pin["path"]), "Source5 Soak pressure supervisor",
-            MAX_MANIFEST_BYTES,
+            MAX_MANIFEST_BYTES, required_capture=artifact_view is not None,
         )
         require(supervisor_sha == supervisor_pin["raw_sha256"],
                 "Source5 Soak pressure supervisor bytes differ from their raw pin")
@@ -4076,7 +4421,7 @@ def _verify_source5_soak_pressure_offline_impl(
         )
         require(parent_recipe_pin["path"] in mapped_files,
                 "Source5 Soak pressure map omits its parent recipe")
-        parent_recipe, _parent_raw, parent_raw_sha = read_canonical(
+        parent_recipe, _parent_raw, parent_raw_sha = read_origin_canonical(
             Path(parent_recipe_pin["path"]), "Source5 Soak parent recipe",
             MAX_RECIPE_BYTES,
         )
@@ -4435,6 +4780,8 @@ def _verify_source5_soak_pressure_offline_impl(
                 "Source5 Soak pressure map omits exact artifacts/logs")
         _preflight_pressure_json_path_closure(
             [recipe_value], mapped_paths, directories,
+            artifact_view=artifact_view,
+            captured_origin_paths=captured_files,
         )
         source_pin = exact(recipe["files"]["source_manifest"], {
             "path", "raw_sha256",
@@ -4495,9 +4842,9 @@ def _verify_source5_soak_pressure_offline_impl(
         for label, pin_value in driver_logs.items():
             log_pin = exact(pin_value, {"path", "raw_sha256"},
                             f"Source5 Soak pressure {label} log pin")
-            _log_raw, log_sha = read_stable(
+            _log_raw, log_sha = read_origin_stable(
                 Path(log_pin["path"]), f"Source5 Soak pressure {label} log",
-                MAX_EVENTS_BYTES,
+                MAX_EVENTS_BYTES, required_capture=artifact_view is not None,
             )
             require(log_sha == log_pin["raw_sha256"],
                     f"Source5 Soak pressure {label} log bytes differ")
@@ -4519,9 +4866,9 @@ def _verify_source5_soak_pressure_offline_impl(
         require(pressure_value.get("schema") == RECIPE_SCHEMA_V2 and
                 recipe_validated["condition_sha256"] == recipe_pin["condition_sha256"],
                 "Source5 Soak pressure recipe no longer satisfies the original V2 gate")
-        run_value, _run_raw, run_sha = read_canonical(
+        run_value, _run_raw, run_sha = read_origin_canonical(
             artifact_root / "run.json", "Source5 Soak pressure run receipt",
-            MAX_MANIFEST_BYTES,
+            MAX_MANIFEST_BYTES, required_capture=artifact_view is not None,
         )
         require(run_sha == pins["run"],
                 "Source5 Soak pressure run receipt bytes differ from their raw pin")
@@ -4543,9 +4890,13 @@ def _verify_source5_soak_pressure_offline_impl(
                 "Source5 Soak PID absence observation predates pressure cleanup completion")
         result = verify_pressure(
             recipe_path, recipe_pin["semantic_sha256"], artifact_root, expected,
+            artifact_view=artifact_view,
+            captured_origin_paths=sorted(captured_files),
+            captured_directory_paths=sorted(directories),
         )
-        proof_value, proof_raw, proof_raw_sha = read_canonical(
+        proof_value, proof_raw, proof_raw_sha = read_origin_canonical(
             proof_path, "Source5 Soak pressure proof", MAX_PRESSURE_PROOF_BYTES,
+            required_capture=artifact_view is not None,
         )
         require(result["readback_sha256"] == pressure_readback_sha ==
                 proof_value.get("readback_sha256") and
@@ -4611,26 +4962,38 @@ def _verify_source5_soak_pressure_offline_impl(
 def verify_source5_soak_pressure_offline(
     pressure_recipe_pin: object, pressure_artifacts: object,
     soak_host_verification_pin: object, *, evidence_path_map: object,
-    source_root: object,
+    source_root: object, artifact_view: Any = None,
+    captured_origin_paths: object | None = None,
+    evidence_file_paths: object | None = None,
+    evidence_directory_paths: object | None = None,
 ) -> dict[str, Any]:
     """Replay the historical budgetless single-APP Soak host receipt."""
     return _verify_source5_soak_pressure_offline_impl(
         pressure_recipe_pin, pressure_artifacts, soak_host_verification_pin,
         evidence_path_map=evidence_path_map, source_root=source_root,
-        bounded_v3=False,
+        bounded_v3=False, artifact_view=artifact_view,
+        captured_origin_paths=captured_origin_paths,
+        evidence_file_paths=evidence_file_paths,
+        evidence_directory_paths=evidence_directory_paths,
     )
 
 
 def verify_source5_soak_pressure_offline_v3(
     pressure_recipe_pin: object, pressure_artifacts: object,
     soak_host_verification_pin: object, *, evidence_path_map: object,
-    source_root: object,
+    source_root: object, artifact_view: Any = None,
+    captured_origin_paths: object | None = None,
+    evidence_file_paths: object | None = None,
+    evidence_directory_paths: object | None = None,
 ) -> dict[str, Any]:
     """Replay one bounded Soak APP against its strict host-v3 receipt."""
     return _verify_source5_soak_pressure_offline_impl(
         pressure_recipe_pin, pressure_artifacts, soak_host_verification_pin,
         evidence_path_map=evidence_path_map, source_root=source_root,
-        bounded_v3=True,
+        bounded_v3=True, artifact_view=artifact_view,
+        captured_origin_paths=captured_origin_paths,
+        evidence_file_paths=evidence_file_paths,
+        evidence_directory_paths=evidence_directory_paths,
     )
 
 

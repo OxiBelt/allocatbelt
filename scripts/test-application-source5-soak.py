@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
 import os
 import subprocess
 import sys
+import stat
 import tempfile
 import types
 import unittest
@@ -63,6 +65,67 @@ class Source5SoakPublicApiTests(unittest.TestCase):
             "allocator": "allocatbelt",
             "executor": "bounded",
         })
+
+    def test_pressure_predecessor_read_precedes_its_pressure_owner_read(self) -> None:
+        host_id = "host-a"
+        jobs = {
+            "exploration": [{
+                "phase": "exploration", "run_id": "explore-0",
+                "host_id": host_id, "mode": "closed_loop",
+            }],
+            "aa": [{
+                "phase": "aa", "run_id": "aa-0",
+                "host_id": host_id, "mode": "closed_loop",
+            }],
+            "confirmation": [{
+                "phase": "confirmation", "run_id": "confirm-0",
+                "host_id": host_id, "mode": "closed_loop",
+            }],
+            "pressure": [{
+                "phase": "pressure", "run_id": f"pressure-{index}",
+                "host_id": host_id, "mode": "closed_loop",
+                "predecessor_run_ids": ["confirm-0"],
+            } for index in range(2)],
+            "soak": [{
+                "phase": "soak", "run_id": "soak-0",
+                "host_id": host_id, "mode": "closed_loop",
+            }],
+        }
+        context = types.SimpleNamespace(
+            host_id=host_id, plan={"jobs": jobs},
+            manifest={"campaign_id": "campaign"},
+        )
+        caps = {
+            (phase, job["run_id"]): {
+                "maximum_request_bytes": 128,
+                "maximum_response_bytes": 128,
+                "object_count": 1,
+                "bundle_bytes": 1024,
+            }
+            for phase, phase_jobs in jobs.items()
+            for job in phase_jobs
+        }
+
+        schedule = self.controller._source5_archive_read_schedule(
+            context, caps,
+        )
+        pressure_reads = [
+            row for row in schedule
+            if row["analysis_phase"] == "pressure_analysis" and
+            row["use"] in {"pressure_predecessor", "phase_analysis"}
+        ]
+        self.assertEqual(len(pressure_reads), 4)
+        for index, pressure_job in enumerate(jobs["pressure"]):
+            predecessor, owner = pressure_reads[index * 2:index * 2 + 2]
+            self.assertEqual(predecessor["use"], "pressure_predecessor")
+            self.assertEqual(predecessor["owner_phase"], "confirmation")
+            self.assertEqual(
+                predecessor["job"]["run_id"],
+                pressure_job["predecessor_run_ids"][0],
+            )
+            self.assertEqual(owner["use"], "phase_analysis")
+            self.assertEqual(owner["owner_phase"], "pressure")
+            self.assertEqual(owner["job"]["run_id"], pressure_job["run_id"])
 
     def test_prospective_resource_budget_is_additive_to_exact_material_v1(self) -> None:
         job = {
@@ -520,6 +583,212 @@ class Source5SoakPublicApiTests(unittest.TestCase):
             with self.subTest(mapping=mapping), self.assertRaises(self.soak.Source5SoakError):
                 self.soak._validate_evidence_path_map(mapping)
 
+    def test_captured_evidence_inventory_reads_archived_output_without_origin_stat(self) -> None:
+        class CapturedView:
+            def __init__(self, raw_by_origin: dict[str, bytes]):
+                self.raw_by_origin = raw_by_origin
+
+            def has_file(self, path: str | Path) -> bool:
+                return str(path) in self.raw_by_origin
+
+            def read(self, path: str | Path, _label: str, maximum: int):
+                raw = self.raw_by_origin[str(path)]
+                if len(raw) > maximum:
+                    raise ValueError("test capture exceeded parser cap")
+                return raw, hashlib.sha256(raw).hexdigest()
+
+            def open_snapshot(self, path: str | Path, _label: str, maximum: int):
+                raw = self.raw_by_origin[str(path)]
+                if len(raw) > maximum:
+                    raise ValueError("test capture exceeded parser cap")
+
+                @contextlib.contextmanager
+                def snapshot():
+                    yield io.BytesIO(raw), hashlib.sha256(raw).hexdigest(), len(raw)
+
+                return snapshot()
+
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-captured-inventory-") as directory:
+            base = Path(directory).resolve()
+            source_root = base / "resident-source"
+            input_root = base / "resident-input"
+            source_root.mkdir(mode=0o700)
+            input_root.mkdir(mode=0o700)
+            output_root = base / "reclaimed-output"
+            probe_root = base / "reclaimed-probe"
+            captured_output = output_root / "soak-launch.json"
+            owner_receipt = base / "reclaimed-host-receipt.json"
+            output_raw = b"archived Soak launch receipt\n"
+            mode = lambda path: f"{stat.S_IMODE(path.stat().st_mode):04o}"
+            entries = [
+                {"path": str(source_root), "kind": "directory", "mode": mode(source_root)},
+                {"path": str(input_root), "kind": "directory", "mode": mode(input_root)},
+                {"path": str(output_root), "kind": "directory", "mode": "0700"},
+                {"path": str(probe_root), "kind": "directory", "mode": "0700"},
+                {"path": str(captured_output), "kind": "file", "mode": "0600",
+                 "size": len(output_raw), "raw_sha256": self.soak.sha256(output_raw)},
+            ]
+            entries.sort(key=lambda entry: entry["path"])
+            receipt = {
+                "schema": self.soak.HOST_VERIFICATION_SCHEMA,
+                "tree_roots": {
+                    "source": str(source_root), "input": str(input_root),
+                    "output": str(output_root), "probe_capture": str(probe_root),
+                },
+                "evidence_inventory": entries,
+                "evidence_bases": sorted([str(source_root), str(input_root)]),
+                "construction_probe": {"schema": self.soak.PROBE_CAPTURE_SCHEMA},
+            }
+            captured = CapturedView({
+                str(captured_output): output_raw,
+                str(owner_receipt): b"host receipt is separately verified by the caller\n",
+            })
+            self.soak._verify_evidence_inventory(
+                receipt, None, artifact_view=captured,
+                tree_inventories=[],
+                captured_origin_paths=sorted(captured.raw_by_origin),
+                evidence_file_paths=[str(captured_output)],
+                evidence_directory_paths=sorted({
+                    str(source_root), str(input_root), str(output_root), str(probe_root),
+                }),
+                source_root=source_root, input_root=input_root,
+                output_root=output_root, probe_capture_root=probe_root,
+                host_receipt_path=str(owner_receipt),
+                readback=self.readback,
+            )
+            self.assertFalse(output_root.exists())
+            self.assertFalse(probe_root.exists())
+
+    def test_soak_origin_json_preserves_live_and_captured_raw_pin_contract(self) -> None:
+        value = {"schema": "allocatbelt.test-soak-origin-json.v1", "count": 3}
+        raw = self.soak.canonical_bytes(value)
+        raw_sha = self.soak.sha256(raw)
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-origin-json-") as temporary:
+            path = Path(temporary) / "resident.json"
+            path.write_bytes(raw)
+            os.chmod(path, 0o600)
+            live = self.soak._read_soak_origin_json(
+                path, raw_sha, "resident Soak fixture", 1024,
+                self.readback, None, frozenset(),
+            )
+            self.assertEqual(live, (value, raw, raw_sha))
+            with self.assertRaisesRegex(
+                self.soak.Source5SoakError,
+                "resident Soak fixture differs from its raw pin",
+            ):
+                self.soak._read_soak_origin_json(
+                    path, "f" * 64, "resident Soak fixture", 1024,
+                    self.readback, None, frozenset(),
+                )
+
+            archived_path = Path(temporary) / "reclaimed.json"
+            stage_root = Path(temporary) / "stage"
+            stage_root.mkdir(mode=0o700)
+            staged_file = stage_root / "object-00.bin"
+            staged_file.write_bytes(raw)
+            os.chmod(staged_file, 0o400)
+            archived = self.readback.CapturedSoakArtifactView(
+                stage_root,
+                {str(archived_path): {
+                    "origin_path": str(archived_path),
+                    "path": str(staged_file),
+                    "role": "source5_soak_artifact",
+                    "host_id": "host-a",
+                    "raw_sha256": raw_sha,
+                    "semantic_sha256": None,
+                    "byte_count": len(raw),
+                    "maximum_bytes": len(raw),
+                }},
+            )
+            inspected: list[str] = []
+            original_lstat = Path.lstat
+
+            def track_lstat(path: Path, *args, **kwargs):
+                inspected.append(str(path))
+                if str(path) == str(archived_path):
+                    raise AssertionError("captured Soak readback stat-ed its reclaimed origin")
+                return original_lstat(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "lstat", track_lstat):
+                replay = self.soak._read_soak_origin_json(
+                    archived_path, raw_sha, "captured Soak fixture", 1024,
+                    self.readback, archived, frozenset({str(archived_path)}),
+                    required_capture=True,
+                )
+            self.assertEqual(replay, (value, raw, raw_sha))
+            self.assertNotIn(str(archived_path), inspected)
+            self.assertFalse(archived_path.exists())
+
+    def test_captured_soak_view_requires_0400_dirfd_stage_and_rejects_root_replacement(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-captured-dirfd-") as temporary:
+            root = Path(temporary).resolve()
+            stage_root = root / "stage"
+            stage_root.mkdir(mode=0o700)
+            origin = root / "reclaimed-soak-output.json"
+            raw = self.soak.canonical_bytes({"schema": "fixture", "value": 4})
+            local = stage_root / "object-00.bin"
+            local.write_bytes(raw)
+            os.chmod(local, 0o400)
+            reference = {
+                "origin_path": str(origin), "path": str(local),
+                "role": "source5_soak_artifact", "host_id": "host-a",
+                "raw_sha256": self.soak.sha256(raw), "semantic_sha256": None,
+                "byte_count": len(raw), "maximum_bytes": len(raw),
+            }
+            view = self.readback.CapturedSoakArtifactView(
+                stage_root, {str(origin): reference},
+            )
+            with view.open_snapshot(origin, "Soak staged output", len(raw)) as (
+                    stream, actual_sha, byte_count):
+                self.assertEqual(stream.read(), raw)
+                self.assertEqual(actual_sha, reference["raw_sha256"])
+                self.assertEqual(byte_count, len(raw))
+
+            hardlink = root / "outside-hardlink.bin"
+            os.link(local, hardlink)
+            with self.assertRaisesRegex(
+                    self.readback.SoakReadbackError,
+                    "mode-0400 regular file",
+            ):
+                view.read(origin, "Soak hardlinked output", len(raw))
+            hardlink.unlink()
+
+            moved_root = root / "stage-renamed"
+            stage_root.rename(moved_root)
+            stage_root.symlink_to(moved_root.name, target_is_directory=True)
+            with self.assertRaisesRegex(
+                    self.readback.SoakReadbackError,
+                    "cannot safely open or verify captured Soak staged output",
+            ):
+                view.read(origin, "Soak staged output", len(raw))
+
+    def test_captured_soak_view_rejects_a_symlink_stage_member(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-captured-symlink-") as temporary:
+            root = Path(temporary).resolve()
+            stage_root = root / "stage"
+            stage_root.mkdir(mode=0o700)
+            origin = root / "reclaimed-soak-output.json"
+            raw = self.soak.canonical_bytes({"schema": "fixture", "value": 5})
+            target = stage_root / "object-real.bin"
+            target.write_bytes(raw)
+            os.chmod(target, 0o400)
+            symlink = stage_root / "object-00.bin"
+            symlink.symlink_to(target.name)
+            view = self.readback.CapturedSoakArtifactView(
+                stage_root, {str(origin): {
+                    "origin_path": str(origin), "path": str(symlink),
+                    "role": "source5_soak_artifact", "host_id": "host-a",
+                    "raw_sha256": self.soak.sha256(raw),
+                    "semantic_sha256": None, "byte_count": len(raw),
+                    "maximum_bytes": len(raw),
+                }},
+            )
+            with self.assertRaisesRegex(
+                    self.readback.SoakReadbackError,
+                    "cannot safely open or verify captured Soak symlink member",
+            ):
+                view.read(origin, "Soak symlink member", len(raw))
+
     def test_typed_source_inventory_closes_declared_parent_directories_only(self) -> None:
         with tempfile.TemporaryDirectory(prefix="allocatbelt-soak-source-map-") as temporary:
             root = Path(temporary).resolve()
@@ -928,7 +1197,13 @@ class Source5SoakPublicApiTests(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory(prefix="allocatbelt-source5-soak-api-") as temporary:
             temp_root = Path(temporary)
-            fixture = self.recipe_fixtures.SourceV5CliFixture(temp_root)
+            fixture = self.recipe_fixtures.SourceV5CliFixture(
+                temp_root,
+                aa_controls_override=(
+                    self.recipe_fixtures.SourceV5CliFixture.
+                    synthetic_a48_controls()
+                ),
+            )
             host_id = fixture.job["host_id"]
             recipe_path = fixture.output / "source5-parent-recipe.json"
             receipt_path = fixture.output / "source5-build-receipt.json"
@@ -1020,7 +1295,10 @@ class Source5SoakPublicApiTests(unittest.TestCase):
                 prepared_input_completion=completion,
                 host_id=host_id,
                 plan=fixture.plan,
-                manifest={"campaign_id": fixture.spec["campaign_id"]},
+                manifest={
+                    "schema": self.controller.EXECUTION_SCHEMA_V2,
+                    "campaign_id": fixture.spec["campaign_id"],
+                },
                 modules={
                     "scripts/application-source5-soak.py": self.soak,
                     "scripts/application-soak-readback.py": readback,
@@ -1260,11 +1538,16 @@ class Source5SoakPublicApiTests(unittest.TestCase):
             ), mock.patch.object(
                 self.soak, "_capture_source5_soak_probe_monitored",
                 side_effect=AssertionError("preflight reached a probe owner"),
-            ):
+            ), mock.patch.object(
+                self.soak, "_verify_build_receipt",
+                wraps=self.soak._verify_build_receipt,
+            ) as live_builder:
                 self.soak.prepare_source5_soak(
                     prepare_helper_input, prepare_context, prepare_details,
                     readback,
                 )
+            self.assertEqual(live_builder.call_count, 1)
+            self.assertIsNone(live_builder.call_args.kwargs.get("artifact_view"))
             self.assertFalse((prepare_output / "soak-preflight.json").exists())
             for owner_artifact in (
                 "soak-launch.json", "source5-soak-supervisor.json",
@@ -1273,6 +1556,546 @@ class Source5SoakPublicApiTests(unittest.TestCase):
                 "source5-soak-pressure-owner-return.json",
             ):
                 self.assertFalse((prepare_output / owner_artifact).exists())
+
+            self._build_and_replay_full_width_contract_fixture(
+                fixture, context, completion, source, source_pins, binding,
+                material_index, recipe_path, receipt_path, artifact_root,
+                host_id,
+            )
+
+    def _build_and_replay_full_width_contract_fixture(
+        self, fixture, context, completion, source, source_pins, binding,
+        material_index, recipe_path, receipt_path, artifact_root, host_id,
+    ) -> None:
+        """Exercise the unmocked full Plan-width builder on synthetic SourceV5 bytes."""
+        controller = self.controller
+        module_paths = {
+            "scripts/application-campaign.py",
+            "scripts/application-campaign-inputs.py",
+            "scripts/application-byte-capacity.py",
+            "scripts/application-campaign-chronology.py",
+            "scripts/application-fixed-pair.py",
+            "scripts/application-pressure-pair.py",
+            "scripts/application-source5-campaign.py",
+            "scripts/application-source5-soak.py",
+            "scripts/application-soak-readback.py",
+            "scripts/application-source5-offline-dispatch.py",
+            "scripts/application-source5-evidence-transport-v3.py",
+            "scripts/application-source5-evidence-budget.py",
+            "scripts/application-source5-evidence-catalogue.py",
+            "scripts/application-feedback-composition.py",
+            "scripts/application-feedback-readback.py",
+            "scripts/application-pressure-readback.py",
+        }
+        source_rows = source["source"]["files"]
+        typed_by_path = {row["path"]: row for row in source_rows}
+        modules = {}
+        for relative in sorted(module_paths):
+            record = typed_by_path[relative]
+            path = fixture.root / relative
+            raw, actual, _info = self.soak.read_stable(
+                path, f"fixture pinned width module {relative}",
+                self.soak.MAX_SCRIPT_BYTES,
+            )
+            self.assertEqual(actual, record["sha256"])
+            self.assertEqual(len(raw), record["size"])
+            modules[relative] = controller._load_module(
+                raw, path, relative.replace("/", "_").replace(".", "_"),
+            )
+
+        context.modules = modules
+        context.campaign = modules["scripts/application-campaign.py"]
+        context.chronology = modules["scripts/application-campaign-chronology.py"]
+        context.fixed_pair = modules["scripts/application-fixed-pair.py"]
+        context.pressure_pair = modules["scripts/application-pressure-pair.py"]
+        context.spec = fixture.spec
+        context.plan_raw = fixture.plan_path.read_bytes()
+        context.output_root = artifact_root
+        context.scope = "final_frozen"
+        context.host_evidence_budget_pin = None
+        context.host_evidence_budget_raw = None
+        context.journal_width_budget_pin = None
+        context.journal_width_jobs = None
+        context.journal_width_soak_materials = None
+        context.journal_width_tmpdir_budget = None
+        context.journal_width_original_pins = None
+        context.journal_width_observed_host = None
+        context.journal_width_cleanup_source_bytes = None
+        context.journal_width_contract = None
+        context.journal_width_contract_pin = None
+
+        catalogue = modules[controller.EVIDENCE_CATALOGUE_SOURCE_PATH]
+        catalogue_pins = {}
+        for role, relative in catalogue.OWNER_PATHS.items():
+            row = typed_by_path[relative]
+            catalogue_pins[role] = {
+                "path": relative, "raw_sha256": row["sha256"],
+                "byte_count": row["size"],
+            }
+        context.owner_evidence_contract = {
+            "owner_source_pins": catalogue_pins,
+        }
+
+        all_module_pins = {}
+        for selected_host, selected_source in fixture.manifests.items():
+            all_module_pins[selected_host] = {
+                row["path"]: {"path": row["path"], "sha256": row["sha256"]}
+                for row in selected_source["source"]["files"]
+                if row["kind"] == "file"
+            }
+        host_dir = artifact_root / fixture.spec["campaign_id"] / "source5" / host_id
+        capacity_dir = host_dir / "capacity-registration"
+        capacity_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        registration = {
+            "host_completion": {
+                "path": str(capacity_dir / "host-completion.json"),
+                "raw_sha256": "1" * 64, "semantic_sha256": "2" * 64,
+            },
+            "host_verification": {
+                "path": str(capacity_dir / "host-verification.json"),
+                "raw_sha256": "3" * 64,
+            },
+            "ledger": {
+                "path": str(capacity_dir / "ledger.jsonl"),
+                "raw_sha256": "4" * 64, "terminal_head": "5" * 64,
+            },
+            "capacity_schedule_sha256": fixture.plan[
+                "capacity_process_templates_sha256"],
+            "registration_head": "6" * 64,
+        }
+        preparation_test = load_source(
+            "source5_width_preparation_fixture",
+            ROOT / "scripts/test-application-source5-input-preparation.py",
+        )
+        prep_fixture, _prep_spec = preparation_test.preparation_fixture()
+        prep_fixture["core"]["campaign_id"] = fixture.spec["campaign_id"]
+        inputs_module = modules["scripts/application-campaign-inputs.py"]
+        preparation_path = fixture.input_root / "width-preparation-intent.json"
+        preparation_pin = inputs_module.build_preparation_intent(
+            prep_fixture["core"], prep_fixture["source_pins"],
+            prep_fixture["observed_hosts"], prep_fixture["capacity_templates"],
+            prep_fixture["condition_intensities"], preparation_path,
+        )
+        preparation_pin = {
+            key: preparation_pin[key]
+            for key in ("path", "raw_sha256", "semantic_sha256")
+        }
+        ceilings = {
+            "maximum_job_output_bytes": 1_073_741_824,
+            "maximum_job_output_inodes": 1024,
+            "maximum_generation_bytes": 2_147_483_648,
+            "maximum_generation_inodes": 8192,
+            "maximum_tmpdir_bytes": 1_073_741_824,
+            "maximum_tmpdir_inodes": 4096,
+            "maximum_trace_file_bytes": 536_870_912,
+            "durable_receipt_reserve_bytes": 1_048_576,
+            "durable_receipt_reserve_inodes": 8,
+            "minimum_free_bytes": 2_147_483_648,
+            "minimum_free_inodes": 10_000,
+            "monitor_sample_interval_milliseconds": 100,
+            "process_deadline_seconds": fixture.spec["deadlines"][
+                "process_seconds"],
+        }
+        prepared_budget = inputs_module.build_preparation_resource_budget(
+            inputs_module.json.loads(preparation_path.read_bytes()),
+            preparation_pin, host_id, ceilings,
+        )
+        prepared_budget_path = fixture.input_root / "width-resource-budget.json"
+        prepared_budget_raw = inputs_module._canonical(prepared_budget)
+        prepared_budget_path.write_bytes(prepared_budget_raw)
+        prepared_budget_path.chmod(0o600)
+        prepared_budget_pin = {
+            "path": str(prepared_budget_path),
+            "raw_sha256": inputs_module._sha256(prepared_budget_raw),
+            "semantic_sha256": prepared_budget["resource_budget_sha256"],
+        }
+
+        capacity_entries = [
+            row for row in fixture.plan["capacity_process_templates"]
+            if row["capacity_key"]["host_id"] == host_id
+        ]
+        self.assertEqual(len(capacity_entries), 15)
+        width_completion = {
+            **completion,
+            "capacity_preparations": [{
+                "host_id": host_id, "entries": capacity_entries,
+            }],
+            "resource_budgets": {host_id: prepared_budget_pin},
+        }
+        context.prepared_input_completion = width_completion
+        context.manifest = {
+            "schema": controller.EXECUTION_SCHEMA_V4,
+            "campaign_id": fixture.spec["campaign_id"],
+            "hosts": list(fixture.host_ids),
+            "modules": all_module_pins,
+            "original_inputs": {
+                "campaign_artifacts_root": str(fixture.oracle_root),
+            },
+            "prepared_capacity_registration": registration,
+            "prepared_input_generation": {
+                "completion": preparation_pin,
+                "provenance": {
+                    "schema": "allocatbelt.application-source5-preparation-provenance.v1",
+                    "preparation_pin": preparation_pin,
+                    "final_spec_pin": {
+                        "path": str(fixture.spec_path),
+                        "raw_sha256": fixture.spec_sha256,
+                        "semantic_sha256": fixture.spec_sha256,
+                    },
+                    "final_plan_pin": {
+                        "path": str(fixture.plan_path),
+                        "raw_sha256": fixture.plan_file_sha256,
+                        "semantic_sha256": fixture.plan_sha256,
+                    },
+                },
+            },
+        }
+        manifest_raw = controller.canonical_bytes(context.manifest)
+        context.manifest_pin = {
+            "path": str(fixture.input_root / "width-execution-manifest.json"),
+            "raw_sha256": controller.sha256(manifest_raw),
+        }
+        context.capacity_completion = {
+            "artifact": {
+                "path": str(capacity_dir / "capacity-completion.json"),
+                "sha256": "7" * 64,
+            },
+            "ledger_raw_sha256": "4" * 64,
+            "terminal_head": "5" * 64,
+            "schedule_sha256": registration["capacity_schedule_sha256"],
+            "registration_head": registration["registration_head"],
+        }
+
+        observed_controls = next(
+            row["controls"] for row in fixture.spec["hosts"]
+            if row["host_id"] == host_id
+        )
+        cpu_set = observed_controls["cpu_set"]
+        cpu_values = []
+        for component in cpu_set.split(","):
+            bounds = [int(value) for value in component.split("-")]
+            cpu_values.extend(range(bounds[0], bounds[-1] + 1))
+        observed = {
+            "boot_id_sha256": "8" * 64,
+            "controls_sha256": controller.sha256(
+                controller.canonical_bytes(observed_controls),
+            ),
+            "controls": observed_controls,
+            "cpu_affinity": sorted(set(cpu_values)),
+            "network_namespace_inode": 1,
+        }
+        observed_path = fixture.input_root / "width-observed-host.json"
+        observed_raw = controller.canonical_bytes(observed)
+        observed_path.write_bytes(observed_raw)
+        observed_path.chmod(0o600)
+        context.observed_host_pin = {
+            "path": str(observed_path),
+            "raw_sha256": controller.sha256(observed_raw),
+        }
+
+        budget_directory = (artifact_root / fixture.spec["campaign_id"] /
+                            "source5" / host_id / "evidence-budget")
+        budget_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        host_budget_path = budget_directory / "host-evidence-budget-v2.json"
+        host_budget_fixture = {"schema": "fixture.width-budget-pin.v1"}
+        host_budget_raw = controller.canonical_bytes(host_budget_fixture)
+        host_budget_pin = {
+            "path": str(host_budget_path),
+            "raw_sha256": controller.sha256(host_budget_raw),
+            "semantic_sha256": controller.sha256(host_budget_raw),
+        }
+        context.host_evidence_budget_pin = host_budget_pin
+        context.journal_width_budget_pin = host_budget_pin
+
+        pressure_jobs = [
+            row for row in fixture.plan["jobs"]["pressure"]
+            if row["host_id"] == host_id
+        ]
+        pressure_directory = artifact_root / "pressure-materials"
+        pressure_directory.mkdir(mode=0o700)
+        pressure_body = {
+            "schema": controller.PRESSURE_MATERIAL_INDEX_SCHEMA_V2,
+            "campaign_id": fixture.spec["campaign_id"],
+            "host_id": host_id,
+            "jobs": {
+                row["run_id"]: {
+                    "path": str(pressure_directory / f"{row['run_id']}.json"),
+                    "raw_sha256": "9" * 64,
+                } for row in pressure_jobs
+            },
+        }
+        pressure_index = {
+            **pressure_body,
+            "manifest_sha256": controller.sha256(
+                controller.canonical_bytes(pressure_body),
+            ),
+        }
+        pressure_index_path = pressure_directory / "materials-index.json"
+        pressure_index_raw = controller.canonical_bytes(pressure_index)
+        pressure_index_path.write_bytes(pressure_index_raw)
+        pressure_index_path.chmod(0o600)
+
+        soak_budget_module = modules["scripts/application-source5-soak.py"]
+        source_ref = source_pins[host_id]
+        parent_pin = material_index["parent_recipe"]
+        build_pin = material_index["build_receipt"]
+        module_prepared = {"source": source, "source_root": fixture.root}
+        resource_budget_body = {
+            "schema": soak_budget_module.SOAK_RESOURCE_BUDGET_SCHEMA,
+            "binding": {
+                "campaign_id": fixture.spec["campaign_id"],
+                "host_id": host_id,
+                "job_sha256": soak_budget_module.sha256(
+                    soak_budget_module.canonical_bytes(fixture.job),
+                ),
+                "source_manifest": {
+                    "path": source_ref["path"],
+                    "raw_sha256": source_ref["raw_sha256"],
+                    "semantic_sha256": source["manifest_sha256"],
+                },
+                "source_tree_sha256": source["source"]["source_tree_sha256"],
+                "parent_recipe": parent_pin,
+                "build_receipt": build_pin,
+                "prepared_host_binding_sha256": binding["binding_sha256"],
+                "observed_host": binding["prepared_host_context_pin"],
+                "monitor_owner": soak_budget_module._resource_budget_module_pin(
+                    module_prepared, "scripts/application-fixed-pair.py",
+                    "monitor owner",
+                ),
+                "soak_adapter": soak_budget_module._resource_budget_module_pin(
+                    module_prepared, "scripts/application-source5-soak.py",
+                    "Soak adapter",
+                ),
+                "soak_reader": soak_budget_module._resource_budget_module_pin(
+                    module_prepared, "scripts/application-soak-readback.py",
+                    "Soak reader",
+                ),
+            },
+            "layout": {
+                "output_root": str(fixture.output),
+                "application_tmpdir": str(artifact_root / "tmp" / "application"),
+                "pressure_scratch": str(artifact_root / "tmp" / "pressure"),
+                "probe_capture_root": str(artifact_root / "probe" /
+                                           ("a" * 32)),
+                "probe_tmpdir": str(artifact_root / "probe" /
+                                     ("a" * 32) / "tmp"),
+                "host_receipt_path": str(artifact_root / "host-receipt.json"),
+            },
+            "schedule": {
+                "production_seconds": 10_800,
+                "application_sample_interval_ms": 100,
+                "application_sample_tolerance_ns": 10_000_000,
+                "application_sample_count": 108_001,
+                "application_wall_timeout_seconds": 11_050,
+                "pressure_total_deadline_seconds": 12_000,
+                "authorization_effective_timeout_seconds": 13_000,
+                "probe_timeout_seconds": 30,
+                "resource_monitor_interval_ms": 100,
+                "resource_monitor_tolerance_ns": 100_000_000,
+            },
+            "ceilings": {
+                "maximum_output_bytes": 8 * 1024 * 1024 * 1024,
+                "maximum_output_inodes": 100_000,
+                "maximum_application_tmpdir_bytes": 512 * 1024 * 1024,
+                "maximum_application_tmpdir_inodes": 4096,
+                "maximum_pressure_scratch_bytes": 512 * 1024 * 1024,
+                "maximum_pressure_scratch_inodes": 4096,
+                "maximum_probe_output_bytes": 64 * 1024 * 1024,
+                "maximum_probe_output_inodes": 16,
+                "maximum_probe_tmpdir_bytes": 64 * 1024 * 1024,
+                "maximum_probe_tmpdir_inodes": 256,
+                "minimum_free_bytes": 1024 * 1024 * 1024,
+                "minimum_free_inodes": 1024,
+                "durable_receipt_reserve_bytes": 8 * 1024 * 1024,
+                "durable_receipt_reserve_inodes": 16,
+                "maximum_monitor_stream_bytes": 1024 * 1024 * 1024,
+                "maximum_monitor_rows": 1_000_000,
+                "maximum_monitor_row_bytes": 2 * 1024 * 1024,
+            },
+            "artifact_limits": {
+                name: 8 * 1024 * 1024
+                for name in soak_budget_module.RESOURCE_BUDGET_ARTIFACT_LIMIT_FIELDS
+            },
+        }
+        resource_budget_body["artifact_limits"].update({
+            "terminal_stream_bytes": 32 * 1024 * 1024 * 1024,
+            "resource_samples_bytes": 96 * 1024 * 1024,
+            "pressure_events_bytes": 512 * 1024 * 1024,
+            "probe_stdout_bytes": 512 * 1024,
+            "probe_stderr_bytes": 64 * 1024,
+            "probe_owner_receipt_bytes": 16 * 1024 * 1024,
+            "probe_inventory_bytes": 16 * 1024 * 1024,
+            "probe_failure_bytes": 64 * 1024,
+            "probe_capture_receipt_bytes": 16 * 1024 * 1024,
+            "resource_monitor_stream_bytes": 512 * 1024 * 1024,
+            "owner_return_receipt_bytes": 2 * 1024 * 1024,
+        })
+        soak_budget = soak_budget_module.make_resource_budget_document(
+            resource_budget_body,
+        )
+        soak_budget_directory = artifact_root / "soak"
+        soak_budget_directory.mkdir(mode=0o700, exist_ok=True)
+        soak_budget_path = soak_budget_directory / "width-resource-budget.json"
+        soak_budget_raw = soak_budget_module.canonical_bytes(soak_budget)
+        soak_budget_path.write_bytes(soak_budget_raw)
+        soak_budget_path.chmod(0o600)
+        width_soak_index_path = soak_budget_directory / "width-materials-index.json"
+        controller.create_soak_material_index(
+            context, recipe_path, receipt_path, width_soak_index_path,
+            soak_budget_path,
+        )
+
+        projected = controller.build_source5_journal_width_contract(
+            context, pressure_index_path, width_soak_index_path,
+            host_budget_path, None,
+        )
+        contract = projected["contract"]
+        expected_counts = {
+            "exploration": 360, "aa": 48, "confirmation": 8100,
+            "pressure": 8100, "soak": 1,
+        }
+        observed_counts = {
+            phase: sum(row["host_id"] == host_id
+                       for row in fixture.plan["jobs"][phase])
+            for phase in expected_counts
+        }
+        self.assertEqual(observed_counts, expected_counts)
+        self.assertEqual(sum(observed_counts.values()), 16_609)
+        self.assertEqual(len(contract["job_rows"]), 16_609)
+        self.assertEqual(len(contract["owner_pins"]), 11)
+        self.assertEqual(contract["total_event_count"], 99_659)
+        self.assertFalse(fixture.plan["execution_ready"])
+        self.assertFalse(fixture.plan["full_gate_ready"])
+
+        context.journal_width_contract = contract
+        context.journal_width_contract_pin = {
+            "path": str(host_dir / "journal-width-contract.json"),
+            "raw_sha256": projected["raw_sha256"],
+            "semantic_sha256": projected["semantic_sha256"],
+        }
+        controller._require_source5_journal_width_projection(context, projected)
+
+        analyzer_rows = []
+        for phase in ("confirmation", "pressure"):
+            for job in controller._host_jobs(context, phase):
+                if job.get("mode") != "open_loop":
+                    continue
+                descriptors = (
+                    context.fixed_pair._member_descriptors(
+                        job, context.campaign,
+                    ) if phase == "confirmation" else
+                    context.pressure_pair.pressure_process_descriptors(job)
+                )
+                for member_index, descriptor in enumerate(descriptors):
+                    if phase == "confirmation":
+                        role = "normal_app_output"
+                        owner = "fixed_pair"
+                        maximum = context.fixed_pair.MAX_ID_BYTES
+                        trace_path = (
+                            artifact_root / fixture.spec["campaign_id"] /
+                            "source5" / host_id / "job-artifacts" /
+                            phase / job["run_id"] /
+                            f"{descriptor['pair']}-{descriptor['executor']}.ids.tsv"
+                        )
+                    else:
+                        role = "opaque_trace"
+                        owner = "pressure_pair"
+                        maximum = context.pressure_pair.MAX_TRACE_BYTES
+                        member_root = (
+                            artifact_root / fixture.spec["campaign_id"] /
+                            "source5" / host_id / "job-artifacts" /
+                            "pressure" / job["run_id"] /
+                            f"{member_index:02d}-{descriptor['pair']}-"
+                            f"{descriptor['executor']}-{descriptor['allocator']}"
+                        )
+                        trace_path = Path(
+                            controller._pressure_member_outputs(member_root)["ids"]
+                        )
+                    analyzer_rows.append({
+                        "path": str(trace_path),
+                        "kind": "file", "role": role, "owner": owner,
+                        "host_id": host_id,
+                        "storage_root": str(artifact_root),
+                        "phase": phase, "run_id": job["run_id"],
+                        "member_index": member_index,
+                        "max_bytes": maximum,
+                        "max_file_bytes": maximum,
+                    })
+        self.assertTrue(any(
+            row["phase"] == "pressure" and
+            Path(row["path"]).name == "ids.tsv"
+            for row in analyzer_rows
+        ))
+        analyzer_projection = controller._source5_analyzer_scratch_projection(
+            context, analyzer_rows,
+        )
+        self.assertEqual(
+            analyzer_projection["maximum_trace_file_bytes"],
+            context.pressure_pair.MAX_TRACE_BYTES,
+        )
+        self.assertEqual(analyzer_projection["maximum_trace_families"], 4)
+        with self.assertRaisesRegex(
+                controller.Source5CampaignError, "do not close"):
+            controller._source5_analyzer_scratch_projection(
+                context, analyzer_rows[:-1],
+            )
+        swapped_trace_rows = [dict(row) for row in analyzer_rows]
+        swapped_trace_rows[0]["path"] += ".other"
+        with self.assertRaisesRegex(
+                controller.Source5CampaignError, "exact owner role"):
+            controller._source5_analyzer_scratch_projection(
+                context, swapped_trace_rows,
+            )
+
+        mutant = json.loads(controller.canonical_bytes(contract))
+        for row in mutant["job_rows"]:
+            row["maximum_event_bytes_by_kind"] = {
+                kind: 1 for kind in row["event_counts"]
+            }
+            row["failed_event_bytes_by_kind"] = {
+                kind: 1 for kind in row["event_counts"]
+            }
+            job_events = sum(row["event_counts"].values())
+            row["success_job_bytes"] = job_events
+            row["failed_window_bytes"] = job_events
+            row["byte_uplift"] = 0
+        for total in mutant["phase_totals"]:
+            total["success_event_bytes"] = sum(
+                row["success_job_bytes"] for row in mutant["job_rows"]
+                if row["phase"] == total["phase"]
+            )
+        for fixed in mutant["fixed_event_widths"]:
+            fixed["maximum_line_bytes"] = 1
+        mutant["total_event_bytes"] = (
+            sum(row["count"] for row in mutant["fixed_event_widths"]) +
+            sum(row["success_job_bytes"] for row in mutant["job_rows"])
+        )
+        first = mutant["job_rows"][0]
+        mutant["failed_owner_window"] = {
+            key: first[key] for key in (
+                "phase", "job_index", "ordinal", "run_id", "job_sha256",
+                "failed_event_count", "failed_event_count_uplift",
+                "failed_window_bytes", "success_job_bytes", "byte_uplift",
+            )
+        }
+        mutant_body = {key: value for key, value in mutant.items()
+                       if key != "contract_sha256"}
+        mutant["contract_sha256"] = controller.sha256(
+            controller.canonical_bytes(mutant_body),
+        )
+        mutant_raw = controller.canonical_bytes(mutant)
+        context.journal_width_contract = mutant
+        context.journal_width_contract_pin = {
+            "path": str(host_dir / "journal-width-contract.json"),
+            "raw_sha256": controller.sha256(mutant_raw),
+            "semantic_sha256": mutant["contract_sha256"],
+        }
+        with self.assertRaisesRegex(
+                controller.Source5CampaignError,
+                "deterministic source-side preflight recomputation"):
+            controller._require_source5_journal_width_projection(
+                context, projected,
+            )
 
 
 if __name__ == "__main__":

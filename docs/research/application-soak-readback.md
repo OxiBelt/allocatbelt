@@ -207,3 +207,34 @@ bounded_execution_ready,qualification_eligible,execution_ready}`. It reports
 bounded readiness only after all live and offline evidence passes. It leaves
 qualification and campaign execution readiness false. This candidate contains
 no three-hour host capture or SourceV5 re-preparation evidence.
+
+## Authenticated captured-output replay
+
+The additive
+`verify_source5_soak_component_captured_outputs(..., captured_evidence=...)`
+entrypoint consumes Root's authenticated
+`allocatbelt.application-source5-archived-job-read-view.v1` for the exact
+original Soak job. It verifies the request, final checkpoint and signed object
+manifest again against the original campaign/job pins before it reads staged
+output objects. The older `verify_source5_soak_component_offline` API retains
+its closed identity-path-map schema and behavior.
+
+Captured object lookup keys remain the original absolute paths. The replay
+opens only the exact local stage files supplied by the authenticated view,
+checks their no-follow regular-file identity, owner, mode, single-link status,
+size and raw digest, and streams large terminal, sample, monitor and pressure
+records. It never stats a reclaimed origin path or fabricates origin
+filesystem metadata. SourceV5, SpecV3, PlanV3, binaries, capacity inputs and
+other retained dependencies continue through their real pinned paths.
+
+ProbeV2's nonempty-capable `opaque_trace` TMPDIR is accepted only with the
+request's exact typed tree row, the raw-pinned
+`allocatbelt.application-feedback-probe-tmpdir-inventory.v1` document and the
+ProbeV2 capture receipt that binds the same initial/final root identity and
+inventory pin. The row's file descendants must match the signed archive
+objects one-to-one; directory facts come only from the receipt-backed typed
+inventory. An empty directory is never inferred from a missing archive file.
+The verifier preserves the original policy, host receipt, resource-monitor,
+single-APP pressure, 100 ms sample, 108,001-row, RSS-growth and final-usage
+checks. Short functional diagnostics can validate lifecycle wiring but do not
+qualify the three-hour run.

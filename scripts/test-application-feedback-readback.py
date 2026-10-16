@@ -7,7 +7,9 @@ artifacts; they do not launch an application or establish performance.
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -39,6 +41,10 @@ def _load(name: str, path: Path) -> Any:
 reader = _load("application_feedback_readback_test_target", READER_PATH)
 FEEDBACK_OFFLINE_FIXTURE_SCHEMA = "allocatbelt.application-feedback-offline-fixture.v1"
 campaign = _load("application_campaign_feedback_fixture", CAMPAIGN_PATH)
+pressure_pair = _load(
+    "application_pressure_pair_feedback_capture_test_target",
+    SCRIPT_DIR / "application-pressure-pair.py",
+)
 
 
 def _source_v5_manifest(identity: dict[str, Any]) -> dict[str, Any]:
@@ -928,6 +934,585 @@ def _sample_row(
     return ("\t".join(output) + "\n").encode("ascii")
 
 
+class CapturedTraceReplayTests(unittest.TestCase):
+    def _captured_fixture(self, root: Path):
+        fixture = Fixture(root / "origin", workload="mixed")
+        fixture.install_v4_source_v5()
+        expected = fixture.verify()
+        origin_bytes = {
+            str(fixture.expectation_path): fixture.expectation_path.read_bytes(),
+            str(fixture.manifest_path): fixture.manifest_path.read_bytes(),
+            str(fixture.events_path): fixture.events_path.read_bytes(),
+            str(fixture.samples_path): fixture.samples_path.read_bytes(),
+        }
+        stage_root = root / "stage"
+        stage_root.mkdir(mode=0o700)
+        references = {}
+        for index, (origin, raw) in enumerate(sorted(origin_bytes.items())):
+            local = stage_root / f"object-{index:02d}.bin"
+            local.write_bytes(raw)
+            local.chmod(0o400)
+            references[origin] = {
+                "origin_path": origin, "path": str(local),
+                "role": "pressure_pair_artifact", "host_id": fixture.identity["host_id"],
+                "raw_sha256": _sha(raw), "semantic_sha256": None,
+                "byte_count": len(raw), "maximum_bytes": len(raw),
+            }
+        view = pressure_pair.CapturedPressureArtifactView(
+            str(stage_root), references,
+        )
+        captured = sorted(origin_bytes)
+        resident = sorted({
+            *captured, str(fixture.source_path),
+            str(fixture.construction_probe_path),
+        })
+        trace_root = str(fixture.trace)
+        context = {
+            "schema": pressure_pair.CAPTURED_PRESSURE_REPLAY_CONTEXT_SCHEMA,
+            "artifact_view": view,
+            "captured_origin_paths": captured,
+            "evidence_file_paths": resident,
+            "evidence_directory_paths": [trace_root],
+            "source_symlink_paths": [], "tree_inventories": [],
+            "probe_capture_pin": {
+                "path": str(root / "probe-capture.json"),
+                "raw_sha256": "a" * 64, "receipt_sha256": "b" * 64,
+            },
+            "capacity_bundle": {
+                "request": {"path": str(root / "capacity-request.json"),
+                            "raw_sha256": "c" * 64},
+                "artifact": {"path": str(root / "capacity.tsv"),
+                             "raw_sha256": "d" * 64},
+                "receipt": {"path": str(root / "capacity-receipt.json"),
+                            "raw_sha256": "e" * 64},
+            },
+        }
+        for path in (fixture.expectation_path, fixture.manifest_path,
+                     fixture.events_path, fixture.samples_path):
+            path.unlink()
+        return fixture, expected, context, set(origin_bytes)
+
+    def test_captured_pressure_context_streams_expectation_and_trace_without_origin_io(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="feedback-captured-trace-") as temporary:
+            root = Path(temporary).resolve()
+            fixture, expected, context, origins = self._captured_fixture(root)
+            inspected: list[str] = []
+            original_lstat = Path.lstat
+            original_open = os.open
+
+            def guarded_lstat(path: Path, *args: Any, **kwargs: Any):
+                rendered = str(path)
+                if rendered in origins or rendered == str(fixture.trace):
+                    inspected.append(rendered)
+                    raise AssertionError("captured feedback replay touched a reclaimed origin")
+                return original_lstat(path, *args, **kwargs)
+
+            def guarded_open(path: Any, *args: Any, **kwargs: Any):
+                if isinstance(path, (str, bytes, os.PathLike)):
+                    rendered = os.fsdecode(path)
+                    if rendered in origins or rendered == str(fixture.trace):
+                        inspected.append(rendered)
+                        raise AssertionError("captured feedback replay opened a reclaimed origin")
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "lstat", guarded_lstat), \
+                 patch.object(os, "open", guarded_open):
+                actual = reader._verify_feedback_replay(
+                    fixture.expectation_path, fixture.expectation_sha,
+                    fixture.trace, dict(fixture.hashes),
+                    offline_replay_context=context,
+                )
+            self.assertEqual(actual, expected)
+            self.assertEqual(inspected, [])
+            self.assertFalse(fixture.expectation_path.exists())
+            self.assertFalse(fixture.events_path.exists())
+
+    def test_captured_pressure_trace_rejects_tampered_staged_stream(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="feedback-captured-tamper-") as temporary:
+            root = Path(temporary).resolve()
+            fixture, _expected, context, _origins = self._captured_fixture(root)
+            event_origin = str(fixture.events_path)
+            reference = context["artifact_view"].objects[event_origin]
+            staged = Path(reference["path"])
+            staged.chmod(0o600)
+            staged.write_bytes(b"x" * reference["byte_count"])
+            staged.chmod(0o400)
+            with self.assertRaisesRegex(
+                    pressure_pair.PressurePairError,
+                    "differs from its exact raw pin"):
+                reader._verify_feedback_replay(
+                    fixture.expectation_path, fixture.expectation_sha,
+                    fixture.trace, dict(fixture.hashes),
+                    offline_replay_context=context,
+                )
+
+    def test_captured_pressure_trace_rejects_missing_symlink_and_truncated_objects(self) -> None:
+        for mutation in ("missing", "symlink", "truncated"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory(
+                    prefix=f"feedback-captured-{mutation}-") as temporary:
+                root = Path(temporary).resolve()
+                fixture, _expected, context, _origins = self._captured_fixture(root)
+                event_origin = str(fixture.events_path)
+                reference = context["artifact_view"].objects[event_origin]
+                staged = Path(reference["path"])
+                if mutation == "missing":
+                    staged.unlink()
+                elif mutation == "symlink":
+                    other = next(
+                        Path(row["path"])
+                        for origin, row in context["artifact_view"].objects.items()
+                        if origin != event_origin
+                    )
+                    staged.unlink()
+                    staged.symlink_to(other.name)
+                else:
+                    staged.chmod(0o600)
+                    staged.write_bytes(b"x" * max(0, reference["byte_count"] - 1))
+                    staged.chmod(0o400)
+                with self.assertRaises(pressure_pair.PressurePairError):
+                    reader._verify_feedback_replay(
+                        fixture.expectation_path, fixture.expectation_sha,
+                        fixture.trace, dict(fixture.hashes),
+                        offline_replay_context=context,
+                    )
+
+    def test_captured_pressure_mode_routes_proof_and_runtime_binding_through_view(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="feedback-captured-pressure-mode-") as temporary:
+            root = Path(temporary).resolve()
+            fixture = Fixture(root / "origin", workload="mixed")
+            # This component case exercises the v2 pressure-proof and v1
+            # runtime readers. The v4 expectation permits calibration only.
+            self.assertEqual(json.loads(fixture.expectation_bytes)["schema"], reader.EXPECTATION_SCHEMA_V2)
+            fixture.capacity_trace = False
+            fixture.identity["pressure_qualification"] = True
+            fixture._write_trace()
+
+            helper = FeedbackReadbackTests()
+            helper.fixture = fixture
+            runtime_capture: dict[str, Any] = {}
+            original_runtime_check = reader._verify_runtime_binding
+
+            def capture_valid_runtime_binding(
+                recipe: dict[str, Any], final_policy: dict[str, Any],
+                accepted_sample_count: int, *, artifact_view: Any = None,
+            ):
+                result = original_runtime_check(
+                    recipe, final_policy, accepted_sample_count,
+                    artifact_view=artifact_view,
+                )
+                if "raw" not in runtime_capture and result[0] and not result[2]:
+                    pin = recipe["final_runtime_binding"]
+                    runtime_capture["path"] = pin["path"]
+                    runtime_capture["raw"] = Path(pin["path"]).read_bytes()
+                    runtime_capture["schema_header"] = runtime_capture["raw"].splitlines()[0]
+                    runtime_capture["final_policy"] = dict(final_policy)
+                    runtime_capture["accepted_sample_count"] = accepted_sample_count
+                return result
+
+            with patch.object(reader, "_verify_runtime_binding",
+                              side_effect=capture_valid_runtime_binding):
+                helper.test_runtime_binding_v2_requires_final_zero_snapshot_and_v1_never_qualifies()
+            self.assertIn("raw", runtime_capture)
+            self.assertEqual(
+                runtime_capture["schema_header"],
+                f"schema\t{reader.RUNTIME_BINDING_SCHEMA_V1}".encode("ascii"),
+            )
+
+            pressure = helper._pressure_spec()
+            pressure["identity"]["pressure_qualification"] = True
+            proof = helper._pressure_proof(
+                _sha(PRESSURE_READER_PATH.read_bytes()),
+            )
+            proof["continuous_ready_window"]["start_monotonic_ns"] = 5_100_000_000
+            proof_body = {key: value for key, value in proof.items()
+                          if key != "readback_sha256"}
+            proof["readback_sha256"] = reader.digest_object(proof_body)
+            proof_path = fixture.root / "pressure-readback.json"
+            proof_raw = reader.canonical_bytes(proof)
+            proof_path.write_bytes(proof_raw)
+            pressure["external_pressure_proof"]["raw_sha256"] = _sha(proof_raw)
+            runtime_path = Path(runtime_capture["path"])
+            runtime_raw = runtime_capture["raw"]
+            runtime_path.write_bytes(runtime_raw)
+            pressure["final_runtime_binding"] = {
+                "path": str(runtime_path), "raw_sha256": _sha(runtime_raw),
+            }
+            _freeze_fixture_expectation(fixture, pressure)
+            fixture._write_trace()
+
+            origin_bytes = {
+                str(fixture.expectation_path): fixture.expectation_path.read_bytes(),
+                str(fixture.manifest_path): fixture.manifest_path.read_bytes(),
+                str(fixture.events_path): fixture.events_path.read_bytes(),
+                str(fixture.samples_path): fixture.samples_path.read_bytes(),
+                str(proof_path): proof_raw,
+                str(runtime_path): runtime_raw,
+            }
+            stage_root = root / "pressure-stage"
+            stage_root.mkdir(mode=0o700)
+            references = {}
+            for index, (origin, raw) in enumerate(sorted(origin_bytes.items())):
+                local = stage_root / f"object-{index:02d}.bin"
+                local.write_bytes(raw)
+                local.chmod(0o400)
+                references[origin] = {
+                    "origin_path": origin, "path": str(local),
+                    "role": "pressure_pair_artifact",
+                    "host_id": fixture.identity["host_id"],
+                    "raw_sha256": _sha(raw), "semantic_sha256": None,
+                    "byte_count": len(raw), "maximum_bytes": len(raw),
+                }
+            view = pressure_pair.CapturedPressureArtifactView(
+                str(stage_root), references,
+            )
+            captured = sorted(origin_bytes)
+            resident = sorted({
+                *captured, str(fixture.source_path),
+                str(fixture.construction_probe_path),
+            })
+            context = {
+                "schema": pressure_pair.CAPTURED_PRESSURE_REPLAY_CONTEXT_SCHEMA,
+                "artifact_view": view,
+                "captured_origin_paths": captured,
+                "evidence_file_paths": resident,
+                "evidence_directory_paths": [str(fixture.trace)],
+                "source_symlink_paths": [], "tree_inventories": [],
+                "probe_capture_pin": {
+                    "path": str(root / "probe-capture.json"),
+                    "raw_sha256": "a" * 64, "receipt_sha256": "b" * 64,
+                },
+                "capacity_bundle": {
+                    "request": {"path": str(root / "capacity-request.json"),
+                                "raw_sha256": "c" * 64},
+                    "artifact": {"path": str(root / "capacity.tsv"),
+                                 "raw_sha256": "d" * 64},
+                    "receipt": {"path": str(root / "capacity-receipt.json"),
+                                "raw_sha256": "e" * 64},
+                },
+            }
+            for path in (fixture.expectation_path, fixture.manifest_path,
+                         fixture.events_path, fixture.samples_path,
+                         proof_path, runtime_path):
+                if path != fixture.source_path and path != fixture.construction_probe_path:
+                    path.unlink()
+
+            production = (5_200_000_000, 5_200_000_010)
+            drain = (6_400_000_000, 6_400_000_010)
+            inspected: list[str] = []
+            original_lstat = Path.lstat
+            original_open = os.open
+
+            def guarded_lstat(path: Path, *args: Any, **kwargs: Any):
+                if str(path) in captured or str(path) == str(fixture.trace):
+                    inspected.append(str(path))
+                    raise AssertionError("captured pressure binding replay touched an origin output")
+                return original_lstat(path, *args, **kwargs)
+
+            def guarded_open(path: Any, *args: Any, **kwargs: Any):
+                if isinstance(path, (str, bytes, os.PathLike)):
+                    rendered = os.fsdecode(path)
+                    if rendered in captured or rendered == str(fixture.trace):
+                        inspected.append(rendered)
+                        raise AssertionError("captured pressure binding replay opened an origin output")
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "lstat", guarded_lstat), \
+                 patch.object(os, "open", guarded_open):
+                proof_result = reader._verify_pressure_proof(
+                    pressure, production, drain,
+                    offline_replayed_proof=proof, allow_pressure_v2=True,
+                    artifact_view=view,
+                )
+                runtime_result = reader._verify_runtime_binding(
+                    pressure, runtime_capture["final_policy"],
+                    runtime_capture["accepted_sample_count"],
+                    artifact_view=view,
+                )
+            self.assertEqual(proof_result, (True, _sha(proof_raw)))
+            self.assertTrue(runtime_result[0])
+            self.assertFalse(runtime_result[2])
+            self.assertEqual(inspected, [])
+
+    def test_captured_pressure_mode_replays_full_stream_proof_and_runtime_without_origin_io(self) -> None:
+        # This synthetic v2 exercise covers component-reader eligibility only;
+        # it is not a Source5 host/campaign or performance qualification.
+        with tempfile.TemporaryDirectory(prefix="feedback-captured-pressure-full-") as temporary:
+            root = Path(temporary).resolve()
+            fixture = Fixture(root / "origin", workload="mixed")
+            fixture.identity["pressure_qualification"] = True
+            fixture._write_trace()
+            helper = FeedbackReadbackTests()
+            helper.fixture = fixture
+            runtime_capture: dict[str, Any] = {}
+            original_runtime_check = reader._verify_runtime_binding
+
+            def capture_complete_runtime_binding(
+                recipe: dict[str, Any], final_policy: dict[str, Any],
+                accepted_sample_count: int, *, artifact_view: Any = None,
+            ):
+                result = original_runtime_check(
+                    recipe, final_policy, accepted_sample_count,
+                    artifact_view=artifact_view,
+                )
+                if result[0] and result[2]:
+                    pin = recipe["final_runtime_binding"]
+                    runtime_capture.update({
+                        "path": pin["path"],
+                        "raw": Path(pin["path"]).read_bytes(),
+                        "final_policy": dict(final_policy),
+                        "accepted_sample_count": accepted_sample_count,
+                    })
+                    runtime_capture["schema_header"] = runtime_capture["raw"].splitlines()[0]
+                return result
+
+            with patch.object(reader, "_verify_runtime_binding",
+                              side_effect=capture_complete_runtime_binding):
+                helper.test_runtime_binding_v2_requires_final_zero_snapshot_and_v1_never_qualifies()
+            self.assertIn("raw", runtime_capture)
+            self.assertEqual(
+                runtime_capture["schema_header"],
+                f"schema\t{reader.RUNTIME_BINDING_SCHEMA_V2}".encode("ascii"),
+            )
+
+            pressure = helper._pressure_spec()
+            pressure["identity"] = dict(fixture.identity)
+            proof = helper._pressure_proof(_sha(PRESSURE_READER_PATH.read_bytes()))
+            proof["continuous_ready_window"] = {
+                "start_monotonic_ns": 5_000_000_000,
+                "end_monotonic_ns": 7_000_000_000,
+            }
+            proof_body = {key: value for key, value in proof.items()
+                          if key != "readback_sha256"}
+            proof["readback_sha256"] = reader.digest_object(proof_body)
+            proof_path = fixture.root / "pressure-readback.json"
+            proof_raw = reader.canonical_bytes(proof)
+            proof_path.write_bytes(proof_raw)
+            pressure["external_pressure_proof"]["raw_sha256"] = _sha(proof_raw)
+            runtime_path = Path(runtime_capture["path"])
+            runtime_raw = runtime_capture["raw"]
+            runtime_path.write_bytes(runtime_raw)
+            pressure["final_runtime_binding"] = {
+                "path": str(runtime_path), "raw_sha256": _sha(runtime_raw),
+            }
+            _freeze_fixture_expectation(fixture, pressure)
+            fixture._write_trace()
+
+            origin_bytes = {
+                str(fixture.expectation_path): fixture.expectation_path.read_bytes(),
+                str(fixture.manifest_path): fixture.manifest_path.read_bytes(),
+                str(fixture.events_path): fixture.events_path.read_bytes(),
+                str(fixture.samples_path): fixture.samples_path.read_bytes(),
+                str(proof_path): proof_raw,
+                str(runtime_path): runtime_raw,
+            }
+            stage_root = root / "pressure-full-stage"
+            stage_root.mkdir(mode=0o700)
+            references = {}
+            for index, (origin, raw) in enumerate(sorted(origin_bytes.items())):
+                local = stage_root / f"object-{index:02d}.bin"
+                local.write_bytes(raw)
+                local.chmod(0o400)
+                references[origin] = {
+                    "origin_path": origin, "path": str(local),
+                    "role": "pressure_pair_artifact",
+                    "host_id": fixture.identity["host_id"],
+                    "raw_sha256": _sha(raw), "semantic_sha256": None,
+                    "byte_count": len(raw), "maximum_bytes": len(raw),
+                }
+            view = pressure_pair.CapturedPressureArtifactView(
+                str(stage_root), references,
+            )
+            captured = sorted(origin_bytes)
+            resident = sorted({
+                *captured, str(fixture.source_path),
+                str(fixture.construction_probe_path),
+            })
+            trace_root = str(fixture.trace)
+            context = {
+                "schema": pressure_pair.CAPTURED_PRESSURE_REPLAY_CONTEXT_SCHEMA,
+                "artifact_view": view,
+                "captured_origin_paths": captured,
+                "evidence_file_paths": resident,
+                "evidence_directory_paths": [trace_root],
+                "source_symlink_paths": [], "tree_inventories": [],
+                "probe_capture_pin": {
+                    "path": str(root / "probe-capture.json"),
+                    "raw_sha256": "a" * 64, "receipt_sha256": "b" * 64,
+                },
+                "capacity_bundle": {
+                    "request": {"path": str(root / "capacity-request.json"),
+                                "raw_sha256": "c" * 64},
+                    "artifact": {"path": str(root / "capacity.tsv"),
+                                 "raw_sha256": "d" * 64},
+                    "receipt": {"path": str(root / "capacity-receipt.json"),
+                                "raw_sha256": "e" * 64},
+                },
+            }
+            for path in (fixture.expectation_path, fixture.manifest_path,
+                         fixture.events_path, fixture.samples_path,
+                         proof_path, runtime_path):
+                path.unlink()
+            fixture.trace.rmdir()
+
+            source_origin = str(fixture.source_path)
+            missing_source_context = dict(context)
+            missing_source_context["evidence_file_paths"] = [
+                path for path in resident if path != source_origin
+            ]
+            source_inspected: list[str] = []
+            original_lstat = Path.lstat
+            original_stat = Path.stat
+            original_resolve = Path.resolve
+            original_open = os.open
+
+            def guard_unlisted_source_lstat(
+                path: Path, *args: Any, **kwargs: Any,
+            ):
+                if str(path) == source_origin:
+                    source_inspected.append(str(path))
+                    raise AssertionError("unlisted resident source manifest was statted")
+                return original_lstat(path, *args, **kwargs)
+
+            def guard_unlisted_source_stat(
+                path: Path, *args: Any, **kwargs: Any,
+            ):
+                if str(path) == source_origin:
+                    source_inspected.append(str(path))
+                    raise AssertionError("unlisted resident source manifest was statted")
+                return original_stat(path, *args, **kwargs)
+
+            def guard_unlisted_source_resolve(
+                path: Path, *args: Any, **kwargs: Any,
+            ):
+                if str(path) == source_origin:
+                    source_inspected.append(str(path))
+                    raise AssertionError("unlisted resident source manifest was resolved")
+                return original_resolve(path, *args, **kwargs)
+
+            def guard_unlisted_source_open(path: Any, *args: Any, **kwargs: Any):
+                if isinstance(path, (str, bytes, os.PathLike)) and \
+                        os.fsdecode(path) == source_origin:
+                    source_inspected.append(source_origin)
+                    raise AssertionError("unlisted resident source manifest was opened")
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "lstat", guard_unlisted_source_lstat), \
+                 patch.object(Path, "stat", guard_unlisted_source_stat), \
+                 patch.object(Path, "resolve", guard_unlisted_source_resolve), \
+                 patch.object(os, "open", guard_unlisted_source_open):
+                with self.assertRaisesRegex(
+                        reader.ValidationError,
+                        "omits exact resident source manifest"):
+                    reader._verify_feedback_replay(
+                        fixture.expectation_path, fixture.expectation_sha,
+                        fixture.trace, dict(fixture.hashes),
+                        offline_replay_context=missing_source_context,
+                        offline_replayed_proof=proof,
+                    )
+            self.assertEqual(source_inspected, [])
+
+            inspected: list[str] = []
+            original_lstat = Path.lstat
+            original_stat = Path.stat
+            original_resolve = Path.resolve
+            original_open = os.open
+
+            def guarded_lstat(path: Path, *args: Any, **kwargs: Any):
+                rendered = str(path)
+                if rendered in captured or rendered == trace_root:
+                    inspected.append(rendered)
+                    raise AssertionError("captured pressure replay touched a reclaimed output")
+                return original_lstat(path, *args, **kwargs)
+
+            def guarded_stat(path: Path, *args: Any, **kwargs: Any):
+                rendered = str(path)
+                if rendered in captured or rendered == trace_root:
+                    inspected.append(rendered)
+                    raise AssertionError("captured pressure replay statted a reclaimed output")
+                return original_stat(path, *args, **kwargs)
+
+            def guarded_resolve(
+                path: Path, *args: Any, **kwargs: Any,
+            ):
+                rendered = str(path)
+                if rendered in captured or rendered == trace_root:
+                    inspected.append(rendered)
+                    raise AssertionError("captured pressure replay resolved a reclaimed output")
+                return original_resolve(path, *args, **kwargs)
+
+            def guarded_open(path: Any, *args: Any, **kwargs: Any):
+                if isinstance(path, (str, bytes, os.PathLike)):
+                    rendered = os.fsdecode(path)
+                    if rendered in captured or rendered == trace_root:
+                        inspected.append(rendered)
+                        raise AssertionError("captured pressure replay opened a reclaimed output")
+                return original_open(path, *args, **kwargs)
+
+            with patch.object(Path, "lstat", guarded_lstat), \
+                 patch.object(Path, "stat", guarded_stat), \
+                 patch.object(Path, "resolve", guarded_resolve), \
+                 patch.object(os, "open", guarded_open):
+                result = reader._verify_feedback_replay(
+                    fixture.expectation_path, fixture.expectation_sha,
+                    fixture.trace, dict(fixture.hashes),
+                    offline_replay_context=context,
+                    offline_replayed_proof=proof,
+                )
+            self.assertTrue(result["validated"])
+            self.assertTrue(result["qualification_eligible"])
+            self.assertTrue(result["final_runtime_binding"]["validated"])
+            self.assertEqual(inspected, [])
+
+    def test_captured_trace_rejects_any_nested_file_or_directory(self) -> None:
+        for nested_kind in ("captured_file", "mapped_only_file", "directory"):
+            with self.subTest(nested_kind=nested_kind), tempfile.TemporaryDirectory(
+                    prefix=f"feedback-captured-nested-{nested_kind}-") as temporary:
+                root = Path(temporary).resolve()
+                fixture, _expected, context, _origins = self._captured_fixture(root)
+                trace_root = str(fixture.trace)
+                nested_dir = str(Path(trace_root) / "unexpected")
+                references = {
+                    origin: dict(row)
+                    for origin, row in context["artifact_view"].objects.items()
+                }
+                if nested_kind in ("captured_file", "mapped_only_file"):
+                    nested_origin = str(Path(nested_dir) / "extra.bin")
+                    if nested_kind == "captured_file":
+                        raw = b"unexpected nested trace member\n"
+                        local = context["artifact_view"].stage_root / "nested-extra.bin"
+                        local.write_bytes(raw)
+                        local.chmod(0o400)
+                        references[nested_origin] = {
+                            "origin_path": nested_origin, "path": str(local),
+                            "role": "pressure_pair_artifact",
+                            "host_id": fixture.identity["host_id"],
+                            "raw_sha256": _sha(raw), "semantic_sha256": None,
+                            "byte_count": len(raw), "maximum_bytes": len(raw),
+                        }
+                        context["captured_origin_paths"] = sorted(
+                            [*context["captured_origin_paths"], nested_origin],
+                        )
+                    context["evidence_file_paths"] = sorted(
+                        [*context["evidence_file_paths"], nested_origin],
+                    )
+                else:
+                    nested_origin = None
+                context["evidence_directory_paths"] = sorted(
+                    [*context["evidence_directory_paths"], nested_dir],
+                )
+                context["artifact_view"] = pressure_pair.CapturedPressureArtifactView(
+                    str(context["artifact_view"].stage_root), references,
+                )
+                with self.assertRaisesRegex(
+                        reader.ValidationError, "unpinned",
+                ):
+                    reader._verify_feedback_replay(
+                        fixture.expectation_path, fixture.expectation_sha,
+                        fixture.trace, dict(fixture.hashes),
+                        offline_replay_context=context,
+                    )
+
+
 class FeedbackReadbackTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="feedback-readback-test-")
@@ -1403,6 +1988,82 @@ class FeedbackReadbackTests(unittest.TestCase):
         self.assertTrue(result["validated"])
         self.assertFalse(result["qualification_eligible"])
         self.assertEqual(result["mode"], "functional")
+
+    def test_v3_soak_receipt_and_readback_use_captured_view_without_origin_io(self) -> None:
+        fixture = Fixture(self.fixture.root / "soak-binding-captured-v3", workload="mixed")
+        recipe, source_manifest, trace_manifest = _v3_soak_binding_case(fixture)
+        binding = recipe["final_runtime_binding"]
+        origin_bytes = {
+            binding[name]["path"]: Path(binding[name]["path"]).read_bytes()
+            for name in ("soak_receipt", "soak_readback")
+        }
+        stage_root = fixture.root / "captured-soak-stage"
+        stage_root.mkdir(mode=0o700)
+        references = {}
+        for index, (origin, raw) in enumerate(sorted(origin_bytes.items())):
+            local = stage_root / f"soak-object-{index:02d}.bin"
+            local.write_bytes(raw)
+            local.chmod(0o400)
+            references[origin] = {
+                "origin_path": origin, "path": str(local),
+                "role": "pressure_pair_artifact",
+                "host_id": fixture.identity["host_id"],
+                "raw_sha256": _sha(raw), "semantic_sha256": None,
+                "byte_count": len(raw), "maximum_bytes": len(raw),
+            }
+        view = pressure_pair.CapturedPressureArtifactView(
+            str(stage_root), references,
+        )
+        for path in origin_bytes:
+            Path(path).unlink()
+        origins = set(origin_bytes)
+        inspected: list[str] = []
+        original_lstat = Path.lstat
+        original_stat = Path.stat
+        original_resolve = Path.resolve
+        original_open = os.open
+
+        def guarded_lstat(path: Path, *args: Any, **kwargs: Any):
+            rendered = str(path)
+            if rendered in origins:
+                inspected.append(rendered)
+                raise AssertionError("captured Soak binding lstat touched a reclaimed origin")
+            return original_lstat(path, *args, **kwargs)
+
+        def guarded_stat(path: Path, *args: Any, **kwargs: Any):
+            rendered = str(path)
+            if rendered in origins:
+                inspected.append(rendered)
+                raise AssertionError("captured Soak binding stat touched a reclaimed origin")
+            return original_stat(path, *args, **kwargs)
+
+        def guarded_resolve(path: Path, *args: Any, **kwargs: Any):
+            rendered = str(path)
+            if rendered in origins:
+                inspected.append(rendered)
+                raise AssertionError("captured Soak binding resolve touched a reclaimed origin")
+            return original_resolve(path, *args, **kwargs)
+
+        def guarded_open(path: Any, *args: Any, **kwargs: Any):
+            if isinstance(path, (str, bytes, os.PathLike)):
+                rendered = os.fsdecode(path)
+                if rendered in origins:
+                    inspected.append(rendered)
+                    raise AssertionError("captured Soak binding open touched a reclaimed origin")
+            return original_open(path, *args, **kwargs)
+
+        with patch.object(Path, "lstat", guarded_lstat), \
+             patch.object(Path, "stat", guarded_stat), \
+             patch.object(Path, "resolve", guarded_resolve), \
+             patch.object(os, "open", guarded_open):
+            result = reader._verify_soak_final_binding_v3(
+                recipe, source_manifest, trace_manifest, artifact_view=view,
+            )
+        self.assertTrue(result["validated"])
+        self.assertFalse(result["qualification_eligible"])
+        self.assertEqual(result["raw_sha256"], _sha(origin_bytes[binding["soak_receipt"]["path"]]))
+        self.assertEqual(result["readback_raw_sha256"], _sha(origin_bytes[binding["soak_readback"]["path"]]))
+        self.assertEqual(inspected, [])
 
     def test_v3_soak_binding_rejects_nonzero_final_usage(self) -> None:
         fixture = Fixture(self.fixture.root / "soak-binding-final-v3", workload="mixed")
@@ -2211,6 +2872,162 @@ class OfflineProbeReplayContextTests(unittest.TestCase):
             unknown = {**context, "validated": True}
             with self.assertRaisesRegex(reader.ValidationError, "unexpected key set"):
                 reader._validate_feedback_offline_context(unknown)
+
+    def test_captured_probe_v2_replays_exact_nonempty_typed_tree_without_origin_paths(self) -> None:
+        class View:
+            def __init__(self, objects: dict[str, bytes]):
+                self.objects = objects
+
+            def has_file(self, path: str | Path) -> bool:
+                return str(path) in self.objects
+
+            def read(self, path: str | Path, _label: str, maximum: int):
+                raw = self.objects[str(path)]
+                reader.require(len(raw) <= maximum, "test view parser cap")
+                return raw, hashlib.sha256(raw).hexdigest()
+
+            def open_snapshot(self, *_args: Any):
+                path, label, maximum = _args
+                raw = self.objects[str(path)]
+                reader.require(len(raw) <= maximum, f"{label} test snapshot cap")
+                @contextlib.contextmanager
+                def snapshot():
+                    yield io.BytesIO(raw), hashlib.sha256(raw).hexdigest(), len(raw)
+                return snapshot()
+
+        with tempfile.TemporaryDirectory(prefix="feedback-captured-tree-") as directory:
+            base = Path(directory) / "origin" / "job"
+            output_root = base / "probe-output"
+            tmp_root = output_root / "tmp"
+            capture_path = output_root / "capture-receipt.json"
+            stdout_path = output_root / "stdout.bin"
+            stderr_path = output_root / "stderr.bin"
+            owner_path = output_root / "owner-result.json"
+            inventory_path = output_root / "tmpdir-inventory.json"
+            trace_path = tmp_root / "opaque.trace"
+            trace = b"captured trace bytes\n"
+            trace_entry = {
+                "path": str(trace_path), "kind": "file", "uid": os.getuid(),
+                "mode": 0o600, "size": len(trace),
+                "raw_sha256": hashlib.sha256(trace).hexdigest(),
+            }
+            inventory_body = {
+                "schema": reader.PROBE_TMPDIR_INVENTORY_SCHEMA,
+                "entries": [trace_entry],
+            }
+            inventory = {
+                **inventory_body,
+                "inventory_sha256": hashlib.sha256(
+                    reader.canonical_bytes(inventory_body),
+                ).hexdigest(),
+            }
+            inventory_raw = reader.canonical_bytes(inventory)
+            owner_body = {
+                "schema": reader.PROBE_OWNER_RESULT_SCHEMA,
+                "direct": {}, "start_callback_count": 0,
+                "start_callback_proofs": [],
+            }
+            owner = {
+                **owner_body,
+                "owner_result_sha256": hashlib.sha256(
+                    reader.canonical_bytes(owner_body),
+                ).hexdigest(),
+            }
+            owner_raw = reader.canonical_bytes(owner)
+            raw_files = {
+                str(capture_path): b"captured owner receipt bytes\n",
+                str(stdout_path): b"{}\n", str(stderr_path): b"",
+                str(owner_path): owner_raw,
+                str(inventory_path): inventory_raw,
+                str(trace_path): trace,
+            }
+            pin = lambda path, raw: {
+                "path": str(path), "raw_sha256": hashlib.sha256(raw).hexdigest(),
+            }
+            capture_pin = {
+                **pin(capture_path, raw_files[str(capture_path)]),
+                "receipt_sha256": "a" * 64,
+            }
+            inventory_pin = {
+                **pin(inventory_path, inventory_raw),
+                "inventory_sha256": inventory["inventory_sha256"],
+            }
+            owner_pin = {
+                **pin(owner_path, owner_raw),
+                "owner_result_sha256": owner["owner_result_sha256"],
+            }
+            capture = {
+                "stdout": pin(stdout_path, raw_files[str(stdout_path)]),
+                "stderr": pin(stderr_path, raw_files[str(stderr_path)]),
+                "owner_result_pin": owner_pin,
+                "tmpdir_inventory_pin": inventory_pin,
+                "tmpdir_initial": {
+                    "path": str(tmp_root), "device": 1, "inode": 2,
+                    "mode": 0o700, "mount": {}, "available_bytes": 8192,
+                    "available_inodes": 32, "bytes_limit": 4096,
+                    "inode_limit": 16,
+                },
+                "tmpdir_final": {
+                    "path": str(tmp_root), "device": 1, "inode": 2,
+                    "mode": 0o700, "mount": {}, "bytes_used": len(trace),
+                    "file_count": 1, "directory_count": 0,
+                    "bytes_limit": 4096, "inode_limit": 16,
+                    "available_bytes": 8192, "available_inodes": 32,
+                },
+                "storage_budget": {
+                    "tmpdir_bytes": 4096, "tmpdir_inodes": 16,
+                    "stdout_bytes": 1024, "stderr_bytes": 64 * 1024,
+                    "owner_result_bytes": reader.MAX_PROBE_OWNER_RESULT_BYTES,
+                    "inventory_bytes": reader.MAX_PROBE_TMPDIR_INVENTORY_BYTES,
+                    "failure_bytes": reader.MAX_PROBE_CAPTURE_FAILURE_BYTES,
+                    "receipt_bytes": 1024 * 1024, "output_inodes": 8,
+                },
+            }
+            tree = {
+                "owner_job_sha256": "b" * 64, "root_path": str(tmp_root),
+                "role": "opaque_trace",
+                "owner_receipt_pin": {
+                    "path": capture_pin["path"],
+                    "raw_sha256": capture_pin["raw_sha256"],
+                    "semantic_sha256": capture_pin["receipt_sha256"],
+                },
+                "inventory_pin": {
+                    "path": inventory_pin["path"],
+                    "raw_sha256": inventory_pin["raw_sha256"],
+                    "semantic_sha256": inventory_pin["inventory_sha256"],
+                },
+                "inventory_sha256": inventory_pin["inventory_sha256"],
+                "entry_count": 1, "byte_count": len(trace),
+                "entries": [trace_entry],
+            }
+            paths = sorted(raw_files)
+            context = {
+                "schema": reader.FEEDBACK_CAPTURED_OFFLINE_CONTEXT_SCHEMA,
+                "artifact_view": View(raw_files),
+                "captured_origin_paths": paths,
+                "evidence_file_paths": paths,
+                "evidence_directory_paths": sorted({str(output_root), str(tmp_root)}),
+                "source_symlink_paths": [], "tree_inventories": [tree],
+                "probe_capture_pin": capture_pin,
+                "capacity_bundle": {
+                    "request": {"path": str(base / "capacity-request.json"), "raw_sha256": "c" * 64},
+                    "artifact": {"path": str(base / "capacity.tsv"), "raw_sha256": "d" * 64},
+                    "receipt": {"path": str(base / "capacity-receipt.json"), "raw_sha256": "e" * 64},
+                },
+            }
+            checked = reader._validate_feedback_offline_context(context)
+            self.assertFalse(output_root.exists(), "archived origin output must not be statted or recreated")
+            self.assertEqual(reader._preflight_probe_capture_tree(
+                capture, checked, capture_path,
+            ), [trace_entry])
+
+            altered = dict(context)
+            altered["tree_inventories"] = [{**tree, "byte_count": len(trace) + 1}]
+            checked_altered = reader._validate_feedback_offline_context(altered)
+            with self.assertRaisesRegex(reader.ValidationError, "typed tree differs"):
+                reader._preflight_probe_capture_tree(
+                    capture, checked_altered, capture_path,
+                )
 
 
     def test_pressure_pair_request_rejects_caller_supplied_success_flags_before_io(self) -> None:

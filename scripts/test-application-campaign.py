@@ -8,6 +8,7 @@ import importlib.util
 import contextlib
 import copy
 import io
+import json
 import math
 import os
 import py_compile
@@ -291,6 +292,82 @@ def add_frozen_rates(spec: dict, include_oracles: bool) -> None:
 
 
 class ApplicationCampaignTests(unittest.TestCase):
+    def test_analyzer_scratch_projection_covers_full_source_group_and_window(self) -> None:
+        spec, _sources = spec_fixture()
+        trace_cap = 512 * 1024 * 1024
+        projection = campaign.analyzer_scratch_projection(spec, trace_cap)
+        self.assertEqual(projection["maximum_arrivals"], campaign.MAX_ARRIVALS)
+        self.assertEqual(projection["maximum_pairs"], 36)
+        self.assertEqual(projection["maximum_block_arrivals"], 1000)
+        self.assertEqual(projection["maximum_trace_families"], 4)
+        process_bytes = (
+            4 * campaign.ANALYZER_TRACE_SPOOL_INITIAL_BYTES +
+            4 * ((campaign.MAX_ARRIVALS + 999) // 1000) *
+            campaign.ANALYZER_TRACE_SPOOL_BLOCK_HEADER_BYTES +
+            campaign.MAX_ARRIVALS * campaign.ANALYZER_TRACE_SPOOL_ENTRY_BYTES
+        )
+        expected_pair_spools = 2 * process_bytes
+        self.assertEqual(projection["maximum_pair_spool_bytes"],
+                         expected_pair_spools)
+        p99_groups = {}
+        for cell in spec["cells"]:
+            families = tuple(sorted(
+                campaign.STANDALONE if cell["family"] == "mixed"
+                else (cell["family"],)
+            ))
+            for baseline in ("mimalloc-secure", "mimalloc-standard"):
+                for load in campaign.LOADS:
+                    name = json.dumps((
+                        cell["family"], cell["profile"], "open_loop", load,
+                        "allocator", baseline,
+                    ), sort_keys=True, separators=(",", ":"))
+                    p99_groups[name] = families
+            for load in campaign.LOADS:
+                name = json.dumps((
+                    cell["family"], cell["profile"], "open_loop", load,
+                    "executor", "allocatbelt",
+                ), sort_keys=True, separators=(",", ":"))
+                p99_groups[name] = families
+        frame_bounds = []
+        for name, families in p99_groups.items():
+            header = (
+                3 + 2 + len(name.encode("utf-8")) + 2 +
+                sum(2 + len(family.encode("utf-8")) for family in families) + 2
+            )
+            family_process_bytes = (
+                len(families) * campaign.ANALYZER_TRACE_SPOOL_INITIAL_BYTES +
+                len(families) * ((campaign.MAX_ARRIVALS + 999) // 1000) *
+                campaign.ANALYZER_TRACE_SPOOL_BLOCK_HEADER_BYTES +
+                campaign.MAX_ARRIVALS * campaign.ANALYZER_TRACE_SPOOL_ENTRY_BYTES
+            )
+            frame_bounds.append(header + 2 * 36 * family_process_bytes)
+        self.assertEqual(projection["maximum_group_frame_bytes"],
+                         max(frame_bounds))
+        self.assertLessEqual(projection["maximum_group_frame_bytes"],
+                             campaign.ANALYZER_GROUP_FRAME_LIMIT_BYTES)
+        self.assertEqual(
+            projection["maximum_bytes"],
+            projection["maximum_group_frame_bytes"] + expected_pair_spools +
+            trace_cap + campaign.ANALYZER_OUTPUT_LIMIT_BYTES,
+        )
+        self.assertEqual(
+            projection["maximum_inodes"],
+            3 + 2 * projection["maximum_trace_families"] + 1,
+        )
+        fixed_trace = campaign.analyzer_scratch_projection(
+            spec, 16 * 1024 * 1024,
+        )
+        self.assertEqual(
+            projection["maximum_bytes"] - fixed_trace["maximum_bytes"],
+            trace_cap - 16 * 1024 * 1024,
+        )
+        with self.assertRaisesRegex(
+            campaign.CampaignError, "owner trace cap",
+        ):
+            campaign.analyzer_scratch_projection(
+                spec, campaign.MAX_TRACE_ARTIFACT_BYTES + 1,
+            )
+
     def test_qualification_metadata_rejects_functional_missing_and_duplicate_scope(self) -> None:
         with tempfile.TemporaryDirectory(prefix="application-scope-") as temporary:
             pair_dir = Path(temporary)
@@ -1024,6 +1101,466 @@ class ApplicationCampaignTests(unittest.TestCase):
             self.assertEqual(pressure_result["comparison_family"], "external_pressure")
             self.assertEqual(pressure_result["family_size"], result["family_size"])
             self.assertFalse(pressure_result["passed"])
+
+    def test_hashing_bounded_writer_hashes_short_writes_and_rejects_overflow(self) -> None:
+        class ShortWriter:
+            def __init__(self) -> None:
+                self.data = bytearray()
+
+            def write(self, value: memoryview) -> int:
+                count = min(3, len(value))
+                self.data.extend(value[:count])
+                return count
+
+            def flush(self) -> None:
+                return None
+
+        target = ShortWriter()
+        writer = campaign._HashingBoundedWriter(target, 7)
+        self.assertEqual(writer.write(b"abcde"), 5)
+        self.assertEqual(writer.tell(), 5)
+        self.assertEqual(writer.hexdigest(), campaign.hashlib.sha256(b"abcde").hexdigest())
+        with self.assertRaises(campaign.CampaignError):
+            writer.write(b"fgh")
+        self.assertEqual(bytes(target.data), b"abcde")
+
+    def test_analyzer_group_reads_both_pair_traces_under_one_exact_view(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="application-analyzer-view-") as temporary:
+            root = Path(temporary)
+            owner_job = {"phase": "confirmation", "ordinal": 1,
+                         "run_id": "original-job"}
+            trace_refs = []
+            for side in ("candidate", "control"):
+                path = root / f"{side}.ids.tsv"
+                rows = [
+                    "schema\tallocatbelt-app-arrivals-v3",
+                    "identity\t" + "\t".join([
+                        "n" * 32, "synthetic", "allocatbelt", "system",
+                        "cpu", "steady", "s" * 64, "b" * 64,
+                    ]),
+                    "id\tworkload\tscheduled_ns\tcompletion_ns\tterminal\tchecksum\texpected_checksum",
+                    "0\tcpu\t0\t100\tcompleted\t1\t1",
+                    "1\tcpu\t100\t201\tcompleted\t1\t1",
+                ]
+                path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+                trace_refs.append({
+                    "path": str(path), "sha256": campaign.sha256_file(path),
+                    "owner_job": owner_job,
+                })
+            tests = [{
+                "name": "cpu-p99", "ratios": [1.0], "threshold": 1.1,
+                "direction": "upper", "pair_group": ["cpu", "steady"],
+                "block_group": ["cpu", "steady"],
+                "traces": [{
+                    "candidate": {"__trace_source__": trace_refs[0]},
+                    "control": {"__trace_source__": trace_refs[1]},
+                    "family": "cpu", "candidate_p99": 100,
+                    "control_p99": 100,
+                }],
+                "suite_key": None, "suite_components": None,
+                "suite_weights": None,
+            }]
+            protocol = {
+                "confirmation_pairs": 1, "bootstrap_block_arrivals": 1,
+                "bootstrap_draws": 1, "bootstrap_seed": 7,
+                "confidence": 0.95,
+            }
+            opened = []
+            visited_jobs = []
+
+            class ArtifactView:
+                @contextlib.contextmanager
+                def open_snapshot(self, path, label, maximum):
+                    opened.append(str(path))
+                    with campaign.stable_file_snapshot(path, label, maximum) as snapshot:
+                        yield snapshot
+
+            @contextlib.contextmanager
+            def trace_view_factory(job, _cancel_event):
+                visited_jobs.append(job)
+                yield ArtifactView()
+
+            destination = io.BytesIO()
+            writer = campaign._HashingBoundedWriter(
+                destination, campaign.ANALYZER_INPUT_LIMIT_BYTES,
+            )
+            _tests, group_ids, digest, byte_count = campaign._binary_analysis_input(
+                tests, protocol, writer, root, trace_view_factory,
+            )
+            self.assertEqual(visited_jobs, [owner_job])
+            self.assertEqual(opened, [row["path"] for row in trace_refs])
+            self.assertEqual(group_ids, {'["cpu","steady"]': 0})
+            self.assertEqual(byte_count, len(destination.getvalue()))
+            self.assertEqual(digest, campaign.hashlib.sha256(
+                destination.getvalue(),
+            ).hexdigest())
+
+    def test_analyzer_group_closes_candidate_spools_when_control_trace_fails(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="application-analyzer-partial-spool-") as temporary:
+            root = Path(temporary)
+            candidate_ref = {"path": str(root / "candidate.ids.tsv"),
+                             "sha256": "a" * 64}
+            control_ref = {"path": str(root / "control.ids.tsv"),
+                           "sha256": "b" * 64}
+            family_tests = {
+                "cpu": {
+                    "traces": [{
+                        "candidate": {"__trace_source__": candidate_ref},
+                        "control": {"__trace_source__": control_ref},
+                    }],
+                },
+            }
+            opened_spools = []
+
+            def open_candidate_then_fail_control(*_args, **_kwargs):
+                if not opened_spools:
+                    spool = tempfile.TemporaryFile(mode="w+b", dir=root)
+                    opened_spools.append(spool)
+                    return {
+                        "spools": {"cpu": spool}, "blocks": 1,
+                        "observed_ids": 1,
+                    }
+                raise campaign.CampaignError("control trace validation failed")
+
+            destination = io.BytesIO()
+            with mock.patch.object(
+                campaign, "_write_trace_frame_to_spools",
+                side_effect=open_candidate_then_fail_control,
+            ):
+                with self.assertRaisesRegex(
+                    campaign.CampaignError, "control trace validation failed",
+                ):
+                    campaign._write_analysis_group(
+                        destination, 0, '["synthetic","open_loop"]', 1,
+                        family_tests, root, 1,
+                    )
+
+            self.assertEqual(len(opened_spools), 1)
+            self.assertTrue(opened_spools[0].closed)
+            self.assertEqual(destination.getvalue(), b"")
+
+    def test_rust_analyzer_streams_owned_pipe_and_checks_decoder_consumption(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="application-analyzer-pipe-") as temporary:
+            root = Path(temporary)
+            binary = root / "fake-analyzer"
+            script = (
+                f"#!{sys.executable}\n"
+                "import os, struct, sys\n"
+                "payload = sys.stdin.buffer.read()\n"
+                "if sys.argv[1] != '/dev/stdin': raise SystemExit(41)\n"
+                "name = b'stream-endpoint'\n"
+                "out = bytearray(b'ABQSO01\\0')\n"
+                "out.extend(struct.pack('<IHH', 1, 1, 1))\n"
+                "out.extend(struct.pack('<QQQd', 7, len(payload), 4096, 1.0))\n"
+                "out.extend(struct.pack('<HH', 0, len(name)))\n"
+                "out.extend(name)\n"
+                "out.extend(struct.pack('<ddddd', 1.0, 0.0, 0.0, 1.0, 1.0))\n"
+                "fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n"
+                "with os.fdopen(fd, 'wb') as stream: stream.write(out)\n"
+            )
+            binary.write_text(script, encoding="utf-8")
+            binary.chmod(0o700)
+            protocol = {
+                "confirmation_pairs": 1,
+                "bootstrap_block_arrivals": 1,
+                "bootstrap_draws": 1,
+                "bootstrap_seed": 7,
+                "confidence": 0.95,
+            }
+            tests = [{
+                "name": "stream-endpoint", "ratios": [1.0],
+                "pair_group": ["synthetic", "capacity"],
+                "traces": None, "suite_components": None,
+            }]
+            intervals, metadata = campaign._run_rust_analysis(
+                tests, protocol, binary, campaign.sha256_file(binary), root, 30,
+            )
+            transport = metadata["input_transport"]
+            process = transport["process"]
+            pipe = process["pipe"]
+            self.assertEqual(intervals, [{
+                "point": 1.0, "lower": 1.0, "upper": 1.0,
+                "scale_log": 0.0,
+            }])
+            self.assertEqual(transport["schema"],
+                             "allocatbelt.application-rust-analyzer-input-transport.v2")
+            self.assertEqual(transport["kind"], "owned_stdin_pipe")
+            self.assertEqual(transport["input_bytes"], metadata["input_bytes"])
+            self.assertEqual(transport["input_sha256"], metadata["input_sha256"])
+            self.assertEqual(transport["decoder_consumed_bytes"], metadata["input_bytes"])
+            launch = transport["launch_transition"]
+            self.assertEqual(
+                launch["schema"],
+                "allocatbelt.application-rust-analyzer-launch-transition.v1",
+            )
+            self.assertEqual(launch["kind"], "pinned_binary_fd_gate_exec")
+            self.assertEqual(
+                launch["status"], "exec_confirmed_close_on_exec_pipe",
+            )
+            self.assertEqual(
+                launch["executable_identity"],
+                "exec_pipe_confirmed_non_elf_fixture",
+            )
+            self.assertEqual(launch["binary_sha256"],
+                             campaign.sha256_file(binary))
+            self.assertEqual(len(launch["launcher_sha256"]), 64)
+            self.assertEqual(process["parent_pid"], os.getpid())
+            self.assertGreater(process["child_pid"], 0)
+            self.assertGreater(process["start_ticks"], 0)
+            self.assertEqual(pipe["file_type"], "fifo")
+            self.assertEqual(pipe["child_fd"], 0)
+            self.assertGreater(pipe["inode"], 0)
+            self.assertFalse(any("analysis-input" in item.name for item in root.iterdir()))
+
+            short_binary = root / "fake-analyzer-short-consumption"
+            short_binary.write_text(
+                script.replace("len(payload)", "max(0, len(payload) - 1)"),
+                encoding="utf-8",
+            )
+            short_binary.chmod(0o700)
+            with self.assertRaises(campaign.CampaignError):
+                campaign._run_rust_analysis(
+                    tests, protocol, short_binary,
+                    campaign.sha256_file(short_binary), root, 30,
+                )
+
+    def test_rust_analyzer_timeout_cancels_blocked_read_before_return(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="application-analyzer-cancel-") as temporary:
+            root = Path(temporary)
+            binary = root / "blocked-analyzer"
+            pid_marker = root / "child.pid"
+            script = (
+                f"#!{sys.executable}\n"
+                "import os, sys\n"
+                f"open({str(pid_marker)!r}, 'w', encoding='ascii').write(str(os.getpid()))\n"
+                "import time\n"
+                "time.sleep(30)\n"
+            )
+            binary.write_text(script, encoding="utf-8")
+            binary.chmod(0o700)
+            trace = {"path": str(root / "not-opened.ids.tsv"),
+                     "sha256": "a" * 64,
+                     "owner_job": {"phase": "confirmation", "ordinal": 1,
+                                   "run_id": "original-blocked-job"}}
+            tests = [{
+                "name": "blocked-p99", "ratios": [1.0],
+                "pair_group": ["synthetic", "open_loop"],
+                "traces": [{
+                    "candidate": {"__trace_source__": trace},
+                    "control": {"__trace_source__": trace},
+                    "family": "cpu", "candidate_p99": 100,
+                    "control_p99": 100,
+                }],
+                "suite_components": None,
+            }]
+            protocol = {
+                "confirmation_pairs": 1, "bootstrap_block_arrivals": 1,
+                "bootstrap_draws": 1, "bootstrap_seed": 7,
+                "confidence": 0.95,
+            }
+            read_started = campaign.threading.Event()
+            read_stopped = campaign.threading.Event()
+            late_publications = []
+
+            @contextlib.contextmanager
+            def blocked_view(_job, cancel_event):
+                read_started.set()
+                try:
+                    while not cancel_event.wait(0.01):
+                        pass
+                    raise campaign.CampaignError("blocked archive read was cancelled")
+                    yield object()
+                finally:
+                    if not cancel_event.is_set():
+                        late_publications.append("response_verified")
+                    read_stopped.set()
+
+            actual_pidfd_signal = campaign.signal.pidfd_send_signal
+            pidfd_signals = []
+
+            def record_pidfd_signal(pidfd, signum, siginfo=None, flags=0):
+                pidfd_signals.append((pidfd, signum))
+                return actual_pidfd_signal(pidfd, signum, siginfo, flags)
+
+            with mock.patch.object(
+                campaign.signal, "pidfd_send_signal",
+                side_effect=record_pidfd_signal,
+            ):
+                with self.assertRaises(campaign.CampaignError):
+                    campaign._run_rust_analysis(
+                        tests, protocol, binary,
+                        campaign.sha256_file(binary), root, 1, blocked_view,
+                    )
+            self.assertTrue(read_started.is_set())
+            self.assertTrue(read_stopped.is_set())
+            self.assertEqual(late_publications, [])
+            self.assertTrue(pidfd_signals)
+            self.assertTrue(all(fd > 0 and signum == campaign.signal.SIGKILL
+                                for fd, signum in pidfd_signals))
+            child_pid = int(pid_marker.read_text(encoding="ascii"))
+            self.assertFalse(Path(f"/proc/{child_pid}/stat").exists())
+            self.assertFalse(any("analysis-input" in item.name for item in root.iterdir()))
+
+    def test_rust_analyzer_refuses_sigchld_ignore_before_spawn(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="application-analyzer-sigchld-") as temporary:
+            root = Path(temporary)
+            binary = root / "analyzer-not-started"
+            binary.write_text(
+                f"#!{sys.executable}\nraise SystemExit(0)\n",
+                encoding="utf-8",
+            )
+            binary.chmod(0o700)
+            protocol = {
+                "confirmation_pairs": 1, "bootstrap_block_arrivals": 1,
+                "bootstrap_draws": 1, "bootstrap_seed": 7,
+                "confidence": 0.95,
+            }
+            tests = [{
+                "name": "sigchld-owner", "ratios": [1.0],
+                "pair_group": ["synthetic", "capacity"],
+                "traces": None, "suite_components": None,
+            }]
+            previous = campaign.signal.getsignal(campaign.signal.SIGCHLD)
+            try:
+                campaign.signal.signal(campaign.signal.SIGCHLD,
+                                       campaign.signal.SIG_IGN)
+                with mock.patch.object(campaign.subprocess, "Popen") as spawn:
+                    with self.assertRaisesRegex(
+                        campaign.CampaignError, "SIGCHLD",
+                    ):
+                        campaign._run_rust_analysis(
+                            tests, protocol, binary,
+                            campaign.sha256_file(binary), root, 1,
+                        )
+                spawn.assert_not_called()
+            finally:
+                campaign.signal.signal(campaign.signal.SIGCHLD, previous)
+
+    def test_rust_analyzer_does_not_release_gate_after_defined_sigmask_change(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="application-analyzer-sigmask-") as temporary:
+            root = Path(temporary)
+            binary = root / "must-not-exec-after-mask-change"
+            marker = root / "analyzer-started"
+            binary.write_text(
+                f"#!{sys.executable}\n"
+                f"open({str(marker)!r}, 'w', encoding='ascii').write('started')\n"
+                "raise SystemExit(0)\n",
+                encoding="utf-8",
+            )
+            binary.chmod(0o700)
+            protocol = {
+                "confirmation_pairs": 1, "bootstrap_block_arrivals": 1,
+                "bootstrap_draws": 1, "bootstrap_seed": 7,
+                "confidence": 0.95,
+            }
+            tests = [{
+                "name": "sigmask-owner", "ratios": [1.0],
+                "pair_group": ["synthetic", "capacity"],
+                "traces": None, "suite_components": None,
+            }]
+            before = (0, (False, False), 0, 0)
+            after = (0, (True, False), 0, 0)
+            with mock.patch.object(
+                campaign, "_require_analyzer_waitable_sigchld",
+                side_effect=(before, after),
+            ):
+                with self.assertRaisesRegex(
+                    campaign.CampaignError, "SIGCHLD waitability changed",
+                ):
+                    campaign._run_rust_analysis(
+                        tests, protocol, binary,
+                        campaign.sha256_file(binary), root, 1,
+                    )
+            self.assertFalse(marker.exists())
+
+    def test_pidfd_open_failure_closes_gate_before_analyzer_exec(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="application-analyzer-gate-failure-") as temporary:
+            root = Path(temporary)
+            binary = root / "must-not-exec"
+            marker = root / "analyzer-started"
+            binary.write_text(
+                f"#!{sys.executable}\n"
+                f"open({str(marker)!r}, 'w', encoding='ascii').write('started')\n"
+                "import time\ntime.sleep(30)\n",
+                encoding="utf-8",
+            )
+            binary.chmod(0o700)
+            protocol = {
+                "confirmation_pairs": 1, "bootstrap_block_arrivals": 1,
+                "bootstrap_draws": 1, "bootstrap_seed": 7,
+                "confidence": 0.95,
+            }
+            tests = [{
+                "name": "gated-start", "ratios": [1.0],
+                "pair_group": ["synthetic", "capacity"],
+                "traces": None, "suite_components": None,
+            }]
+            with mock.patch.object(
+                campaign.os, "pidfd_open",
+                side_effect=OSError("injected pidfd acquisition failure"),
+            ), mock.patch.object(
+                campaign.os, "kill",
+                side_effect=AssertionError("numeric PID signal is forbidden"),
+            ), mock.patch.object(
+                campaign.signal, "pidfd_send_signal",
+                side_effect=AssertionError("no pidfd exists after acquisition failure"),
+            ):
+                with self.assertRaisesRegex(
+                    campaign.CampaignError, "pidfd before exec release",
+                ):
+                    campaign._run_rust_analysis(
+                        tests, protocol, binary,
+                        campaign.sha256_file(binary), root, 1,
+                    )
+            self.assertFalse(marker.exists())
+
+    def test_rust_analyzer_waitid_ownership_loss_uses_only_pidfd_signal(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="application-analyzer-echild-") as temporary:
+            root = Path(temporary)
+            binary = root / "analyzer-waitid-loss"
+            binary.write_text(
+                f"#!{sys.executable}\nimport time\ntime.sleep(30)\n",
+                encoding="utf-8",
+            )
+            binary.chmod(0o700)
+            protocol = {
+                "confirmation_pairs": 1, "bootstrap_block_arrivals": 1,
+                "bootstrap_draws": 1, "bootstrap_seed": 7,
+                "confidence": 0.95,
+            }
+            tests = [{
+                "name": "waitid-owner", "ratios": [1.0],
+                "pair_group": ["synthetic", "capacity"],
+                "traces": None, "suite_components": None,
+            }]
+            actual_pidfd_signal = campaign.signal.pidfd_send_signal
+            signals = []
+
+            def record_pidfd_signal(pidfd, signum, siginfo=None, flags=0):
+                signals.append((pidfd, signum))
+                return actual_pidfd_signal(pidfd, signum, siginfo, flags)
+
+            with mock.patch.object(
+                campaign.os, "waitid",
+                side_effect=ChildProcessError("injected wait ownership loss"),
+            ), mock.patch.object(
+                campaign.signal, "pidfd_send_signal",
+                side_effect=record_pidfd_signal,
+            ), mock.patch.object(
+                campaign.os, "kill",
+                side_effect=AssertionError("numeric PID signal is forbidden"),
+            ):
+                with self.assertRaisesRegex(
+                    campaign.CampaignError, "wait ownership was lost",
+                ):
+                    campaign._run_rust_analysis(
+                        tests, protocol, binary,
+                        campaign.sha256_file(binary), root, 1,
+                    )
+
+            self.assertTrue(signals)
+            self.assertTrue(all(fd > 0 and signum == campaign.signal.SIGKILL
+                                for fd, signum in signals))
 
     def test_prepare_oracles_cli_runs_pinned_fake_generators(self) -> None:
         with tempfile.TemporaryDirectory(prefix="application-prepare-cli-") as temporary:

@@ -367,6 +367,161 @@ class Source5EvidenceBudgetPlanTests(unittest.TestCase):
             )
 
 
+class Source5JournalWidthContractTests(unittest.TestCase):
+    @staticmethod
+    def summary_fixture(*, include_audit_budget_pins: bool):
+        catalogue_roles = {
+            "fixed_pair", "pressure_pair", "source5_controller", "source5_soak",
+            "soak_reader", "offline_dispatcher", "chronology",
+            "evidence_transport",
+        }
+        budget_roles = {
+            "fixed_pair", "pressure_pair", "source5_controller", "source5_soak",
+            "soak_reader", "feedback_composer", "feedback_reader",
+            "pressure_reader", "evidence_transport",
+        }
+        role_rows = {}
+        for index, role in enumerate(sorted(catalogue_roles | budget_roles), 1):
+            role_rows[role] = {
+                "path": f"scripts/source-{role.replace('_', '-')}.py",
+                "raw_sha256": f"{index:064x}",
+                "byte_count": 100 + index,
+            }
+        catalogue_pins = {
+            role: dict(role_rows[role]) for role in catalogue_roles
+        }
+        original_pins = {
+            "plan": {
+                "path": "/inputs/plan.json", "raw_sha256": "a" * 64,
+                "semantic_sha256": "b" * 64,
+            },
+            "source_manifests": {"host-a": {
+                "path": "/inputs/source.json", "raw_sha256": "c" * 64,
+                "semantic_sha256": "d" * 64,
+            }},
+        }
+        event_counts = {
+            "source5_authorized": 1,
+            "source5_app_started": 2,
+            "source5_app_terminal": 2,
+            "source5_job_terminal": 1,
+        }
+        event_widths = {kind: 100 for kind in event_counts}
+        job_row = {
+            "phase": "exploration", "job_index": 0, "ordinal": 1,
+            "run_id": "original-run-1", "job_sha256": "e" * 64,
+            "event_counts": event_counts,
+            "maximum_event_bytes_by_kind": event_widths,
+            "failed_event_counts": event_counts,
+            "failed_event_bytes_by_kind": dict(event_widths),
+            "success_job_bytes": 600, "failed_window_bytes": 600,
+            "failed_event_count": 6, "failed_event_count_uplift": 0,
+            "byte_uplift": 0,
+        }
+        phase_totals = [{
+            "phase": phase, "job_count": int(phase == "exploration"),
+            "event_count": 6 if phase == "exploration" else 0,
+            "success_event_bytes": 600 if phase == "exploration" else 0,
+        } for phase in budget.PHASES]
+        fixed_event_widths = [{
+            "event": event, "phase": phase, "count": 1,
+            "maximum_line_bytes": 100,
+        } for event, phase in (
+            ("source5_prepared_capacity_registered", "registration"),
+            *(("source5_analysis", phase) for phase in (
+                "exploration", "aa", "fixed_analysis", "pressure_analysis",
+                "soak", "final_analysis",
+            )),
+        )]
+        failed_window = {
+            key: job_row[key] for key in (
+                "phase", "job_index", "ordinal", "run_id", "job_sha256",
+                "failed_event_count", "failed_event_count_uplift",
+                "failed_window_bytes", "success_job_bytes", "byte_uplift",
+            )
+        }
+        body = {
+            "schema": budget.JOURNAL_WIDTH_CONTRACT_SCHEMA,
+            "campaign_id": "campaign-a", "host_id": "host-a",
+            "original_pins_sha256": "f" * 64,
+            "plan_pin": original_pins["plan"],
+            "source_manifest_pin": original_pins["source_manifests"]["host-a"],
+            "owner_pins": role_rows,
+            "job_rows": [job_row], "phase_totals": phase_totals,
+            "fixed_event_widths": fixed_event_widths,
+            "total_event_count": 13, "total_event_bytes": 1300,
+            "failed_owner_window": failed_window,
+        }
+        contract = sealed(body, "contract_sha256")
+        audit = {
+            "campaign_id": "campaign-a", "host_id": "host-a",
+            "original_pins": original_pins,
+            "schedule": {
+                "job_counts": {phase: int(phase == "exploration")
+                                for phase in budget.PHASES},
+                "maximum_callback_events": 13,
+            },
+        }
+        if include_audit_budget_pins:
+            audit["producer_catalogue"] = {
+                "owner_schema_pins": {
+                    role: {
+                        "path": role_rows[role]["path"], "mode": "100644",
+                        "sha256": role_rows[role]["raw_sha256"],
+                        "size": role_rows[role]["byte_count"],
+                    } for role in budget_roles
+                },
+            }
+        return contract, audit, {"owner_source_pins": catalogue_pins}
+
+    def test_width_contract_verifies_captured_bytes_without_opening_origin(self) -> None:
+        body = {"schema": budget.JOURNAL_WIDTH_CONTRACT_SCHEMA}
+        contract = {**body, "contract_sha256": sha(canonical(body))}
+        raw = canonical(contract)
+        pin = {
+            "path": "/host-origin/not-readable-on-coordinator.json",
+            "raw_sha256": sha(raw),
+            "semantic_sha256": contract["contract_sha256"],
+        }
+        checked, checked_raw, checked_pin = \
+            budget._verify_captured_journal_width_contract(pin, raw)
+        self.assertEqual(checked, contract)
+        self.assertEqual(checked_raw, raw)
+        self.assertEqual(checked_pin, pin)
+
+        with self.assertRaisesRegex(budget.BudgetPlanError, "raw pin differs"):
+            budget._verify_captured_journal_width_contract(pin, raw + b" ")
+
+    def test_width_summary_replays_eleven_role_union_without_serializing_audit_profile(self) -> None:
+        contract, audit, owner_contract = self.summary_fixture(
+            include_audit_budget_pins=False,
+        )
+        checked, event_count, maximum_line = \
+            budget._validate_journal_width_contract_summary(
+                contract, audit, owner_contract,
+            )
+        self.assertEqual(checked, contract)
+        self.assertEqual(event_count, 13)
+        self.assertEqual(maximum_line, 100)
+
+    def test_width_summary_compares_all_nine_budget_pins_when_audit_is_available(self) -> None:
+        contract, audit, owner_contract = self.summary_fixture(
+            include_audit_budget_pins=True,
+        )
+        budget._validate_journal_width_contract_summary(
+            contract, audit, owner_contract,
+        )
+        audit["producer_catalogue"]["owner_schema_pins"]["feedback_reader"][
+            "sha256"
+        ] = "0" * 64
+        with self.assertRaisesRegex(
+                budget.BudgetPlanError,
+                "exact campaign/host/input/source pins"):
+            budget._validate_journal_width_contract_summary(
+                contract, audit, owner_contract,
+            )
+
+
 class Source5PathCatalogueTests(unittest.TestCase):
     @staticmethod
     def row(path: str, *, role: str = "normal_app_output",
@@ -485,6 +640,26 @@ class Source5PathCatalogueTests(unittest.TestCase):
             local_catalogue["run_id"] = run_id
             catalogue_rows.append(local_catalogue)
         rows.extend(catalogue_rows)
+        cleanup_cap = budget._cleanup_sidecar_source_bound(
+            budget.SOURCE5_CLEANUP_SESSION_MEMBER_LIMIT,
+        )
+        for ordinal, run_id in enumerate(record_sizes, 1):
+            for member_index in (0, 1):
+                prefix = (f"/private/output/confirmation/cleanup-sidecars/"
+                          f"{ordinal:06d}-{'a' * 64}-member{member_index}.json")
+                for role, path, maximum in (
+                    (budget.SOURCE5_CLEANUP_SIDECAR_ROLE,
+                     prefix, cleanup_cap),
+                    (budget.SOURCE5_CLEANUP_SIDECAR_REFUSAL_ROLE,
+                     prefix + ".refusal.json",
+                     budget.SOURCE5_CLEANUP_REFUSAL_BYTES),
+                ):
+                    cleanup_row = self.row(path, role=role, maximum=maximum)
+                    cleanup_row["phase"] = "confirmation"
+                    cleanup_row["run_id"] = run_id
+                    cleanup_row["member_index"] = member_index
+                    cleanup_row["storage_root"] = "/private/output"
+                    rows.append(cleanup_row)
         self.assertEqual(budget.project_archive_job_caps(rows), caps_by_job)
         transport_roles = (
             ("source5_checkpoint_request", "checkpoint_request_bytes", "/private/output"),
@@ -516,6 +691,53 @@ class Source5PathCatalogueTests(unittest.TestCase):
         self.assertEqual(retention["persistent_local_job_record_count"], 2)
         self.assertEqual(retention["maximum_job_record_bytes"], 200)
         self.assertEqual(retention["archive_metadata_job_group_count"], 2)
+        self.assertEqual(retention["maximum_failed_cleanup_window_bytes"],
+                         786_770_440)
+        self.assertEqual(retention["maximum_failed_cleanup_window_inodes"], 2)
+
+    def test_archive_readback_caps_include_every_probe_tree_file_child(self) -> None:
+        rows = [
+            self.row("/private/output/confirmation/component.json",
+                     role="component_receipt", maximum=128),
+            self.row("/private/output/confirmation/probe/receipt.json",
+                     role="probe_capture_receipt_member0", maximum=256),
+            self.row("/private/output/confirmation/probe/inventory.json",
+                     role="probe_capture_inventory_member0", maximum=1024),
+            self.row("/private/output/confirmation/probe/tmp",
+                     role="opaque_trace", kind="tree", maximum=4096,
+                     file_maximum=1024, inodes=3),
+        ]
+        rows[1]["member_index"] = 0
+        rows[2]["member_index"] = 0
+        rows[3]["member_index"] = 0
+        caps = budget.project_archive_readback_caps(rows)[
+            ("confirmation", "original-run-01")
+        ]
+        self.assertEqual(caps["object_count"], 5)
+        self.assertEqual(caps["stage_bytes"], 128 + 256 + 1024 + 4096)
+        self.assertEqual(caps["stage_inodes"], 6)
+        self.assertEqual(caps["maximum_object_bytes"], 1024)
+        self.assertLessEqual(
+            caps["request_bytes"], budget.MAX_ARCHIVE_READ_METADATA_BYTES,
+        )
+        self.assertLessEqual(
+            caps["response_bytes"], budget.MAX_ARCHIVE_READ_METADATA_BYTES,
+        )
+
+    def test_cleanup_source_shape_binds_generic_member_and_error_caps(self) -> None:
+        shape = budget._cleanup_source_shape(
+            budget.SOURCE5_CLEANUP_SESSION_MEMBER_LIMIT,
+        )
+        self.assertEqual(shape["maximum_session_members_per_snapshot"], 262_144)
+        self.assertEqual(shape["maximum_pidfd_signal_entries_per_snapshot"], 262_144)
+        self.assertEqual(shape["maximum_signal_snapshots"], 5)
+        self.assertEqual(shape["maximum_cleanup_errors"], 1348)
+        self.assertEqual(shape["maximum_error_text_bytes"], 8192)
+        self.assertEqual(shape["source_maximum_bytes"], 393_385_220)
+        self.assertEqual(shape["admission_maximum_bytes"], 393_385_220)
+        self.assertEqual(shape["maximum_window_bytes"], 786_770_440)
+        self.assertEqual(shape["refusal_file_bytes"], 65_536)
+        self.assertEqual(shape["maximum_refusal_window_bytes"], 131_072)
 
     def test_archive_caps_cover_r3_stage_schema_and_original_run_id_width(self) -> None:
         row = self.row(
@@ -541,6 +763,97 @@ class Source5PathCatalogueTests(unittest.TestCase):
         )
         self.assertGreater(long["object_manifest_bytes"],
                            short["object_manifest_bytes"])
+
+    def test_v4_analyzer_spool_adds_to_the_active_archive_readback_window(self) -> None:
+        scratch_root = "/private/scratch"
+        output_root = "/private/output"
+        rows = []
+        for role, name, maximum, kind, file_maximum, inodes in (
+            ("source5_archive_read_request_slot", "request.json", 11,
+             "file", 11, 1),
+            ("source5_archive_read_response_slot", "response.json", 13,
+             "file", 13, 1),
+            ("source5_archive_read_response_incoming",
+             "response.json.incoming", 13, "file", 13, 1),
+            ("source5_archive_read_bundle", "response.tar", 17,
+             "file", 17, 1),
+            ("source5_archive_read_bundle_incoming",
+             "response.tar.incoming", 17, "file", 17, 1),
+            ("source5_archive_read_stage", "stage", 100,
+             "tree", 80, 4),
+        ):
+            row = Source5PathCatalogueTests.row(
+                f"{scratch_root}/campaign/host/archive-readback/{name}",
+                role=role, maximum=maximum, kind=kind,
+                file_maximum=file_maximum, inodes=inodes,
+            )
+            row.update({"phase": None, "run_id": None,
+                        "member_index": None, "aggregate_id": None,
+                        "owner": "source5_controller",
+                        "storage_root": scratch_root})
+            rows.append(row)
+        control = Source5PathCatalogueTests.row(
+            f"{output_root}/campaign/source5/host/archive-read-control.jsonl",
+            role=budget.SOURCE5_ARCHIVE_READ_CONTROL_ROLE, maximum=23,
+        )
+        control.update({"phase": None, "run_id": None,
+                        "member_index": None, "aggregate_id": None,
+                        "owner": "source5_controller",
+                        "storage_root": output_root})
+        rows.append(control)
+        width = Source5PathCatalogueTests.row(
+            f"{output_root}/campaign/source5/host/journal-width.json",
+            role="journal_width_contract", maximum=29,
+        )
+        width.update({"phase": None, "run_id": None,
+                      "member_index": None, "aggregate_id": None,
+                      "owner": "source5_controller",
+                      "storage_root": output_root})
+        rows.append(width)
+        analyzer = Source5PathCatalogueTests.row(
+            f"{scratch_root}/campaign/host/analyzer-spool",
+            role=budget.SOURCE5_ANALYZER_SPOOL_ROLE,
+            kind="tree", maximum=101, file_maximum=77, inodes=3,
+        )
+        analyzer.update({"phase": None, "run_id": None,
+                         "member_index": None, "aggregate_id": None,
+                         "owner": "source5_controller",
+                         "storage_root": scratch_root})
+        rows.append(analyzer)
+        rows.append(Source5PathCatalogueTests.row(
+            "/private/artifacts/confirmation/original-run-01/output.json",
+            maximum=20,
+        ))
+
+        with tempfile.TemporaryDirectory(prefix="source5-v4-analyzer-window-") as tmp:
+            catalogue_directory = Path(tmp) / "catalogue"
+            catalogue_directory.mkdir(mode=0o700)
+            manifest = budget.write_path_catalogue_chunks(
+                rows, catalogue_directory,
+            )
+        policy = manifest["retention_policy"]
+        expected_scratch_bytes = 11 + 13 + 17 + 100 + 101
+        expected_scratch_inodes = 1 + 1 + 1 + 4 + 3
+        self.assertEqual(
+            policy["maximum_window_root_byte_bounds"][scratch_root],
+            expected_scratch_bytes,
+        )
+        self.assertEqual(
+            policy["maximum_window_root_inode_bounds"][scratch_root],
+            expected_scratch_inodes,
+        )
+        self.assertEqual(policy["maximum_window_total_bytes"],
+                         expected_scratch_bytes)
+        self.assertEqual(policy["maximum_window_total_inodes"],
+                         expected_scratch_inodes)
+        self.assertEqual(manifest["maximum_payload_bytes"], 243)
+        self.assertEqual(
+            manifest["role_byte_bounds"][budget.SOURCE5_ANALYZER_SPOOL_ROLE],
+            101,
+        )
+        self.assertNotIn(budget.SOURCE5_ANALYZER_SPOOL_ROLE,
+                         policy["always_local_roles"])
+
 
 
 class Source5HostEvidenceBudgetV2Tests(unittest.TestCase):
@@ -576,6 +889,19 @@ class Source5HostEvidenceBudgetV2Tests(unittest.TestCase):
             "soak": {}, "transport_caps": {
                 "chronology": {"MAX_COMPLETION_BYTES": 16 * 1024 * 1024},
             },
+            "cleanup_source_shape": {
+                key: value for key, value in budget._cleanup_source_shape(
+                    budget.SOURCE5_CLEANUP_SESSION_MEMBER_LIMIT,
+                ).items()
+                if key in {
+                    "maximum_session_members_per_snapshot",
+                    "maximum_pidfd_signal_entries_per_snapshot",
+                    "maximum_signal_snapshots", "maximum_cleanup_errors",
+                    "maximum_error_text_bytes", "normal_cleanup_poll_count",
+                    "emergency_cleanup_poll_count", "term_grace_seconds",
+                    "kill_reap_seconds", "cleanup_poll_interval_seconds",
+                }
+            },
             "role_ceiling_conflicts": {},
             "exact_full_path_catalogue_complete": True,
             "execution_ready": False, "qualification_eligible": False,
@@ -594,6 +920,27 @@ class Source5HostEvidenceBudgetV2Tests(unittest.TestCase):
                 "/private/artifacts/job-records/original-run-01.json",
                 role="source5_job_record", maximum=128 * 1024,
             )]
+            cleanup_cap = budget._cleanup_sidecar_source_bound(
+                budget.SOURCE5_CLEANUP_SESSION_MEMBER_LIMIT,
+            )
+            for member_index in (0, 1):
+                cleanup_stem = (f"/private/output/confirmation/cleanup-sidecars/"
+                                f"000001-{'a' * 64}-member{member_index}.json")
+                for role, path, maximum in (
+                    (budget.SOURCE5_CLEANUP_SIDECAR_ROLE,
+                     cleanup_stem, cleanup_cap),
+                    (budget.SOURCE5_CLEANUP_SIDECAR_REFUSAL_ROLE,
+                     cleanup_stem + ".refusal.json",
+                     budget.SOURCE5_CLEANUP_REFUSAL_BYTES),
+                ):
+                    cleanup_row = Source5PathCatalogueTests.row(
+                        path, role=role, maximum=maximum,
+                    )
+                    cleanup_row["phase"] = "confirmation"
+                    cleanup_row["run_id"] = "original-run-01"
+                    cleanup_row["member_index"] = member_index
+                    cleanup_row["storage_root"] = "/private/output"
+                    core_rows.append(cleanup_row)
             caps = budget.project_archive_job_caps(core_rows)[
                 ("confirmation", "original-run-01")
             ]
@@ -648,6 +995,13 @@ class Source5HostEvidenceBudgetV2Tests(unittest.TestCase):
             )
             checked = budget.validate_host_evidence_budget_v2(result)
             self.assertEqual(result, checked)
+            self.assertEqual(set(result), {
+                "schema", "campaign_id", "host_id", "original_pins",
+                "schedule", "owner_contract", "path_catalogue",
+                "storage_reservation", "role_byte_reservations", "transport",
+                "execution_blockers", "readiness", "budget_sha256",
+            })
+            self.assertNotIn("journal_width_contract_pin", result)
             self.assertEqual(
                 catalogue["retention_policy"]["maximum_job_record_bytes"],
                 128 * 1024,
@@ -747,6 +1101,29 @@ class Source5HostEvidenceBudgetV2Tests(unittest.TestCase):
                 policy["maximum_window_total_bytes"],
             )
             self.assertEqual(policy["maximum_transfer_packet_inodes"], 1)
+
+
+
+class Source5HostEvidenceBudgetV3SchemaTests(unittest.TestCase):
+    def test_v3_ready_flags_require_json_booleans_not_integer_aliases(self) -> None:
+        readiness = {
+            "budget_complete": True,
+            "execution_ready": True,
+            "component_gate_ready": False,
+            "qualification_eligible": False,
+        }
+        budget._validate_source5_v3_ready_state(readiness)
+        for field, integer in (
+            ("budget_complete", 1), ("execution_ready", 1),
+            ("component_gate_ready", 0), ("qualification_eligible", 0),
+        ):
+            with self.subTest(field=field):
+                mutant = dict(readiness)
+                mutant[field] = integer
+                with self.assertRaisesRegex(
+                        budget.BudgetPlanError, "literal ready/unqualified booleans"):
+                    budget._validate_source5_v3_ready_state(mutant)
+
 
 
 if __name__ == "__main__":

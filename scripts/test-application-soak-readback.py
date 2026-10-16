@@ -3518,5 +3518,53 @@ class CapturedSoakInputTests(unittest.TestCase):
             self.assertEqual(len(list(Path('/proc/self/fd').iterdir())), before)
 
 
+class CapturedSoakArchiveViewTests(unittest.TestCase):
+    def test_archive_view_reads_only_the_exact_staged_raw_object(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="source5-soak-archive-view-") as directory:
+            root = Path(directory)
+            stage = root / "stage"
+            stage.mkdir(mode=0o700)
+            stored = stage / "object.bin"
+            raw = b"captured Soak owner bytes\n"
+            stored.write_bytes(raw)
+            stored.chmod(0o400)
+            origin = root / "reclaimed" / "soak-readback.json"
+            row = {
+                "origin_path": str(origin), "path": str(stored),
+                "role": "source5_soak_output", "host_id": "native-host",
+                "raw_sha256": hashlib.sha256(raw).hexdigest(),
+                "semantic_sha256": None, "byte_count": len(raw),
+                "maximum_bytes": len(raw),
+            }
+            view = module.CapturedSoakArtifactView(stage, {str(origin): row})
+            self.assertFalse(origin.exists())
+            self.assertTrue(view.has_file(origin))
+            self.assertFalse(view.has_file(root / "reclaimed" / "unlisted.json"))
+            self.assertEqual(view.read(origin, "Soak output", len(raw)),
+                             (raw, hashlib.sha256(raw).hexdigest()))
+
+    def test_archive_view_rejects_a_replaced_or_modified_stage_object(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="source5-soak-archive-tamper-") as directory:
+            root = Path(directory)
+            stage = root / "stage"
+            stage.mkdir(mode=0o700)
+            stored = stage / "object.bin"
+            stored.write_bytes(b"original\n")
+            stored.chmod(0o400)
+            origin = root / "gone" / "owner-return.json"
+            row = {
+                "origin_path": str(origin), "path": str(stored),
+                "role": "source5_soak_output", "host_id": "native-host",
+                "raw_sha256": hashlib.sha256(b"original\n").hexdigest(),
+                "semantic_sha256": None, "byte_count": len(b"original\n"),
+                "maximum_bytes": len(b"original\n"),
+            }
+            view = module.CapturedSoakArtifactView(stage, {str(origin): row})
+            stored.chmod(0o600)
+            stored.write_bytes(b"tampered\n")
+            stored.chmod(0o400)
+            with self.assertRaisesRegex(module.SoakReadbackError, "captured bytes differ from their exact raw pin"):
+                view.read(origin, "Soak output", len(b"original\n"))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

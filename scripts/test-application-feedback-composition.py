@@ -393,6 +393,56 @@ class CompositionContractTests(unittest.TestCase):
                     root, valid_records, set(), context, "test SourceV5",
                 )
 
+    def test_captured_offline_context_requires_exact_raw_object_and_directory_sets(self) -> None:
+        object_path = self.root / "reclaimed" / "probe" / "capture-receipt.json"
+        directory = self.root / "reclaimed" / "probe"
+
+        class View:
+            def has_file(self, path: str | Path) -> bool:
+                return str(path) == str(object_path)
+
+            def read(self, *_args: Any):
+                raise AssertionError("context validation must not read artifact bytes")
+
+            def open_snapshot(self, *_args: Any):
+                raise AssertionError("context validation must not open artifact bytes")
+
+        context = {
+            "schema": composition.FEEDBACK_CAPTURED_OFFLINE_CONTEXT_SCHEMA,
+            "artifact_view": View(),
+            "captured_origin_paths": [str(object_path)],
+            "evidence_file_paths": [str(object_path)],
+            "evidence_directory_paths": [str(directory)],
+            "source_symlink_paths": [],
+            "tree_inventories": [],
+            "probe_capture_pin": {
+                "path": str(object_path), "raw_sha256": "a" * 64,
+                "receipt_sha256": "b" * 64,
+            },
+            "capacity_bundle": {
+                "request": {"path": str(self.root / "request.json"), "raw_sha256": "c" * 64},
+                "artifact": {"path": str(self.root / "capacity.tsv"), "raw_sha256": "d" * 64},
+                "receipt": {"path": str(self.root / "capacity-receipt.json"), "raw_sha256": "e" * 64},
+            },
+        }
+        reader_checked = reader._validate_feedback_offline_context(context)
+        composer_checked = composition._offline_context(context)
+        self.assertEqual(reader_checked["captured_files"], frozenset({str(object_path)}))
+        self.assertEqual(composer_checked["captured_files"], frozenset({str(object_path)}))
+        self.assertFalse(object_path.exists())
+
+        for module, checked in ((reader, reader_checked),
+                                (composition, composer_checked)):
+            self.assertNotIn("evidence_path_map", checked)
+            malformed = dict(context)
+            malformed["captured_origin_paths"] = [
+                str(object_path), str(self.root / "unlisted.json"),
+            ]
+            error = reader.ValidationError if module is reader else composition.CompositionError
+            with self.assertRaises(error):
+                module._validate_feedback_offline_context(malformed) if module is reader \
+                    else module._offline_context(malformed)
+
     def test_required_native_source5_symlink_literal_change_is_rejected(self) -> None:
         capture_mode = os.environ.get("ALLOCATBELT_FEEDBACK_V5_NATIVE_CAPTURE_REQUIRED", "0")
         manifest_env = os.environ.get("ALLOCATBELT_FEEDBACK_V5_SOURCE_MANIFEST")

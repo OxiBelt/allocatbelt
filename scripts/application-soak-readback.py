@@ -14,6 +14,7 @@ qualification eligibility is always false.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import errno
 import fcntl
@@ -67,6 +68,7 @@ SOURCE_V5_PRESSURE_MAX_TOTAL_SECONDS = 14_400
 SOURCE_V5_PRESSURE_OWNERSHIP_PROTOCOL = "allocatbelt.pressure-worker-ownership.v1"
 SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA = "allocatbelt.application-source5-soak-offline-replay-context.v1"
 SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA_V2 = "allocatbelt.application-source5-soak-offline-replay-context.v2"
+SOURCE5_SOAK_CAPTURED_CONTEXT_SCHEMA = "allocatbelt.application-source5-soak-captured-replay-context.v1"
 SOAK_RESOURCE_BUDGET_SCHEMA = "allocatbelt.application-source5-soak-resource-budget.v2"
 SOAK_RESOURCE_MONITOR_SCHEMA = "allocatbelt.application-source5-soak-resource-monitor-stream.v1"
 SOAK_RESOURCE_MONITOR_ROW_SCHEMA = "allocatbelt.application-source5-soak-resource-monitor-row.v1"
@@ -413,6 +415,246 @@ class StableInput:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+
+class CapturedSoakArtifactView:
+    """Read exact 0400 objects from one authenticated flat stage directory.
+
+    The owner supplies only the already-authenticated per-job reference map.
+    Original paths remain lookup keys; all filesystem access is confined to a
+    no-follow directory descriptor for the private staging root.
+    """
+
+    def __init__(self, stage_root: Path | str, objects: object):
+        root = Path(stage_root)
+        require(root.is_absolute() and str(root) == os.path.normpath(str(root)) and
+                ".." not in root.parts and "\x00" not in str(root),
+                "captured Soak stage root is not a normalized absolute path")
+        try:
+            root_fd = self._open_directory_tree(root)
+        except OSError as error:
+            raise SoakReadbackError(
+                f"captured Soak stage root is unavailable or linked: {error}",
+            ) from error
+        try:
+            root_info = os.fstat(root_fd)
+            require(stat.S_ISDIR(root_info.st_mode) and
+                    root_info.st_uid == os.getuid() and
+                    stat.S_IMODE(root_info.st_mode) == 0o700,
+                    "captured Soak stage root is not an owned mode-0700 directory")
+            self._stage_identity = self._local_identity(root_info)
+        finally:
+            os.close(root_fd)
+        require(type(objects) is dict and 0 < len(objects) <= 250_000,
+                "captured Soak archive object map is empty or oversized")
+        normalized: dict[str, dict[str, Any]] = {}
+        local_names: set[str] = set()
+        for origin, row_value in objects.items():
+            row = exact_object(row_value, {
+                "origin_path", "path", "role", "host_id", "raw_sha256",
+                "semantic_sha256", "byte_count", "maximum_bytes",
+            }, "captured Soak archive object reference")
+            origin_path = Path(origin) if type(origin) is str else Path(".")
+            local_path = Path(row["path"]) if type(row["path"]) is str else Path(".")
+            require(type(origin) is str and origin_path.is_absolute() and
+                    str(origin_path) == origin and ".." not in origin_path.parts and
+                    row["origin_path"] == origin and
+                    local_path.is_absolute() and
+                    str(local_path) == os.path.normpath(str(local_path)) and
+                    ".." not in local_path.parts and local_path.parent == root and
+                    local_path != origin_path and local_path.name not in local_names,
+                    "captured Soak archive reference path is malformed or aliased")
+            text(row["role"], "captured Soak object role", maximum=128)
+            text(row["host_id"], "captured Soak object host", maximum=128)
+            raw_sha = digest(row["raw_sha256"],
+                             "captured Soak object raw SHA-256")
+            semantic_sha = row["semantic_sha256"]
+            require(semantic_sha is None or
+                    (type(semantic_sha) is str and
+                     re.fullmatch(r"[0-9a-f]{64}", semantic_sha) is not None),
+                    "captured Soak object semantic SHA-256 is malformed")
+            byte_count = uint(row["byte_count"],
+                              "captured Soak object byte count")
+            maximum = uint(row["maximum_bytes"],
+                           "captured Soak object exact byte ceiling")
+            require(maximum == byte_count,
+                    "captured Soak object size differs from its exact archive declaration")
+            normalized[origin] = {
+                **row, "path": str(local_path), "raw_sha256": raw_sha,
+                "byte_count": byte_count, "maximum_bytes": maximum,
+            }
+            local_names.add(local_path.name)
+        self.stage_root = root
+        self.objects = normalized
+
+    @staticmethod
+    def _local_identity(info: os.stat_result) -> tuple[int, ...]:
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+                info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    @staticmethod
+    def _open_directory_tree(path: Path) -> int:
+        require(path.is_absolute() and ".." not in path.parts and
+                "\x00" not in str(path),
+                "captured Soak stage root path is malformed")
+        flags = (os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW |
+                 os.O_CLOEXEC)
+        descriptor = os.open("/", flags)
+        try:
+            for component in path.parts[1:]:
+                next_descriptor = os.open(component, flags,
+                                           dir_fd=descriptor)
+                old_descriptor = descriptor
+                descriptor = next_descriptor
+                os.close(old_descriptor)
+            return descriptor
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+
+    def has_file(self, origin: Path | str) -> bool:
+        value = str(origin)
+        path = Path(value)
+        return (path.is_absolute() and str(path) == value and
+                ".." not in path.parts and value in self.objects)
+
+    @contextlib.contextmanager
+    def open_snapshot(
+        self, origin: Path | str, label: str, maximum: int,
+    ) -> Iterator[tuple[BinaryIO, str, int]]:
+        origin_text = str(origin)
+        require(self.has_file(origin_text),
+                f"{label} is absent from the exact captured Soak refs")
+        row = self.objects[origin_text]
+        local = Path(row["path"])
+        maximum = uint(maximum, f"{label} capture byte ceiling")
+        require(row["byte_count"] <= maximum,
+                f"{label} captured object exceeds its parser ceiling")
+        root_fd: int | None = None
+        descriptor: int | None = None
+        stream: BinaryIO | None = None
+        try:
+            root_fd = self._open_directory_tree(self.stage_root)
+            root_before = os.fstat(root_fd)
+            require(self._local_identity(root_before) == self._stage_identity,
+                    f"{label} captured Soak stage root changed")
+            before_path = os.stat(local.name, dir_fd=root_fd,
+                                  follow_symlinks=False)
+            descriptor = os.open(
+                local.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                dir_fd=root_fd,
+            )
+            before = os.fstat(descriptor)
+            require(self._local_identity(before) ==
+                    self._local_identity(before_path) and
+                    stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and
+                    before.st_uid == os.getuid() and
+                    stat.S_IMODE(before.st_mode) == 0o400 and
+                    before.st_size == row["byte_count"],
+                    f"{label} capture is not its exact owned mode-0400 regular file")
+            hasher = hashlib.sha256()
+            remaining = row["byte_count"]
+            while remaining:
+                block = os.read(descriptor, min(1024 * 1024, remaining))
+                require(bool(block), f"{label} captured object was truncated")
+                remaining -= len(block)
+                hasher.update(block)
+            require(os.read(descriptor, 1) == b"" and
+                    hasher.hexdigest() == row["raw_sha256"],
+                    f"{label} captured bytes differ from their exact raw pin")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            stream = os.fdopen(os.dup(descriptor), "rb")
+            yield stream, row["raw_sha256"], row["byte_count"]
+            after = os.fstat(descriptor)
+            named_after = os.stat(local.name, dir_fd=root_fd,
+                                  follow_symlinks=False)
+            root_after = os.fstat(root_fd)
+            require(self._local_identity(before) ==
+                    self._local_identity(after) ==
+                    self._local_identity(named_after) and
+                    stat.S_ISREG(named_after.st_mode) and
+                    named_after.st_nlink == 1 and
+                    named_after.st_uid == os.getuid() and
+                    stat.S_IMODE(named_after.st_mode) == 0o400 and
+                    self._local_identity(root_after) == self._stage_identity,
+                    f"{label} captured object or stage root changed during replay")
+            replacement_root_fd = self._open_directory_tree(self.stage_root)
+            try:
+                require(self._local_identity(os.fstat(replacement_root_fd)) ==
+                        self._stage_identity,
+                        f"{label} captured Soak stage path was replaced during replay")
+            finally:
+                os.close(replacement_root_fd)
+        except OSError as error:
+            raise SoakReadbackError(
+                f"cannot safely open or verify captured {label}: {error}",
+            ) from error
+        finally:
+            if stream is not None:
+                stream.close()
+            if descriptor is not None:
+                os.close(descriptor)
+            if root_fd is not None:
+                os.close(root_fd)
+
+    def read(self, origin: Path | str, label: str,
+             maximum: int) -> tuple[bytes, str]:
+        chunks: list[bytes] = []
+        hasher = hashlib.sha256()
+        total = 0
+        with self.open_snapshot(origin, label, maximum) as (
+                stream, expected_sha, byte_count):
+            while total < byte_count:
+                block = stream.read(min(1024 * 1024, byte_count - total))
+                require(bool(block), f"{label} captured object was truncated")
+                total += len(block)
+                hasher.update(block)
+                chunks.append(block)
+            require(stream.read(1) == b"" and total == byte_count and
+                    hasher.hexdigest() == expected_sha,
+                    f"{label} captured object differs from its raw pin")
+        return b"".join(chunks), expected_sha
+
+
+def _offline_artifact_view(offline_context: dict[str, Any]) -> Any | None:
+    schema = offline_context.get("schema")
+    if schema != SOURCE5_SOAK_CAPTURED_CONTEXT_SCHEMA:
+        return None
+    exact_object(offline_context, {
+        "schema", "artifact_view", "captured_origin_paths",
+        "evidence_file_paths", "evidence_directory_paths",
+        "tree_inventories", "construction_probe_capture",
+        "host_verification_pin", "application_environment",
+        "pressure_origin",
+    }, "Source5 captured Soak replay context")
+    require(isinstance(offline_context["artifact_view"],
+                       CapturedSoakArtifactView),
+            "Source5 captured Soak replay lacks its exact staged artifact view")
+    for field in ("captured_origin_paths", "evidence_file_paths",
+                  "evidence_directory_paths", "tree_inventories"):
+        require(type(offline_context[field]) is list,
+                f"Source5 captured Soak {field} is not a closed list")
+    view = offline_context["artifact_view"]
+    origins = offline_context["captured_origin_paths"]
+    files = offline_context["evidence_file_paths"]
+    directories = offline_context["evidence_directory_paths"]
+    normalize = lambda values: [
+        str(Path(value)) for value in values
+        if type(value) is str and Path(value).is_absolute() and
+        str(Path(value)) == value and ".." not in Path(value).parts
+    ]
+    require(normalize(origins) == origins == sorted(set(origins)) and
+            normalize(files) == files == sorted(set(files)) and
+            normalize(directories) == directories == sorted(set(directories)) and
+            set(origins) == set(view.objects) and
+            all(view.has_file(path) for path in origins) and
+            not set(origins).intersection(directories),
+            "Source5 captured replay paths differ from its exact owner/view closure")
+    return offline_context["artifact_view"]
 
 
 def read_stable_bytes(
@@ -1042,14 +1284,19 @@ def verify_source_tree(
         live_commit = _run_checked(["git", "rev-parse", "HEAD"], root, "source git identity").decode("ascii").strip()
         require(live_commit == commit, "live source Git commit differs from its frozen manifest")
     else:
-        exact_object(offline_context, {
-            "schema", "evidence_path_map", "construction_probe_capture",
-            "host_verification_pin", "application_environment",
-            "pressure_origin",
-        }, "Source5 Soak offline replay context")
+        if offline_context.get("schema") == \
+                SOURCE5_SOAK_CAPTURED_CONTEXT_SCHEMA:
+            _offline_artifact_view(offline_context)
+        else:
+            exact_object(offline_context, {
+                "schema", "evidence_path_map", "construction_probe_capture",
+                "host_verification_pin", "application_environment",
+                "pressure_origin",
+            }, "Source5 Soak offline replay context")
         require(offline_context["schema"] in {
                     SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA,
                     SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA_V2,
+                    SOURCE5_SOAK_CAPTURED_CONTEXT_SCHEMA,
                 },
                 "Source5 Soak offline replay context schema differs")
         # Offline replay pins the recorded commit as part of the raw source
@@ -1628,10 +1875,13 @@ def _audit_manifest_and_binaries_v5(
         capture_pin = exact_object(selected_probe_context["capture_pin"], {
             "path", "raw_sha256", "receipt_sha256",
         }, "Source5 ProbeV2 capture receipt pin")
-        capture, capture_raw, capture_raw_sha = read_json(
-            Path(capture_pin["path"]), capture_pin["raw_sha256"],
-            "Source5 selected ProbeV2 capture receipt", 16 * 1024 * 1024,
+        capture_view = _offline_artifact_view(offline_context) if offline_context is not None else None
+        capture, capture_raw_sha, capture_raw = read_json(
+            Path(capture_pin["path"]), "Source5 selected ProbeV2 capture receipt",
+            16 * 1024 * 1024, artifact_view=capture_view,
         )
+        require(capture_raw_sha == capture_pin["raw_sha256"],
+                "Source5 selected ProbeV2 capture receipt raw digest differs")
         require(capture == selected_probe_context["capture"] and
                 capture_raw_sha == capture_pin["raw_sha256"] and
                 capture.get("schema") ==
@@ -2312,14 +2562,17 @@ def _current_audit_offline(
     args: argparse.Namespace, offline_context: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Rebuild the SourceV5 Soak audit without Git, APP, or procfs probes."""
-    exact_object(offline_context, {
-        "schema", "evidence_path_map", "construction_probe_capture",
+    artifact_view = _offline_artifact_view(offline_context)
+    if artifact_view is None:
+        exact_object(offline_context, {
+            "schema", "evidence_path_map", "construction_probe_capture",
             "host_verification_pin", "application_environment",
             "pressure_origin",
-    }, "Source5 Soak offline replay context")
+        }, "Source5 Soak offline replay context")
     require(offline_context["schema"] in {
                 SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA,
                 SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA_V2,
+                SOURCE5_SOAK_CAPTURED_CONTEXT_SCHEMA,
             },
             "Source5 Soak offline replay context schema differs")
     require(type(offline_context["application_environment"]) is dict and
@@ -2350,9 +2603,17 @@ def _current_audit_offline(
     require(audit["recipe"] == recipe and audit["launch_enabled"] is
             recipe["qualification"]["launch_enabled"],
             "Source5 offline audit changed the original recipe or readiness")
-    output_dir = _check_private_output_directory(args.output_dir)
+    if artifact_view is None:
+        output_dir = _check_private_output_directory(args.output_dir)
+    else:
+        output_dir = Path(args.output_dir)
+        require(output_dir.is_absolute() and
+                str(output_dir) == os.path.normpath(str(output_dir)) and
+                ".." not in output_dir.parts,
+                "captured Soak output root is not a normalized original path")
     audit["launch_descriptor"] = _make_launch_descriptor(
         audit, output_dir, args.cpu_set,
+        captured_output_root=artifact_view is not None,
     )
     # The original baseline preflight belongs to the immutable false legacy
     # audit, whose v2 descriptor intentionally has no environment. The actual
@@ -2362,7 +2623,10 @@ def _current_audit_offline(
             audit["launch_descriptor"].get("launch_enabled") is False and
             audit["launch_descriptor"].get("environment") == {},
             "Source5 offline baseline audit no longer preserves false legacy readiness")
-    preflight = _verify_preflight(output_dir / "soak-preflight.json", audit)
+    preflight = _verify_preflight(
+        output_dir / "soak-preflight.json", audit,
+        artifact_view=artifact_view,
+    )
     audit["preflight"] = preflight
     return audit, preflight
 
@@ -2654,8 +2918,12 @@ def _write_exclusive_json(path: Path, value: dict[str, Any]) -> str:
         os.close(fd)
 
 
-def _readback_json(path: Path, label: str, maximum: int = 256 * 1024) -> dict[str, Any]:
-    value, _checksum, raw = read_json(path, label, maximum)
+def _readback_json(
+    path: Path, label: str, maximum: int = 256 * 1024, *,
+    artifact_view: Any = None,
+) -> dict[str, Any]:
+    value, _checksum, raw = read_json(path, label, maximum,
+                                     artifact_view=artifact_view)
     require(raw == canonical_bytes(value), f"{label} is not canonical JSON")
     return value
 
@@ -2667,9 +2935,16 @@ def _make_launch_descriptor(
     terminal_path: Path | None = None,
     samples_path: Path | None = None,
     *, path_value: str | None = None,
+    captured_output_root: bool = False,
 ) -> dict[str, Any]:
     _parse_cpu_set(cpu_set)
-    output_dir = _check_private_output_directory(output_dir)
+    if captured_output_root:
+        require(output_dir.is_absolute() and
+                str(output_dir) == os.path.normpath(str(output_dir)) and
+                ".." not in output_dir.parts,
+                "captured Soak output root is not a normalized original path")
+    else:
+        output_dir = _check_private_output_directory(output_dir)
     if audit["recipe"]["schema"] == RECIPE_SCHEMA_V2:
         return _make_launch_descriptor_v2(
             audit, output_dir, cpu_set, terminal_path, samples_path,
@@ -2927,8 +3202,13 @@ def _preflight_report(audit: dict[str, Any]) -> dict[str, Any]:
     return report
 
 
-def _verify_preflight(preflight_path: Path, current: dict[str, Any]) -> dict[str, Any]:
-    preflight = _readback_json(preflight_path, "preflight receipt")
+def _verify_preflight(
+    preflight_path: Path, current: dict[str, Any], *,
+    artifact_view: Any = None,
+) -> dict[str, Any]:
+    preflight = _readback_json(
+        preflight_path, "preflight receipt", artifact_view=artifact_view,
+    )
     expected_keys = {
         "schema", "recipe_sha256", "source_manifest_sha256", "source_tree_sha256", "build_sha256",
         "candidate_binary_sha256", "oracle_producer_binary_sha256", "reference_ring_sha256",
@@ -3059,9 +3339,16 @@ def _verify_launch_receipt(
     preflight: dict[str, Any],
     *,
     require_success: bool,
+    artifact_view: Any = None,
 ) -> tuple[dict[str, Any], str]:
-    path = _artifact_from_receipt(output_dir, "soak-launch.json", "parent launch receipt", MAX_RECEIPT_BYTES)
-    receipt, checksum, raw = read_json(path, "parent launch receipt", MAX_RECEIPT_BYTES)
+    path = _artifact_from_receipt(
+        output_dir, "soak-launch.json", "parent launch receipt",
+        MAX_RECEIPT_BYTES, artifact_view=artifact_view,
+    )
+    receipt, checksum, raw = read_json(
+        path, "parent launch receipt", MAX_RECEIPT_BYTES,
+        artifact_view=artifact_view,
+    )
     require(raw == canonical_bytes(receipt), "parent launch receipt is not canonical JSON")
     expected_keys = {
         "schema", "recipe_sha256", "preflight_sha256", "run_id", "execution_scope",
@@ -3204,8 +3491,12 @@ def _validate_receipt_json(
     receipt_path: Path,
     artifact_dir: Path,
     audit: dict[str, Any],
+    *, artifact_view: Any = None,
 ) -> tuple[dict[str, Any], str, dict[str, Any]]:
-    receipt, receipt_sha, _raw = read_json(receipt_path, "Rust soak receipt", MAX_RECEIPT_BYTES)
+    receipt, receipt_sha, _raw = read_json(
+        receipt_path, "Rust soak receipt", MAX_RECEIPT_BYTES,
+        artifact_view=artifact_view,
+    )
     if audit["recipe"]["schema"] == RECIPE_SCHEMA_V2:
         return _validate_receipt_json_v2(receipt, receipt_sha, _raw, audit)
     keys = {
@@ -3299,10 +3590,17 @@ def _validate_receipt_json_v2(
     return receipt, receipt_sha, audit["recipe"]
 
 
-def _artifact_from_receipt(artifact_dir: Path, basename: object, label: str, maximum: int) -> Path:
+def _artifact_from_receipt(
+    artifact_dir: Path, basename: object, label: str, maximum: int, *,
+    artifact_view: Any = None,
+) -> Path:
     name = text(basename, f"{label} relative path", maximum=256)
     require("/" not in name and "\\" not in name and name not in (".", ".."), f"{label} must be a single safe basename")
     path = artifact_dir / name
+    if artifact_view is not None:
+        require(artifact_view.has_file(path),
+                f"{label} is absent from the exact captured Soak objects")
+        return path
     try:
         parent_real = artifact_dir.resolve(strict=True)
         path_info = path.lstat()
@@ -3315,9 +3613,13 @@ def _artifact_from_receipt(artifact_dir: Path, basename: object, label: str, max
     return path
 
 
-def _parse_terminal_stream(path: Path, receipt: dict[str, Any], ring: dict[str, Any], maximum: int) -> tuple[str, int]:
+def _parse_terminal_stream(
+    path: Path, receipt: dict[str, Any], ring: dict[str, Any], maximum: int,
+    *, artifact_view: Any = None,
+) -> tuple[str, int]:
     expected_checksums = ring["expected_checksums"]
-    with StableInput(path, "terminal stream", maximum) as stream:
+    with StableInput(path, "terminal stream", maximum,
+                     artifact_view=artifact_view) as stream:
         first = stream.readline().decode("ascii", errors="strict").rstrip("\n")
         ring_hash_line = stream.readline().decode("ascii", errors="strict").rstrip("\n")
         rows_line = stream.readline().decode("ascii", errors="strict").rstrip("\n")
@@ -3486,7 +3788,10 @@ def rss_window_for_index(index: int) -> str | None:
     return None
 
 
-def _parse_samples(path: Path, receipt: dict[str, Any], audit: dict[str, Any], maximum: int) -> dict[str, Any]:
+def _parse_samples(
+    path: Path, receipt: dict[str, Any], audit: dict[str, Any], maximum: int,
+    *, artifact_view: Any = None,
+) -> dict[str, Any]:
     duration = audit["duration_seconds"]
     expected_count = duration * 1000 // SAMPLE_INTERVAL_MS + 1
     require(expected_count <= QUALIFIED_SECONDS * 1000 // SAMPLE_INTERVAL_MS + 1, "sample count exceeds the fixed horizon bound")
@@ -3496,7 +3801,8 @@ def _parse_samples(path: Path, receipt: dict[str, Any], audit: dict[str, Any], m
     first_window: list[int] = []
     final_window: list[int] = []
     last_timestamp = -1
-    with StableInput(path, "resource sample stream", maximum) as stream:
+    with StableInput(path, "resource sample stream", maximum,
+                     artifact_view=artifact_view) as stream:
         header_raw = stream.readline()
         require(header_raw.endswith(b"\n") and b"\r" not in header_raw, "sample header is not newline framed")
         try:
@@ -3856,6 +4162,7 @@ def _validate_artifacts_v2(artifact_dir: Path, audit: dict[str, Any]) -> dict[st
 
 def _validate_pressure_proof_offline(
     artifact_dir: Path, audit: dict[str, Any], offline_context: dict[str, Any],
+    *, artifact_view: Any = None,
 ) -> dict[str, Any]:
     """Replay the original one-APP pressure run through its captured reader."""
     pressure_info = audit["source"].get("pressure_recipe")
@@ -3940,11 +4247,26 @@ def _validate_pressure_proof_offline(
             pressure_artifacts["driver_logs"]["stderr"]["path"] ==
                 str(artifact_dir / "pressure-driver.stderr.log"),
             "Source5 Soak pressure output paths differ from the strict origin receipt")
+    verifier_kwargs: dict[str, Any] = {
+        "source_root": Path(audit["source_root"]),
+    }
+    if artifact_view is None:
+        verifier_kwargs["evidence_path_map"] = \
+            offline_context["evidence_path_map"]
+    else:
+        verifier_kwargs.update({
+            "evidence_path_map": None,
+            "artifact_view": artifact_view,
+            "captured_origin_paths":
+                offline_context["captured_origin_paths"],
+            "evidence_file_paths": offline_context["evidence_file_paths"],
+            "evidence_directory_paths":
+                offline_context["evidence_directory_paths"],
+        })
     result = verifier(
         recipe_pin, pressure_artifacts,
         offline_context["host_verification_pin"],
-        evidence_path_map=offline_context["evidence_path_map"],
-        source_root=Path(audit["source_root"]),
+        **verifier_kwargs,
     )
     require(type(result) is dict and
             result.get("readback_sha256") ==
@@ -3967,6 +4289,7 @@ def _validate_pressure_proof_offline(
     proof_raw, proof_sha = read_stable_bytes(
         artifact_dir / "pressure-readback.json",
         "SourceV5 saved pressure readback proof", MAX_RECEIPT_BYTES,
+        artifact_view=artifact_view,
     )
     proof = _read_json_raw(proof_raw, "SourceV5 saved pressure readback proof")
     require(pressure_artifacts["proof"]["raw_sha256"] == proof_sha and
@@ -3979,48 +4302,60 @@ def _validate_artifacts_offline(
     artifact_dir: Path, audit: dict[str, Any], offline_context: dict[str, Any],
 ) -> dict[str, Any]:
     """Replay all Soak streams offline; never launch, inspect peers, or accept summaries."""
-    exact_object(offline_context, {
-        "schema", "evidence_path_map", "construction_probe_capture",
-        "host_verification_pin", "application_environment",
-        "pressure_origin",
-    }, "Source5 Soak offline replay context")
+    artifact_view = _offline_artifact_view(offline_context)
+    if artifact_view is None:
+        exact_object(offline_context, {
+            "schema", "evidence_path_map", "construction_probe_capture",
+            "host_verification_pin", "application_environment",
+            "pressure_origin",
+        }, "Source5 Soak offline replay context")
     require(offline_context["schema"] in {
                 SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA,
                 SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA_V2,
+                SOURCE5_SOAK_CAPTURED_CONTEXT_SCHEMA,
             } and audit["recipe"]["schema"] == RECIPE_SCHEMA_V2 and
             ((audit["mode"] == "qualified" and
               audit["duration_seconds"] == QUALIFIED_SECONDS) or
              (offline_context["schema"] ==
                   SOURCE5_SOAK_OFFLINE_CONTEXT_SCHEMA_V2 and
               audit["mode"] == "functional" and
+              0 < audit["duration_seconds"] < QUALIFIED_SECONDS) or
+             (offline_context["schema"] ==
+                  SOURCE5_SOAK_CAPTURED_CONTEXT_SCHEMA and
+              audit["mode"] == "functional" and
               0 < audit["duration_seconds"] < QUALIFIED_SECONDS)),
             "Source5 offline replay is not a bounded qualified or functional Soak")
     launch_receipt, _launch_sha = _verify_launch_receipt(
         artifact_dir, audit, audit["preflight"], require_success=True,
+        artifact_view=artifact_view,
     )
     audit["launch_receipt"] = launch_receipt
     receipt_path = _artifact_from_receipt(
         artifact_dir, "soak-receipt.json", "runtime-soak.v2 receipt",
-        MAX_RECEIPT_BYTES,
+        MAX_RECEIPT_BYTES, artifact_view=artifact_view,
     )
     receipt, receipt_sha, _raw = _validate_receipt_json(
-        receipt_path, artifact_dir, audit,
+        receipt_path, artifact_dir, audit, artifact_view=artifact_view,
     )
     terminal_path = _artifact_from_receipt(
         artifact_dir, receipt["terminal_stream_relative_path"],
         "terminal stream", audit["recipe"]["runtime"]["terminal_budget_bytes"],
+        artifact_view=artifact_view,
     )
     sample_path = _artifact_from_receipt(
         artifact_dir, receipt["resource_samples_relative_path"],
         "resource sample stream", audit["recipe"]["runtime"]["sample_budget_bytes"],
+        artifact_view=artifact_view,
     )
     terminal_sha, terminal_count = _parse_terminal_stream(
         terminal_path, receipt, audit["ring"],
         audit["recipe"]["runtime"]["terminal_budget_bytes"],
+        artifact_view=artifact_view,
     )
     samples = _parse_samples(
         sample_path, receipt, audit,
         audit["recipe"]["runtime"]["sample_budget_bytes"],
+        artifact_view=artifact_view,
     )
     phases = _validate_phase_and_receipt_v2(
         receipt, audit, terminal_count, samples,
@@ -4032,7 +4367,10 @@ def _validate_artifacts_offline(
             "SourceV5 offline Soak lost its exact original horizon or RSS gates")
     require(audit["launch_enabled"] is True,
             "SourceV5 Soak offline replay requires the separately authorized Soak overlay")
-    _validate_pressure_proof_offline(artifact_dir, audit, offline_context)
+    _validate_pressure_proof_offline(
+        artifact_dir, audit, offline_context,
+        artifact_view=artifact_view,
+    )
     return {
         "schema": RESULT_SCHEMA_V2,
         "validated": True,
@@ -4207,11 +4545,13 @@ def _write_verify_inputs_postflight(
 def _verify_verify_inputs_postflight(
     audit: dict[str, Any], preflight: dict[str, Any], output_dir: Path,
     launch_receipt_sha: str,
+    *, artifact_view: Any = None,
 ) -> dict[str, Any]:
     """Replay the exact legacy postflight role under the selected overlay."""
     path = output_dir / "soak-postflight.json"
     postflight, checksum, raw = read_json(
         path, "Soak input-stability postflight", MAX_RECEIPT_BYTES,
+        artifact_view=artifact_view,
     )
     expected = {
         "schema": POSTFLIGHT_SCHEMA,

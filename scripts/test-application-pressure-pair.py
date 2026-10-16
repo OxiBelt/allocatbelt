@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import inspect
 import importlib.util
 import contextlib
 import io
@@ -1995,6 +1996,573 @@ class StrictObservedHostBindingTests(unittest.TestCase):
             self.assertEqual(source_path.read_bytes(), replacement)
 
 
+class CapturedFixedPredecessorContextTests(unittest.TestCase):
+    """Shape-only checks for the additive live predecessor-context boundary."""
+
+    def _projection_fixture(self, root: Path):
+        job = {
+            "host_id": "host-a", "phase": "pressure",
+            "run_id": "pressure-run-01",
+            "predecessor_run_ids": ["fixed-run-01"],
+        }
+        job_record = {"path": str(root / "fixed-job-record.json"),
+                      "raw_sha256": "a" * 64}
+        receipt_value = {"schema": "allocatbelt.fixed-pressure-predecessor.v1",
+                         "component_sha256": "b" * 64}
+        receipt_pin = {"path": str(root / "preflight" /
+                                    "fixed-pressure-predecessor.json"),
+                       "raw_sha256": "c" * 64}
+        auth = {
+            "job": job, "job_index": 12,
+            "helper_input": {"path": str(root / "helper.json"),
+                             "sha256": "d" * 64},
+            "authorization_id": "pressure-auth-01",
+            "capacity_registration_head": "e" * 64,
+        }
+        overlay = {"chronology": {
+            "journal_head": "f" * 64, "journal_record_count": 17,
+            "registration_head": "e" * 64,
+        }}
+        recipe = {"fixed_predecessor": {"record": job_record}}
+        inputs = {"job": job, "job_index": 12}
+        projection = {
+            "schema": pair.SOURCE5_PRESSURE_PREREQUISITES_SCHEMA,
+            "job": job, "job_index": 12,
+            "helper_input": auth["helper_input"],
+            "authorization_id": auth["authorization_id"],
+            "authorization_head": "1" * 64,
+            "authorization_record_count": 4,
+            "registration_head": "e" * 64,
+            "historical_head": "f" * 64,
+            "historical_record_count": 17,
+            "fixed_predecessor": {
+                "run_id": "fixed-run-01", "job_record": job_record,
+                "receipt": receipt_pin, "receipt_value": receipt_value,
+                "component_sha256": "2" * 64,
+                "process_metrics_sha256": "3" * 64,
+                "state": "valid_pair",
+            },
+            "component_replayed": True,
+            "qualification_eligible": False,
+        }
+        return projection, recipe, inputs, auth, overlay
+
+    def test_json_context_is_not_a_chronology_issued_capability(self) -> None:
+        with self.assertRaisesRegex(
+                pair.PressurePairError, "non-JSON chronology-issued context"):
+            pair._verify_captured_source5_pressure_predecessor_context(
+                {}, {}, Path("/private/pressure-output"), None,
+                {}, {}, {}, {}, {},
+            )
+
+    def test_validator_receives_original_lock_authorization_and_recipe_pins(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-captured-issuer-") as tmp:
+            root = Path(tmp)
+            source_root = root / "source"
+            chronology_path = source_root / "scripts" / \
+                "application-campaign-chronology.py"
+            chronology_path.parent.mkdir(parents=True)
+            chronology_path.write_text("# pinned chronology source\n",
+                                      encoding="utf-8")
+            namespace: dict[str, object] = {}
+            projection = {"captured": True}
+            validator_source = (
+                "def validate(context, *, lock, authorization_context, "
+                "recipe_pin, output_root):\n"
+                "    calls.append((context, lock, authorization_context, "
+                "recipe_pin, output_root))\n"
+                "    return projection\n"
+            )
+            calls: list[tuple] = []
+            namespace["calls"] = calls
+            namespace["projection"] = projection
+            exec(compile(validator_source, str(chronology_path), "exec"),
+                 namespace)
+            chronology = types.SimpleNamespace(
+                __file__=str(chronology_path),
+                validate_source5_pressure_predecessor_context=
+                    namespace["validate"],
+            )
+
+            context = object()
+            lock = object()
+            authorization = {"authorization_id": "auth-01"}
+            recipe_pin = {"path": str(root / "recipe.json"),
+                          "raw_sha256": "a" * 64}
+            output_root = root / "output"
+            with patch.object(
+                    pair,
+                    "_validate_captured_source5_pressure_prerequisites",
+                    return_value={"validated": True}) as close_projection:
+                result = pair._verify_captured_source5_pressure_predecessor_context(
+                    context, recipe_pin, output_root, lock, {},
+                    {"source_root": source_root},
+                    {"campaign_chronology": chronology}, authorization, {},
+                )
+
+            self.assertEqual(result, {"validated": True})
+            self.assertEqual(len(calls), 1)
+            self.assertIs(calls[0][0], context)
+            self.assertIs(calls[0][1], lock)
+            self.assertIs(calls[0][2], authorization)
+            self.assertEqual(calls[0][3], recipe_pin)
+            self.assertEqual(calls[0][4], output_root)
+            self.assertEqual(close_projection.call_args.args[0], projection)
+            self.assertIs(close_projection.call_args.args[0], projection)
+
+    def test_validator_loader_keeps_supplied_chronology_module_identity(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-chronology-instance-") as tmp:
+            root = Path(tmp)
+            source_root = root / "source"
+            chronology_path = source_root / "scripts" / \
+                "application-campaign-chronology.py"
+            chronology_path.parent.mkdir(parents=True)
+            chronology_path.write_text("# chronology loaded by caller\n",
+                                      encoding="utf-8")
+            chronology_path.chmod(0o644)
+            chronology_raw = chronology_path.read_bytes()
+            chronology_sha = hashlib.sha256(chronology_raw).hexdigest()
+            chronology_record = {
+                "path": "scripts/application-campaign-chronology.py",
+                "kind": "file", "mode": "100644",
+                "sha256": chronology_sha, "size": len(chronology_raw),
+            }
+            source_paths = {
+                "campaign_controller": "scripts/application-campaign.py",
+                "campaign_chronology":
+                    "scripts/application-campaign-chronology.py",
+                "feedback_composition":
+                    "scripts/application-feedback-composition.py",
+                "feedback_validator":
+                    "scripts/application-feedback-readback.py",
+                "pressure_validator":
+                    "scripts/application-pressure-readback.py",
+                "soak_supervisor": "scripts/application-soak-readback.py",
+                "capacity_producer": "scripts/application-byte-capacity.py",
+                "pressure_driver": "scripts/application-pressure-driver.py",
+                "fixed_pair": "scripts/application-fixed-pair.py",
+                "soak_recipe_builder": "scripts/application-soak-recipe.py",
+                "soak_runner": "scripts/application-soak-runner.py",
+            }
+            source_hashes = {
+                name: (chronology_sha if name == "campaign_chronology"
+                       else hashlib.sha256(name.encode()).hexdigest())
+                for name in source_paths
+            }
+            harness = {
+                "campaign_controller": {
+                    "path": source_paths["campaign_controller"],
+                    "sha256": source_hashes["campaign_controller"],
+                },
+                "feedback_validator": {
+                    "path": source_paths["feedback_validator"],
+                    "sha256": source_hashes["feedback_validator"],
+                },
+                "byte_capacity_producer": {
+                    "path": source_paths["capacity_producer"],
+                    "sha256": source_hashes["capacity_producer"],
+                },
+                "pressure_driver": {
+                    "path": source_paths["pressure_driver"],
+                    "sha256": source_hashes["pressure_driver"],
+                },
+                "pressure_validator": {
+                    "path": source_paths["pressure_validator"],
+                    "sha256": source_hashes["pressure_validator"],
+                },
+                "soak_recipe_builder": {
+                    "path": source_paths["soak_recipe_builder"],
+                    "sha256": source_hashes["soak_recipe_builder"],
+                },
+                "soak_validator": {
+                    "path": source_paths["soak_supervisor"],
+                    "sha256": source_hashes["soak_supervisor"],
+                },
+                "soak_runner": {
+                    "path": source_paths["soak_runner"],
+                    "sha256": source_hashes["soak_runner"],
+                },
+            }
+            source = {
+                "source": {"files": [chronology_record]},
+                "qualification_harness": harness,
+            }
+            recipe = {
+                "validators": {
+                    name: {"path": source_paths[name],
+                           "sha256": source_hashes[name]}
+                    for name in (
+                        "campaign_controller", "campaign_chronology",
+                        "feedback_composition", "feedback_validator",
+                        "pressure_validator", "soak_supervisor",
+                        "capacity_producer",
+                    )
+                },
+            }
+            supplied = types.ModuleType("already_loaded_chronology")
+            supplied.__file__ = str(chronology_path)
+            loaded_elsewhere = types.ModuleType("ordinary_validator")
+
+            def fake_module_loader(source_value, source_root_value, relative,
+                                   label, maximum):
+                return loaded_elsewhere, {
+                    "path": relative, "sha256": source_hashes.get(
+                        next((key for key, path in source_paths.items()
+                              if path == relative), ""),
+                    ),
+                }
+
+            with patch.object(pair, "_pinned_source_module",
+                              side_effect=fake_module_loader) as loader:
+                modules = pair._load_validators(
+                    recipe, {"source": source,
+                             "source_root": source_root}, supplied,
+                )
+
+            self.assertIs(modules["campaign_chronology"], supplied)
+            self.assertFalse(any(call.args[2] ==
+                                 "scripts/application-campaign-chronology.py"
+                                 for call in loader.call_args_list))
+
+    def test_live_apis_add_context_without_a_journal_map_parameter(self) -> None:
+        for function in (pair._prepare_prerequisites,
+                         pair.validate_pressure_pair_artifacts,
+                         pair._run_pressure_pair_component,
+                         pair.run_pressure_pair_locked,
+                         pair.verify_pressure_pair_with_host_receipt):
+            with self.subTest(function=function.__name__):
+                signature = inspect.signature(function)
+                parameter = signature.parameters.get(
+                    "pressure_predecessor_context",
+                )
+                self.assertIsNotNone(parameter)
+                self.assertEqual(parameter.default, None)
+                self.assertNotIn("evidence_path_map", signature.parameters)
+
+    def test_projection_closes_active_authorization_and_original_predecessor(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-captured-context-") as tmp:
+            root = Path(tmp)
+            projection, recipe, inputs, auth, overlay = self._projection_fixture(root)
+            checked = pair._validate_captured_source5_pressure_prerequisites(
+                projection, recipe, inputs, auth, overlay, root,
+            )
+            self.assertEqual(checked, projection)
+
+            wrong_predecessor = {
+                **projection,
+                "fixed_predecessor": {
+                    **projection["fixed_predecessor"],
+                    "run_id": "unrelated-fixed-run",
+                },
+            }
+            with self.assertRaisesRegex(pair.PressurePairError,
+                                        "original pressure-plan edge"):
+                pair._validate_captured_source5_pressure_prerequisites(
+                    wrong_predecessor, recipe, inputs, auth, overlay, root,
+                )
+
+            wrong_head = {**projection, "historical_head": "4" * 64}
+            with self.assertRaisesRegex(pair.PressurePairError,
+                                        "active pressure authorization/overlay"):
+                pair._validate_captured_source5_pressure_prerequisites(
+                    wrong_head, recipe, inputs, auth, overlay, root,
+                )
+
+
+class FixedPredecessorReceiptPersistenceTests(unittest.TestCase):
+    def test_live_preflight_persists_and_rechecks_exact_reconstructed_receipt(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-fixed-receipt-live-") as temporary:
+            root = Path(temporary).resolve()
+            preflight = root / "preflight"
+            preflight.mkdir(mode=0o700)
+            path = preflight / "fixed-pressure-predecessor.json"
+            receipt = {"schema": "allocatbelt.fixed-pressure-predecessor.v1",
+                       "state": "valid_pair", "metrics": [1, 2]}
+            raw = pair.canonical_bytes(receipt)
+            expected_sha = hashlib.sha256(raw).hexdigest()
+
+            actual_sha = pair._close_reconstructed_fixed_predecessor_receipt(
+                path, receipt, raw, captured_receipt_pin=None,
+                captured_replay=False,
+            )
+            self.assertEqual(actual_sha, expected_sha)
+            self.assertEqual(path.read_bytes(), raw)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+            repeated_sha = pair._close_reconstructed_fixed_predecessor_receipt(
+                path, receipt, raw, captured_receipt_pin=None,
+                captured_replay=False,
+            )
+            self.assertEqual(repeated_sha, expected_sha)
+
+            changed = {**receipt, "metrics": [1, 3]}
+            with self.assertRaisesRegex(
+                    pair.PressurePairError,
+                    "stored fixed-pressure predecessor receipt differs"):
+                pair._close_reconstructed_fixed_predecessor_receipt(
+                    path, changed, pair.canonical_bytes(changed),
+                    captured_receipt_pin=None, captured_replay=False,
+                )
+
+    def test_archived_replay_closes_captured_pin_without_origin_io(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-fixed-receipt-replay-") as temporary:
+            root = Path(temporary).resolve()
+            absent_origin = root / "reclaimed" / "preflight" / \
+                "fixed-pressure-predecessor.json"
+            receipt = {"schema": "allocatbelt.fixed-pressure-predecessor.v1",
+                       "state": "valid_pair", "metrics": [7, 8]}
+            raw = pair.canonical_bytes(receipt)
+            raw_sha = hashlib.sha256(raw).hexdigest()
+            with patch.object(
+                    pair, "read_json",
+                    side_effect=AssertionError("captured replay read an origin receipt")), \
+                 patch.object(
+                    pair, "write_new",
+                    side_effect=AssertionError("captured replay wrote an origin receipt")):
+                actual_sha = pair._close_reconstructed_fixed_predecessor_receipt(
+                    absent_origin, receipt, raw,
+                    captured_receipt_pin={"path": str(absent_origin),
+                                          "raw_sha256": raw_sha},
+                    captured_replay=True,
+                )
+            self.assertEqual(actual_sha, raw_sha)
+            self.assertFalse(absent_origin.exists())
+
+            with self.assertRaisesRegex(
+                    pair.PressurePairError,
+                    "differs from fresh source/job/metrics reconstruction"):
+                pair._close_reconstructed_fixed_predecessor_receipt(
+                    absent_origin, receipt, raw,
+                    captured_receipt_pin={"path": str(absent_origin),
+                                          "raw_sha256": "0" * 64},
+                    captured_replay=True,
+                )
+
+
+class PressureApplicationTmpdirOwnerProofTests(unittest.TestCase):
+    def _proofs(self):
+        path = "/reserved/source5/pressure/member-0/application-tmp"
+        mount = {
+            "mount_id": 17, "major_minor": "8:1", "mount_root": "/",
+            "mount_point": "/reserved", "filesystem_type": "ext4",
+            "mount_source": "/dev/sda1", "device": 8,
+        }
+        initial = {
+            "path": path, "device": 8, "inode": 1001, "mode": 0o700,
+            "mount": mount, "available_bytes": 1 << 20,
+            "available_inodes": 4096, "bytes_limit": 65536,
+            "inode_limit": 128,
+        }
+        final = {
+            "path": path, "device": 8, "inode": 1001, "mode": 0o700,
+            "mount": mount, "bytes_used": 0, "file_count": 0,
+            "directory_count": 0, "bytes_limit": 65536,
+            "inode_limit": 128, "available_bytes": 1 << 20,
+            "available_inodes": 4096,
+        }
+        return initial, final
+
+    def test_owner_return_proof_preserves_exact_identity_and_empty_counts(self) -> None:
+        initial, final = self._proofs()
+        checked_initial, checked_final = pair._validate_pressure_tmpdir_owner_proof(
+            initial, final, initial["path"],
+            {"bytes_limit": 65536, "inode_limit": 128},
+            "pressure member zero",
+        )
+        self.assertEqual(checked_initial, initial)
+        self.assertEqual(checked_final, final)
+
+    def test_owner_return_proof_rejects_nonempty_or_replaced_root(self) -> None:
+        initial, final = self._proofs()
+        nonempty = dict(final, file_count=1)
+        with self.assertRaisesRegex(pair.PressurePairError,
+                                    "exact empty original owner-return inventory"):
+            pair._validate_pressure_tmpdir_owner_proof(
+                initial, nonempty, initial["path"],
+                {"bytes_limit": 65536, "inode_limit": 128},
+                "pressure member zero",
+            )
+        replaced = dict(final, inode=1002)
+        with self.assertRaisesRegex(pair.PressurePairError,
+                                    "exact empty original owner-return inventory"):
+            pair._validate_pressure_tmpdir_owner_proof(
+                initial, replaced, initial["path"],
+                {"bytes_limit": 65536, "inode_limit": 128},
+                "pressure member zero",
+            )
+
+
+class CapturedPressureArtifactViewTests(unittest.TestCase):
+    def test_hview_stream_reads_exact_stage_object_without_origin_stat(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-captured-stage-") as temporary:
+            root = Path(temporary).resolve()
+            stage_root = root / "stage"
+            stage_root.mkdir(mode=0o700)
+            origin = str(root / "reclaimed" / "pressure-output.jsonl")
+            local = stage_root / "object-00.bin"
+            raw = b"captured pressure stream\n"
+            local.write_bytes(raw)
+            local.chmod(0o400)
+            raw_sha = hashlib.sha256(raw).hexdigest()
+            view = pair.CapturedPressureArtifactView(str(stage_root), {
+                origin: {
+                    "origin_path": origin, "path": str(local),
+                    "role": "pressure_pair_artifact", "host_id": "host-a",
+                    "raw_sha256": raw_sha, "semantic_sha256": None,
+                    "byte_count": len(raw), "maximum_bytes": len(raw),
+                },
+            })
+            self.assertTrue(view.has_file(origin))
+            self.assertFalse(Path(origin).exists())
+
+            inspected: list[str] = []
+            original_lstat = Path.lstat
+
+            def track_lstat(path: Path, *args, **kwargs):
+                inspected.append(str(path))
+                if str(path) == origin:
+                    raise AssertionError("captured replay lstat-ed an original origin")
+                return original_lstat(path, *args, **kwargs)
+
+            io_context = {
+                "artifact_view": view,
+                "captured_origin_paths": frozenset({origin}),
+                "output_root": root / "reclaimed",
+                "retained_output_paths": frozenset(),
+                "optional_output_paths": frozenset(),
+            }
+            token_value = pair._PRESSURE_CAPTURED_REPLAY.set(io_context)
+            try:
+                with patch.object(Path, "lstat", track_lstat):
+                    actual, checksum, actual_info = pair.read_stable(
+                        Path(origin), "captured pressure stream", len(raw),
+                    )
+                self.assertEqual(actual, raw)
+                self.assertEqual(checksum, raw_sha)
+                self.assertIsNone(actual_info)
+                self.assertNotIn(origin, inspected)
+                with self.assertRaisesRegex(
+                        pair.PressurePairError,
+                        "missing from the exact archive view"):
+                    pair.read_stable(
+                        root / "reclaimed" / "unlisted.bin",
+                        "unlisted pressure output", 128,
+                    )
+            finally:
+                pair._PRESSURE_CAPTURED_REPLAY.reset(token_value)
+
+    def test_stage_map_rejects_aliasing_and_mutated_objects(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-captured-tamper-") as temporary:
+            root = Path(temporary).resolve()
+            stage_root = root / "stage"
+            stage_root.mkdir(mode=0o700)
+            local = stage_root / "object-00.bin"
+            raw = b"expected\n"
+            local.write_bytes(raw)
+            local.chmod(0o400)
+            origin = str(root / "reclaimed" / "pressure-output.json")
+            reference = {
+                "origin_path": origin, "path": str(local),
+                "role": "pressure_pair_artifact", "host_id": "host-a",
+                "raw_sha256": hashlib.sha256(raw).hexdigest(),
+                "semantic_sha256": None, "byte_count": len(raw),
+                "maximum_bytes": len(raw),
+            }
+            view = pair.CapturedPressureArtifactView(str(stage_root), {origin: reference})
+            local.chmod(0o600)
+            with self.assertRaisesRegex(pair.PressurePairError,
+                                        "private mode-0400 staged regular object"):
+                view.read(origin, "mutated pressure object", 128)
+            with self.assertRaisesRegex(pair.PressurePairError, "aliased"):
+                pair.CapturedPressureArtifactView(str(stage_root), {
+                    origin: reference,
+                    str(root / "reclaimed" / "pressure-second.json"): {
+                        **reference,
+                        "origin_path": str(root / "reclaimed" / "pressure-second.json"),
+                    },
+                })
+
+    def test_stage_map_rejects_truncated_symlink_and_missing_objects(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-captured-truncated-") as temporary:
+            root = Path(temporary).resolve()
+            stage_root = root / "stage"
+            stage_root.mkdir(mode=0o700)
+            origin = str(root / "reclaimed" / "pressure-output.json")
+            expected = b"complete captured bytes\n"
+            local = stage_root / "object-00.bin"
+            local.write_bytes(expected[:-1])
+            local.chmod(0o400)
+            reference = {
+                "origin_path": origin, "path": str(local),
+                "role": "pressure_pair_artifact", "host_id": "host-a",
+                "raw_sha256": hashlib.sha256(expected).hexdigest(),
+                "semantic_sha256": None, "byte_count": len(expected),
+                "maximum_bytes": len(expected),
+            }
+            truncated = pair.CapturedPressureArtifactView(str(stage_root), {
+                origin: reference,
+            })
+            with self.assertRaisesRegex(pair.PressurePairError,
+                                        "exact private mode-0400 staged regular object"):
+                truncated.read(origin, "truncated pressure object", 128)
+
+            local.chmod(0o600)
+            local.write_bytes(expected)
+            local.chmod(0o400)
+            symlink = stage_root / "object-01.bin"
+            symlink.symlink_to(local.name)
+            linked = pair.CapturedPressureArtifactView(str(stage_root), {
+                origin: {**reference, "path": str(symlink)},
+            })
+            with self.assertRaisesRegex(pair.PressurePairError,
+                                        "cannot safely open or verify captured pressure symlink pressure object"):
+                linked.read(origin, "symlink pressure object", 128)
+
+            regular = pair.CapturedPressureArtifactView(str(stage_root), {
+                origin: reference,
+            })
+            with self.assertRaisesRegex(pair.PressurePairError,
+                                        "absent from the exact captured pressure object set"):
+                regular.read(str(root / "reclaimed" / "missing.json"),
+                             "missing pressure object", 128)
+
+    def test_stage_map_uses_dirfd_and_rejects_linked_objects_or_replaced_root(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-captured-dirfd-") as temporary:
+            root = Path(temporary).resolve()
+            stage_root = root / "stage"
+            stage_root.mkdir(mode=0o700)
+            local = stage_root / "object-00.bin"
+            raw = b"captured pressure identity\n"
+            local.write_bytes(raw)
+            local.chmod(0o400)
+            origin = str(root / "reclaimed" / "pressure-output.json")
+            reference = {
+                "origin_path": origin, "path": str(local),
+                "role": "pressure_pair_artifact", "host_id": "host-a",
+                "raw_sha256": hashlib.sha256(raw).hexdigest(),
+                "semantic_sha256": None, "byte_count": len(raw),
+                "maximum_bytes": len(raw),
+            }
+            view = pair.CapturedPressureArtifactView(
+                str(stage_root), {origin: reference},
+            )
+            hardlink = root / "outside-hardlink.bin"
+            os.link(local, hardlink)
+            with self.assertRaisesRegex(pair.PressurePairError,
+                                        "mode-0400 staged regular object"):
+                view.read(origin, "linked pressure object", len(raw))
+            hardlink.unlink()
+
+            moved_root = root / "stage-renamed"
+            stage_root.rename(moved_root)
+            stage_root.symlink_to(moved_root.name, target_is_directory=True)
+            with self.assertRaisesRegex(
+                    pair.PressurePairError,
+                    "cannot safely open or verify captured pressure replaced pressure stage",
+            ):
+                view.read(origin, "replaced pressure stage", len(raw))
+
+
 def run_pressure_pair_offline_fixture(
     request_path: Path, expected_request_raw_sha256: str,
     source5_journal_context: object,
@@ -2027,6 +2595,7 @@ def run_pressure_pair_offline_fixture(
 def capture_pressure_pair_origin_fixture(
     recipe_pin: dict, output_root: Path, readback_pin: dict, host_receipt_path: Path,
     *, chronology_module, lock, authorization_context: dict,
+    pressure_predecessor_context=None,
 ) -> dict:
     """Run the real strict origin API for caller-supplied completed evidence.
 
@@ -2039,6 +2608,7 @@ def capture_pressure_pair_origin_fixture(
         recipe_pin, output_root, readback_pin, host_receipt_path,
         chronology_module=chronology_module, lock=lock,
         authorization_context=authorization_context,
+        pressure_predecessor_context=pressure_predecessor_context,
     )
 
 

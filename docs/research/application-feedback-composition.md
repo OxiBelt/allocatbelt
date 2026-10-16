@@ -179,6 +179,15 @@ before captured SourceV5 code is executed. The path map supports identical
 origin/local absolute paths only. Neither offline API launches an APP, reads
 coordinator `/proc`, or changes legacy `resolve`/`finalize` behavior.
 
+The Source5 Soak adapter has a separate additive
+`allocatbelt.application-feedback-captured-offline-replay-context.v1` for its
+authenticated archived ProbeV2 capture. It carries an exact original-path to
+stage-object reader plus the request's receipt-backed `opaque_trace` inventory
+row and owner-directory facts. Composer replays the capture receipt, TMPDIR
+inventory and each raw-pinned tree file against that closure without building
+an identity map or inspecting reclaimed origin paths. The original offline
+identity-map API and default policy schemas remain unchanged.
+
 The offline composition APIs prove this calibrated policy component only.
 `verify_feedback_offline` currently stops with an explicit blocked error after
 the ProbeV2 replay because its context does not yet contain the independent

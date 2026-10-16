@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import hashlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import platform
@@ -603,7 +605,7 @@ class CampaignChronologyCliTests(unittest.TestCase):
             try:
                 stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
                 state = stat_text[stat_text.rfind(")") + 2:].split()[0]
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 state = None
             if state in (None, "Z", "X"):
                 break
@@ -764,7 +766,27 @@ class CampaignChronologyCliTests(unittest.TestCase):
             [sys.executable, "-B", str(self.source_root / "scripts/application-campaign-chronology.py"), command,
              *self._common_args(), *extra],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+            start_new_session=True,
         )
+
+        def finish_bounded(drain_timeout: float) -> tuple[bytes, bytes]:
+            try:
+                stdout, stderr = process.communicate(timeout=drain_timeout)
+                return stdout, stderr
+            except subprocess.TimeoutExpired as error:
+                # A reaped leader does not anchor a numeric process group.
+                # Act only on the still-owned child; inherited pipes are a
+                # harness failure and fixture finally releases its hang flag.
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
+                raise AssertionError(
+                    "chronology CLI output pipes did not reach bounded EOF",
+                ) from error
+
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self.audit_path.exists():
@@ -779,14 +801,13 @@ class CampaignChronologyCliTests(unittest.TestCase):
                 if (current_popens > initial_popens and
                         self._escaped_interrupt_identity(environment) is not None):
                     process.send_signal(signal.SIGINT)
-                    stdout, stderr = process.communicate(timeout=30)
+                    stdout, stderr = finish_bounded(30)
                     return process.returncode, stdout, stderr
             if process.poll() is not None:
-                stdout, stderr = process.communicate()
+                stdout, stderr = finish_bounded(2)
                 return process.returncode, stdout, stderr
             time.sleep(0.01)
-        process.kill()
-        stdout, stderr = process.communicate()
+        stdout, stderr = finish_bounded(0.1)
         raise AssertionError(f"chronology CLI did not reach pair-runner Popen: {stderr.decode(errors='replace')}")
 
     @staticmethod
@@ -907,8 +928,14 @@ class CampaignChronologyCliTests(unittest.TestCase):
             self.campaign_id, self.host_id, original_context["boot_id_sha256"],
         )
         self.assertEqual(replayed["record_count"], 1)
-        self.assertEqual(replayed["terminal_head"],
-                         json.loads(original_journal.splitlines()[0])["record_sha256"])
+        first_envelope = json.loads(original_journal.splitlines()[0])
+        self.assertEqual(first_envelope["record"], events[0])
+        expected_head = sha(canonical({
+            "previous_sha256": first_envelope["previous_sha256"],
+            "record": events[0],
+        }))
+        self.assertEqual(first_envelope["record_sha256"], expected_head)
+        self.assertEqual(replayed["terminal_head"], expected_head)
         self.assertIs(replayed["component_dispatch_pending"], True)
         self.assertIs(replayed["qualification_eligible"], False)
         broken_chain = original_journal.replace(
@@ -2359,6 +2386,8 @@ class Source5JournalInputValidationTests(unittest.TestCase):
             "prepared_completion"), chronology.MAX_COMPLETION_BYTES)
         self.assertEqual(chronology._source5_journal_role_limit(
             "typed_source_symlink"), 4 * 1024)
+        self.assertEqual(chronology._source5_journal_role_limit(
+            "journal_width_contract"), 16 * 1024 * 1024)
 
     def test_final_plan_horizon_is_derived_from_all_original_host_job_lists(self) -> None:
         chronology = self.chronology
@@ -2434,6 +2463,73 @@ class Source5JournalInputValidationTests(unittest.TestCase):
         }
         parsed = chronology._source5_journal_request(request)
         self.assertEqual(parsed["journal"]["record_count"], 100_001)
+        budgeted = copy.deepcopy(request)
+        budgeted["schema"] = chronology.SOURCE5_HOST_JOURNAL_REQUEST_SCHEMA_V2
+        budgeted["host_evidence_budget"] = {
+            "path": "/private/artifacts/campaign-1/source5/host-a/"
+                    "evidence-budget/host-evidence-budget.json",
+            "raw_sha256": "c" * 64,
+            "semantic_sha256": "d" * 64,
+        }
+        budgeted["origin_receipt"]["path"] = str(
+            chronology_dir / "source5-origin-journal-receipt-v2.json",
+        )
+        self.assertEqual(chronology._source5_journal_request(budgeted)["schema"],
+                         chronology.SOURCE5_HOST_JOURNAL_REQUEST_SCHEMA_V2)
+        budget_pin = budgeted["host_evidence_budget"]
+        budget_row = {
+            "role": "host_evidence_budget", "host_id": host_id,
+            "origin_path": budget_pin["path"], "local_path": budget_pin["path"],
+            "raw_sha256": budget_pin["raw_sha256"],
+            "semantic_sha256": budget_pin["semantic_sha256"],
+            "byte_count": 1024,
+        }
+        index_value = chronology.build_source5_journal_evidence_index_v2(
+            campaign_id, host_id, "/private/source", "/private/input", output,
+            [budget_row], budget_pin,
+        )
+        self.assertEqual(index_value["schema"],
+                         chronology.SOURCE5_JOURNAL_EVIDENCE_INDEX_SCHEMA_V2)
+        index_pin = {
+            "path": str(chronology_dir / "evidence-index-v2.json"),
+            "raw_sha256": "e" * 64,
+            "semantic_sha256": index_value["index_sha256"],
+        }
+        request_value = chronology.build_source5_host_journal_request_v2(
+            scope=budgeted["scope"], campaign_id=campaign_id, host_id=host_id,
+            source_root=budgeted["source_root"], input_root=budgeted["input_root"],
+            output_root=output,
+            execution_manifest_pin=budgeted["execution_manifest"],
+            provenance=budgeted["provenance"], journal=budgeted["journal"],
+            origin_receipt_pin=budgeted["origin_receipt"],
+            evidence_index_pin=index_pin,
+            host_evidence_budget_pin=budget_pin,
+        )
+        self.assertEqual(request_value["host_evidence_budget"], budget_pin)
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "one exact host budget row"):
+            chronology.build_source5_journal_evidence_index_v2(
+                campaign_id, host_id, "/private/source", "/private/input", output,
+                [], budget_pin,
+            )
+        missing_budget = copy.deepcopy(budgeted)
+        del missing_budget["host_evidence_budget"]
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "unexpected field set"):
+            chronology._source5_journal_request(missing_budget)
+        legacy_receipt_path = copy.deepcopy(budgeted)
+        legacy_receipt_path["origin_receipt"]["path"] = str(
+            chronology_dir / "source5-origin-journal-receipt.json",
+        )
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "exact locked host chronology directory"):
+            chronology._source5_journal_request(legacy_receipt_path)
+        prospective_budget = copy.deepcopy(budgeted)
+        prospective_budget["scope"] = "prospective_exploration"
+        prospective_budget["provenance"]["preparation_pin"] = None
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "final prepared scope"):
+            chronology._source5_journal_request(prospective_budget)
         too_many = copy.deepcopy(request)
         too_many["journal"]["record_count"] = \
             chronology.MAX_SOURCE5_JOURNAL_EVENTS + 1
@@ -2447,6 +2543,1582 @@ class Source5JournalInputValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(chronology.ChronologyError,
                                     "record count"):
             chronology._source5_journal_request(legacy)
+
+
+class Source5JournalWidthContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.chronology = load_script(
+            SCRIPT_DIR / "application-campaign-chronology.py",
+            "source5_journal_width_contract_test_target",
+        )
+
+    def test_analyzer_pipe_comparison_normalizes_only_live_process_identity(self) -> None:
+        chronology = self.chronology
+        value = {
+            "bootstrap": {
+                "input_sha256": "a" * 64, "input_bytes": 4096,
+                "input_transport": {
+                    "schema": "allocatbelt.application-rust-analyzer-input-transport.v1",
+                    "kind": "owned_stdin_pipe", "input_sha256": "a" * 64,
+                    "input_bytes": 4096, "decoder_consumed_bytes": 4096,
+                    "process": {
+                        "parent_pid": 100, "child_pid": 101,
+                        "start_ticks": 200,
+                        "pipe": {
+                            "file_type": "fifo", "parent_fd": 3,
+                            "child_fd": 0, "device": 12,
+                            "inode": 34, "mode": 0o600,
+                        },
+                    },
+                },
+                "analyzer_wall_seconds": 1.0,
+                "resident_peak_bytes": 1024,
+                "output_sha256": "b" * 64,
+            },
+            "numeric_gates_passed": False,
+        }
+        other = copy.deepcopy(value)
+        process = other["bootstrap"]["input_transport"]["process"]
+        process["parent_pid"] = 300
+        process["child_pid"] = 301
+        process["start_ticks"] = 400
+        process["pipe"]["inode"] = 56
+        self.assertEqual(chronology._source5_comparable_analysis(value),
+                         chronology._source5_comparable_analysis(other))
+
+        changed_device = copy.deepcopy(value)
+        changed_device["bootstrap"]["input_transport"]["process"]["pipe"]["device"] = 13
+        self.assertNotEqual(chronology._source5_comparable_analysis(value),
+                            chronology._source5_comparable_analysis(changed_device))
+
+        changed_bytes = copy.deepcopy(value)
+        changed_bytes["bootstrap"]["input_bytes"] = 4097
+        changed_bytes["bootstrap"]["input_transport"]["input_bytes"] = 4097
+        changed_bytes["bootstrap"]["input_transport"]["decoder_consumed_bytes"] = 4097
+        self.assertNotEqual(chronology._source5_comparable_analysis(value),
+                            chronology._source5_comparable_analysis(changed_bytes))
+
+        changed_hash = copy.deepcopy(value)
+        changed_hash["bootstrap"]["input_sha256"] = "c" * 64
+        changed_hash["bootstrap"]["input_transport"]["input_sha256"] = "c" * 64
+        self.assertNotEqual(chronology._source5_comparable_analysis(value),
+                            chronology._source5_comparable_analysis(changed_hash))
+
+        changed_kind = copy.deepcopy(value)
+        changed_kind["bootstrap"]["input_transport"]["kind"] = "regular_file"
+        with self.assertRaises(chronology.ChronologyError):
+            chronology._source5_comparable_analysis(changed_kind)
+
+    def test_analyzer_pipe_v2_keeps_exact_gated_launch_proof(self) -> None:
+        chronology = self.chronology
+        value = {
+            "bootstrap": {
+                "input_sha256": "a" * 64, "input_bytes": 4096,
+                "analyzer_binary_sha256": "e" * 64,
+                "input_transport": {
+                    "schema": "allocatbelt.application-rust-analyzer-input-transport.v2",
+                    "kind": "owned_stdin_pipe", "input_sha256": "a" * 64,
+                    "input_bytes": 4096, "decoder_consumed_bytes": 4096,
+                    "launch_transition": {
+                        "schema": "allocatbelt.application-rust-analyzer-launch-transition.v1",
+                        "kind": "pinned_binary_fd_gate_exec",
+                        "status": "exec_confirmed_close_on_exec_pipe",
+                        "launcher_sha256": "c" * 64,
+                        "binary_sha256": "e" * 64,
+                        "executable_identity": "elf_proc_inode_matched",
+                    },
+                    "process": {
+                        "parent_pid": 100, "child_pid": 101,
+                        "start_ticks": 200,
+                        "pipe": {
+                            "file_type": "fifo", "parent_fd": 3,
+                            "child_fd": 0, "device": 12,
+                            "inode": 34, "mode": 0o600,
+                        },
+                    },
+                },
+                "analyzer_wall_seconds": 1.0,
+                "resident_peak_bytes": 1024,
+                "output_sha256": "b" * 64,
+            },
+        }
+        other = copy.deepcopy(value)
+        process = other["bootstrap"]["input_transport"]["process"]
+        process["parent_pid"] = 300
+        process["child_pid"] = 301
+        process["start_ticks"] = 400
+        process["pipe"]["inode"] = 56
+        self.assertEqual(chronology._source5_comparable_analysis(value),
+                         chronology._source5_comparable_analysis(other))
+
+        changed_launcher = copy.deepcopy(value)
+        changed_launcher["bootstrap"]["input_transport"][
+            "launch_transition"]["launcher_sha256"] = "f" * 64
+        self.assertNotEqual(
+            chronology._source5_comparable_analysis(value),
+            chronology._source5_comparable_analysis(changed_launcher),
+        )
+
+        changed_executable = copy.deepcopy(value)
+        changed_executable["bootstrap"]["input_transport"][
+            "launch_transition"]["executable_identity"] = "unverified"
+        with self.assertRaises(chronology.ChronologyError):
+            chronology._source5_comparable_analysis(changed_executable)
+
+        unknown = copy.deepcopy(value)
+        unknown["bootstrap"]["input_transport"]["ignored"] = True
+        with self.assertRaises(chronology.ChronologyError):
+            chronology._source5_comparable_analysis(unknown)
+
+    def _contract_fixture(self) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any],
+                                         dict[str, Any], dict[str, Any], dict[str, str],
+                                         dict[str, str], dict[str, Any]]:
+        chronology = self.chronology
+        host_id = "host-a"
+        campaign_id = "campaign-v4"
+        phases = chronology._SOURCE5_WIDTH_PHASES
+        run_id = "run-" + ("escaped\\quote\"é" * 18)
+        plan_jobs: dict[str, list[dict[str, Any]]] = {}
+        expected_jobs: dict[str, dict[str, Any]] = {}
+        for ordinal, phase in enumerate(phases):
+            plan_jobs[phase] = [{
+                "phase": phase, "host_id": "host-b", "ordinal": 0,
+                "run_id": f"foreign-{phase}",
+            }, {
+                "phase": phase, "host_id": host_id,
+                "ordinal": ordinal + 7, "run_id": f"{phase}-{run_id}",
+                "escaped_path": "/private/" + ("\\\"é" * 80),
+            }]
+            expected_jobs[phase] = plan_jobs[phase][1]
+        plan = {"jobs": plan_jobs}
+        plan_pin = {
+            "path": "/private/input/final-plan.json",
+            "raw_sha256": "a" * 64, "semantic_sha256": "b" * 64,
+        }
+        source_pin = {
+            "path": "/private/input/source-manifest.json",
+            "raw_sha256": "c" * 64, "semantic_sha256": "d" * 64,
+        }
+        owner_paths = chronology.SOURCE5_WIDTH_OWNER_PATHS
+        source_files = []
+        owner_pins = {}
+        for index, (role, path) in enumerate(owner_paths.items()):
+            digest = sha(f"source-owner-{index}".encode())
+            source_files.append({
+                "path": path, "kind": "file", "sha256": digest,
+                "size": 100 + index,
+            })
+            owner_pins[role] = {
+                "path": path, "raw_sha256": digest,
+                "byte_count": 100 + index,
+            }
+        source_document = {"source": {"files": source_files}}
+        original_pins = {
+            "schema": "allocatbelt.application-campaign-chronology.v2",
+            "campaign_id": campaign_id, "host_id": host_id,
+            "plan": plan_pin, "source_manifest": source_pin,
+            "escaped": "/private/" + ("\\\"é" * 80),
+        }
+        request = {
+            "campaign_id": campaign_id, "host_id": host_id,
+            "scope": "final_prepared_bounded",
+        }
+        manifest = {
+            "schema": chronology.SOURCE5_EXECUTION_SCHEMA_V4,
+            "campaign_id": campaign_id,
+        }
+        job_rows = []
+        phase_totals = []
+        success_event_count = 0
+        success_job_bytes = 0
+        failed_rows = []
+        for phase_index, phase in enumerate(phases):
+            job = expected_jobs[phase]
+            member_count = 1 if phase == "soak" else 2
+            event_counts = {
+                "source5_authorized": 1,
+                "source5_app_started": member_count,
+                "source5_app_terminal": member_count,
+                "source5_job_terminal": 1,
+            }
+            success_widths = {
+                "source5_authorized": 900 + phase_index,
+                "source5_app_started": 1300 + phase_index,
+                "source5_app_terminal": 1700 + phase_index,
+                "source5_job_terminal": 700 + phase_index,
+            }
+            failed_widths = dict(success_widths)
+            if phase_index == 0:
+                failed_widths["source5_app_terminal"] += 300
+            success_bytes = sum(event_counts[key] * success_widths[key]
+                                for key in chronology._SOURCE5_WIDTH_KINDS)
+            failed_bytes = sum(event_counts[key] * failed_widths[key]
+                               for key in chronology._SOURCE5_WIDTH_KINDS)
+            row = {
+                "phase": phase, "job_index": 0,
+                "ordinal": job["ordinal"], "run_id": job["run_id"],
+                "job_sha256": sha(canonical(job)),
+                "event_counts": event_counts,
+                "maximum_event_bytes_by_kind": success_widths,
+                "failed_event_counts": dict(event_counts),
+                "failed_event_bytes_by_kind": failed_widths,
+                "success_job_bytes": success_bytes,
+                "failed_window_bytes": failed_bytes,
+                "failed_event_count": sum(event_counts.values()),
+                "failed_event_count_uplift": 0,
+                "byte_uplift": failed_bytes - success_bytes,
+            }
+            job_rows.append(row)
+            phase_totals.append({
+                "phase": phase, "job_count": 1,
+                "event_count": sum(event_counts.values()),
+                "success_event_bytes": success_bytes,
+            })
+            success_event_count += sum(event_counts.values())
+            success_job_bytes += success_bytes
+            failed_rows.append({
+                "phase": phase, "job_index": 0,
+                "ordinal": job["ordinal"], "run_id": job["run_id"],
+                "job_sha256": row["job_sha256"],
+                "failed_event_count": sum(event_counts.values()),
+                "failed_event_count_uplift": 0,
+                "failed_window_bytes": failed_bytes,
+                "success_job_bytes": success_bytes,
+                "byte_uplift": failed_bytes - success_bytes,
+            })
+        fixed_rows = [{
+            "event": "source5_prepared_capacity_registered",
+            "phase": "registration", "count": 1,
+            "maximum_line_bytes": 800,
+        }] + [{
+            "event": "source5_analysis", "phase": phase, "count": 1,
+            "maximum_line_bytes": 850 + index,
+        } for index, phase in enumerate(chronology._SOURCE5_ANALYSIS_PHASES)]
+        fixed_count = sum(row["count"] for row in fixed_rows)
+        fixed_bytes = sum(row["count"] * row["maximum_line_bytes"]
+                          for row in fixed_rows)
+        failed_owner_window = max(
+            failed_rows,
+            key=lambda row: (row["byte_uplift"],
+                             row["failed_event_count_uplift"],
+                             -phases.index(row["phase"]), -row["job_index"]),
+        )
+        body = {
+            "schema": chronology.SOURCE5_JOURNAL_WIDTH_CONTRACT_SCHEMA_V1,
+            "campaign_id": campaign_id, "host_id": host_id,
+            "original_pins_sha256": sha(canonical(original_pins)),
+            "plan_pin": plan_pin, "source_manifest_pin": source_pin,
+            "owner_pins": owner_pins, "job_rows": job_rows,
+            "phase_totals": phase_totals,
+            "fixed_event_widths": fixed_rows,
+            "total_event_count": fixed_count + success_event_count,
+            "total_event_bytes": fixed_bytes + success_job_bytes +
+                failed_owner_window["byte_uplift"],
+            "failed_owner_window": failed_owner_window,
+        }
+        contract = {**body, "contract_sha256": sha(canonical(body))}
+        return (contract, manifest, plan, request, original_pins,
+                source_pin, plan_pin, source_document)
+
+    def test_width_contract_covers_all_callbacks_and_one_failed_owner_window(self) -> None:
+        chronology = self.chronology
+        (contract, manifest, plan, request, original, source_pin,
+         plan_pin, source_document) = self._contract_fixture()
+        projection = chronology._source5_validate_journal_width_contract(
+            contract, manifest, plan, request, original,
+            source_pin, plan_pin, source_document,
+        )
+        self.assertEqual(contract["total_event_count"], 35)
+        self.assertEqual(projection["maximum_callback_events"], 35)
+        self.assertEqual(contract["failed_owner_window"]["phase"], "exploration")
+        self.assertEqual(contract["failed_owner_window"]["byte_uplift"], 600)
+        self.assertEqual(
+            projection["maximum_journal_bytes"], contract["total_event_bytes"],
+        )
+
+    def test_width_contract_rejects_omitted_callbacks_and_altered_byte_sum(self) -> None:
+        chronology = self.chronology
+        (contract, manifest, plan, request, original, source_pin,
+         plan_pin, source_document) = self._contract_fixture()
+        omitted = copy.deepcopy(contract)
+        del omitted["job_rows"][0]["event_counts"]["source5_app_terminal"]
+        body = {key: value for key, value in omitted.items()
+                if key != "contract_sha256"}
+        omitted["contract_sha256"] = sha(canonical(body))
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "unexpected field set"):
+            chronology._source5_validate_journal_width_contract(
+                omitted, manifest, plan, request, original,
+                source_pin, plan_pin, source_document,
+            )
+        altered = copy.deepcopy(contract)
+        altered["total_event_bytes"] += 1
+        body = {key: value for key, value in altered.items()
+                if key != "contract_sha256"}
+        altered["contract_sha256"] = sha(canonical(body))
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "total/failure-window arithmetic"):
+            chronology._source5_validate_journal_width_contract(
+                altered, manifest, plan, request, original,
+                source_pin, plan_pin, source_document,
+            )
+
+    def test_v4_line_width_counts_escaped_paths_and_u64_envelope(self) -> None:
+        chronology = self.chronology
+        path_value = "/private/" + ("\\\"é" * 700)
+        self.assertLessEqual(len(path_value.encode("utf-8")),
+                             chronology.MAX_PATH_BYTES)
+        original = {"escaped_path": path_value}
+        details = {
+            "phase": "exploration",
+            "analysis": {"path": path_value, "raw_sha256": "a" * 64},
+            "analysis_sha256": "b" * 64, "job_count": 1,
+            "job_set_sha256": "c" * 64,
+            "job_evidence_complete": True,
+            "numeric_gates_passed": False, "phase_gate_passed": False,
+            "campaign_qualification_eligible": False,
+        }
+        record = {
+            "schema": chronology.JOURNAL_SCHEMA, "sequence": 1,
+            "monotonic_ns": chronology.U64_MAX,
+            "campaign_id": "campaign-v4", "host_id": "host-a",
+            "boot_id_sha256": "d" * 64, "original_pins": original,
+            "event": "source5_analysis", "details": details,
+        }
+        unsigned = {"previous_sha256": "0" * 64, "record": record}
+        record_sha = sha(chronology.canonical_bytes(unsigned))
+        line = chronology.canonical_bytes({
+            **unsigned, "record_sha256": record_sha,
+        })
+        projection = {
+            "job_rows": {},
+            "fixed_event_widths": [{
+                "event": "source5_analysis", "phase": "exploration",
+                "count": 1, "maximum_line_bytes": len(line),
+            }],
+        }
+        stats: dict[str, Any] = {}
+        records = list(chronology._iter_journal_records_from_chunks(
+            [line], original, "campaign-v4", "host-a", "d" * 64,
+            stats, expected_byte_count=len(line), maximum_events=1,
+            maximum_bytes=len(line), source5_width_projection=projection,
+        ))
+        self.assertEqual(len(records), 1)
+        too_small = copy.deepcopy(projection)
+        too_small["fixed_event_widths"][0]["maximum_line_bytes"] -= 1
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "exceeds its exact source-derived event width"):
+            list(chronology._iter_journal_records_from_chunks(
+                [line], original, "campaign-v4", "host-a", "d" * 64,
+                {}, expected_byte_count=len(line), maximum_events=1,
+                maximum_bytes=len(line), source5_width_projection=too_small,
+            ))
+
+    def test_v4_failed_owner_window_blocks_successor_authorization(self) -> None:
+        chronology = self.chronology
+        prepared = {
+            "source5_execution_schema": chronology.SOURCE5_EXECUTION_SCHEMA_V4,
+        }
+        state = chronology._empty_journal({"source5": "pins"})
+        state["prepared_capacity_registration"] = {"registered": True}
+        state["registration_head"] = "a" * 64
+        state["source5_failed_owner_window"] = True
+        details = {
+            key: None
+            for key in chronology._source5_authorization_detail_fields(prepared)
+        }
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "a prior Source5 owner failed"):
+            chronology._check_event_semantics(
+                state, "source5_authorized", details, "b" * 64,
+                prepared, replay=True,
+            )
+
+    def test_cleanup_source_shape_recomputes_full_generic_failure_cap(self) -> None:
+        chronology = self.chronology
+        cleanup_shape = {
+            "maximum_session_members_per_snapshot": 262_144,
+            "maximum_pidfd_signal_entries_per_snapshot": 262_144,
+            "maximum_signal_snapshots": 5,
+            "maximum_cleanup_errors": 1_348,
+            "maximum_error_text_bytes": 8_192,
+            "normal_cleanup_poll_count": 404,
+            "emergency_cleanup_poll_count": 104,
+            "term_grace_seconds": 3.0,
+            "kill_reap_seconds": 1.0,
+            "cleanup_poll_interval_seconds": 0.01,
+            "source_maximum_bytes": 393_385_220,
+            "admission_maximum_bytes": 393_385_220,
+            "maximum_window_bytes": 786_770_440,
+            "refusal_file_bytes": 65_536,
+            "maximum_refusal_window_bytes": 131_072,
+        }
+        retention = {
+            "cleanup_source_shape": cleanup_shape,
+            "maximum_cleanup_sidecar_source_bytes": 393_385_220,
+            "maximum_cleanup_sidecar_bytes": 393_385_220,
+            "maximum_failed_cleanup_window_bytes": 786_770_440,
+            "maximum_failed_cleanup_window_inodes": 2,
+            "maximum_cleanup_sidecar_refusal_bytes": 65_536,
+            "maximum_failed_cleanup_refusal_window_bytes": 131_072,
+            "maximum_failed_cleanup_refusal_window_inodes": 2,
+        }
+        budget = {
+            "path_catalogue": {"retention_policy": retention},
+            "owner_contract": {
+                "fixed_pair": {"limits": {"MAX_PROC_ENTRIES": 262_144}},
+                "cleanup_source_shape": {
+                    key: value for key, value in cleanup_shape.items()
+                    if key not in {
+                        "source_maximum_bytes", "admission_maximum_bytes",
+                        "maximum_window_bytes", "refusal_file_bytes",
+                        "maximum_refusal_window_bytes",
+                    }
+                },
+            },
+        }
+        limits = chronology._source5_cleanup_limits_from_budget(budget)
+        self.assertEqual(limits["source_max_bytes"], 393_385_220)
+        self.assertEqual(limits["sidecar_window_bytes"], 786_770_440)
+        changed = copy.deepcopy(budget)
+        changed["path_catalogue"]["retention_policy"][
+            "maximum_cleanup_sidecar_bytes"
+        ] -= 1
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "source/admission/window budgets"):
+            chronology._source5_cleanup_limits_from_budget(changed)
+        nonfinite = copy.deepcopy(budget)
+        nonfinite_shape = nonfinite["path_catalogue"]["retention_policy"][
+            "cleanup_source_shape"
+        ]
+        nonfinite_shape["term_grace_seconds"] = float("inf")
+        nonfinite["owner_contract"]["cleanup_source_shape"][
+            "term_grace_seconds"
+        ] = float("inf")
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "not a finite positive number"):
+            chronology._source5_cleanup_limits_from_budget(nonfinite)
+        member = {
+            "pid": 7, "state": "Z", "parent_pid": 1,
+            "process_group": 1, "session_id": 1, "start_ticks": 9,
+        }
+        cleanup = {
+            "leader_info": None, "child_return_code": None,
+            "timed_out": False, "artifact_budget_exceeded": False,
+            "received_signal": None, "term_grace_seconds": 3.0,
+            "kill_reap_seconds": 1.0,
+            "signals": [{
+                "group_signal": {
+                    "signal": 15, "leader_pid": 1,
+                    "leader_start_ticks": 9, "leader_unreaped": True,
+                },
+                "group_error": None, "pidfd_signals": [],
+                "scan_error": None, "members": [member],
+            }],
+            "leader_unreaped_during_group_signals": True,
+            "group_signal_after_leader_reap_count": 0,
+            "leader_reaped": False, "remaining_session_members": [member],
+            "cleanup_errors": [], "cleanup_status": "failed",
+        }
+        chronology._source5_validate_cleanup_source_shape(cleanup, limits)
+        emergency_minimal = {
+            "cleanup_status": "unverified", "leader_reaped": False,
+            "group_signal_after_leader_reap_count": 0,
+            "cleanup_errors": ["emergency cleanup detail retained"],
+        }
+        chronology._source5_validate_cleanup_source_shape(
+            emergency_minimal, limits,
+        )
+        escaped_state = copy.deepcopy(cleanup)
+        escaped_state["signals"][0]["members"][0]["state"] = "é"
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "process state is malformed"):
+            chronology._source5_validate_cleanup_source_shape(
+                escaped_state, limits,
+            )
+        oversized_error = copy.deepcopy(cleanup)
+        oversized_error["cleanup_errors"] = ["x" * 8_193]
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "cleanup error text/count"):
+            chronology._source5_validate_cleanup_source_shape(
+                oversized_error, limits,
+            )
+
+    def test_host_budget_binds_v4_width_pin_and_keeps_legacy_unbound(self) -> None:
+        chronology = self.chronology
+        legacy_fields = chronology.SOURCE5_HOST_BUDGET_V2_LEGACY_FIELDS
+        legacy_budget = {name: None for name in legacy_fields}
+        legacy_budget["schema"] = "allocatbelt.application-source5-host-evidence-budget.v2"
+        width_pin = {
+            "path": "/private/artifacts/campaign-v4/source5/host-a/"
+                    "prepared-input/journal-width-contract.json",
+            "raw_sha256": "a" * 64,
+            "semantic_sha256": "b" * 64,
+        }
+        v4_manifest = {
+            "schema": chronology.SOURCE5_EXECUTION_SCHEMA_V4,
+            "journal_width_contracts": {"host-a": {
+                "artifact": {"path": width_pin["path"],
+                             "raw_sha256": width_pin["raw_sha256"]},
+                "semantic_sha256": width_pin["semantic_sha256"],
+            }},
+        }
+        v4_budget = {
+            **legacy_budget,
+            "execution_manifest_schema": chronology.SOURCE5_EXECUTION_SCHEMA_V4,
+            "journal_width_contract_pin": copy.deepcopy(width_pin),
+        }
+        chronology._source5_validate_budget_width_binding(
+            v4_budget, v4_manifest, "host-a", width_pin,
+        )
+        changed = copy.deepcopy(v4_budget)
+        changed["journal_width_contract_pin"]["raw_sha256"] = "c" * 64
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "not bound to the exact prepared width contract"):
+            chronology._source5_validate_budget_width_binding(
+                changed, v4_manifest, "host-a", width_pin,
+            )
+        v3_manifest = {"schema": chronology.SOURCE5_EXECUTION_SCHEMA_V3}
+        chronology._source5_validate_budget_width_binding(
+            legacy_budget, v3_manifest, "host-a", None,
+        )
+        self.assertFalse(chronology._source5_host_budget_width_bound(
+            legacy_budget,
+        ))
+        signer_only_v4_manifest = {
+            "schema": chronology.SOURCE5_EXECUTION_SCHEMA_V4,
+        }
+        chronology._source5_validate_budget_width_binding(
+            legacy_budget, signer_only_v4_manifest, "host-a", None,
+        )
+        illegal_legacy_extension = {
+            **legacy_budget,
+            "execution_manifest_schema": chronology.SOURCE5_EXECUTION_SCHEMA_V4,
+            "journal_width_contract_pin": None,
+        }
+        with self.assertRaisesRegex(chronology.ChronologyError,
+                                    "requires its exact execution-v4 manifest"):
+            chronology._source5_validate_budget_width_binding(
+                illegal_legacy_extension, v3_manifest, "host-a", None,
+            )
+
+    def test_width_bound_captured_validation_has_no_origin_fallback(self) -> None:
+        chronology = self.chronology
+        host_id = "host-a"
+        width_pin = {
+            "path": "/private/artifacts/campaign/source5/host-a/"
+                    "prepared-input/journal-width-contract.json",
+            "raw_sha256": "a" * 64, "semantic_sha256": "b" * 64,
+        }
+        legacy = {
+            name: None for name in chronology.SOURCE5_HOST_BUDGET_V2_LEGACY_FIELDS
+        }
+        legacy["schema"] = "allocatbelt.application-source5-host-evidence-budget.v2"
+        budget = {
+            **legacy,
+            "execution_manifest_schema": chronology.SOURCE5_EXECUTION_SCHEMA_V4,
+            "journal_width_contract_pin": width_pin,
+        }
+        manifest = {
+            "schema": chronology.SOURCE5_EXECUTION_SCHEMA_V4,
+            "hosts": [host_id],
+            "journal_width_contracts": {host_id: {
+                "artifact": {
+                    "path": width_pin["path"],
+                    "raw_sha256": width_pin["raw_sha256"],
+                },
+                "semantic_sha256": width_pin["semantic_sha256"],
+            }},
+        }
+        with self.assertRaisesRegex(
+                chronology.ChronologyError,
+                "omits the direct journal_width_contract role"):
+            chronology._source5_captured_host_budget_validation_inputs(
+                budget, manifest, host_id, {}, 8 * 1024 * 1024,
+            )
+        changed_row = {
+            "origin_path": width_pin["path"],
+            "role": "journal_width_contract", "host_id": host_id,
+            "raw_sha256": "c" * 64,
+            "semantic_sha256": width_pin["semantic_sha256"],
+            "byte_count": 1,
+        }
+        with self.assertRaisesRegex(
+                chronology.ChronologyError,
+                "captured width-contract row differs"):
+            chronology._source5_captured_host_budget_validation_inputs(
+                budget, manifest, host_id,
+                {width_pin["path"]: changed_row}, 8 * 1024 * 1024,
+            )
+
+    def test_h8_v4_budget_builder_requires_captured_width_bytes_and_reader(self) -> None:
+        chronology = self.chronology
+        budget_tests = load_script(
+            SCRIPT_DIR / "test-application-source5-evidence-budget.py",
+            "source5_h8_budget_fixture_for_chronology",
+        )
+        budget = budget_tests.budget
+        fixture = budget_tests.fixture()
+        host_id = fixture["host_id"]
+
+        execution = copy.deepcopy(fixture["execution"])
+        execution["schema"] = chronology.SOURCE5_EXECUTION_SCHEMA_V4
+        execution_body = {
+            key: value for key, value in execution.items()
+            if key != "manifest_sha256"
+        }
+        execution["manifest_sha256"] = sha(canonical(execution_body))
+        fixture["execution"] = execution
+        execution_raw = canonical(execution)
+        execution_pin = fixture["pins"]["execution_manifest"]
+        fixture["pins"]["execution_manifest"] = {
+            "path": execution_pin["path"],
+            "raw_sha256": sha(execution_raw),
+            "semantic_sha256": execution["manifest_sha256"],
+        }
+        audit = budget.build_host_evidence_budget_plan(
+            fixture["spec"], fixture["plan"], fixture["sources"],
+            execution, host_id, pins_value=fixture["pins"],
+        )
+        # Keep the producer's established one-job construction fixture. This
+        # exercises the actual H8 v4 builder/validator without asserting that
+        # the original campaign is execution-ready.
+        audit = copy.deepcopy(audit)
+        audit["schedule"]["job_counts"] = {
+            phase: int(phase == "exploration") for phase in budget.PHASES
+        }
+        audit["schedule"]["fixed_job_count"] = 1
+        audit["schedule"]["pressure_job_count"] = 0
+        audit["schedule"]["total_job_count"] = 1
+        audit["schedule"]["maximum_callback_events"] = 13
+        audit["schedule"]["worst_case_journal_bytes"] = \
+            13 * budget.MAX_EVENT_BYTES
+        audit_body = {
+            key: value for key, value in audit.items()
+            if key != "budget_plan_sha256"
+        }
+        audit["budget_plan_sha256"] = sha(canonical(audit_body))
+
+        source_digest = audit["original_pins"]["source_manifests"][host_id][
+            "semantic_sha256"
+        ]
+        typed_rows = {
+            row["path"]: row
+            for row in fixture["sources"][host_id]["source"]["files"]
+        }
+        width_owner_pins = {
+            role: {"path": relative, "raw_sha256": typed_rows[relative]["sha256"],
+                   "byte_count": typed_rows[relative]["size"]}
+            for role, relative in chronology.SOURCE5_WIDTH_OWNER_PATHS.items()
+        }
+        owner_pins = {
+            role: width_owner_pins[role]
+            for role in chronology.SOURCE5_HOST_BUDGET_V2_LEGACY_OWNER_PATHS
+        }
+        source_cleanup = budget._cleanup_source_shape(
+            budget.SOURCE5_CLEANUP_SESSION_MEMBER_LIMIT,
+        )
+        owner_cleanup_fields = {
+            "maximum_session_members_per_snapshot",
+            "maximum_pidfd_signal_entries_per_snapshot",
+            "maximum_signal_snapshots", "maximum_cleanup_errors",
+            "maximum_error_text_bytes", "normal_cleanup_poll_count",
+            "emergency_cleanup_poll_count", "term_grace_seconds",
+            "kill_reap_seconds", "cleanup_poll_interval_seconds",
+        }
+        owner_cleanup = {
+            key: source_cleanup[key] for key in owner_cleanup_fields
+        }
+        owner_contract_body = {
+            "schema": "allocatbelt.application-source5-owner-evidence-catalogue.v1",
+            "source_manifest_sha256": source_digest,
+            "owner_source_pins": owner_pins,
+            "fixed_pair": {}, "pressure_pair": {}, "soak": {},
+            "transport_caps": {
+                "chronology": {"MAX_COMPLETION_BYTES": 16 * 1024 * 1024},
+            },
+            "cleanup_source_shape": owner_cleanup,
+            "role_ceiling_conflicts": {},
+            "exact_full_path_catalogue_complete": True,
+            "execution_ready": False, "qualification_eligible": False,
+        }
+        owner_contract = {
+            **owner_contract_body,
+            "owner_contract_sha256": sha(canonical(owner_contract_body)),
+        }
+
+        job = next(
+            value for value in fixture["plan"]["jobs"]["exploration"]
+            if value["host_id"] == host_id
+        )
+        phase = "exploration"
+        run_id = job["run_id"]
+        ordinal = 1
+        event_counts = {
+            "source5_authorized": 1,
+            "source5_app_started": 2,
+            "source5_app_terminal": 2,
+            "source5_job_terminal": 1,
+        }
+        success_widths = {name: 128 for name in event_counts}
+        failed_widths = dict(success_widths)
+        failed_widths["source5_app_terminal"] += 1
+        success_job_bytes = sum(
+            event_counts[name] * success_widths[name] for name in event_counts
+        )
+        failed_window_bytes = sum(
+            event_counts[name] * failed_widths[name] for name in event_counts
+        )
+        failed_job_row = {
+            "phase": phase, "job_index": 0, "ordinal": ordinal,
+            "run_id": run_id, "job_sha256": sha(canonical(job)),
+            "failed_event_count": sum(event_counts.values()),
+            "failed_event_count_uplift": 0,
+            "failed_window_bytes": failed_window_bytes,
+            "success_job_bytes": success_job_bytes,
+            "byte_uplift": failed_window_bytes - success_job_bytes,
+        }
+        job_row = {
+            "phase": phase, "job_index": 0, "ordinal": ordinal,
+            "run_id": run_id, "job_sha256": sha(canonical(job)),
+            "event_counts": event_counts,
+            "maximum_event_bytes_by_kind": success_widths,
+            "failed_event_counts": dict(event_counts),
+            "failed_event_bytes_by_kind": failed_widths,
+            "success_job_bytes": success_job_bytes,
+            "failed_window_bytes": failed_window_bytes,
+            "failed_event_count": sum(event_counts.values()),
+            "failed_event_count_uplift": 0,
+            "byte_uplift": failed_window_bytes - success_job_bytes,
+        }
+        phase_totals = [{
+            "phase": selected_phase,
+            "job_count": int(selected_phase == phase),
+            "event_count": sum(event_counts.values()) if selected_phase == phase else 0,
+            "success_event_bytes": success_job_bytes if selected_phase == phase else 0,
+        } for selected_phase in budget.PHASES]
+        fixed_widths = [{
+            "event": "source5_prepared_capacity_registered",
+            "phase": "registration", "count": 1,
+            "maximum_line_bytes": 128,
+        }] + [{
+            "event": "source5_analysis", "phase": selected_phase,
+            "count": 1, "maximum_line_bytes": 128,
+        } for selected_phase in (
+            "exploration", "aa", "fixed_analysis", "pressure_analysis",
+            "soak", "final_analysis",
+        )]
+        width_pin_path = (
+            "/private/artifacts/campaign-a/source5/host-a/prepared-input/"
+            "journal-width-contract.json"
+        )
+        width_contract_body = {
+            "schema": budget.JOURNAL_WIDTH_CONTRACT_SCHEMA,
+            "campaign_id": audit["campaign_id"], "host_id": host_id,
+            "original_pins_sha256": sha(canonical(audit["original_pins"])),
+            "plan_pin": audit["original_pins"]["plan"],
+            "source_manifest_pin": audit["original_pins"]["source_manifests"][host_id],
+            "owner_pins": width_owner_pins,
+            "job_rows": [job_row], "phase_totals": phase_totals,
+            "fixed_event_widths": fixed_widths,
+            "total_event_count": 13,
+            "total_event_bytes": 7 * 128 + success_job_bytes +
+                failed_job_row["byte_uplift"],
+            "failed_owner_window": failed_job_row,
+        }
+        width_contract = {
+            **width_contract_body,
+            "contract_sha256": sha(canonical(width_contract_body)),
+        }
+        width_raw = canonical(width_contract)
+        width_pin = {
+            "path": width_pin_path, "raw_sha256": sha(width_raw),
+            "semantic_sha256": width_contract["contract_sha256"],
+        }
+
+        row_helper = budget_tests.Source5PathCatalogueTests.row
+        job_digest = sha(canonical(job))
+        core_rows = [
+            row_helper(
+                f"/private/artifacts/{phase}/{run_id}/application-output.json",
+                maximum=1024,
+            ),
+            row_helper(
+                f"/private/artifacts/campaign-a/source5/{host_id}/job-records/{run_id}.json",
+                role="source5_job_record", maximum=128 * 1024,
+            ),
+        ]
+        for row in core_rows:
+            row["phase"] = phase
+            row["run_id"] = run_id
+            row["storage_root"] = "/private/artifacts"
+        cleanup_cap = budget._cleanup_sidecar_source_bound(
+            budget.SOURCE5_CLEANUP_SESSION_MEMBER_LIMIT,
+        )
+        for member_index in (0, 1):
+            cleanup_stem = (
+                f"/private/output/{phase}/cleanup-sidecars/"
+                f"{ordinal:06d}-{job_digest}-member{member_index}.json"
+            )
+            for role, path, maximum in (
+                (budget.SOURCE5_CLEANUP_SIDECAR_ROLE, cleanup_stem,
+                 cleanup_cap),
+                (budget.SOURCE5_CLEANUP_SIDECAR_REFUSAL_ROLE,
+                 cleanup_stem + ".refusal.json",
+                 budget.SOURCE5_CLEANUP_REFUSAL_BYTES),
+            ):
+                row = row_helper(path, role=role, maximum=maximum)
+                row.update({
+                    "phase": phase, "run_id": run_id,
+                    "member_index": member_index,
+                    "storage_root": "/private/output",
+                })
+                core_rows.append(row)
+        archive_caps = budget.project_archive_job_caps(core_rows)[
+            (phase, run_id)
+        ]
+        transport_rows = []
+        for role, field, root in (
+            ("source5_checkpoint_request", "checkpoint_request_bytes", "/private/output"),
+            ("source5_transfer_offer", "transfer_offer_bytes", "/private/output"),
+            ("source5_transfer_packet", "transfer_packet_bytes", "/private/scratch"),
+            ("source5_ack_bundle", "ack_bundle_bytes", "/private/output"),
+            ("source5_ack_bundle_incoming", "ack_bundle_bytes", "/private/output"),
+            ("source5_checkpoint", "checkpoint_bytes", "/private/output"),
+            ("source5_object_manifest", "object_manifest_bytes", "/private/output"),
+            ("source5_archive_ack", "archive_ack_bytes", "/private/output"),
+            ("source5_archive_signature", "signature_bytes", "/private/output"),
+            ("source5_stage_map", "stage_map_bytes", "/private/output"),
+        ):
+            row = row_helper(
+                f"{root}/evidence/{phase}/{run_id}/{role}.bin",
+                role=role, maximum=archive_caps[field],
+            )
+            row.update({"phase": phase, "run_id": run_id,
+                        "storage_root": root})
+            transport_rows.append(row)
+        width_row = row_helper(
+            width_pin_path, role="journal_width_contract",
+            maximum=len(width_raw),
+        )
+        width_row.update({
+            "owner": "source5_controller", "phase": None, "run_id": None,
+            "storage_root": "/private/artifacts",
+            "origin_pin": {
+                "raw_sha256": width_pin["raw_sha256"],
+                "semantic_sha256": width_pin["semantic_sha256"],
+            },
+        })
+
+        readback_rows = []
+        for role, name, maximum, kind, file_maximum, inodes in (
+            ("source5_archive_read_request_slot", "request.json", 11, "file", 11, 1),
+            ("source5_archive_read_response_slot", "response.json", 13, "file", 13, 1),
+            ("source5_archive_read_response_incoming", "response.json.incoming", 13, "file", 13, 1),
+            ("source5_archive_read_bundle", "response.tar", 17, "file", 17, 1),
+            ("source5_archive_read_bundle_incoming", "response.tar.incoming", 17, "file", 17, 1),
+            ("source5_archive_read_stage", "stage", 100, "tree", 80, 4),
+            (budget.SOURCE5_ANALYZER_SPOOL_ROLE, "analyzer-spool", 101, "tree", 77, 3),
+        ):
+            row = row_helper(
+                f"/private/scratch/archive-readback/{name}", role=role,
+                maximum=maximum, kind=kind, file_maximum=file_maximum, inodes=inodes,
+            )
+            row.update({"phase": None, "run_id": None, "member_index": None,
+                        "aggregate_id": None, "owner": "source5_controller",
+                        "storage_root": "/private/scratch"})
+            readback_rows.append(row)
+        control = row_helper(
+            "/private/output/archive-read-control.jsonl",
+            role=budget.SOURCE5_ARCHIVE_READ_CONTROL_ROLE, maximum=23,
+        )
+        control.update({"phase": None, "run_id": None, "member_index": None,
+                        "aggregate_id": None, "owner": "source5_controller",
+                        "storage_root": "/private/output"})
+        readback_rows.append(control)
+
+        roots = [
+            {"path": "/private/artifacts", "role": "artifact",
+             "reserved_bytes": budget.MAX_U64,
+             "reserved_inodes": budget.MAX_U64, "filesystem_id": "1"},
+            {"path": "/private/output", "role": "output",
+             "reserved_bytes": budget.MAX_U64,
+             "reserved_inodes": budget.MAX_U64, "filesystem_id": "2"},
+            {"path": "/private/scratch", "role": "scratch",
+             "reserved_bytes": budget.MAX_U64,
+             "reserved_inodes": budget.MAX_U64, "filesystem_id": "3"},
+            {"path": "/private/store", "role": "evidence_store",
+             "reserved_bytes": budget.MAX_U64,
+             "reserved_inodes": budget.MAX_U64, "filesystem_id": "4"},
+        ]
+        with tempfile.TemporaryDirectory(
+                prefix="source5-chronology-h8-v4-budget-") as temporary:
+            root = Path(temporary)
+            catalogue_directory = root / "catalogue"
+            catalogue_directory.mkdir(mode=0o700)
+            catalogue = budget.write_path_catalogue_chunks(
+                [*core_rows, *transport_rows, width_row, *readback_rows], catalogue_directory,
+            )
+            reservation = budget.build_storage_reservation_value(
+                audit["campaign_id"], host_id, roots,
+            )
+            reservation_raw = canonical(reservation)
+            reservation_pin = {
+                "path": "/private/reservation.json",
+                "raw_sha256": sha(reservation_raw),
+                "semantic_sha256": reservation["reservation_sha256"],
+                "byte_count": len(reservation_raw),
+            }
+            built = budget.build_host_evidence_budget_v2(
+                audit, owner_contract, catalogue, reservation,
+                reservation_pin,
+                journal_width_contract_value=width_contract,
+                journal_width_contract_pin_value=width_pin,
+                journal_width_contract_raw=width_raw,
+            )
+            chunk_bytes = {
+                item["path"]: Path(item["path"]).read_bytes()
+                for item in catalogue["chunks"]
+            }
+            descriptor_by_path = {
+                item["path"]: item for item in catalogue["chunks"]
+            }
+
+            def read_catalogue_chunk(path: str, byte_count: int) -> bytes:
+                descriptor = descriptor_by_path.get(path)
+                self.assertIsNotNone(descriptor)
+                self.assertEqual(descriptor["byte_count"], byte_count)
+                return chunk_bytes[path]
+
+            validated = budget.validate_host_evidence_budget_v2(
+                built, journal_width_contract_raw=width_raw,
+                catalogue_row_reader=read_catalogue_chunk,
+            )
+            self.assertEqual(built, validated)
+            self.assertEqual(set(built), chronology.SOURCE5_HOST_BUDGET_V2_WIDTH_FIELDS)
+            self.assertEqual(built["execution_manifest_schema"],
+                             chronology.SOURCE5_EXECUTION_SCHEMA_V4)
+            self.assertEqual(built["journal_width_contract_pin"], width_pin)
+            self.assertEqual(
+                set(built["owner_contract"]["owner_source_pins"]),
+                set(chronology.SOURCE5_HOST_BUDGET_V2_LEGACY_OWNER_PATHS),
+            )
+            self.assertEqual(built["schedule"]["maximum_callback_event_bytes"], 129)
+            self.assertEqual(built["schedule"]["worst_case_journal_bytes"],
+                             width_contract["total_event_bytes"])
+            self.assertEqual(built["readiness"], {
+                "budget_complete": False, "execution_ready": False,
+                "component_gate_ready": False, "qualification_eligible": False,
+            })
+            self.assertEqual(built["execution_blockers"], [
+                "verified_between_pair_archive_ack_reclaim_not_integrated",
+            ])
+
+            manifest = {
+                "schema": chronology.SOURCE5_EXECUTION_SCHEMA_V4,
+                "journal_width_contracts": {host_id: {
+                    "artifact": {
+                        "path": width_pin["path"],
+                        "raw_sha256": width_pin["raw_sha256"],
+                    },
+                    "semantic_sha256": width_pin["semantic_sha256"],
+                }},
+            }
+            chronology._source5_validate_budget_width_binding(
+                built, manifest, host_id, width_pin,
+            )
+            with self.assertRaisesRegex(
+                    budget.BudgetPlanError,
+                    "captured bytes are not bounded"):
+                budget.validate_host_evidence_budget_v2(
+                    built, journal_width_contract_raw=None,
+                    catalogue_row_reader=read_catalogue_chunk,
+                )
+            with self.assertRaisesRegex(budget.BudgetPlanError,
+                                        "raw pin differs"):
+                budget.validate_host_evidence_budget_v2(
+                    built, journal_width_contract_raw=width_raw + b" ",
+                    catalogue_row_reader=read_catalogue_chunk,
+                )
+
+    def test_failed_cleanup_record_uses_compact_summary_and_separate_pin(self) -> None:
+        chronology = self.chronology
+        cleanup = {
+            "cleanup_status": "failed", "leader_reaped": False,
+            "group_signal_after_leader_reap_count": 1,
+            "cleanup_errors": ["synthetic owner cleanup error"],
+        }
+        raw = chronology.canonical_bytes(cleanup)
+        summary, pin = chronology._source5_cleanup_sidecar_reference(
+            cleanup, Path("/private/out/member-cleanup.json"), sha(raw), len(raw),
+        )
+        self.assertEqual(summary["cleanup_sha256"], sha(raw))
+        self.assertEqual(pin["raw_sha256"], sha(raw))
+        self.assertEqual(pin["byte_count"], len(raw))
+        self.assertNotIn("sidecar", summary)
+        self.assertNotIn("cleanup_errors", summary)
+        self.assertLess(len(canonical(summary)), 2_048)
+        refusal, refusal_pin = chronology._source5_cleanup_refusal_reference(
+            cleanup, Path("/private/out/member-cleanup.json.refusal.json"),
+            canonical({"schema": "refusal"}), sha(raw), len(raw), len(raw) - 1,
+            "cleanup_raw_bytes_exceeded",
+        )
+        self.assertFalse(refusal["raw_cleanup_retained"])
+        self.assertFalse(refusal["cleanup_verified"])
+        self.assertEqual(refusal["disposition"], "refused_over_quota")
+        self.assertEqual(refusal_pin["byte_count"], len(canonical({"schema": "refusal"})))
+
+
+class Source5CapturedLegacyBudgetApiTests(unittest.TestCase):
+    def test_legacy_captured_validator_keeps_its_positional_only_contract(self):
+        chronology = load_script(
+            SCRIPT_DIR / "application-campaign-chronology.py",
+            "source5_legacy_positional_budget_api_test",
+        )
+        value = {key: None for key in chronology.SOURCE5_HOST_BUDGET_V2_LEGACY_FIELDS}
+        value["schema"] = "allocatbelt.application-source5-host-evidence-budget.v2"
+        called = []
+        class CapturedLegacyValidator:
+            @staticmethod
+            def validate_host_evidence_budget_v2(argument):
+                called.append(argument)
+                return argument
+        def forbidden_origin_read(*_args):
+            raise AssertionError("legacy schema dispatch opened an origin")
+        result = chronology._source5_validate_budget_with_captured_inputs(
+            CapturedLegacyValidator, value, None, forbidden_origin_read,
+        )
+        self.assertIs(result, value)
+        self.assertEqual(called, [value])
+
+
+class Source5FixedCapturedReplayTests(unittest.TestCase):
+    """Caller wiring with real0400 IO/archive validators; numeric owner mocked."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.chronology = load_script(SCRIPT_DIR / "application-campaign-chronology.py", "captured_fixed_chronology_target")
+        cls.archive = load_script(SCRIPT_DIR / "application-source5-evidence-archive.py", "captured_fixed_archive_fixture")
+
+    @staticmethod
+    def _seal(body, field):
+        return {**body, field: sha(canonical({key: value for key, value in body.items() if key != field}))}
+
+    def _seal_view(self, case):
+        record = self._seal(case["record"], "record_sha256")
+        case["record"] = record
+        record_raw = canonical(record)
+        write_file(case["record_path"], record_raw, 0o600)
+        record_pin = {"path": str(case["record_path"]), "raw_sha256": sha(record_raw)}
+        case["record_pin"] = record_pin
+        chronology = record["chronology"]
+        authorization = {"authorization_id": chronology["authorization_id"],
+                         "authorization_head": chronology["authorization_head"],
+                         "terminal_head": chronology["job_terminal_head"],
+                         "component_sha256": chronology["component_sha256"],
+                         "process_metrics_sha256": chronology["process_metrics_sha256"]}
+        request = self._seal({"schema": self.archive.REQUEST_SCHEMA_V1,
+            "context": case["archive_context"], "job_record_pin": record_pin,
+            "authorization": authorization, "predecessor_ack_pin": None,
+            "owner_receipt_pins": {row["role"]: {
+                "path": row["origin_path"], "raw_sha256": row["raw_sha256"],
+                "semantic_sha256": row["semantic_sha256"]}
+                for row in sorted(case["entries"], key=lambda row: row["role"]) if "receipt" in row["role"]},
+            "empty_tmp_proofs": [], "entries": case["entries"]}, "request_sha256")
+        request_raw = canonical(request)
+        request_pin = {"path": "/absent-private-root/request.json", "raw_sha256": sha(request_raw),
+                       "semantic_sha256": request["request_sha256"]}
+        job = record["job"]
+        objects = []
+        for row in case["entries"]:
+            identity = self.archive._object_identity(row["origin_path"], row["raw_sha256"])
+            objects.append({**row, "object_id": identity,
+                "object_pin": {"path": "/absent-private-root/source5/objects/" + identity,
+                               "raw_sha256": row["raw_sha256"], "semantic_sha256": row["raw_sha256"],
+                               "byte_count": row["byte_count"]}})
+        manifest = self._seal({"schema": self.archive.OBJECT_MANIFEST_SCHEMA_V1,
+            "campaign_id": "captured-fixture", "host_id": "host-1", "phase": job["phase"],
+            "job_index": 0, "job_ordinal": job["ordinal"], "job_sha256": sha(canonical(job)),
+            "run_id": job["run_id"], "job_record_raw_sha256": sha(record_raw),
+            "predecessor_ack_pin": None, "objects": objects, "object_count": len(objects),
+            "payload_bytes": sum(row["byte_count"] for row in objects)}, "manifest_sha256")
+        manifest_raw = canonical(manifest)
+        manifest_pin = {"path": "/absent-private-root/manifest.json", "raw_sha256": sha(manifest_raw),
+                        "semantic_sha256": manifest["manifest_sha256"]}
+        checkpoint = self._seal({"schema": self.archive.CHECKPOINT_SCHEMA_V1,
+            "request_pin": request_pin, "context": case["archive_context"], "job_record_pin": record_pin,
+            "authorization": authorization, "predecessor_ack_pin": None,
+            "owner_receipt_pins": request["owner_receipt_pins"], "empty_tmp_proofs": [],
+            "object_manifest_pin": manifest_pin, "entries": case["entries"]}, "checkpoint_sha256")
+        checkpoint_raw = canonical(checkpoint)
+        view = case.get("view", {})
+        view.update({"schema": "allocatbelt.application-source5-archived-job-read-view.v1",
+            "campaign_id": "captured-fixture", "host_id": "host-1", "phase": job["phase"],
+            "job_index": 0, "ordinal": job["ordinal"], "run_id": job["run_id"], "job_sha256": sha(canonical(job)),
+            "checkpoint_pin": {"path": "/absent-private-root/checkpoint.json", "raw_sha256": sha(checkpoint_raw),
+                               "semantic_sha256": checkpoint["checkpoint_sha256"]}, "checkpoint_raw": checkpoint_raw,
+            "manifest_pin": manifest_pin, "manifest_raw": manifest_raw,
+            "archive_ack_pin": {"path": "/absent-private-root/ack.json", "raw_sha256": "a" * 64, "semantic_sha256": "b" * 64},
+            "signature_pin": {"path": "/absent-private-root/ack.sig", "raw_sha256": "c" * 64, "signer_fingerprint": "A" * 40},
+            "archive_request_pin": request_pin, "archive_request_raw": request_raw,
+            "fixed_host_receipt_pin": case["host_pin"], "owner_host_receipt_pin": case["host_pin"],
+            "readback_request_pin": {"path": str(case["root"] / "read-request"), "raw_sha256": "d" * 64, "semantic_sha256": "e" * 64},
+            "readback_response_pin": {"path": str(case["root"] / "read-response"), "raw_sha256": "f" * 64, "semantic_sha256": "0" * 64, "byte_count": 100},
+            "readback_bundle_pin": {"path": str(case["root"] / "read-body"), "raw_sha256": "1" * 64, "byte_count": 10240},
+            "stage_root": str(case["stage"]), "objects": case["refs"],
+            "qualification_eligible": False, "may_reclaim": False})
+        case["view"] = view
+
+    @contextmanager
+    def _case(self):
+        chronology = self.chronology
+        with tempfile.TemporaryDirectory(prefix="chrono-captured-fixed-") as temporary:
+            root = Path(temporary).resolve()
+            pair, stage = root / "pair", root / "stage"
+            pair.mkdir(mode=0o700)
+            stage.mkdir(mode=0o700)
+            job = {"host_id": "host-1", "phase": "confirmation", "ordinal": 1, "run_id": "captured-fixed-job"}
+            metrics = [{"member": 0}, {"member": 1}]
+            source_pin = {"path": str(root / "source.json"), "raw_sha256": "2" * 64, "semantic_sha256": "3" * 64}
+            execution_pin = {"path": str(root / "execution.json"), "raw_sha256": "4" * 64}
+            plan_pin = {"path": str(root / "plan.json"), "raw_sha256": "5" * 64, "semantic_sha256": "6" * 64}
+            budget_pin = {"path": str(root / "budget.json"), "raw_sha256": "7" * 64, "semantic_sha256": "8" * 64}
+            manifest = {"schema": chronology.SOURCE5_EXECUTION_SCHEMA_V4, "manifest_sha256": "9" * 64}
+            overlay = {"output_root": str(pair), "runtime_bindings": {"pin": {"path": str(pair / "runtime.json"), "sha256": sha(b"runtime")}},
+                       "sources": {"manifests": {"host-1": {"pin": {"path": source_pin["path"], "sha256": source_pin["raw_sha256"]}, "manifest_sha256": source_pin["semantic_sha256"]}},
+                                   "selected": {"source_tree_sha256": "a" * 64}}}
+            overlay_raw = canonical(overlay)
+            overlay_pin = {"path": str(pair / "fixed-pair-execution-overlay.json"), "sha256": sha(overlay_raw)}
+            helper = {"payload": {"overlay_pin": overlay_pin}}
+            helper_raw = canonical(helper)
+            helper_pin = {"path": str(root / "reclaimed-helper.json"), "raw_sha256": sha(helper_raw)}
+            receipt = self._seal({"process_metrics": metrics, "process_validation_errors": [None, None],
+                       "inputs_unchanged": True, "processes_sha256": sha(b"processes")}, "receipt_sha256")
+            receipt_raw = canonical(receipt)
+            receipt_pin = {"path": str(pair / "fixed-pair-execution-receipt.json"), "raw_sha256": sha(receipt_raw)}
+            host_body = self._seal({"fixture": "mocked numeric owner; no host attestation claim"}, "receipt_sha256")
+            host_raw = canonical(host_body)
+            host_pin = {"path": str(root / "fixed-host-receipt.json"), "raw_sha256": sha(host_raw), "host_verification_sha256": host_body["receipt_sha256"]}
+            fixed_path = SCRIPT_DIR / "application-fixed-pair.py"
+            fixed_raw = fixed_path.read_bytes()
+            fixed_sha = sha(fixed_raw)
+            files = []
+            for relative in ("scripts/application-fixed-pair.py", "scripts/application-source5-evidence-archive.py"):
+                path = SOURCE_ROOT / relative
+                raw = path.read_bytes()
+                files.append({"path": relative, "kind": "file", "mode": format(path.stat().st_mode, "o"), "sha256": sha(raw), "size": len(raw)})
+            prepared = {"campaign_id": "captured-fixture", "host_id": "host-1", "source_root": SOURCE_ROOT,
+                        "source": {"source": {"files": files}}, "source5_execution_schema": chronology.SOURCE5_EXECUTION_SCHEMA_V4,
+                        "source5_execution_manifest_pin": execution_pin, "plan": {"jobs": {"confirmation": [job]}},
+                        "original_pins": {"plan": plan_pin, "source_manifests": [{"host_id": "host-1", **source_pin}]}}
+            verification = {"schema": "allocatbelt.application-fixed-pair-execution-receipt.v1", "verified": True,
+                            "status": "valid_pair", "qualification_eligible": False, "receipt_sha256": receipt_pin["raw_sha256"],
+                            "overlay_sha256": overlay_pin["sha256"], "run_id": job["run_id"]}
+            component = {"schema": "allocatbelt.application-source5-fixed-component.v1",
+                         "overlay": {"path": overlay_pin["path"], "raw_sha256": overlay_pin["sha256"]},
+                         "receipt": receipt_pin, "verification": verification}
+            starts = [{"event_head": str(index + 1) * 64, "proof": {"fixture_start": index},
+                       "descriptor": {"pair": f"member-{index}"}, "pid": index + 100, "start_ticks": index + 1000}
+                      for index in range(2)]
+            terminals = [{"event_head": str(index + 3) * 64, "cleanup": {"fixture_cleanup": index}} for index in range(2)]
+            chain = {"authorization_id": "fixture-authorization", "authorization_head": "5" * 64,
+                     "app_started_heads": [item["event_head"] for item in starts], "app_terminal_heads": [item["event_head"] for item in terminals],
+                     "job_terminal_head": "6" * 64, "component_sha256": sha(canonical(component)), "process_metrics_sha256": sha(canonical(metrics)),
+                     "app_start_events": [item["proof"] for item in starts], "app_terminal_events": [{"cleanup": item["cleanup"]} for item in terminals],
+                     "member_processes": [{"descriptor": item["descriptor"], "pid": item["pid"], "start_ticks": item["start_ticks"], "member_index": index}
+                                          for index, item in enumerate(starts)]}
+            auth = {"job": job, "helper_input": helper_pin, "execution_manifest": execution_pin,
+                    "helper_module": {"path": "scripts/application-fixed-pair.py", "sha256": fixed_sha}, "host_evidence_budget": budget_pin}
+            evidence = {"kind": "source5_fixed_pair", "overlay": component["overlay"], "receipt": receipt_pin,
+                        "processes": {"path": str(pair / "processes.tsv"), "raw_sha256": receipt["processes_sha256"]},
+                        "runtime_bindings": {"path": str(pair / "runtime.json"), "raw_sha256": sha(b"runtime")},
+                        "source_snapshot": {"artifact": {"path": source_pin["path"], "raw_sha256": source_pin["raw_sha256"]},
+                                            "semantic_sha256": source_pin["semantic_sha256"], "source_tree_sha256": "a" * 64},
+                        "execution_manifest": execution_pin, "helper_input": helper_pin, "helper_module": auth["helper_module"], "host_receipt": host_pin}
+            record = {"schema": chronology.SOURCE5_JOB_RECORD_SCHEMA, "state": "valid_pair", "job": job,
+                      "pair_directory": str(pair), "process_metrics": metrics, "evidence": evidence,
+                      "chronology": chain, "qualification_eligible": False}
+            finished = {"state": "valid_pair", "authorization_id": chain["authorization_id"], "details": auth,
+                        "authorization_head": chain["authorization_head"], "terminal": {"component_sha256": chain["component_sha256"], "process_metrics_sha256": chain["process_metrics_sha256"]},
+                        "record_sha256": chain["job_terminal_head"], "starts": starts, "terminals": terminals}
+            payloads = [(helper_pin["path"], helper_raw, "source5_helper_input", None),
+                        (overlay_pin["path"], overlay_raw, "fixed_pair_overlay", None),
+                        (receipt_pin["path"], receipt_raw, "component_receipt", receipt["receipt_sha256"]),
+                        (host_pin["path"], host_raw, "fixed_pair_host_receipt", host_pin["host_verification_sha256"]),
+                        (str(pair / "processes.tsv"), b"processes", "process_ledger", None),
+                        (str(pair / "runtime.json"), b"runtime", "runtime_binding", None)]
+            refs, entries = {}, []
+            for index, (origin, raw, role, semantic) in enumerate(sorted(payloads)):
+                local = stage / f"{index:06d}"
+                write_file(local, raw, 0o400)
+                refs[origin] = {"origin_path": origin, "path": str(local), "role": role, "host_id": "host-1",
+                                "raw_sha256": sha(raw), "semantic_sha256": semantic, "byte_count": len(raw), "maximum_bytes": len(raw)}
+                entries.append({"origin_path": origin, "role": role, "raw_sha256": sha(raw), "semantic_sha256": semantic, "byte_count": len(raw)})
+            record_directory = root / "job-records"
+            record_directory.mkdir(mode=0o700)
+            case = {"root": root, "stage": stage, "job": job, "record": record, "record_path": record_directory / f"{job['run_id']}.json",
+                    "prepared": prepared, "manifest": manifest, "state": {"source5_finished": {("confirmation", job["run_id"]): finished}},
+                    "auth": auth, "refs": refs, "entries": entries, "host_pin": host_pin, "helper_pin": helper_pin,
+                    "receipt": receipt, "overlay": overlay, "verification": verification, "calls": [], "payloads": payloads,
+                    "archive_context": {"schema": self.archive.CONTEXT_SCHEMA_V1, "campaign_id": "captured-fixture", "host_id": "host-1",
+                        "phase": "confirmation", "job_index": 0, "source_manifest_pin": source_pin,
+                        "execution_manifest_pin": {**execution_pin, "semantic_sha256": manifest["manifest_sha256"]},
+                        "plan_pin": plan_pin, "resource_budget_pin": budget_pin, "predecessor_ack_pin": None, "authorized_signer_fingerprint": "A" * 40}}
+            self._seal_view(case)
+            yield case
+
+    def _run(self, case, *, fixed_api=True, captured=True):
+        chronology = self.chronology
+        real_loader = chronology._load_module
+        def load(raw, path, label):
+            module = real_loader(raw, path, label)
+            if label == "source5_fixed_predecessor_verifier":
+                def owner(*arguments):
+                    case["calls"].append(("captured", arguments))
+                    return {"schema": module.CAPTURED_REPLAY_CONTEXT_SCHEMA_V1, "verification": copy.deepcopy(case["verification"]),
+                            "overlay": copy.deepcopy(case["overlay"]), "execution_receipt": copy.deepcopy(case["receipt"]),
+                            "host_verification_pin": copy.deepcopy(case["host_pin"]), "full_replay_verified": True, "qualification_eligible": False}
+                def live(*arguments):
+                    if captured:
+                        raise AssertionError("captured replay called live verifier")
+                    case["calls"].append(("live", arguments))
+                    return copy.deepcopy(case["verification"])
+                def read(*arguments):
+                    if captured:
+                        raise AssertionError("captured replay reread live overlay")
+                    case["calls"].append(("read", arguments))
+                    return case["overlay"], b"", "", {}, {}
+                module.verify_fixed_pair_overlay_captured_v1 = owner
+                module.verify_fixed_pair_overlay = live
+                module._read_overlay = read
+            return module
+        with patch.object(chronology, "_lock_token_is_live", return_value=True), \
+                patch.object(chronology, "_prepare_source5_context", return_value=(case["manifest"], case["prepared"], case["state"], {})), \
+                patch.object(chronology, "_load_module", side_effect=load):
+            options = {"captured_evidence": case["view"]} if captured else {}
+            if fixed_api:
+                return chronology.verify_source5_completed_fixed_phase_locked(object(), {}, case["record_pin"], **options)
+            return chronology.verify_source5_completed_job_locked(object(), {}, None, case["record_pin"], **options)
+
+    def test_both_fixed_public_apis_use_captures_and_keep_original_component(self):
+        with self._case() as case:
+            for fixed_api in (True, False):
+                result = self._run(case, fixed_api=fixed_api)
+                self.assertEqual(result["record"]["raw_sha256"], case["record_pin"]["raw_sha256"])
+                self.assertEqual(result["process_metrics"], case["record"]["process_metrics"])
+            self.assertEqual([item[0] for item in case["calls"]], ["captured", "captured"])
+            self.assertTrue(all(not Path(origin).exists() for origin in case["refs"]))
+
+    def test_wrong_job_view_is_rejected_before_owner_replay(self):
+        with self._case() as case:
+            case["view"]["ordinal"] += 1
+            with self.assertRaisesRegex(self.chronology.ChronologyError, "different original job"):
+                self._run(case)
+            self.assertEqual(case["calls"], [])
+
+    def test_wrong_raw_manifest_pin_is_rejected_before_owner_replay(self):
+        with self._case() as case:
+            case["view"]["manifest_raw"] += b" "
+            with self.assertRaisesRegex(self.chronology.ChronologyError, "object manifest raw bytes differ"):
+                self._run(case)
+            self.assertEqual(case["calls"], [])
+
+    def test_wrong_reference_raw_pin_is_rejected_against_manifest(self):
+        with self._case() as case:
+            case["view"]["objects"][case["helper_pin"]["path"]]["raw_sha256"] = "0" * 64
+            with self.assertRaisesRegex(self.chronology.ChronologyError, "reference differs from its exact manifest row"):
+                self._run(case)
+            self.assertEqual(case["calls"], [])
+
+    def test_missing_archived_helper_never_falls_back_to_existing_origin(self):
+        with self._case() as case:
+            origin = case["helper_pin"]["path"]
+            raw = Path(case["refs"][origin]["path"]).read_bytes()
+            write_file(Path(origin), raw, 0o600)
+            del case["refs"][origin]
+            with self.assertRaisesRegex(self.chronology.ChronologyError, "refs do not close"):
+                self._run(case)
+            self.assertEqual(case["calls"], [])
+
+    def test_physical_helper_corruption_is_not_replaced_with_origin_bytes(self):
+        with self._case() as case:
+            origin = case["helper_pin"]["path"]
+            local = Path(case["refs"][origin]["path"])
+            original = local.read_bytes()
+            write_file(Path(origin), original, 0o600)
+            local.chmod(0o600)
+            local.write_bytes(b"!" * len(original))
+            local.chmod(0o400)
+            with self.assertRaisesRegex(self.chronology.ChronologyError, "capture is invalid.*raw bytes differ"):
+                self._run(case)
+            self.assertEqual(case["calls"], [])
+
+    def test_v4_rejects_historical_fixed_evidence_without_host_receipt(self):
+        with self._case() as case:
+            del case["record"]["evidence"]["host_receipt"]
+            self._seal_view(case)
+            with self.assertRaisesRegex(self.chronology.ChronologyError, "unexpected field set"):
+                self._run(case)
+            self.assertEqual(case["calls"], [])
+
+    def test_repinned_component_drift_reaches_original_component_digest_guard(self):
+        with self._case() as case:
+            changed = "0" * 64
+            case["record"]["chronology"]["component_sha256"] = changed
+            case["state"]["source5_finished"][("confirmation", case["job"]["run_id"])]["terminal"]["component_sha256"] = changed
+            self._seal_view(case)
+            with self.assertRaisesRegex(self.chronology.ChronologyError, "fixed component digest differs"):
+                self._run(case)
+            self.assertEqual([item[0] for item in case["calls"]], ["captured"])
+
+    def test_captured_legacy_generation_is_explicitly_unsupported(self):
+        with self._case() as case:
+            case["prepared"]["source5_execution_schema"] = self.chronology.SOURCE5_EXECUTION_SCHEMA_V3
+            with self.assertRaisesRegex(self.chronology.ChronologyError, "v4 fixed jobs only"):
+                self._run(case)
+            self.assertEqual(case["calls"], [])
+
+    def test_captured_pressure_job_remains_explicitly_unsupported(self):
+        with self._case() as case:
+            case["record"]["job"]["phase"] = "pressure"
+            self._seal_view(case)
+            with self.assertRaisesRegex(self.chronology.ChronologyError, "v4 fixed jobs only"):
+                self._run(case, fixed_api=False)
+            self.assertEqual(case["calls"], [])
+
+    def test_capture_metadata_cannot_enter_original_verification_projection(self):
+        with self._case() as case:
+            case["verification"]["host_verification_sha256"] = "0" * 64
+            with self.assertRaisesRegex(self.chronology.ChronologyError, "original fixed component verification projection.*unexpected field set"):
+                self._run(case)
+            self.assertEqual([item[0] for item in case["calls"]], ["captured"])
+
+    def test_legacy_default_keeps_live_reader_and_historical_evidence_shape(self):
+        with self._case() as case:
+            case["prepared"]["source5_execution_schema"] = self.chronology.SOURCE5_EXECUTION_SCHEMA_V3
+            del case["record"]["evidence"]["host_receipt"]
+            self._seal_view(case)
+            for origin, raw, _role, _semantic in case["payloads"]:
+                write_file(Path(origin), raw, 0o600)
+            self._run(case, captured=False)
+            self.assertEqual([item[0] for item in case["calls"]], ["live", "read"])
+
+
+class Source5V3CatalogueRoleTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.chronology = load_script(
+            SCRIPT_DIR / "application-campaign-chronology.py",
+            "source5_v3_catalogue_role_chronology",
+        )
+        cls.transport = load_script(
+            SCRIPT_DIR / "application-source5-evidence-transport-v3.py",
+            "source5_v3_catalogue_role_transport",
+        )
+
+    def _fixture(
+        self, root: Path, *, extra_role: str = "source5_checkpoint_request",
+        extra_raw: bytes = b"durable archive metadata\n",
+        extra_maximum: int | None = None,
+    ):
+        source_fixture = Source5JournalInputValidationTests(
+            "test_full_typed_source_and_artifact_index_closure_is_exact",
+        )
+        source_fixture.chronology = self.chronology
+        request, manifest, sources, hosts, legacy_index, store = \
+            source_fixture._full_source_index_fixture()
+        extra_path = "/private/archive/earlier-than-source.json"
+        extra_maximum = (len(extra_raw) if extra_maximum is None else
+                         extra_maximum)
+        common = {
+            "role": extra_role, "host_id": request["host_id"],
+            "origin_path": extra_path, "local_path": extra_path,
+            "raw_sha256": sha(extra_raw), "semantic_sha256": None,
+            "byte_count": len(extra_raw), "maximum_bytes": extra_maximum,
+        }
+        rows = [dict(row) for row in legacy_index["entries"]]
+        rows.append(common)
+        rows.sort(key=lambda row: row["origin_path"])
+        store[extra_path] = {**common, "raw_bytes": extra_raw}
+        for row in rows:
+            if "maximum_bytes" not in row:
+                row["maximum_bytes"] = self.chronology.SOURCE5_JOURNAL_ROLE_LIMITS[
+                    row["role"]
+                ]
+            store[row["origin_path"]]["maximum_bytes"] = row["maximum_bytes"]
+        catalogue_rows = [{
+            "path": row["origin_path"], "kind": "file", "role": row["role"],
+            "host_id": row["host_id"], "max_file_bytes": row["maximum_bytes"],
+            "origin_pin": None, "aggregate_id": None,
+            "aggregate_max_bytes": None,
+        } for row in rows]
+        budget_pin = {
+            "path": "/private/budget.json", "raw_sha256": "a" * 64,
+            "semantic_sha256": "b" * 64,
+        }
+        index_directory = root / "index"
+        index_directory.mkdir(mode=0o700)
+        os.chmod(index_directory, 0o700)
+        index_root, index_pin, _files = self.transport.write_index_v3(
+            campaign_id="campaign-a", host_id=request["host_id"],
+            source_root=request["source_root"], input_root="/private/input",
+            output_root="/private/output", host_evidence_budget=budget_pin,
+            entries=rows, directory=index_directory,
+            maximum_entries=64, maximum_index_bytes=1024 * 1024,
+            chunk_bytes=64 * 1024, fanout=4,
+        )
+        checked_root, entries = self.transport.open_index_v3(
+            index_pin, budget_pin=budget_pin, campaign_id="campaign-a",
+            host_id=request["host_id"], source_root=request["source_root"],
+            input_root="/private/input", output_root="/private/output",
+            maximum_entries=64, maximum_index_bytes=1024 * 1024,
+            chunk_bytes=64 * 1024, fanout=4,
+        )
+        self.assertEqual(checked_root, index_root)
+        request.update({
+            "schema": self.chronology.SOURCE5_HOST_JOURNAL_REQUEST_SCHEMA_V3,
+            "evidence_index": index_pin, "host_evidence_budget": budget_pin,
+        })
+        opened = []
+
+        class CapturedObject:
+            source5_captured_object_v2 = True
+
+            def __init__(self, path, payload):
+                self.path, self.payload = path, payload
+
+            def open_stream(self):
+                opened.append(self.path)
+                return io.BytesIO(self.payload)
+
+        for path, row in store.items():
+            row["raw_bytes"] = CapturedObject(path, row["raw_bytes"])
+        return {
+            "request": request, "manifest": manifest, "sources": sources,
+            "hosts": hosts, "index": {**index_root, "entries": entries},
+            "store": store, "catalogue": catalogue_rows, "opened": opened,
+            "extra_path": extra_path,
+        }
+
+    def _bind(self, fixture):
+        authority = self.chronology._source5_bind_v3_catalogue_authority(
+            fixture["request"], fixture["index"], fixture["index"]["entries"],
+            iter(fixture["catalogue"]), self.transport, 64,
+        )
+        fixture["index"]["_validated_v3_catalogue_authority"] = authority
+
+    def _verify(self, fixture):
+        self.chronology._source5_validate_full_source_index_closure(
+            fixture["request"], fixture["manifest"], fixture["sources"],
+            fixture["hosts"], fixture["index"], fixture["store"],
+        )
+
+    def test_v3_new_role_is_hashed_only_after_complete_known_source(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="source5-v3-role-positive-") as tmp:
+            fixture = self._fixture(Path(tmp))
+            self._bind(fixture)
+            self.assertEqual(fixture["opened"], [])
+            self._verify(fixture)
+            first_extra = fixture["opened"].index(fixture["extra_path"])
+            self.assertEqual(set(fixture["opened"][:first_extra]),
+                             set(fixture["store"]) - {fixture["extra_path"]})
+            self.assertEqual(fixture["opened"].count(fixture["extra_path"]), 1)
+
+    def test_v3_zero_byte_new_role_keeps_its_zero_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="source5-v3-role-empty-") as tmp:
+            fixture = self._fixture(Path(tmp), extra_raw=b"", extra_maximum=0)
+            self._bind(fixture)
+            self._verify(fixture)
+            self.assertIn(fixture["extra_path"], fixture["opened"])
+
+    def test_v3_missing_or_forged_authority_never_reads_new_role(self) -> None:
+        for forged in (None, {"validated": True}):
+            with self.subTest(forged=forged), tempfile.TemporaryDirectory() as tmp:
+                fixture = self._fixture(Path(tmp))
+                fixture["index"]["_validated_v3_catalogue_authority"] = forged
+                with self.assertRaisesRegex(self.chronology.ChronologyError,
+                                            "exact authenticated catalogue authority"):
+                    self._verify(fixture)
+                self.assertNotIn(fixture["extra_path"], fixture["opened"])
+
+    def test_v3_catalogue_ceiling_or_role_drift_is_rejected_before_raw_read(self) -> None:
+        for field, value in (("max_file_bytes", 1), ("role", "forged_role")):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                fixture = self._fixture(Path(tmp))
+                row = next(row for row in fixture["catalogue"]
+                           if row["path"] == fixture["extra_path"])
+                row[field] = value
+                with self.assertRaisesRegex(self.transport.EvidenceTransportError,
+                                            "owner path ceiling"):
+                    self._bind(fixture)
+                self.assertEqual(fixture["opened"], [])
+
+    def test_v3_authority_binds_index_budget_and_exact_captured_ceiling(self) -> None:
+        for field in ("evidence_index", "host_evidence_budget", "captured_maximum"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                fixture = self._fixture(Path(tmp))
+                self._bind(fixture)
+                if field == "captured_maximum":
+                    fixture["store"][fixture["extra_path"]]["maximum_bytes"] += 1
+                    message = "differs from its authenticated row"
+                else:
+                    fixture["request"][field] = {
+                        **fixture["request"][field], "raw_sha256": "f" * 64,
+                    }
+                    message = "exact authenticated catalogue authority"
+                with self.assertRaisesRegex(self.chronology.ChronologyError, message):
+                    self._verify(fixture)
+                self.assertNotIn(fixture["extra_path"], fixture["opened"])
+
+    def test_v3_catalogue_cannot_widen_a_known_legacy_role(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="source5-v3-role-known-") as tmp:
+            fixture = self._fixture(
+                Path(tmp), extra_role="typed_source_symlink",
+                extra_raw=b"x" * (self.chronology.MAX_SOURCE5_TYPED_SYMLINK_BYTES + 1),
+                extra_maximum=8192,
+            )
+            self._bind(fixture)
+            with self.assertRaisesRegex(self.chronology.ChronologyError,
+                                        "bounded unsigned integer"):
+                self._verify(fixture)
+            self.assertNotIn(fixture["extra_path"], fixture["opened"])
+
+    def test_v3_bad_source_bytes_stop_before_new_role_payload(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="source5-v3-role-source-") as tmp:
+            fixture = self._fixture(Path(tmp))
+            self._bind(fixture)
+            source_row = fixture["store"]["/private/source/scripts/runtime-readback.py"]
+            source_row["raw_bytes"].payload = b"x" * source_row["byte_count"]
+            with self.assertRaisesRegex(self.chronology.ChronologyError,
+                                        "bytes differ"):
+                self._verify(fixture)
+            self.assertNotIn(fixture["extra_path"], fixture["opened"])
+
+    def test_legacy_unknown_role_has_no_caller_asserted_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="source5-legacy-role-") as tmp:
+            fixture = self._fixture(Path(tmp))
+            fixture["request"]["schema"] = \
+                self.chronology.SOURCE5_HOST_JOURNAL_REQUEST_SCHEMA_V2
+            with self.assertRaisesRegex(self.chronology.ChronologyError,
+                                        "lacks authenticated v3 catalogue authority"):
+                self._verify(fixture)
+            self.assertNotIn(fixture["extra_path"], fixture["opened"])
+
+
+class ProcessLivenessHelperTests(unittest.TestCase):
+    def test_exit_during_proc_stat_read_is_not_live(self) -> None:
+        for error in (FileNotFoundError(2, "gone"), ProcessLookupError(3, "gone")):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(Path, "read_text", side_effect=error):
+                    CampaignChronologyCliTests._wait_for_pid_not_live(self, 123456)
+
+    def test_unrelated_proc_read_errors_remain_unverified(self) -> None:
+        for error in (PermissionError(13, "denied"), OSError(5, "I/O failure")):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(Path, "read_text", side_effect=error):
+                    with self.assertRaises(type(error)):
+                        CampaignChronologyCliTests._wait_for_pid_not_live(self, 123456)
 
 
 if __name__ == "__main__":

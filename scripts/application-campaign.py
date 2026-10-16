@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import ctypes
 import heapq
 import hashlib
 import io
@@ -19,6 +20,7 @@ import json
 import math
 import os
 import re
+import select
 import signal
 import shutil
 import statistics
@@ -27,6 +29,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 from fractions import Fraction
@@ -89,6 +92,41 @@ ANALYZER_INPUT_MAGIC = b"ABQST01\0"
 ANALYZER_OUTPUT_MAGIC = b"ABQSO01\0"
 ANALYZER_INPUT_LIMIT_BYTES = 32 * 1024**3
 ANALYZER_RESIDENT_BUDGET_BYTES = 2 * 1024**3
+ANALYZER_GROUP_FRAME_LIMIT_BYTES = 8 * 1024**3
+ANALYZER_OUTPUT_LIMIT_BYTES = 2 * 1024**2
+ANALYZER_TRACE_SPOOL_INITIAL_BYTES = 4
+ANALYZER_TRACE_SPOOL_BLOCK_HEADER_BYTES = 8
+ANALYZER_TRACE_SPOOL_ENTRY_BYTES = 12
+ANALYZER_TRACE_SNAPSHOT_MEMORY_BYTES = 2 * 1024**2
+ANALYZER_GATE_LAUNCHER_SOURCE = (
+    "import fcntl, os, sys\n"
+    "gate_fd = int(sys.argv[1])\n"
+    "binary_fd = int(sys.argv[2])\n"
+    "status_fd = int(sys.argv[3])\n"
+    "binary_argv0 = sys.argv[4]\n"
+    "output_path = sys.argv[5]\n"
+    "fcntl.fcntl(status_fd, fcntl.F_SETFD, fcntl.FD_CLOEXEC)\n"
+    "while True:\n"
+    "    try:\n"
+    "        token = os.read(gate_fd, 1)\n"
+    "        break\n"
+    "    except InterruptedError:\n"
+    "        pass\n"
+    "os.close(gate_fd)\n"
+    "if token != b'\\x01':\n"
+    "    os._exit(125)\n"
+    "try:\n"
+    "    os.execve('/proc/self/fd/' + str(binary_fd),\n"
+    "              [binary_argv0, '/dev/stdin', output_path], os.environ)\n"
+    "except BaseException:\n"
+    "    try:\n"
+    "        os.write(status_fd, b'!')\n"
+    "    finally:\n"
+    "        os._exit(126)\n"
+)
+ANALYZER_GATE_LAUNCHER_SHA256 = hashlib.sha256(
+    ANALYZER_GATE_LAUNCHER_SOURCE.encode("utf-8"),
+).hexdigest()
 ANALYZER_PRIMARY_ENDPOINTS_PER_HOST = 486
 ANALYZER_SUITE_ENDPOINTS_PER_HOST = 9
 ANALYZER_PAIR_GROUPS_PER_HOST = 135
@@ -1812,11 +1850,11 @@ def _write_trace_frame_to_spools(
     families: tuple[str, ...],
     block_size: int,
     scratch_directory: Path,
+    artifact_view: Any | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     require(is_sha256(expected_sha256), "trace source sidecar digest is malformed")
-    spools = {family: tempfile.TemporaryFile(mode="w+b", dir=scratch_directory) for family in families}
-    for spool in spools.values():
-        spool.write(b"\0\0\0\0")
+    spools: dict[str, Any] = {}
     block_values = {family: [] for family in families}
     block_counts = {family: 0 for family in families}
     observed_ids = 0
@@ -1838,7 +1876,19 @@ def _write_trace_frame_to_spools(
             block_values[family].clear()
 
     try:
-        with stable_file_snapshot(ids_path, "analyzer trace sidecar", MAX_TRACE_ARTIFACT_BYTES) as (snapshot, digest, _size):
+        for family in families:
+            spool = tempfile.TemporaryFile(mode="w+b", dir=scratch_directory)
+            spools[family] = spool
+            spool.write(b"\0\0\0\0")
+        snapshot_source = (
+            stable_file_snapshot(
+                ids_path, "analyzer trace sidecar", MAX_TRACE_ARTIFACT_BYTES,
+            ) if artifact_view is None else
+            artifact_view.open_snapshot(
+                ids_path, "analyzer trace sidecar", MAX_TRACE_ARTIFACT_BYTES,
+            )
+        )
+        with snapshot_source as (snapshot, digest, _size):
             require(digest == expected_sha256, "trace source sidecar hash changed before analyzer serialization")
             with io.TextIOWrapper(snapshot, encoding="utf-8") as stream:
                 require(read_bounded_text_line(stream, "analyzer trace schema") == "schema\tallocatbelt-app-arrivals-v3", "analyzer trace has an unsupported per-ID schema")
@@ -1849,6 +1899,8 @@ def _write_trace_frame_to_spools(
                 require(read_bounded_text_line(stream, "analyzer trace header") == "id\tworkload\tscheduled_ns\tcompletion_ns\tterminal\tchecksum\texpected_checksum", "analyzer trace header is malformed")
                 in_block = 0
                 for expected_id in range(MAX_ARRIVALS):
+                    require(cancel_event is None or not cancel_event.is_set(),
+                            "analyzer trace serialization was cancelled")
                     line = read_bounded_text_line(stream, f"analyzer trace row {expected_id}")
                     if line is None:
                         break
@@ -1874,18 +1926,444 @@ def _write_trace_frame_to_spools(
         for spool in spools.values():
             spool.close()
         raise CampaignError(f"cannot stream compact analyzer trace: {error}") from error
-    require(observed_ids > 0 and all(block_counts[family] > 0 for family in families), "analyzer trace has no IDs or no global arrival blocks")
-    require(len(set(block_counts.values())) == 1, "mixed source-family global block horizons differ")
-    for spool in spools.values():
-        spool.seek(0)
-        spool.write(struct.pack("<I", block_counts[families[0]]))
-        spool.seek(0)
-    return {"spools": spools, "blocks": block_counts[families[0]], "observed_ids": observed_ids}
+    except BaseException:
+        for spool in spools.values():
+            spool.close()
+        raise
+    try:
+        require(observed_ids > 0 and all(block_counts[family] > 0 for family in families), "analyzer trace has no IDs or no global arrival blocks")
+        require(len(set(block_counts.values())) == 1, "mixed source-family global block horizons differ")
+        for spool in spools.values():
+            spool.seek(0)
+            spool.write(struct.pack("<I", block_counts[families[0]]))
+            spool.seek(0)
+        require(cancel_event is None or not cancel_event.is_set(),
+                "analyzer trace serialization was cancelled")
+        return {"spools": spools, "blocks": block_counts[families[0]], "observed_ids": observed_ids}
+    except BaseException:
+        for spool in spools.values():
+            spool.close()
+        raise
 
 
-def _copy_spool(destination: Any, spool: Any) -> None:
+def _copy_spool(
+    destination: Any, spool: Any,
+    cancel_event: threading.Event | None = None,
+) -> None:
     spool.seek(0)
-    shutil.copyfileobj(spool, destination, length=1024 * 1024)
+    while True:
+        require(cancel_event is None or not cancel_event.is_set(),
+                "analyzer input serialization was cancelled")
+        block = spool.read(1024 * 1024)
+        if not block:
+            return
+        destination.write(block)
+
+
+def _analyzer_process_trace_spool_bytes(
+    family_count: int, block_size: int,
+) -> int:
+    require(type(family_count) is int and 0 <= family_count <= len(STANDALONE) and
+            type(block_size) is int and block_size > 0,
+            "analyzer trace spool projection has an invalid family or block count")
+    block_count = (MAX_ARRIVALS + block_size - 1) // block_size
+    return (
+        family_count * ANALYZER_TRACE_SPOOL_INITIAL_BYTES +
+        family_count * block_count * ANALYZER_TRACE_SPOOL_BLOCK_HEADER_BYTES +
+        MAX_ARRIVALS * ANALYZER_TRACE_SPOOL_ENTRY_BYTES
+        if family_count else 0
+    )
+
+
+def _analyzer_group_frame_byte_bound(
+    group_name: str, families: tuple[str, ...], pair_count: int,
+    block_size: int,
+) -> int:
+    require(type(group_name) is str and type(families) is tuple and
+            families == tuple(sorted(set(families))) and
+            all(family in STANDALONE for family in families) and
+            type(pair_count) is int and 0 < pair_count < (1 << 16),
+            "analyzer group frame projection has malformed frozen identities")
+    header_bytes = (
+        struct.calcsize("<BH") + len(_wire_string(group_name)) +
+        struct.calcsize("<H") +
+        sum(len(_wire_string(family)) for family in families) +
+        struct.calcsize("<H")
+    )
+    return (header_bytes + 2 * pair_count *
+            _analyzer_process_trace_spool_bytes(len(families), block_size))
+
+
+def analyzer_scratch_projection(
+    spec: dict[str, Any], maximum_trace_file_bytes: int,
+) -> dict[str, Any]:
+    """Project one concurrent pinned-source analyzer group and its local scratch."""
+    require(type(spec) is dict and type(spec.get("cells")) is list and
+            type(spec.get("protocol")) is dict and
+            type(maximum_trace_file_bytes) is int and
+            0 < maximum_trace_file_bytes <= MAX_TRACE_ARTIFACT_BYTES,
+            "analyzer scratch projection lacks its exact spec/owner trace cap")
+    protocol = spec["protocol"]
+    pair_count = protocol.get("confirmation_pairs")
+    block_size = protocol.get("bootstrap_block_arrivals")
+    require(type(pair_count) is int and 0 < pair_count < (1 << 16) and
+            type(block_size) is int and block_size > 0,
+            "analyzer scratch projection has malformed pinned pair/block counts")
+    groups: dict[str, set[str]] = {}
+    for cell in spec["cells"]:
+        require(type(cell) is dict and type(cell.get("family")) is str and
+                type(cell.get("profile")) is str and
+                cell["family"] in FAMILIES,
+                "analyzer scratch projection has a malformed frozen workload cell")
+        families = (STANDALONE if cell["family"] == "mixed" else
+                    (cell["family"],))
+        for baseline in ("mimalloc-secure", "mimalloc-standard"):
+            for mode, load in (("capacity", 0),
+                               *( ("open_loop", item) for item in LOADS )):
+                name = json.dumps((
+                    cell["family"], cell["profile"], mode, load,
+                    "allocator", baseline,
+                ), sort_keys=True, separators=(",", ":"))
+                current = groups.setdefault(name, set())
+                if mode == "open_loop":
+                    current.update(families)
+        for mode, load in (("capacity", 0),
+                           *( ("open_loop", item) for item in LOADS )):
+            name = json.dumps((
+                cell["family"], cell["profile"], mode, load,
+                "executor", "allocatbelt",
+            ), sort_keys=True, separators=(",", ":"))
+            current = groups.setdefault(name, set())
+            if mode == "open_loop":
+                current.update(families)
+    require(groups and any(families for families in groups.values()),
+            "analyzer scratch projection contains no original p99 trace group")
+    group_bounds = [
+        _analyzer_group_frame_byte_bound(
+            name, tuple(sorted(families)), pair_count, block_size,
+        )
+        for name, families in groups.items()
+    ]
+    maximum_group_frame_bytes = max(group_bounds)
+    maximum_family_count = max(map(len, groups.values()))
+    maximum_process_spool_bytes = _analyzer_process_trace_spool_bytes(
+        maximum_family_count, block_size,
+    )
+    maximum_pair_spool_bytes = 2 * maximum_process_spool_bytes
+    block_count = (MAX_ARRIVALS + block_size - 1) // block_size
+    maximum_single_spool_bytes = (
+        ANALYZER_TRACE_SPOOL_INITIAL_BYTES +
+        block_count * ANALYZER_TRACE_SPOOL_BLOCK_HEADER_BYTES +
+        MAX_ARRIVALS * ANALYZER_TRACE_SPOOL_ENTRY_BYTES
+    )
+    snapshot_bytes = min(maximum_trace_file_bytes,
+                         MAX_TRACE_ARTIFACT_BYTES)
+    snapshot_disk_inode = int(
+        snapshot_bytes > ANALYZER_TRACE_SNAPSHOT_MEMORY_BYTES,
+    )
+    maximum_bytes = (
+        maximum_group_frame_bytes + maximum_pair_spool_bytes +
+        snapshot_bytes + ANALYZER_OUTPUT_LIMIT_BYTES
+    )
+    maximum_inodes = (
+        3 + 2 * maximum_family_count + snapshot_disk_inode
+    )
+    maximum_file_bytes = max(
+        maximum_group_frame_bytes, maximum_single_spool_bytes,
+        snapshot_bytes, ANALYZER_OUTPUT_LIMIT_BYTES,
+    )
+    require(0 < maximum_group_frame_bytes <=
+                ANALYZER_GROUP_FRAME_LIMIT_BYTES and
+            maximum_bytes < (1 << 64) and maximum_inodes > 1,
+            "source-derived analyzer scratch projection exceeds its finite protocol cap")
+    return {
+        "schema": "allocatbelt.application-rust-analyzer-scratch-projection.v1",
+        "maximum_arrivals": MAX_ARRIVALS,
+        "maximum_pairs": pair_count,
+        "maximum_block_arrivals": block_size,
+        "maximum_trace_families": maximum_family_count,
+        "maximum_trace_file_bytes": maximum_trace_file_bytes,
+        "maximum_group_frame_bytes": maximum_group_frame_bytes,
+        "maximum_pair_spool_bytes": maximum_pair_spool_bytes,
+        "maximum_trace_snapshot_bytes": snapshot_bytes,
+        "maximum_output_bytes": ANALYZER_OUTPUT_LIMIT_BYTES,
+        "maximum_bytes": maximum_bytes,
+        "maximum_file_bytes": maximum_file_bytes,
+        "maximum_inodes": maximum_inodes,
+    }
+
+
+class _HashingBoundedWriter:
+    """Count and hash exactly the bytes accepted by a bounded binary sink."""
+
+    def __init__(
+        self, destination: Any, maximum_bytes: int, *,
+        hash_enabled: bool = True,
+    ) -> None:
+        require(type(maximum_bytes) is int and
+                0 < maximum_bytes <= ANALYZER_INPUT_LIMIT_BYTES,
+                "analyzer input writer has no valid finite byte ceiling")
+        self.destination = destination
+        self.maximum_bytes = maximum_bytes
+        self.byte_count = 0
+        self.digest = hashlib.sha256() if hash_enabled else None
+
+    def tell(self) -> int:
+        return self.byte_count
+
+    def write(self, value: bytes | bytearray | memoryview) -> int:
+        try:
+            view = memoryview(value).cast("B")
+        except (TypeError, ValueError) as error:
+            raise CampaignError("analyzer input writer received a non-byte buffer") from error
+        length = len(view)
+        require(self.byte_count + length <= self.maximum_bytes,
+                "analysis stream exceeds its declared byte ceiling")
+        offset = 0
+        while offset < length:
+            written = self.destination.write(view[offset:])
+            require(type(written) is int and 0 < written <= length - offset,
+                    "analyzer input pipe made no bounded write progress")
+            chunk = view[offset:offset + written]
+            if self.digest is not None:
+                self.digest.update(chunk)
+            self.byte_count += written
+            offset += written
+        return length
+
+    def flush(self) -> None:
+        self.destination.flush()
+
+    def hexdigest(self) -> str:
+        require(self.digest is not None,
+                "analyzer bounded writer was not configured for hashing")
+        return self.digest.hexdigest()
+
+
+def _read_linux_process_start_ticks(pid: int) -> int:
+    require(type(pid) is int and pid > 0,
+            "analyzer child PID is malformed")
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_bytes()
+    except OSError as error:
+        raise CampaignError("cannot capture owned analyzer process identity") from error
+    require(0 < len(raw) <= 16 * 1024 and raw.endswith(b"\n"),
+            "analyzer process identity has an invalid finite record")
+    separator = raw.rfind(b")")
+    require(separator > 0, "analyzer process identity has no command delimiter")
+    fields = raw[separator + 1:].split()
+    require(len(fields) > 19 and fields[0] not in {b"Z", b"X"},
+            "analyzer exited before its owned process identity was captured")
+    try:
+        start_ticks = int(fields[19], 10)
+    except ValueError as error:
+        raise CampaignError("analyzer process start ticks are malformed") from error
+    require(start_ticks > 0, "analyzer process start ticks are not positive")
+    return start_ticks
+
+
+def _owned_analyzer_pipe_identity(process: subprocess.Popen[Any]) -> dict[str, Any]:
+    require(process.stdin is not None and process.pid is not None,
+            "analyzer process has no owned stdin pipe")
+    descriptor = process.stdin.fileno()
+    try:
+        parent = os.fstat(descriptor)
+        child = os.stat(f"/proc/{process.pid}/fd/0")
+    except OSError as error:
+        raise CampaignError("cannot inspect the owned analyzer stdin pipe") from error
+    require(stat.S_ISFIFO(parent.st_mode) and stat.S_ISFIFO(child.st_mode) and
+            (parent.st_dev, parent.st_ino) == (child.st_dev, child.st_ino) and
+            stat.S_IMODE(parent.st_mode) == stat.S_IMODE(child.st_mode),
+            "analyzer stdin is not the exact parent-owned pipe")
+    return {
+        "file_type": "fifo",
+        "parent_fd": descriptor,
+        "child_fd": 0,
+        "device": parent.st_dev,
+        "inode": parent.st_ino,
+        "mode": stat.S_IMODE(parent.st_mode),
+    }
+
+
+def _analyzer_executable_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev, info.st_ino, info.st_mode, info.st_size,
+        info.st_mtime_ns, info.st_ctime_ns, info.st_nlink, info.st_uid,
+    )
+
+
+def _hash_open_analyzer_executable(
+    descriptor: int, path: Path, maximum_bytes: int,
+) -> tuple[str, os.stat_result]:
+    try:
+        path_before = path.lstat()
+        before = os.fstat(descriptor)
+    except OSError as error:
+        raise CampaignError("cannot inspect the pinned analyzer executable fd") from error
+    require(stat.S_ISREG(path_before.st_mode) and
+            stat.S_ISREG(before.st_mode) and
+            path_before.st_mode & 0o111 != 0 and
+            before.st_mode & 0o111 != 0 and
+            _analyzer_executable_identity(path_before) ==
+                _analyzer_executable_identity(before) and
+            0 < before.st_size <= maximum_bytes,
+            "pinned analyzer executable fd differs from its bounded regular path")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    total = 0
+    while total < before.st_size:
+        block = os.read(descriptor, min(1024 * 1024, before.st_size - total))
+        require(bool(block), "pinned analyzer executable shortened during hashing")
+        total += len(block)
+        digest.update(block)
+    try:
+        after = os.fstat(descriptor)
+        path_after = path.lstat()
+    except OSError as error:
+        raise CampaignError("pinned analyzer executable changed during hashing") from error
+    require(os.read(descriptor, 1) == b"" and total == before.st_size and
+            _analyzer_executable_identity(before) ==
+                _analyzer_executable_identity(after) and
+            _analyzer_executable_identity(before) ==
+                _analyzer_executable_identity(path_after),
+            "pinned analyzer executable identity changed during hashing")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return digest.hexdigest(), before
+
+
+def _open_pinned_analyzer_executable(
+    path: Path, expected_sha256: str,
+) -> tuple[int, os.stat_result]:
+    require(path.is_absolute() and path.resolve(strict=True) == path and
+            is_sha256(expected_sha256),
+            "analyzer binary path or source pin is malformed")
+    try:
+        descriptor = os.open(
+            path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) |
+            getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
+    except OSError as error:
+        raise CampaignError("cannot open the pinned analyzer executable") from error
+    try:
+        actual, info = _hash_open_analyzer_executable(
+            descriptor, path, 1024 * 1024 * 1024,
+        )
+        require(actual == expected_sha256,
+                "opened analyzer executable differs from its SourceV5 raw pin")
+        return descriptor, info
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _await_analyzer_exec_transition(
+    status_descriptor: int, process: subprocess.Popen[Any],
+    timeout_event: threading.Event, signal_errors: list[OSError],
+    signal_owned_analyzer: Any,
+) -> None:
+    poller = select.poll()
+    poller.register(status_descriptor,
+                    select.POLLIN | select.POLLHUP | select.POLLERR)
+    while True:
+        require(not timeout_event.is_set(),
+                "pinned analyzer timed out before its gated exec transition")
+        if signal_errors:
+            signal_errors.clear()
+            signal_owned_analyzer()
+        events = poller.poll(100)
+        if not events:
+            continue
+        marker = os.read(status_descriptor, 1)
+        require(not marker,
+                "pinned analyzer gate shim failed before its exact exec")
+        require(process.pid is not None and
+                _analyzer_waitid_nowait(process.pid) is None and
+                not timeout_event.is_set(),
+                "pinned analyzer exited before the gated exec transition was verified")
+        return
+
+
+class _LinuxSignalSet(ctypes.Structure):
+    _fields_ = [("_values", ctypes.c_ulong * 16)]
+
+
+class _LinuxSignalAction(ctypes.Structure):
+    _fields_ = [
+        ("handler", ctypes.c_void_p),
+        ("mask", _LinuxSignalSet),
+        ("flags", ctypes.c_int),
+        ("restorer", ctypes.c_void_p),
+    ]
+
+
+def _require_analyzer_waitable_sigchld() -> tuple[int, tuple[bool, ...], int, int]:
+    """Pin default SIGCHLD semantics and reject auto-reaped children."""
+    require(sys.platform.startswith("linux") and
+            callable(getattr(os, "waitid", None)) and
+            callable(getattr(os, "pidfd_open", None)) and
+            callable(getattr(signal, "pidfd_send_signal", None)) and
+            all(hasattr(os, name) for name in (
+                "P_PID", "WEXITED", "WNOHANG", "WNOWAIT",
+            )),
+            "analyzer process ownership requires waitid(WNOWAIT) and pidfd support")
+    require(signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL,
+            "analyzer SIGCHLD disposition must remain default and waitable")
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        sigaction = libc.sigaction
+        sigaction.argtypes = (
+            ctypes.c_int, ctypes.c_void_p,
+            ctypes.POINTER(_LinuxSignalAction),
+        )
+        sigaction.restype = ctypes.c_int
+        sigismember = libc.sigismember
+        sigismember.argtypes = (ctypes.POINTER(_LinuxSignalSet), ctypes.c_int)
+        sigismember.restype = ctypes.c_int
+        action = _LinuxSignalAction()
+        if sigaction(signal.SIGCHLD, None, ctypes.byref(action)) != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number))
+    except (AttributeError, OSError) as error:
+        raise CampaignError(
+            f"cannot verify analyzer SIGCHLD wait ownership: {error}",
+        ) from error
+    require(action.handler in (None, 0) and
+            action.flags & getattr(signal, "SA_NOCLDWAIT", 2) == 0,
+            "analyzer SIGCHLD has a custom handler or SA_NOCLDWAIT")
+    valid_signals = {
+        int(value) for value in signal.valid_signals()
+        if 0 < int(value) < signal.NSIG
+    }
+    mask_members: list[bool] = []
+    for signum in range(1, signal.NSIG):
+        if signum not in valid_signals:
+            continue
+        member = sigismember(ctypes.byref(action.mask), signum)
+        require(member in (0, 1),
+                "cannot read a defined SIGCHLD mask membership")
+        mask_members.append(bool(member))
+    return (
+        action.handler or 0, tuple(mask_members), action.flags,
+        action.restorer or 0,
+    )
+
+
+def _analyzer_waitid_nowait(pid: int) -> Any | None:
+    while True:
+        try:
+            result = os.waitid(
+                os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+            break
+        except InterruptedError:
+            continue
+        except ChildProcessError as error:
+            raise CampaignError(
+                "analyzer child wait ownership was lost before bounded completion",
+            ) from error
+    require(result is None or result.si_pid in (0, pid),
+            "analyzer waitid returned a different child identity")
+    return result if result is not None and result.si_pid == pid else None
 
 
 def _write_analysis_group(
@@ -1896,15 +2374,26 @@ def _write_analysis_group(
     family_tests: dict[str, dict[str, Any]],
     scratch_directory: Path,
     block_size: int,
+    trace_view_factory: Any | None = None,
+    cancel_event: threading.Event | None = None,
+    maximum_frame_bytes: int | None = None,
 ) -> None:
     families = tuple(sorted(family_tests))
+    frame_limit = (ANALYZER_GROUP_FRAME_LIMIT_BYTES
+                   if maximum_frame_bytes is None else maximum_frame_bytes)
+    require(type(frame_limit) is int and 0 < frame_limit <=
+            ANALYZER_GROUP_FRAME_LIMIT_BYTES,
+            "analyzer group frame has no valid source-derived ceiling")
     with tempfile.TemporaryFile(mode="w+b", dir=scratch_directory) as frame:
-        frame.write(struct.pack("<BH", 4, group_id))
-        frame.write(_wire_string(group_name))
-        frame.write(struct.pack("<H", len(families)))
+        bounded_frame = _HashingBoundedWriter(
+            frame, frame_limit, hash_enabled=False,
+        )
+        bounded_frame.write(struct.pack("<BH", 4, group_id))
+        bounded_frame.write(_wire_string(group_name))
+        bounded_frame.write(struct.pack("<H", len(families)))
         for family in families:
-            frame.write(_wire_string(family))
-        frame.write(struct.pack("<H", pair_count))
+            bounded_frame.write(_wire_string(family))
+        bounded_frame.write(struct.pack("<H", pair_count))
         for pair_index in range(pair_count):
             if not families:
                 continue
@@ -1920,18 +2409,55 @@ def _write_analysis_group(
                 )
             candidate_path = Path(candidate_ref["path"])
             control_path = Path(control_ref["path"])
-            candidate = _write_trace_frame_to_spools(candidate_path, candidate_ref["sha256"], families, block_size, scratch_directory)
-            control = _write_trace_frame_to_spools(control_path, control_ref["sha256"], families, block_size, scratch_directory)
+            candidate = None
+            control = None
             try:
+                if trace_view_factory is None:
+                    candidate = _write_trace_frame_to_spools(
+                        candidate_path, candidate_ref["sha256"], families,
+                        block_size, scratch_directory,
+                        cancel_event=cancel_event,
+                    )
+                    control = _write_trace_frame_to_spools(
+                        control_path, control_ref["sha256"], families,
+                        block_size, scratch_directory,
+                        cancel_event=cancel_event,
+                    )
+                else:
+                    candidate_job = candidate_ref.get("owner_job")
+                    control_job = control_ref.get("owner_job")
+                    require(type(candidate_job) is dict and
+                            candidate_job == control_job,
+                            "paired analyzer traces do not share one archived original job")
+                    with trace_view_factory(candidate_job, cancel_event) as artifact_view:
+                        candidate = _write_trace_frame_to_spools(
+                            candidate_path, candidate_ref["sha256"], families,
+                            block_size, scratch_directory, artifact_view,
+                            cancel_event,
+                        )
+                        control = _write_trace_frame_to_spools(
+                            control_path, control_ref["sha256"], families,
+                            block_size, scratch_directory, artifact_view,
+                            cancel_event,
+                        )
+                require(candidate is not None and control is not None,
+                        "analyzer trace frame did not produce its paired spools")
                 require(candidate["observed_ids"] == control["observed_ids"] and candidate["blocks"] == control["blocks"], "paired trace IDs/block horizons differ")
                 for family in families:
-                    _copy_spool(frame, candidate["spools"][family])
-                    _copy_spool(frame, control["spools"][family])
+                    _copy_spool(bounded_frame, candidate["spools"][family],
+                                cancel_event)
+                    _copy_spool(bounded_frame, control["spools"][family],
+                                cancel_event)
             finally:
-                for spool in (*candidate["spools"].values(), *control["spools"].values()):
-                    spool.close()
-        frame_length = frame.tell()
-        require(frame_length <= 8 * 1024**3, "one analyzer pair-group frame exceeds its finite byte bound")
+                for trace in (candidate, control):
+                    if trace is not None:
+                        for spool in trace["spools"].values():
+                            spool.close()
+        require(cancel_event is None or not cancel_event.is_set(),
+                "analyzer input serialization was cancelled")
+        frame_length = bounded_frame.tell()
+        require(frame_length <= frame_limit,
+                "one analyzer pair-group frame exceeds its finite byte bound")
         require(destination.tell() + 8 + frame_length <= ANALYZER_INPUT_LIMIT_BYTES, "analysis stream exceeds its declared byte ceiling")
         frame.seek(0)
         destination.write(struct.pack("<Q", frame_length))
@@ -1939,7 +2465,10 @@ def _write_analysis_group(
 
 
 def _binary_analysis_input(
-    tests: list[dict[str, Any]], protocol: dict[str, Any], output_path: Path, scratch_directory: Path,
+    tests: list[dict[str, Any]], protocol: dict[str, Any], destination: Any,
+    scratch_directory: Path, trace_view_factory: Any | None = None,
+    cancel_event: threading.Event | None = None,
+    maximum_group_frame_bytes: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int], str, int]:
     primary = [test for test in tests if test.get("suite_components") is None]
     suites = [test for test in tests if test.get("suite_components") is not None]
@@ -1951,67 +2480,79 @@ def _binary_analysis_input(
     pair_count = protocol["confirmation_pairs"]
     block_size = protocol["bootstrap_block_arrivals"]
 
-    with output_path.open("xb") as output:
-        output.write(ANALYZER_INPUT_MAGIC)
-        header_fields = struct.pack(
-            "<IHHHHQdIQQ",
-            protocol["bootstrap_draws"], pair_count, len(group_names), len(primary), len(suites),
-            protocol["bootstrap_seed"], protocol["confidence"], block_size,
-            ANALYZER_INPUT_LIMIT_BYTES, ANALYZER_RESIDENT_BUDGET_BYTES,
+    require(destination.tell() == 0,
+            "analyzer stream writer must start at byte zero")
+    destination.write(ANALYZER_INPUT_MAGIC)
+    header_fields = struct.pack(
+        "<IHHHHQdIQQ",
+        protocol["bootstrap_draws"], pair_count, len(group_names), len(primary), len(suites),
+        protocol["bootstrap_seed"], protocol["confidence"], block_size,
+        ANALYZER_INPUT_LIMIT_BYTES, ANALYZER_RESIDENT_BUDGET_BYTES,
+    )
+    _write_frame(destination, bytes([1]) + header_fields)
+    for endpoint_id, test in enumerate(primary):
+        traced = test.get("traces") is not None
+        group_id = group_ids[json.dumps(test["pair_group"], sort_keys=True, separators=(",", ":"))]
+        endpoint = bytearray([1 if traced else 0])
+        endpoint.extend(struct.pack("<H", group_id))
+        endpoint.extend(_wire_string(test["name"]))
+        if traced:
+            trace_pairs = test["traces"]
+            family = trace_pairs[0]["family"]
+            require(all(pair["family"] == family for pair in trace_pairs), "p99 endpoint changes family within its paired trace")
+            endpoint.extend(_wire_string(family))
+            require(len(trace_pairs) == pair_count, "p99 endpoint trace horizon differs from the confirmation pair count")
+            for pair_index, pair in enumerate(trace_pairs):
+                candidate_p99 = parse_uint(str(pair["candidate_p99"]), "candidate observed p99")
+                control_p99 = parse_uint(str(pair["control_p99"]), "control observed p99")
+                require(candidate_p99 > 0 and control_p99 > 0, "p99 endpoint contains a zero denominator")
+                require(math.isclose(test["ratios"][pair_index], candidate_p99 / control_p99, rel_tol=1e-12, abs_tol=0.0), "p99 process ratios differ from their independent observed endpoints")
+                endpoint.extend(struct.pack("<QQ", candidate_p99, control_p99))
+        else:
+            require(len(test["ratios"]) == pair_count, "counter endpoint pair horizon differs")
+            for ratio in test["ratios"]:
+                require(math.isfinite(ratio) and ratio > 0, "counter endpoint ratio is non-finite or non-positive")
+                endpoint.extend(struct.pack("<d", ratio))
+        _write_frame(destination, bytes([2]) + endpoint)
+    for suite_index, suite in enumerate(suites):
+        suite_frame = bytearray([3])
+        suite_frame.extend(_wire_string(suite["name"]))
+        suite_frame.extend(struct.pack("<H", len(suite["suite_components"])))
+        for component_index, weight in zip(suite["suite_components"], suite["suite_weights"], strict=True):
+            require(0 <= component_index < len(tests) and tests[component_index].get("suite_components") is None, "suite references a non-primary endpoint")
+            numerator, denominator = Fraction(weight).limit_denominator(4096).as_integer_ratio()
+            require(math.isclose(float(Fraction(numerator, denominator)), weight, rel_tol=0.0, abs_tol=1e-15), "suite weight cannot be represented by the frozen rational protocol")
+            suite_frame.extend(struct.pack("<HII", primary_index[id(tests[component_index])], numerator, denominator))
+        _write_frame(destination, bytes(suite_frame))
+    for group_name, group_id in group_ids.items():
+        p99_group_tests = [
+            test for test in primary
+            if test["traces"] is not None
+            and json.dumps(test["pair_group"], sort_keys=True, separators=(",", ":")) == group_name
+        ]
+        group_tests = {
+            test["traces"][0]["family"]: test
+            for test in p99_group_tests
+        }
+        require(len(group_tests) == len(p99_group_tests), "paired group repeats a p99 source-family endpoint")
+        group_frame_bound = _analyzer_group_frame_byte_bound(
+            group_name, tuple(sorted(group_tests)), pair_count, block_size,
         )
-        _write_frame(output, bytes([1]) + header_fields)
-        for endpoint_id, test in enumerate(primary):
-            traced = test.get("traces") is not None
-            group_id = group_ids[json.dumps(test["pair_group"], sort_keys=True, separators=(",", ":"))]
-            endpoint = bytearray([1 if traced else 0])
-            endpoint.extend(struct.pack("<H", group_id))
-            endpoint.extend(_wire_string(test["name"]))
-            if traced:
-                trace_pairs = test["traces"]
-                family = trace_pairs[0]["family"]
-                require(all(pair["family"] == family for pair in trace_pairs), "p99 endpoint changes family within its paired trace")
-                endpoint.extend(_wire_string(family))
-                require(len(trace_pairs) == pair_count, "p99 endpoint trace horizon differs from the confirmation pair count")
-                for pair_index, pair in enumerate(trace_pairs):
-                    candidate_p99 = parse_uint(str(pair["candidate_p99"]), "candidate observed p99")
-                    control_p99 = parse_uint(str(pair["control_p99"]), "control observed p99")
-                    require(candidate_p99 > 0 and control_p99 > 0, "p99 endpoint contains a zero denominator")
-                    require(math.isclose(test["ratios"][pair_index], candidate_p99 / control_p99, rel_tol=1e-12, abs_tol=0.0), "p99 process ratios differ from their independent observed endpoints")
-                    endpoint.extend(struct.pack("<QQ", candidate_p99, control_p99))
-            else:
-                require(len(test["ratios"]) == pair_count, "counter endpoint pair horizon differs")
-                for ratio in test["ratios"]:
-                    require(math.isfinite(ratio) and ratio > 0, "counter endpoint ratio is non-finite or non-positive")
-                    endpoint.extend(struct.pack("<d", ratio))
-            _write_frame(output, bytes([2]) + endpoint)
-        for suite_index, suite in enumerate(suites):
-            suite_frame = bytearray([3])
-            suite_frame.extend(_wire_string(suite["name"]))
-            suite_frame.extend(struct.pack("<H", len(suite["suite_components"])))
-            for component_index, weight in zip(suite["suite_components"], suite["suite_weights"], strict=True):
-                require(0 <= component_index < len(tests) and tests[component_index].get("suite_components") is None, "suite references a non-primary endpoint")
-                numerator, denominator = Fraction(weight).limit_denominator(4096).as_integer_ratio()
-                require(math.isclose(float(Fraction(numerator, denominator)), weight, rel_tol=0.0, abs_tol=1e-15), "suite weight cannot be represented by the frozen rational protocol")
-                suite_frame.extend(struct.pack("<HII", primary_index[id(tests[component_index])], numerator, denominator))
-            _write_frame(output, bytes(suite_frame))
-        for group_name, group_id in group_ids.items():
-            p99_group_tests = [
-                test for test in primary
-                if test["traces"] is not None
-                and json.dumps(test["pair_group"], sort_keys=True, separators=(",", ":")) == group_name
-            ]
-            group_tests = {
-                test["traces"][0]["family"]: test
-                for test in p99_group_tests
-            }
-            require(len(group_tests) == len(p99_group_tests), "paired group repeats a p99 source-family endpoint")
-            _write_analysis_group(output, group_id, group_name, pair_count, group_tests, scratch_directory, block_size)
-        _write_frame(output, b"\x05")
-        output.flush()
-        os.fsync(output.fileno())
-    output_path.chmod(0o600)
-    input_sha256 = sha256_file(output_path)
-    input_bytes = output_path.stat().st_size
+        require(maximum_group_frame_bytes is None or
+                group_frame_bound <= maximum_group_frame_bytes,
+                "analyzer group exceeds its exact Source5 scratch projection")
+        _write_analysis_group(
+            destination, group_id, group_name, pair_count, group_tests,
+            scratch_directory, block_size, trace_view_factory, cancel_event,
+            maximum_frame_bytes=(
+                None if maximum_group_frame_bytes is None else
+                group_frame_bound
+            ),
+        )
+    _write_frame(destination, b"\x05")
+    destination.flush()
+    input_sha256 = destination.hexdigest()
+    input_bytes = destination.tell()
     require(input_bytes <= ANALYZER_INPUT_LIMIT_BYTES, "serialized analysis input exceeds its finite byte bound")
     return tests, group_ids, input_sha256, input_bytes
 
@@ -2019,26 +2560,200 @@ def _binary_analysis_input(
 def _run_rust_analysis(
     tests: list[dict[str, Any]], protocol: dict[str, Any], binary: Path,
     expected_binary_sha256: str, scratch_directory: Path, timeout_seconds: int,
+    trace_view_factory: Any | None = None, *,
+    maximum_group_frame_bytes: int | None = None,
+    require_elf: bool = False,
 ) -> tuple[list[dict[str, float]], dict[str, Any]]:
-    require(sha256_file(binary) == expected_binary_sha256, "analysis binary differs from its host source manifest before invocation")
-    input_path = scratch_directory / f".analysis-input-{os.getpid()}-{time.monotonic_ns()}.bin"
+    sigchld_before = _require_analyzer_waitable_sigchld()
     output_path = scratch_directory / f".analysis-output-{os.getpid()}-{time.monotonic_ns()}.bin"
-    try:
-        _, input_group_ids, input_sha256, input_size = _binary_analysis_input(tests, protocol, input_path, scratch_directory)
-        input_sha256_before = sha256_file(input_path)
-        require(input_sha256_before == input_sha256 and input_path.stat().st_size == input_size, "analyzer input hash/length differs after serialization")
-        started = time.monotonic()
+    binary_fd: int | None = None
+    binary_info: os.stat_result | None = None
+    gate_read_fd: int | None = None
+    gate_write_fd: int | None = None
+    status_read_fd: int | None = None
+    status_write_fd: int | None = None
+    process: subprocess.Popen[Any] | None = None
+    pidfd: int | None = None
+    timer: threading.Timer | None = None
+    stream_cancel_event = threading.Event()
+    timeout_event = threading.Event()
+    stream_complete = False
+    process_reaped = False
+    process_start_ticks = 0
+    pipe_identity: dict[str, Any] = {}
+    launch_transition: dict[str, str] | None = None
+    stream_writer: _HashingBoundedWriter | None = None
+    signal_errors: list[OSError] = []
+
+    def signal_owned_analyzer() -> None:
+        if pidfd is None:
+            return
         try:
-            result = subprocess.run([str(binary), str(input_path), str(output_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_seconds, check=False)
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise CampaignError(f"pinned Rust analyzer did not finish within its finite budget: {error}") from error
+            signal.pidfd_send_signal(pidfd, signal.SIGKILL, None, 0)
+        except ProcessLookupError:
+            pass
+        except OSError as error:
+            signal_errors.append(error)
+
+    def expire_analyzer() -> None:
+        timeout_event.set()
+        stream_cancel_event.set()
+        signal_owned_analyzer()
+
+    try:
+        binary_fd, binary_info = _open_pinned_analyzer_executable(
+            binary, expected_binary_sha256,
+        )
+        binary_magic = os.pread(binary_fd, 4, 0)
+        analyzer_is_elf = binary_magic == b"\x7fELF"
+        require(not require_elf or analyzer_is_elf,
+                "Source5 Rust analyzer executable is not a pinned ELF image")
+        gate_read_fd, gate_write_fd = os.pipe2(getattr(os, "O_CLOEXEC", 0))
+        status_read_fd, status_write_fd = os.pipe2(
+            getattr(os, "O_CLOEXEC", 0),
+        )
+        os.set_blocking(status_read_fd, False)
+        try:
+            process = subprocess.Popen(
+                [
+                    sys.executable, "-I", "-S", "-c",
+                    ANALYZER_GATE_LAUNCHER_SOURCE,
+                    str(gate_read_fd), str(binary_fd),
+                    str(status_write_fd), str(binary), str(output_path),
+                ],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                bufsize=0, close_fds=True,
+                pass_fds=(binary_fd, gate_read_fd, status_write_fd),
+            )
+        except OSError as error:
+            raise CampaignError(
+                f"cannot start the source-pinned analyzer gate shim: {error}",
+            ) from error
+        require(process.stdin is not None and process.pid is not None,
+                "pinned analyzer gate shim did not expose its owned stdin pipe")
+        try:
+            # The shim is blocked before exec until the parent owns this stable
+            # kernel handle; every later signal uses this fd, never a PID.
+            pidfd = os.pidfd_open(process.pid, 0)
+        except OSError as error:
+            raise CampaignError(
+                "cannot acquire the gated analyzer pidfd before exec release",
+            ) from error
+        os.close(gate_read_fd)
+        gate_read_fd = None
+        os.close(status_write_fd)
+        status_write_fd = None
+        require(_require_analyzer_waitable_sigchld() == sigchld_before,
+                "SIGCHLD waitability changed during gated analyzer spawn")
+        _analyzer_waitid_nowait(process.pid)
+        launcher_start_ticks = _read_linux_process_start_ticks(process.pid)
+        launcher_pipe_identity = _owned_analyzer_pipe_identity(process)
+        started = time.monotonic()
+        timer = threading.Timer(timeout_seconds, expire_analyzer)
+        timer.daemon = True
+        timer.start()
+        try:
+            require(os.write(gate_write_fd, b"\x01") == 1,
+                    "analyzer gate did not accept its one-byte release")
+        finally:
+            os.close(gate_write_fd)
+            gate_write_fd = None
+        _await_analyzer_exec_transition(
+            status_read_fd, process, timeout_event, signal_errors,
+            signal_owned_analyzer,
+        )
+        os.close(status_read_fd)
+        status_read_fd = None
+        process_start_ticks = _read_linux_process_start_ticks(process.pid)
+        pipe_identity = _owned_analyzer_pipe_identity(process)
+        require(process_start_ticks == launcher_start_ticks and
+                pipe_identity == launcher_pipe_identity,
+                "analyzer PID/start or owned pipe changed across its gated exec")
+        if analyzer_is_elf:
+            try:
+                executed_info = os.stat(f"/proc/{process.pid}/exe")
+            except OSError as error:
+                raise CampaignError(
+                    "cannot verify the analyzer executable after gated exec",
+                ) from error
+            require(binary_info is not None and
+                    (executed_info.st_dev, executed_info.st_ino) ==
+                        (binary_info.st_dev, binary_info.st_ino),
+                    "analyzer process is not executing the exact opened ELF inode")
+            executable_identity = "elf_proc_inode_matched"
+        else:
+            executable_identity = "exec_pipe_confirmed_non_elf_fixture"
+        launch_transition = {
+            "schema": "allocatbelt.application-rust-analyzer-launch-transition.v1",
+            "kind": "pinned_binary_fd_gate_exec",
+            "status": "exec_confirmed_close_on_exec_pipe",
+            "launcher_sha256": ANALYZER_GATE_LAUNCHER_SHA256,
+            "binary_sha256": expected_binary_sha256,
+            "executable_identity": executable_identity,
+        }
+        stream_writer = _HashingBoundedWriter(
+            process.stdin, ANALYZER_INPUT_LIMIT_BYTES,
+        )
+        try:
+            serialized_tests, input_group_ids, input_sha256, input_size = \
+                _binary_analysis_input(
+                    tests, protocol, stream_writer, scratch_directory,
+                    trace_view_factory, stream_cancel_event,
+                    maximum_group_frame_bytes,
+                )
+            stream_complete = True
+        finally:
+            if not process.stdin.closed:
+                process.stdin.close()
+        require(serialized_tests is tests and
+                input_size == stream_writer.byte_count and
+                input_sha256 == stream_writer.hexdigest(),
+                "analyzer stream count/hash differs from the exact bytes accepted by its pipe")
+        try:
+            deadline = time.monotonic() + timeout_seconds + 1
+            while True:
+                wait_result = _analyzer_waitid_nowait(process.pid)
+                if wait_result is not None:
+                    break
+                if timeout_event.is_set() and signal_errors:
+                    signal_errors.clear()
+                    signal_owned_analyzer()
+                if (not timeout_event.is_set() and
+                        time.monotonic() >= deadline):
+                    expire_analyzer()
+                time.sleep(0.01)
+        finally:
+            # The timeout callback may kill but never reaps. Join it before
+            # Popen.wait so it cannot signal a reused PID.
+            timer.cancel()
+            timer.join()
+            timer = None
+        try:
+            return_code = process.wait()
+        except ChildProcessError as error:
+            raise CampaignError(
+                "analyzer child status was reaped by another process owner",
+            ) from error
+        process_reaped = True
         elapsed_seconds = time.monotonic() - started
-        require(result.returncode == 0 and output_path.is_file(), f"pinned Rust analyzer rejected its canonical stream: {result.stderr.decode(errors='replace')[:512]}")
-        require(sha256_file(binary) == expected_binary_sha256, "analysis binary changed during invocation")
-        require(sha256_file(input_path) == input_sha256_before and input_path.stat().st_size == input_size, "analyzer input changed during invocation")
-        output_bytes = output_path.read_bytes()
-        output_sha256 = hashlib.sha256(output_bytes).hexdigest()
-        require(len(output_bytes) <= 2 * 1024 * 1024 and output_bytes.startswith(ANALYZER_OUTPUT_MAGIC), "Rust analyzer response is malformed or exceeds its finite bound")
+        require(launch_transition is not None and binary_fd is not None and
+                binary_info is not None,
+                "analyzer gated launch proof or pinned executable fd is absent")
+        require(not timeout_event.is_set(),
+                "pinned Rust analyzer did not finish within its finite budget")
+        require(return_code == 0 and output_path.is_file(), f"pinned Rust analyzer rejected its canonical stream with exit status {return_code}")
+        executable_sha, executable_info = _hash_open_analyzer_executable(
+            binary_fd, binary, 1024 * 1024 * 1024,
+        )
+        require(executable_sha == expected_binary_sha256 and
+                _analyzer_executable_identity(binary_info) ==
+                    _analyzer_executable_identity(executable_info),
+                "opened analyzer executable changed during invocation")
+        output_bytes, output_sha256 = read_stable_bytes(
+            output_path, "Rust analyzer response", ANALYZER_OUTPUT_LIMIT_BYTES,
+        )
+        require(output_bytes.startswith(ANALYZER_OUTPUT_MAGIC), "Rust analyzer response is malformed or exceeds its finite bound")
         offset = 8
 
         def take(format_string: str) -> tuple[Any, ...]:
@@ -2082,8 +2797,13 @@ def _run_rust_analysis(
             intervals_by_name[name] = {"point": point, "lower": lower, "upper": upper, "scale_log": scale_log}
         require(offset == len(output_bytes), "Rust analyzer response has trailing bytes")
         require(sha256_file(output_path) == output_sha256, "Rust analyzer output changed while it was being validated")
-        require(sha256_file(binary) == expected_binary_sha256, "analysis binary changed before validation completed")
-        require(sha256_file(input_path) == input_sha256_before, "analyzer input changed before validation completed")
+        executable_sha, executable_info = _hash_open_analyzer_executable(
+            binary_fd, binary, 1024 * 1024 * 1024,
+        )
+        require(executable_sha == expected_binary_sha256 and
+                _analyzer_executable_identity(binary_info) ==
+                    _analyzer_executable_identity(executable_info),
+                "opened analyzer executable changed before validation completed")
         intervals = [intervals_by_name[test["name"]] for test in tests]
         metadata = {
             "schema": "allocatbelt.application-rust-bootstrap.v1",
@@ -2100,19 +2820,73 @@ def _run_rust_analysis(
             "scale_definition": "sample_sd_of_joint_log_ratio_draw_matrix",
             "point_definition": "geometric_mean_of_matched_process_ratios; suite endpoints use rational equal profile-family-context weights",
             "analyzer_binary_sha256": expected_binary_sha256,
-            "input_sha256": input_sha256_before,
+            "input_sha256": input_sha256,
             "input_bytes": input_size,
+            "input_transport": {
+                "schema": "allocatbelt.application-rust-analyzer-input-transport.v2",
+                "kind": "owned_stdin_pipe",
+                "input_sha256": input_sha256,
+                "input_bytes": input_size,
+                "decoder_consumed_bytes": consumed_bytes,
+                "launch_transition": launch_transition,
+                "process": {
+                    "parent_pid": os.getpid(),
+                    "child_pid": process.pid,
+                    "start_ticks": process_start_ticks,
+                    "pipe": pipe_identity,
+                },
+            },
             "resident_peak_bytes": resident_peak,
             "output_sha256": output_sha256,
             "analyzer_wall_seconds": elapsed_seconds,
         }
         return intervals, metadata
     finally:
-        for path in (input_path, output_path):
+        if not stream_complete:
+            stream_cancel_event.set()
+        if timer is not None:
+            timer.cancel()
+            timer.join()
+            timer = None
+        if gate_write_fd is not None:
             try:
-                path.unlink()
-            except FileNotFoundError:
+                os.close(gate_write_fd)
+            except OSError:
                 pass
+            gate_write_fd = None
+        if process is not None:
+            if not process_reaped:
+                signal_owned_analyzer()
+            if process.stdin is not None and not process.stdin.closed:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+            if not process_reaped:
+                try:
+                    process.wait()
+                    process_reaped = True
+                except ChildProcessError:
+                    process_reaped = True
+        for descriptor_name in (
+                "gate_read_fd", "gate_write_fd", "status_read_fd",
+                "status_write_fd"):
+            descriptor = locals()[descriptor_name]
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        if binary_fd is not None:
+            os.close(binary_fd)
+            binary_fd = None
+        if pidfd is not None:
+            os.close(pidfd)
+            pidfd = None
+        try:
+            output_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def pair_record_map(records: list[dict[str, Any]], phase: str, host_id: str) -> dict[tuple[str, str, str, int, str, int], dict[str, Any]]:
@@ -2164,7 +2938,10 @@ def validate_aa_records(records: list[dict[str, Any]], expected_jobs: list[dict[
 def analyze_confirmation_host_numeric(
     spec: dict[str, Any], host_id: str, records: list[dict[str, Any]], ledger_root: Path,
     analysis_binary: Path | None = None, analysis_binary_sha256: str | None = None,
-    phase: str = "confirmation",
+    phase: str = "confirmation", trace_view_factory: Any | None = None,
+    analyzer_require_elf: bool = False,
+    analyzer_scratch_directory: Path | None = None,
+    analyzer_maximum_group_frame_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Analyze only explicitly matched two-process treatment jobs."""
     protocol = spec["protocol"]
@@ -2210,7 +2987,14 @@ def analyze_confirmation_host_numeric(
         if analysis_binary is not None:
             process_metric, pair_dir = metric(cell, "open_loop", load, kind, contrast, ordinal, allocator, executor)
             require(isinstance(process_metric.get("ids_path"), str) and is_sha256(process_metric.get("ids_sha256")), "Rust analyzer process is missing its trusted per-ID sidecar reference")
-            return {"__trace_source__": {"path": str(pair_dir / process_metric["ids_path"]), "sha256": process_metric["ids_sha256"]}}
+            owner_job = jobs[pair_key(
+                cell, "open_loop", load, kind, contrast, ordinal,
+            )]["job"]
+            return {"__trace_source__": {
+                "path": str(pair_dir / process_metric["ids_path"]),
+                "sha256": process_metric["ids_sha256"],
+                "owner_job": owner_job,
+            }}
         if cache_key not in trace_cache:
             process_metric, pair_dir = metric(cell, "open_loop", load, kind, contrast, ordinal, allocator, executor)
             families = STANDALONE if cell["family"] == "mixed" else (cell["family"],)
@@ -2370,13 +3154,21 @@ def analyze_confirmation_host_numeric(
             "Rust analyzer input does not cover the complete frozen per-host fixed/pressure metric family",
         )
         require(is_sha256(analysis_binary_sha256), "Rust analyzer is missing its source-manifest binary hash")
+        scratch_directory = (ledger_root if analyzer_scratch_directory is None
+                             else analyzer_scratch_directory)
+        require(isinstance(scratch_directory, Path) and
+                scratch_directory.is_absolute(),
+                "Rust analyzer scratch directory is not an exact absolute path")
         intervals, bootstrap_metadata = _run_rust_analysis(
             tests,
             protocol,
             analysis_binary,
             analysis_binary_sha256,
-            ledger_root,
+            scratch_directory,
             spec["deadlines"]["outer_seconds"],
+            trace_view_factory,
+            maximum_group_frame_bytes=analyzer_maximum_group_frame_bytes,
+            require_elf=analyzer_require_elf,
         )
     result_tests = []
     passed = True

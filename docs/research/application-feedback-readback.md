@@ -271,6 +271,15 @@ owner and each directory's mode and owner; unexpected descendants are rejected
 by name before the verifier inspects their metadata or contents. Offline replay
 then invokes the SourceV5-pinned FixedR8 offline storage verifier. An ancestor
 path does not satisfy a missing file entry.
+
+The bounded Source5 pressure owner also supplies an authenticated
+`allocatbelt.application-source5-pressure-captured-replay.v1` context. In that
+branch the expectation and the exact three trace members are read through the
+owner's artifact view as bounded snapshots; the reclaimed trace directory is
+not opened or statted. ProbeV2 output/TMPDIR replay keeps using the same view
+and additionally closes the capture receipt, inventory document, typed tree
+row, and every file and directory descendant before accepting the probe.
+
 The replay has no APP launch, `/proc` host
 check, or trusted success flag; it reads and recomputes the original bytes
 again rather than accepting a prior in-memory result.
@@ -359,3 +368,21 @@ The pressure request shape is closed:
 The placeholders above describe digest roles only; they are not accepted
 values or a prepared evidence package. The request's original absolute path
 strings must remain byte-for-byte unchanged in the supplied JSON documents.
+
+The additive in-process
+`allocatbelt.application-feedback-captured-offline-replay-context.v1` is used
+by the Source5 Soak H-view and captured pressure replay adapters. It carries the
+authenticated staged object reader, sorted original object paths,
+owner-inventory file/directory facts, and typed ProbeV2 TMPDIR tree rows. It
+does not accept an identity or stage-path map. Captured TMPDIR descendants are
+streamed from raw-pinned stage objects and compared with the ProbeV2 inventory
+and capture receipt; reclaimed origin paths are never inspected. Captured
+pressure feedback replay also reads its pressure receipt, final runtime
+binding, expectation and three trace files through that view. It requires the
+Source manifest to remain a declared resident input, closes the trace root to
+the exact three flat files, and does not stat or open reclaimed output paths.
+Synthetic V2 pressure fixtures exercise the reader's existing per-trace
+eligibility result only; they do not establish Source5 host/campaign readiness
+or allocator performance.
+The existing identity-only offline context and public verification path retain
+their original shapes.
