@@ -2335,6 +2335,90 @@ def _verify_capacity_pilot_captured_pair(
             replay["execution_receipt"])
 
 
+def _capacity_pilot_pair_data_v1(
+    job: dict[str, Any], receipt_value: dict[str, Any], host_id: str,
+    pair_index: int, *, overlay_pin: dict[str, Any],
+    receipt_pin: dict[str, Any], overlay_raw_sha256: str,
+    receipt_raw_sha256: str, verified_receipt_sha256: str,
+    host_verification_pin: dict[str, Any],
+    prepared_host_binding_sha256: str,
+) -> dict[str, Any]:
+    """Project one already-replayed Fixed pair into the original pilot row."""
+    overlay_pin = _exact(
+        overlay_pin, {"path", "sha256"},
+        f"fixed-pair overlay pin[{pair_index}]",
+    )
+    receipt_pin = _exact(
+        receipt_pin, {"path", "sha256"},
+        f"fixed-pair receipt pin[{pair_index}]",
+    )
+    host_verification_pin = _exact(
+        host_verification_pin,
+        {"path", "raw_sha256", "host_verification_sha256"},
+        f"fixed-pair strict host-verification receipt pin[{pair_index}]",
+    )
+    run_id = job["run_id"]
+    _require(receipt_value.get("run_id") == run_id and
+             receipt_value.get("host_id") == host_id and
+             receipt_value.get("status") == "valid_pair",
+             f"fixed-pair receipt[{pair_index}] identity/status differs from its original job")
+    metrics = receipt_value.get("process_metrics")
+    rows = receipt_value.get("process_rows")
+    _require(type(metrics) is list and len(metrics) == 2 and
+             type(rows) is list and len(rows) == 2,
+             f"fixed-pair receipt[{pair_index}] lacks both independently replayed APP members")
+    metric_by_executor = {
+        item.get("executor"): item for item in metrics if type(item) is dict
+    }
+    row_by_executor = {
+        item.get("executor"): item for item in rows if type(item) is dict
+    }
+    _require(set(metric_by_executor) == {"bounded", "tokio"} and
+             set(row_by_executor) == {"bounded", "tokio"},
+             f"fixed-pair receipt[{pair_index}] is not one bounded/Tokio pair")
+    pair: dict[str, Any] = {
+        "ordinal": job["ordinal"],
+        "bounded_status": "valid", "tokio_status": "valid",
+        "raw_pair_sha256": _sha256(_canonical({
+            "overlay_raw_sha256": overlay_raw_sha256,
+            "receipt_raw_sha256": receipt_raw_sha256,
+            "verified_receipt_sha256": verified_receipt_sha256,
+            "host_verification_raw_sha256": host_verification_pin["raw_sha256"],
+            "host_verification_sha256": host_verification_pin["host_verification_sha256"],
+            "prepared_host_binding_sha256": prepared_host_binding_sha256,
+            "run_id": run_id,
+        })),
+    }
+    for executor in ("bounded", "tokio"):
+        row = row_by_executor[executor]
+        metric = metric_by_executor[executor]
+        _require(row.get("allocator") == job["allocator"] and
+                 row.get("mode") == "capacity" and
+                 metric.get("allocator") == job["allocator"] and
+                 metric.get("mode") == "capacity",
+                 f"fixed-pair receipt[{pair_index}] APP allocator/mode differs from its capacity-pilot job")
+        try:
+            on_time = _row_uint(row, "completed_on_time", f"{executor} on-time")
+            late = _row_uint(row, "completed_late", f"{executor} late")
+            attempted = _row_uint(row, "attempted", f"{executor} attempted", positive=True)
+            admitted = _row_uint(row, "admitted", f"{executor} admitted", positive=True)
+            rejected = _row_uint(row, "rejected_full", f"{executor} full rejects") + _row_uint(
+                row, "rejected_resource", f"{executor} resource rejects",
+            )
+        except PreparationError:
+            raise
+        _require(on_time > 0 and admitted == on_time + late and
+                 attempted == admitted + rejected and rejected == 0 and
+                 metric.get("completed_on_time") == on_time and
+                 metric.get("completed_late") == late,
+                 f"fixed-pair receipt[{pair_index}] {executor} capacity accounting does not reconcile")
+        for field, number in (("on_time", on_time), ("late", late),
+                              ("attempted", attempted), ("admitted", admitted),
+                              ("rejected", rejected)):
+            pair[f"{executor}_{field}"] = number
+    return pair
+
+
 def _export_capacity_pilot_impl(
     preparation_final_pins: dict[str, Any], verified_fixed_records: list[dict[str, Any]], host_id: str,
     *, captured_read_provider: Any = None, before_publication: Any = None,
@@ -2517,52 +2601,16 @@ def _export_capacity_pilot_impl(
                      f"fixed-pair receipt[{index}] differs from the captured owner's execution receipt")
             run_id = job["run_id"]
             _require(run_id not in raw_pair_pins, "fixed-pair receipts repeat an original capacity-pilot run ID")
-            _require(receipt_value.get("run_id") == run_id and receipt_value.get("host_id") == host_id and
-                     receipt_value.get("status") == "valid_pair",
-                     f"fixed-pair receipt[{index}] identity/status differs from its original job")
-            metrics = receipt_value.get("process_metrics")
-            rows = receipt_value.get("process_rows")
-            _require(type(metrics) is list and len(metrics) == 2 and type(rows) is list and len(rows) == 2,
-                     f"fixed-pair receipt[{index}] lacks both independently replayed APP members")
-            metric_by_executor = {item.get("executor"): item for item in metrics if type(item) is dict}
-            row_by_executor = {item.get("executor"): item for item in rows if type(item) is dict}
-            _require(set(metric_by_executor) == {"bounded", "tokio"} and set(row_by_executor) == {"bounded", "tokio"},
-                     f"fixed-pair receipt[{index}] is not one bounded/Tokio pair")
-            pair: dict[str, Any] = {
-                "ordinal": job["ordinal"],
-                "bounded_status": "valid", "tokio_status": "valid",
-                "raw_pair_sha256": _sha256(_canonical({
-                    "overlay_raw_sha256": overlay_raw_sha,
-                    "receipt_raw_sha256": receipt_raw_sha,
-                    "verified_receipt_sha256": verified["receipt_sha256"],
-                    "host_verification_raw_sha256": host_verification_pin["raw_sha256"],
-                    "host_verification_sha256": host_verification_pin["host_verification_sha256"],
-                    "prepared_host_binding_sha256": prepared_host_binding["binding_sha256"],
-                    "run_id": run_id,
-                })),
-            }
-            for executor in ("bounded", "tokio"):
-                row = row_by_executor[executor]
-                metric = metric_by_executor[executor]
-                _require(row.get("allocator") == job["allocator"] and row.get("mode") == "capacity" and
-                         metric.get("allocator") == job["allocator"] and metric.get("mode") == "capacity",
-                         f"fixed-pair receipt[{index}] APP allocator/mode differs from its capacity-pilot job")
-                try:
-                    on_time = _row_uint(row, "completed_on_time", f"{executor} on-time")
-                    late = _row_uint(row, "completed_late", f"{executor} late")
-                    attempted = _row_uint(row, "attempted", f"{executor} attempted", positive=True)
-                    admitted = _row_uint(row, "admitted", f"{executor} admitted", positive=True)
-                    rejected = _row_uint(row, "rejected_full", f"{executor} full rejects") + _row_uint(
-                        row, "rejected_resource", f"{executor} resource rejects",
-                    )
-                except PreparationError:
-                    raise
-                _require(on_time > 0 and admitted == on_time + late and attempted == admitted + rejected and rejected == 0 and
-                         metric.get("completed_on_time") == on_time and metric.get("completed_late") == late,
-                         f"fixed-pair receipt[{index}] {executor} capacity accounting does not reconcile")
-                for field, number in (("on_time", on_time), ("late", late), ("attempted", attempted),
-                                      ("admitted", admitted), ("rejected", rejected)):
-                    pair[f"{executor}_{field}"] = number
+            pair = _capacity_pilot_pair_data_v1(
+                job, receipt_value, host_id, index,
+                overlay_pin=overlay_pin,
+                receipt_pin=receipt_pin,
+                overlay_raw_sha256=overlay_raw_sha,
+                receipt_raw_sha256=receipt_raw_sha,
+                verified_receipt_sha256=verified["receipt_sha256"],
+                host_verification_pin=host_verification_pin,
+                prepared_host_binding_sha256=prepared_host_binding["binding_sha256"],
+            )
         key = (job["family"], job["profile"], job["allocator"], job["ordinal"])
         _require(key not in rows_by_key, f"capacity-pilot original ordinal is duplicated: {key}")
         rows_by_key[key] = pair

@@ -507,6 +507,12 @@ with bounded and Tokio members in every pair. That is 720 original 30-second
 APP runs and at least six hours of serial runtime per host. Reruns with new IDs cannot
 replace missing or invalid originals.
 
+Pair accounting and the seven-field raw-pair hash share one private, pure
+projection. It uses the overlay and receipt digests saved by the envelope
+reads, including the strict host receipt and prepared-host binding in the
+hash. The enclosing exporter retains the generation checks and actual
+Fixed owner replay before calling this projection.
+
 The fixed-pair overlay retains its original `observed_host.pin` to the exact
 SpecV3 host-record bytes. It is not substituted with the separately pinned
 preparation host-context file. The legacy `build_prepared_host_binding` API
