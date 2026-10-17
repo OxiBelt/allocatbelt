@@ -1943,6 +1943,7 @@ class Source5ArchiveCallerTests(unittest.TestCase):
                 }
 
         context = types.SimpleNamespace(
+            scope="final_frozen",
             manifest={"campaign_id": "campaign-a",
                       "manifest_sha256": "a" * 64,
                       "schema": controller.EXECUTION_SCHEMA_V4},
@@ -4815,6 +4816,7 @@ class Source5FreshPhaseStartBoundaryTests(unittest.TestCase):
             }]}
             budget_module = types.SimpleNamespace(
                 FAILURE_WINDOW_ONLY_ROLES=frozenset(),
+                validate_path_catalogue_manifest=lambda value: value,
                 verify_path_catalogue_chunks=lambda value: value,
                 iter_path_catalogue_rows=lambda value: iter(value["rows"]),
             )
@@ -4823,8 +4825,8 @@ class Source5FreshPhaseStartBoundaryTests(unittest.TestCase):
                     "uncompleted original ordinal",
             ):
                 controller._source5_assert_uncompleted_catalogue_paths_absent(
-                    types.SimpleNamespace(), {"path_catalogue": catalogue},
-                    budget_module, set(),
+                    types.SimpleNamespace(scope="final_frozen", modules={}),
+                    {"path_catalogue": catalogue}, budget_module, set(),
                 )
 
     def test_phase_runners_check_future_catalogue_paths_before_authorization(self) -> None:

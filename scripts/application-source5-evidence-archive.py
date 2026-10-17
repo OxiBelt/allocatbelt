@@ -160,6 +160,57 @@ MAX_ARCHIVE_SIGNER_CONTEXT_BYTES = 64 * 1024
 SOURCE5_RECORDED_READ_PLAN_PATH = (
     "scripts/application-source5-recorded-preparation-read.py"
 )
+SOURCE5_PREPARED_INPUT_CONSTRUCTION_BASIS_SCHEMA = (
+    "allocatbelt.application-source5-prepared-input-construction-basis.v1"
+)
+SOURCE5_PREPARED_INPUT_CONSTRUCTION_READ_PLAN_SHA256 = (
+    "e7bcc00bc0bbf1650da2825806d7cf60fc8862dde8ac9a0dc511aa0d5bf912fb"
+)
+_SOURCE5_RECORDED_READ_API_NAMES = {
+    "validate_basis": "_validate_basis",
+    "validate_plan_self": "_validate_plan_self",
+    "plan_pin": "recorded_preparation_read_plan_pin_v2",
+    "validate_plan_row": "_validate_plan_row",
+    "validate_window": "validate_recorded_preparation_read_window_v2",
+    "build_request": "build_recorded_preparation_read_request_v2",
+    "validate_request": "validate_recorded_preparation_read_request_v2",
+    "build_response": "build_recorded_preparation_read_response_v2",
+    "validate_response": "validate_recorded_preparation_read_response_v2",
+    "build_control_event": "build_recorded_preparation_read_control_event_v2",
+    "build_session_descriptor":
+        "build_recorded_preparation_read_session_descriptor_v2",
+    "failure_receipt_schema": "FAILURE_RECEIPT_SCHEMA_V2",
+}
+_SOURCE5_PREPARED_INPUT_CONSTRUCTION_API_NAMES = {
+    "validate_basis": "validate_prepared_input_construction_basis_v1",
+    "validate_plan_self": "_validate_prepared_input_construction_plan_self",
+    "plan_pin": "prepared_input_construction_read_plan_pin_v1",
+    "validate_plan_row": "_validate_prepared_input_construction_plan_row",
+    "validate_window":
+        "validate_prepared_input_construction_read_window_v1",
+    "build_request": "build_prepared_input_construction_read_request_v1",
+    "validate_request":
+        "validate_prepared_input_construction_read_request_v1",
+    "build_response":
+        "build_prepared_input_construction_read_response_v1",
+    "validate_response":
+        "validate_prepared_input_construction_read_response_v1",
+    "build_control_event":
+        "build_prepared_input_construction_read_control_event_v1",
+    "build_session_descriptor":
+        "build_prepared_input_construction_read_session_descriptor_v1",
+    "failure_receipt_schema":
+        "PREPARED_INPUT_CONSTRUCTION_FAILURE_RECEIPT_SCHEMA_V1",
+}
+_SOURCE5_ROOT_READ_CALLABLE_APIS = frozenset(
+    set(_SOURCE5_RECORDED_READ_API_NAMES) - {"failure_receipt_schema"}
+)
+RECORDED_READ_CONSTRUCTION_ROOT_CONTROL_SCHEMA_V1 = (
+    "allocatbelt.application-source5-prepared-input-construction-root-control-event.v1"
+)
+RECORDED_READ_CONSTRUCTION_ROOT_FAILURE_SCHEMA_V1 = (
+    "allocatbelt.application-source5-prepared-input-construction-root-failure.v1"
+)
 MAX_ARCHIVE_GPGV_BYTES = 64 * 1024 * 1024
 RECORDED_READ_GPG_RESOURCE_SCHEMA_V2 = (
     "allocatbelt.application-source5-recorded-read-gpg-resource.v2"
@@ -2627,7 +2678,7 @@ def _prepared_lineage_closure(
             source_objects["evidence_budget"])
 
 
-def _recorded_pre_manifest_source_closure(
+def _recorded_pre_manifest_source_graph(
     basis: dict[str, Any], basis_pin: dict[str, Any],
     selected_source_manifest_raw: bytes,
     capture_manifest_raw: bytes, capture_stage_root: str,
@@ -2691,7 +2742,6 @@ def _recorded_pre_manifest_source_closure(
         "lineage": ("verify_source5_prepared_exploration_lineage_v2",),
         "bridge": (
             "build_prepared_exploration_capture_storage_v1",
-            "validate_prepared_exploration_width_contract_v2",
         ),
         "source5_campaign": ("build_source5_original_pins_from_observed_v1",),
         "chronology": ("_validate_chronology_original_pins",),
@@ -2898,45 +2948,6 @@ def _recorded_pre_manifest_source_closure(
         _require(declaration.get("cohort_host_ids") == basis_hosts and
                  len(storage_rows) == len(declaration.get("objects", [])),
                  "recorded-read Source capture declaration is not a complete cohort")
-        width_pin = _pin(basis["width_contract_pin"],
-                         "recorded-read current width contract pin")
-        width_raw = bootstrap_reader(
-            {"path": width_pin["path"],
-             "raw_sha256": width_pin["raw_sha256"]},
-            PREPARATORY_MAX_WIDTH_BYTES,
-        )
-        width = _parse_canonical(
-            width_raw, "recorded-read current width contract",
-            maximum_bytes=PREPARATORY_MAX_WIDTH_BYTES,
-        )
-        selected_jobs = {
-            phase: [job for job in source_plan["jobs"][phase]
-                    if type(job) is dict and job.get("host_id") == consumer]
-            for phase in ("exploration", "aa", "confirmation", "pressure", "soak")
-        }
-        try:
-            checked_width, width_events, max_line = objects[
-                "bridge"
-            ].validate_prepared_exploration_width_contract_v2(
-                width, jobs_by_phase=selected_jobs,
-                expected_campaign_id=basis["campaign_id"],
-                expected_host_id=consumer,
-                expected_original_pins_sha256=_sha(_canonical(
-                    original_pin_dtos[consumer],
-                )), expected_plan_pin=plan_pin,
-                expected_source_manifest_pin=selected_pin,
-                expected_ancestor=proofs[consumer]["ancestor"],
-            )
-        except Exception as error:
-            raise EvidenceArchiveError(
-                f"typed Source width validator rejected recorded-read basis: {error}",
-            ) from error
-        _require(checked_width == width and width_events == 97499 and
-                 max_line > 0 and _sha(width_raw) == width_pin["raw_sha256"] and
-                 _sha(_canonical({key: value for key, value in width.items()
-                                  if key != "contract_sha256"})) ==
-                     width_pin["semantic_sha256"],
-                 "recorded-read current width contract differs from its exact basis pin")
         captured_by_pin = {
             (item["origin_pin"]["path"],
              item["origin_pin"]["raw_sha256"]): item
@@ -2958,22 +2969,196 @@ def _recorded_pre_manifest_source_closure(
                  len(expected_capture_rows) == len(declaration["objects"]),
                  "recorded-read closed capture manifest differs from the full Source-derived declaration")
         return {
-        "reader": bootstrap, "declaration": declaration,
-        "storage_rows": storage_rows, "proofs": proofs,
-        "source_docs": source_docs, "source_modules": objects,
-        "source_plan": source_plan, "spec": spec, "width": width,
-        "source_pins": source_pins, "selected_source_pin": selected_pin,
+            "reader": bootstrap, "declaration": declaration,
+            "storage_rows": storage_rows, "proofs": proofs,
+            "source_docs": source_docs, "source_modules": objects,
+            "source_plan": source_plan, "spec": spec,
+            "source_pins": source_pins,
+            "selected_source_pin": selected_pin,
+            "bootstrap_reader": bootstrap_reader,
+            "original_pin_dtos": original_pin_dtos,
         }
     except BaseException:
         bootstrap.close()
         raise
 
 
+def _recorded_pre_manifest_source_current_width(
+    basis: dict[str, Any], graph: dict[str, Any],
+) -> dict[str, Any]:
+    """Finalize ordinary registration replay with its pinned current width."""
+    bridge = graph["source_modules"]["bridge"]
+    width_validator = getattr(
+        bridge, "validate_prepared_exploration_width_contract_v2", None,
+    )
+    _require(callable(width_validator),
+             "selected Source lacks the current width-contract validator")
+    width_pin = _pin(basis["width_contract_pin"],
+                     "recorded-read current width contract pin")
+    width_raw = graph["bootstrap_reader"](
+        {"path": width_pin["path"], "raw_sha256": width_pin["raw_sha256"]},
+        PREPARATORY_MAX_WIDTH_BYTES,
+    )
+    width = _parse_canonical(
+        width_raw, "recorded-read current width contract",
+        maximum_bytes=PREPARATORY_MAX_WIDTH_BYTES,
+    )
+    source_plan = graph["source_plan"]
+    consumer = basis["consumer_host_id"]
+    selected_jobs = {
+        phase: [job for job in source_plan["jobs"][phase]
+                if type(job) is dict and job.get("host_id") == consumer]
+        for phase in ("exploration", "aa", "confirmation", "pressure", "soak")
+    }
+    try:
+        checked_width, width_events, max_line = width_validator(
+            width, jobs_by_phase=selected_jobs,
+            expected_campaign_id=basis["campaign_id"],
+            expected_host_id=consumer,
+            expected_original_pins_sha256=_sha(_canonical(
+                graph["original_pin_dtos"][consumer],
+            )), expected_plan_pin=_pin(
+                basis["plan_pin"], "recorded-read final Plan pin",
+            ), expected_source_manifest_pin=graph["selected_source_pin"],
+            expected_ancestor=graph["proofs"][consumer]["ancestor"],
+        )
+    except Exception as error:
+        raise EvidenceArchiveError(
+            f"typed Source width validator rejected recorded-read basis: {error}",
+        ) from error
+    _require(checked_width == width and width_events == 97499 and
+             max_line > 0 and _sha(width_raw) == width_pin["raw_sha256"] and
+             _sha(_canonical({key: value for key, value in width.items()
+                              if key != "contract_sha256"})) ==
+                 width_pin["semantic_sha256"],
+             "recorded-read current width contract differs from its exact basis pin")
+    return width
+
+
+def _recorded_pre_manifest_source_closure(
+    basis: dict[str, Any], basis_pin: dict[str, Any],
+    selected_source_manifest_raw: bytes,
+    capture_manifest_raw: bytes, capture_stage_root: str,
+    source_root_value: str, final_plan_module: object, *,
+    deadline_ns: int | None = None, cancel_event=None,
+) -> dict[str, Any]:
+    """Rebuild the common Source graph and retain ordinary current-width replay."""
+    graph = _recorded_pre_manifest_source_graph(
+        basis, basis_pin, selected_source_manifest_raw, capture_manifest_raw,
+        capture_stage_root, source_root_value, final_plan_module,
+        deadline_ns=deadline_ns, cancel_event=cancel_event,
+    )
+    try:
+        graph["width"] = _recorded_pre_manifest_source_current_width(
+            basis, graph,
+        )
+        return graph
+    except BaseException:
+        graph["reader"].close()
+        raise
+
+
+def _recorded_pre_manifest_source_construction_closure(
+    basis: dict[str, Any], basis_pin: dict[str, Any],
+    selected_source_manifest_raw: bytes,
+    capture_manifest_raw: bytes, capture_stage_root: str,
+    source_root_value: str, final_plan_module: object, *,
+    deadline_ns: int | None = None, cancel_event=None,
+) -> dict[str, Any]:
+    """Rebuild the same graph without a future completion or current-width pin."""
+    _require("prepared_input_generation" not in basis and
+             "width_contract_pin" not in basis and
+             type(basis.get("construction_inputs")) is dict,
+             "construction closure contains a future completion/current-width basis field")
+    return _recorded_pre_manifest_source_graph(
+        basis, basis_pin, selected_source_manifest_raw, capture_manifest_raw,
+        capture_stage_root, source_root_value, final_plan_module,
+        deadline_ns=deadline_ns, cancel_event=cancel_event,
+    )
+
+
+def _recorded_read_plan_member(
+    plan_module: object, member: str, *, construction: bool = False,
+) -> Any:
+    names = (_SOURCE5_PREPARED_INPUT_CONSTRUCTION_API_NAMES if construction
+             else _SOURCE5_RECORDED_READ_API_NAMES)
+    _require(member in names,
+             "Root recorded-read API member is outside its fixed protocol map")
+    value = getattr(plan_module, names[member], None)
+    if member == "failure_receipt_schema":
+        _require(type(value) is str and bool(value),
+                 "Root recorded-read failure schema is absent")
+    else:
+        _require(callable(value),
+                 f"Root recorded-read plan lacks its exact {member} API")
+    return value
+
+
+def _prepared_input_construction_read_plan_module(
+    selected_source_manifest_raw: bytes, source_manifest_pin: object,
+    source_module_pins: object, source_root: str, expected_source_root: str,
+) -> object:
+    """Load only the frozen construction planner from the selected Source."""
+    _require(type(source_module_pins) is dict and
+             SOURCE5_RECORDED_READ_PLAN_PATH in source_module_pins,
+             "construction basis omits its selected Source plan module")
+    selected_pin = _exact(
+        source_module_pins[SOURCE5_RECORDED_READ_PLAN_PATH],
+        {"path", "sha256"}, "construction selected Source plan-module pin",
+    )
+    _require(selected_pin == {
+                 "path": SOURCE5_RECORDED_READ_PLAN_PATH,
+                 "sha256": SOURCE5_PREPARED_INPUT_CONSTRUCTION_READ_PLAN_SHA256,
+             }, "construction plan module differs from the frozen recovered pin")
+    namespace = _recorded_pre_manifest_typed_module(
+        selected_source_manifest_raw, source_manifest_pin, source_module_pins,
+        SOURCE5_RECORDED_READ_PLAN_PATH, source_root, expected_source_root,
+        namespace_name="_allocatbelt_prepared_input_construction_read_plan_api",
+    )
+    module = sys.modules[namespace["__name__"]]
+    required_functions = {
+        value for key, value in _SOURCE5_PREPARED_INPUT_CONSTRUCTION_API_NAMES.items()
+        if key != "failure_receipt_schema"
+    } | {
+        "build_prepared_input_construction_read_plan_v1",
+        "validate_prepared_input_construction_read_plan_v1",
+    }
+    _require(getattr(module, "__source5_typed_pin__", None) == selected_pin and
+             all(callable(getattr(module, name, None))
+                 for name in required_functions) and
+             module.PREPARED_INPUT_CONSTRUCTION_BASIS_SCHEMA_V1 ==
+                 SOURCE5_PREPARED_INPUT_CONSTRUCTION_BASIS_SCHEMA and
+             module.PREPARED_INPUT_CONSTRUCTION_READ_PLAN_SCHEMA_V1 ==
+                 "allocatbelt.application-source5-prepared-input-construction-read-plan.v1" and
+             module.PREPARED_INPUT_CONSTRUCTION_WINDOW_CHUNK_SCHEMA_V1 ==
+                 "allocatbelt.application-source5-prepared-input-construction-window-chunk.v1" and
+             module.PREPARED_INPUT_CONSTRUCTION_REQUEST_SCHEMA_V1 ==
+                 "allocatbelt.application-source5-prepared-input-construction-read-request.v1" and
+             module.PREPARED_INPUT_CONSTRUCTION_RESPONSE_SCHEMA_V1 ==
+                 "allocatbelt.application-source5-prepared-input-construction-read-response.v1" and
+             module.PREPARED_INPUT_CONSTRUCTION_CONTROL_EVENT_SCHEMA_V1 ==
+                 "allocatbelt.application-source5-prepared-input-construction-read-control-event.v1" and
+             module.PREPARED_INPUT_CONSTRUCTION_SESSION_DESCRIPTOR_SCHEMA_V1 ==
+                 "allocatbelt.application-source5-prepared-input-construction-read-session.v1" and
+             module.PREPARED_INPUT_CONSTRUCTION_FAILURE_RECEIPT_SCHEMA_V1 ==
+                 "allocatbelt.application-source5-prepared-input-construction-read-failure.v1" and
+             module.PREPARED_INPUT_CONSTRUCTION_PAYLOAD_VIEW_SCHEMA_V1 ==
+                 "allocatbelt.application-source5-prepared-input-construction-payload-view.v1" and
+             module.PREPARED_INPUT_CONSTRUCTION_OPERATION == "completion_construction" and
+             module.READ_WINDOW_COUNT == 720 and
+             module.PREPARED_INPUT_COMPLETION_MAX_BYTES == 64 * 1024 * 1024 and
+             module.PREPARED_INPUT_COMPLETION_PATH_NAME ==
+                 "prepared-inputs-completion.json",
+             "Root selected a different construction planner API or schema family")
+    return module
+
+
 def _recorded_read_root_output_context(
     resource_value: object, basis: dict[str, Any],
     basis_pin: dict[str, Any], plan: dict[str, Any],
     plan_pin: dict[str, Any], read_ordinal: int,
-    window_chunk: dict[str, Any], plan_module: object,
+    window_chunk: dict[str, Any], plan_module: object, *,
+    construction: bool = False,
 ) -> dict[str, Any]:
     resource = _exact(resource_value, RECORDED_READ_ROOT_OUTPUT_FIELDS_V2,
                       "Root recorded-read output reservation")
@@ -3044,26 +3229,28 @@ def _recorded_read_root_output_context(
         resource["maximum_window_seconds"],
         "Root recorded-read output timeout", positive=True, maximum=300,
     )
-    row = plan_module.validate_recorded_preparation_read_window_v2(
-        plan, plan_pin, window_chunk, read_ordinal,
-    )
+    row = _recorded_read_plan_member(
+        plan_module, "validate_window", construction=construction,
+    )(plan, plan_pin, window_chunk, read_ordinal)
     _require(maximum_window ==
              plan["timeout_declaration"]["maximum_io_window_seconds"] and
              maximum_response >= row["resource_bounds"]["outer_response_bytes"] and
              maximum_bundle >= row["resource_bounds"]["tar_bytes"],
              "Root output caps/deadline do not cover this exact Source window")
+    session_component = ("prepared-input-construction" if construction else
+                         "recorded-preparation")
     required_directories = [
         str(root / basis["campaign_id"]),
         str(root / basis["campaign_id"] / "source5"),
         str(root / basis["campaign_id"] / "source5" /
             basis["consumer_host_id"]),
         str(root / basis["campaign_id"] / "source5" /
-            basis["consumer_host_id"] / "recorded-preparation"),
+            basis["consumer_host_id"] / session_component),
         str(root / basis["campaign_id"] / "source5" /
-            basis["consumer_host_id"] / "recorded-preparation" /
+            basis["consumer_host_id"] / session_component /
             plan["session_nonce"]),
         str(root / basis["campaign_id"] / "source5" /
-            basis["consumer_host_id"] / "recorded-preparation" /
+            basis["consumer_host_id"] / session_component /
             plan["session_nonce"] / "slot"),
     ]
     session = Path(required_directories[-2])
@@ -3443,7 +3630,7 @@ def _recorded_root_control_event(
     plan: dict[str, Any], plan_pin: dict[str, Any],
     row: dict[str, Any], sequence: int, action: str,
     request_pin: dict[str, Any], root_paths: dict[str, Any],
-    response_pin=None, bundle_pin=None,
+    response_pin=None, bundle_pin=None, *, construction: bool = False,
 ) -> dict[str, Any]:
     _require(action in {"request_accepted", "response_published"} and
              type(sequence) is int and 0 < sequence < (1 << 64),
@@ -3480,7 +3667,8 @@ def _recorded_root_control_event(
                        positive=True) == row["resource_bounds"]["tar_bytes"],
                  "Root recorded-read event bundle size differs from its exact row")
     body = {
-        "schema": RECORDED_READ_ROOT_CONTROL_SCHEMA_V1,
+        "schema": (RECORDED_READ_CONSTRUCTION_ROOT_CONTROL_SCHEMA_V1
+                   if construction else RECORDED_READ_ROOT_CONTROL_SCHEMA_V1),
         "sequence": sequence,
         "basis_pin": basis_pin,
         "read_plan_pin": plan_pin,
@@ -3561,6 +3749,7 @@ def _recorded_root_control_state(
     basis_pin: dict[str, Any], plan: dict[str, Any],
     plan_pin: dict[str, Any], plan_module: object, *,
     deadline_ns: int | None = None, cancel_event=None,
+    construction: bool = False,
 ) -> tuple[int, dict[str, Any] | None, str]:
     info = os.fstat(descriptor)
     _require(info.st_size <= context["maximum_control_ledger_bytes"] and
@@ -3628,16 +3817,17 @@ def _recorded_root_control_state(
             cached_window_chunk, _row = _recorded_read_window_chunk(
                 plan, plan_pin, plan_module, ordinal,
                 deadline_ns=deadline_ns, cancel_event=cancel_event,
+                construction=construction,
             )
             cached_chunk_ordinal = current_chunk_ordinal
         window_chunk = cached_window_chunk
-        row = plan_module.validate_recorded_preparation_read_window_v2(
-            plan, plan_pin, window_chunk, ordinal,
-        )
+        row = _recorded_read_plan_member(
+            plan_module, "validate_window", construction=construction,
+        )(plan, plan_pin, window_chunk, ordinal)
         request, request_raw, request_pin = \
-            plan_module.build_recorded_preparation_read_request_v2(
-                basis, basis_pin, plan, plan_pin, ordinal, window_chunk,
-            )
+            _recorded_read_plan_member(
+                plan_module, "build_request", construction=construction,
+            )(basis, basis_pin, plan, plan_pin, ordinal, window_chunk)
         request_pin = {key: request_pin[key] for key in (
             "path", "raw_sha256", "semantic_sha256",
         )}
@@ -3645,6 +3835,7 @@ def _recorded_root_control_state(
             expected = _recorded_root_control_event(
                 basis, basis_pin, plan, plan_pin, row, count + 1,
                 "request_accepted", request_pin, context["paths"],
+                construction=construction,
             )
             pending_request = request_pin
         else:
@@ -3653,7 +3844,7 @@ def _recorded_root_control_state(
             expected = _recorded_root_control_event(
                 basis, basis_pin, plan, plan_pin, row, count + 1,
                 "response_published", request_pin, context["paths"],
-                response_pin, bundle_pin,
+                response_pin, bundle_pin, construction=construction,
             )
             pending_request = None
         record_digest = _sha(_canonical({
@@ -3729,10 +3920,11 @@ def _write_recorded_root_failure_receipt(
     context: dict[str, Any], basis: dict[str, Any], basis_pin: dict[str, Any],
     plan: dict[str, Any], plan_pin: dict[str, Any], read_ordinal: int,
     row: dict[str, Any], *, retained_window: bool,
-    deadline_ns: int, cancel_event=None,
+    deadline_ns: int, cancel_event=None, construction: bool = False,
 ) -> None:
     body = {
-        "schema": RECORDED_READ_ROOT_FAILURE_SCHEMA_V1,
+        "schema": (RECORDED_READ_CONSTRUCTION_ROOT_FAILURE_SCHEMA_V1
+                   if construction else RECORDED_READ_ROOT_FAILURE_SCHEMA_V1),
         "basis_pin": basis_pin, "read_plan_pin": plan_pin,
         "session_nonce": plan["session_nonce"],
         "consumer_host_id": plan["consumer_host_id"],
@@ -4049,7 +4241,7 @@ def _recorded_read_archive_manifest(
     return manifest
 
 
-def _serve_recorded_preparation_read_window_core_v1(
+def _serve_source5_preparation_read_window_core(
     request_raw: bytes, *, basis_raw: bytes, read_plan_raw: bytes,
     session_descriptor_raw: bytes, source_root: str,
     selected_source_manifest_raw: bytes,
@@ -4059,6 +4251,7 @@ def _serve_recorded_preparation_read_window_core_v1(
     root_resource_declaration: object,
     root_output_context: dict[str, Any],
     window_deadline_ns: int, cancel_event=None,
+    construction: bool = False,
 ) -> dict[str, Any]:
     """Materialize one actual Source-verified recorded window into its exact slots.
 
@@ -4099,13 +4292,22 @@ def _serve_recorded_preparation_read_window_core_v1(
              _sha(selected_source_manifest_raw) ==
                  source_pin_value.get("raw_sha256"),
              "recorded-read selected current Source bytes differ from the basis")
-    namespaces = _recorded_pre_manifest_typed_module(
-        selected_source_manifest_raw, source_pin_value,
-        basis["source_module_pins"][basis["consumer_host_id"]],
-        SOURCE5_RECORDED_READ_PLAN_PATH, source_root, source_root,
-        namespace_name="_allocatbelt_recorded_read_plan_api",
-    )
-    plan_module = sys.modules[namespaces["__name__"]]
+    selected_module_pins = basis["source_module_pins"][
+        basis["consumer_host_id"]
+    ]
+    if construction:
+        plan_module = _prepared_input_construction_read_plan_module(
+            selected_source_manifest_raw, source_pin_value,
+            selected_module_pins, source_root, source_root,
+        )
+    else:
+        namespaces = _recorded_pre_manifest_typed_module(
+            selected_source_manifest_raw, source_pin_value,
+            selected_module_pins, SOURCE5_RECORDED_READ_PLAN_PATH,
+            source_root, source_root,
+            namespace_name="_allocatbelt_recorded_read_plan_api",
+        )
+        plan_module = sys.modules[namespaces["__name__"]]
     basis_pin = _exact(session, {
         "schema", "basis_pin", "read_plan_pin", "session_nonce",
         "consumer_host_id", "operation_kind", "current_journal_frontier",
@@ -4113,12 +4315,18 @@ def _serve_recorded_preparation_read_window_core_v1(
     }, "recorded-read session descriptor")
     session_body = {key: value for key, value in session.items()
                     if key != "session_sha256"}
-    _require(session["schema"] == plan_module.SESSION_DESCRIPTOR_SCHEMA_V2 and
+    session_schema = (
+        plan_module.PREPARED_INPUT_CONSTRUCTION_SESSION_DESCRIPTOR_SCHEMA_V1
+        if construction else plan_module.SESSION_DESCRIPTOR_SCHEMA_V2
+    )
+    _require(session["schema"] == session_schema and
              session["session_sha256"] == _sha(_canonical(session_body)),
              "recorded-read session descriptor self digest differs")
     basis_pin_value = _pin(session["basis_pin"],
                            "recorded-read session basis pin")
-    checked_plan_pin = plan_module.recorded_preparation_read_plan_pin_v2(plan)
+    checked_plan_pin = _recorded_read_plan_member(
+        plan_module, "plan_pin", construction=construction,
+    )(plan)
     plan_pin = _pin(session["read_plan_pin"],
                      "recorded-read session plan pin")
     _require(plan_pin == checked_plan_pin and
@@ -4129,9 +4337,9 @@ def _serve_recorded_preparation_read_window_core_v1(
              session["current_journal_frontier"] ==
                  basis["current_journal_frontier"],
              "recorded-read session descriptor differs from its exact basis/plan")
-    checked_basis, checked_basis_pin, _hosts = plan_module._validate_basis(
-        basis, basis_pin_value,
-    )
+    checked_basis, checked_basis_pin, _hosts = _recorded_read_plan_member(
+        plan_module, "validate_basis", construction=construction,
+    )(basis, basis_pin_value)
     _require(checked_basis == basis and checked_basis_pin == basis_pin_value,
              "recorded-read basis raw/semantic pin differs")
     source_module_pin = basis["source_module_pins"][basis["consumer_host_id"]][
@@ -4152,10 +4360,11 @@ def _serve_recorded_preparation_read_window_core_v1(
     window_chunk, row = _recorded_read_window_chunk(
         plan, plan_pin, plan_module, ordinal,
         deadline_ns=window_deadline_ns, cancel_event=cancel_event,
+        construction=construction,
     )
-    outer_request = plan_module.validate_recorded_preparation_read_request_v2(
-        request_raw, basis, basis_pin_value, plan, plan_pin, window_chunk,
-    )
+    outer_request = _recorded_read_plan_member(
+        plan_module, "validate_request", construction=construction,
+    )(request_raw, basis, basis_pin_value, plan, plan_pin, window_chunk)
     _require(_absolute_path(archive_source5_root,
                             "recorded-read Source5 archive root") ==
              row["archive_source5_root"] and
@@ -4232,7 +4441,11 @@ def _serve_recorded_preparation_read_window_core_v1(
                  cancel_event=cancel_event,
              )[0],
              "recorded-read request bytes differ from the exact persisted current slot")
-    source_graph = _recorded_pre_manifest_source_closure(
+    source_graph_builder = (
+        _recorded_pre_manifest_source_construction_closure if construction else
+        _recorded_pre_manifest_source_closure
+    )
+    source_graph = source_graph_builder(
         basis, basis_pin_value, selected_source_manifest_raw,
         lineage_capture_manifest_raw, lineage_capture_stage_root,
         source_root, plan_module, deadline_ns=window_deadline_ns,
@@ -4241,7 +4454,17 @@ def _serve_recorded_preparation_read_window_core_v1(
     reader = source_graph["reader"]
     try:
         check_window("Source metadata closure")
-        source_graph["source_modules"]["source5_campaign"]._source5_recorded_read_session_documents(
+        session_validator_name = (
+            "_source5_prepared_input_construction_read_session_documents"
+            if construction else "_source5_recorded_read_session_documents"
+        )
+        session_validator = getattr(
+            source_graph["source_modules"]["source5_campaign"],
+            session_validator_name, None,
+        )
+        _require(callable(session_validator),
+                 "selected typed H lacks the exact session-document validator")
+        session_validator(
             basis, basis_pin_value, plan, plan_pin, plan_module,
             create_missing=False, cancel_event=cancel_event,
             deadline_ns=window_deadline_ns,
@@ -4544,10 +4767,10 @@ def _serve_recorded_preparation_read_window_core_v1(
                 tar_pin["byte_count"],
             )
         _outer, response_raw, _outer_pin = \
-            plan_module.build_recorded_preparation_read_response_v2(
-                request_raw, legacy_response, legacy_response_raw,
-                basis, basis_pin_value, plan, plan_pin, window_chunk,
-            )
+            _recorded_read_plan_member(
+                plan_module, "build_response", construction=construction,
+            )(request_raw, legacy_response, legacy_response_raw,
+              basis, basis_pin_value, plan, plan_pin, window_chunk)
         check_window("before outer response write")
         response_parent_fd = _open_dir_path(
             response_path.parent,
@@ -4576,7 +4799,11 @@ def _serve_recorded_preparation_read_window_core_v1(
             os.close(response_parent_fd)
         _verify_recorded_read_root_output_directory_growth(root_output_context)
         return {
-            "schema": "allocatbelt.application-source5-recorded-preparation-read-window-output.v1",
+            "schema": (
+                "allocatbelt.application-source5-prepared-input-construction-read-window-output.v1"
+                if construction else
+                "allocatbelt.application-source5-recorded-preparation-read-window-output.v1"
+            ),
             "response_pin": {
                 "path": str(response_path),
                 "raw_sha256": output_pin["raw_sha256"],
@@ -4591,7 +4818,7 @@ def _serve_recorded_preparation_read_window_core_v1(
         reader.close()
 
 
-def serve_recorded_preparation_read_window_v1(
+def _serve_source5_preparation_read_window(
     request_raw: bytes, *, basis_raw: bytes, read_plan_raw: bytes,
     session_descriptor_raw: bytes, source_root: str,
     selected_source_manifest_raw: bytes,
@@ -4600,7 +4827,7 @@ def serve_recorded_preparation_read_window_v1(
     response_output_path: str, bundle_output_path: str,
     root_resource_declaration: object,
     root_output_resource_declaration: object,
-    cancel_event=None,
+    cancel_event=None, construction: bool = False,
 ) -> dict[str, Any]:
     """Serve one real Source-verified read into bounded current Root slots.
 
@@ -4628,13 +4855,19 @@ def serve_recorded_preparation_read_window_v1(
              type(selected_source_manifest_raw) is bytes and
              _sha(selected_source_manifest_raw) == source_pin.get("raw_sha256"),
              "recorded-read selected Source bytes differ from the basis")
-    namespace = _recorded_pre_manifest_typed_module(
-        selected_source_manifest_raw, source_pin,
-        basis["source_module_pins"][consumer],
-        SOURCE5_RECORDED_READ_PLAN_PATH, source_root, source_root,
-        namespace_name="_allocatbelt_recorded_read_plan_api",
-    )
-    plan_module = sys.modules[namespace["__name__"]]
+    selected_module_pins = basis["source_module_pins"][consumer]
+    if construction:
+        plan_module = _prepared_input_construction_read_plan_module(
+            selected_source_manifest_raw, source_pin, selected_module_pins,
+            source_root, source_root,
+        )
+    else:
+        namespace = _recorded_pre_manifest_typed_module(
+            selected_source_manifest_raw, source_pin, selected_module_pins,
+            SOURCE5_RECORDED_READ_PLAN_PATH, source_root, source_root,
+            namespace_name="_allocatbelt_recorded_read_plan_api",
+        )
+        plan_module = sys.modules[namespace["__name__"]]
     session = _exact(session, {
         "schema", "basis_pin", "read_plan_pin", "session_nonce",
         "consumer_host_id", "operation_kind", "current_journal_frontier",
@@ -4642,16 +4875,22 @@ def serve_recorded_preparation_read_window_v1(
     }, "recorded-read session descriptor")
     session_body = {key: value for key, value in session.items()
                     if key != "session_sha256"}
-    _require(session["schema"] == plan_module.SESSION_DESCRIPTOR_SCHEMA_V2 and
+    session_schema = (
+        plan_module.PREPARED_INPUT_CONSTRUCTION_SESSION_DESCRIPTOR_SCHEMA_V1
+        if construction else plan_module.SESSION_DESCRIPTOR_SCHEMA_V2
+    )
+    _require(session["schema"] == session_schema and
              session["session_sha256"] == _sha(_canonical(session_body)),
              "recorded-read session descriptor digest differs")
     basis_pin = _pin(session["basis_pin"], "recorded-read basis pin")
     plan_pin = _pin(session["read_plan_pin"], "recorded-read plan pin")
-    checked_basis, checked_basis_pin, _hosts = plan_module._validate_basis(
-        basis, basis_pin,
-    )
+    checked_basis, checked_basis_pin, _hosts = _recorded_read_plan_member(
+        plan_module, "validate_basis", construction=construction,
+    )(basis, basis_pin)
     _require(checked_basis == basis and checked_basis_pin == basis_pin and
-             plan_module.recorded_preparation_read_plan_pin_v2(plan) == plan_pin and
+             _recorded_read_plan_member(
+                 plan_module, "plan_pin", construction=construction,
+             )(plan) == plan_pin and
              plan["basis_pin"] == basis_pin and
              session["session_nonce"] == plan["session_nonce"] and
              session["consumer_host_id"] == consumer and
@@ -4660,9 +4899,10 @@ def serve_recorded_preparation_read_window_v1(
                  basis["current_journal_frontier"],
              "recorded-read session, basis and plan do not close")
     descriptor, descriptor_raw, descriptor_pin = \
-        plan_module.build_recorded_preparation_read_session_descriptor_v2(
-            plan, plan_pin,
-        )
+        _recorded_read_plan_member(
+            plan_module, "build_session_descriptor",
+            construction=construction,
+        )(plan, plan_pin)
     _require(descriptor_raw == session_descriptor_raw,
              "recorded-read session descriptor differs from its plan")
     for pin, raw, label in (
@@ -4692,14 +4932,15 @@ def serve_recorded_preparation_read_window_v1(
     window_chunk, row = _recorded_read_window_chunk(
         plan, plan_pin, plan_module, ordinal,
         deadline_ns=deadline_ns, cancel_event=cancel_event,
+        construction=construction,
     )
-    outer_request = plan_module.validate_recorded_preparation_read_request_v2(
-        request_raw, basis, basis_pin, plan, plan_pin, window_chunk,
-    )
+    outer_request = _recorded_read_plan_member(
+        plan_module, "validate_request", construction=construction,
+    )(request_raw, basis, basis_pin, plan, plan_pin, window_chunk)
     _request, expected_request_raw, expected_request_pin = \
-        plan_module.build_recorded_preparation_read_request_v2(
-            basis, basis_pin, plan, plan_pin, ordinal, window_chunk,
-        )
+        _recorded_read_plan_member(
+            plan_module, "build_request", construction=construction,
+        )(basis, basis_pin, plan, plan_pin, ordinal, window_chunk)
     _require(expected_request_raw == request_raw,
              "recorded-read request is not the deterministic Source request")
     persisted_request, request_sha, _info = _read_absolute_private_file(
@@ -4713,7 +4954,7 @@ def serve_recorded_preparation_read_window_v1(
              "recorded-read current request slot differs")
     root_output = _recorded_read_root_output_context(
         root_output_resource_declaration, basis, basis_pin, plan, plan_pin,
-        ordinal, window_chunk, plan_module,
+        ordinal, window_chunk, plan_module, construction=construction,
     )
     _require(_absolute_path(response_output_path,
                             "Root response output path") ==
@@ -4735,7 +4976,7 @@ def serve_recorded_preparation_read_window_v1(
         cursor, pending, previous = _recorded_root_control_state(
             root_ledger_fd, root_output, basis, basis_pin, plan, plan_pin,
             plan_module, deadline_ns=deadline_ns,
-            cancel_event=cancel_event,
+            cancel_event=cancel_event, construction=construction,
         )
         _require(ordinal == cursor and
                  (pending is None or pending == request_pin),
@@ -4744,12 +4985,13 @@ def serve_recorded_preparation_read_window_v1(
             accepted = _recorded_root_control_event(
                 basis, basis_pin, plan, plan_pin, row, 2 * ordinal + 1,
                 "request_accepted", request_pin, root_output["paths"],
+                construction=construction,
             )
             previous = _append_recorded_root_control_event(
                 root_ledger_fd, accepted, previous, root_output,
                 deadline_ns=deadline_ns, cancel_event=cancel_event,
             )
-        result = _serve_recorded_preparation_read_window_core_v1(
+        result = _serve_source5_preparation_read_window_core(
             request_raw, basis_raw=basis_raw,
             read_plan_raw=read_plan_raw,
             session_descriptor_raw=session_descriptor_raw,
@@ -4763,12 +5005,13 @@ def serve_recorded_preparation_read_window_v1(
             root_resource_declaration=root_resource_declaration,
             root_output_context=root_output,
             window_deadline_ns=deadline_ns,
-            cancel_event=cancel_event,
+            cancel_event=cancel_event, construction=construction,
         )
         completed = _recorded_root_control_event(
             basis, basis_pin, plan, plan_pin, row, 2 * ordinal + 2,
             "response_published", request_pin, root_output["paths"],
             result["response_pin"], result["bundle_pin"],
+            construction=construction,
         )
         _append_recorded_root_control_event(
             root_ledger_fd, completed, previous, root_output,
@@ -4785,7 +5028,7 @@ def serve_recorded_preparation_read_window_v1(
             _write_recorded_root_failure_receipt(
                 root_output, basis, basis_pin, plan, plan_pin, ordinal, row,
                 retained_window=retained, deadline_ns=deadline_ns,
-                cancel_event=cancel_event,
+                cancel_event=cancel_event, construction=construction,
             )
         except BaseException as receipt_error:
             raise EvidenceArchiveError(
@@ -4798,11 +5041,66 @@ def serve_recorded_preparation_read_window_v1(
         os.close(root_ledger_fd)
 
 
-def release_recorded_preparation_read_root_output_v1(
+def serve_recorded_preparation_read_window_v1(
+    request_raw: bytes, *, basis_raw: bytes, read_plan_raw: bytes,
+    session_descriptor_raw: bytes, source_root: str,
+    selected_source_manifest_raw: bytes,
+    lineage_capture_manifest_raw: bytes,
+    lineage_capture_stage_root: str, archive_source5_root: str,
+    response_output_path: str, bundle_output_path: str,
+    root_resource_declaration: object,
+    root_output_resource_declaration: object,
+    cancel_event=None,
+) -> dict[str, Any]:
+    """Serve one ordinary recorded-read window to its Root-owned slots."""
+    return _serve_source5_preparation_read_window(
+        request_raw, basis_raw=basis_raw, read_plan_raw=read_plan_raw,
+        session_descriptor_raw=session_descriptor_raw, source_root=source_root,
+        selected_source_manifest_raw=selected_source_manifest_raw,
+        lineage_capture_manifest_raw=lineage_capture_manifest_raw,
+        lineage_capture_stage_root=lineage_capture_stage_root,
+        archive_source5_root=archive_source5_root,
+        response_output_path=response_output_path,
+        bundle_output_path=bundle_output_path,
+        root_resource_declaration=root_resource_declaration,
+        root_output_resource_declaration=root_output_resource_declaration,
+        cancel_event=cancel_event,
+    )
+
+
+def serve_source5_prepared_input_construction_read_window_v1(
+    request_raw: bytes, *, basis_raw: bytes, read_plan_raw: bytes,
+    session_descriptor_raw: bytes, source_root: str,
+    selected_source_manifest_raw: bytes,
+    lineage_capture_manifest_raw: bytes,
+    lineage_capture_stage_root: str, archive_source5_root: str,
+    response_output_path: str, bundle_output_path: str,
+    root_resource_declaration: object,
+    root_output_resource_declaration: object,
+    cancel_event=None,
+) -> dict[str, Any]:
+    """Serve one construction-specific, Root-verified read window."""
+    return _serve_source5_preparation_read_window(
+        request_raw, basis_raw=basis_raw, read_plan_raw=read_plan_raw,
+        session_descriptor_raw=session_descriptor_raw, source_root=source_root,
+        selected_source_manifest_raw=selected_source_manifest_raw,
+        lineage_capture_manifest_raw=lineage_capture_manifest_raw,
+        lineage_capture_stage_root=lineage_capture_stage_root,
+        archive_source5_root=archive_source5_root,
+        response_output_path=response_output_path,
+        bundle_output_path=bundle_output_path,
+        root_resource_declaration=root_resource_declaration,
+        root_output_resource_declaration=root_output_resource_declaration,
+        cancel_event=cancel_event, construction=True,
+    )
+
+
+def _release_source5_preparation_read_root_output(
     basis_raw: bytes, read_plan_raw: bytes, session_descriptor_raw: bytes,
     source_root: str, selected_source_manifest_raw: bytes,
     root_output_resource_declaration: object, read_ordinal: object,
-    response_pin_value: object, bundle_pin_value: object,
+    response_pin_value: object, bundle_pin_value: object, *,
+    construction: bool = False,
 ) -> dict[str, Any]:
     """Free one exact Root spool only after the caller transferred its pins."""
     basis = _parse_canonical(basis_raw, "recorded-read release basis",
@@ -4817,23 +5115,34 @@ def release_recorded_preparation_read_root_output_v1(
     _require(type(source_pin) is dict and
              _sha(selected_source_manifest_raw) == source_pin.get("raw_sha256"),
              "recorded-read Root release selected Source pin differs")
-    namespace = _recorded_pre_manifest_typed_module(
-        selected_source_manifest_raw, source_pin,
-        basis["source_module_pins"][consumer],
-        SOURCE5_RECORDED_READ_PLAN_PATH, source_root, source_root,
-        namespace_name="_allocatbelt_recorded_read_root_release_plan",
-    )
-    module = sys.modules[namespace["__name__"]]
+    selected_module_pins = basis["source_module_pins"][consumer]
+    if construction:
+        module = _prepared_input_construction_read_plan_module(
+            selected_source_manifest_raw, source_pin, selected_module_pins,
+            source_root, source_root,
+        )
+    else:
+        namespace = _recorded_pre_manifest_typed_module(
+            selected_source_manifest_raw, source_pin, selected_module_pins,
+            SOURCE5_RECORDED_READ_PLAN_PATH, source_root, source_root,
+            namespace_name="_allocatbelt_recorded_read_root_release_plan",
+        )
+        module = sys.modules[namespace["__name__"]]
     basis_pin = _pin(session["basis_pin"], "Root release basis pin")
     plan_pin = _pin(session["read_plan_pin"], "Root release plan pin")
-    _require(module._validate_basis(basis, basis_pin)[0] == basis and
-             module.recorded_preparation_read_plan_pin_v2(plan) == plan_pin and
-             plan["basis_pin"] == basis_pin,
+    checked_basis, checked_basis_pin, _hosts = _recorded_read_plan_member(
+        module, "validate_basis", construction=construction,
+    )(basis, basis_pin)
+    _require(checked_basis == basis and checked_basis_pin == basis_pin and
+             _recorded_read_plan_member(
+                 module, "plan_pin", construction=construction,
+             )(plan) == plan_pin and plan["basis_pin"] == basis_pin,
              "recorded-read Root release basis/plan pins differ")
     _require(session_descriptor_raw ==
-             module.build_recorded_preparation_read_session_descriptor_v2(
-                 plan, plan_pin,
-             )[1],
+             _recorded_read_plan_member(
+                 module, "build_session_descriptor",
+                 construction=construction,
+             )(plan, plan_pin)[1],
              "recorded-read Root release session descriptor differs")
     ordinal = module._uint(read_ordinal, "Root output release ordinal",
                            maximum=module.READ_WINDOW_COUNT - 1)
@@ -4841,12 +5150,32 @@ def release_recorded_preparation_read_root_output_v1(
         "maximum_io_window_seconds"] * 1_000_000_000
     _require(deadline_ns < (1 << 63),
              "Root output release deadline exceeds monotonic arithmetic")
+    if construction:
+        h_namespace = _recorded_pre_manifest_typed_module(
+            selected_source_manifest_raw, source_pin,
+            basis["source_module_pins"][consumer],
+            PREPARED_CAMPAIGN_SOURCE_PATH, source_root, source_root,
+            namespace_name="_allocatbelt_prepared_construction_root_release_h",
+        )
+        h_campaign = sys.modules[h_namespace["__name__"]]
+        h_session_validator = getattr(
+            h_campaign,
+            "_source5_prepared_input_construction_read_session_documents",
+            None,
+        )
+        _require(callable(h_session_validator),
+                 "selected typed H lacks its construction session-document validator")
+        h_session_validator(
+            basis, basis_pin, plan, plan_pin, module, create_missing=False,
+            deadline_ns=deadline_ns,
+        )
     window_chunk, row = _recorded_read_window_chunk(
         plan, plan_pin, module, ordinal, deadline_ns=deadline_ns,
+        construction=construction,
     )
     context = _recorded_read_root_output_context(
         root_output_resource_declaration, basis, basis_pin, plan, plan_pin,
-        ordinal, window_chunk, module,
+        ordinal, window_chunk, module, construction=construction,
     )
     response_pin = _pin(response_pin_value,
                         "Root output release response pin")
@@ -4857,9 +5186,9 @@ def release_recorded_preparation_read_root_output_v1(
              bundle_pin["path"] == context["paths"]["bundle"],
              "Root output release paths differ from its nonce-bound slots")
     request, request_raw, request_pin = \
-        module.build_recorded_preparation_read_request_v2(
-            basis, basis_pin, plan, plan_pin, ordinal, window_chunk,
-        )
+        _recorded_read_plan_member(
+            module, "build_request", construction=construction,
+        )(basis, basis_pin, plan, plan_pin, ordinal, window_chunk)
     request_pin3 = {key: request_pin[key] for key in (
         "path", "raw_sha256", "semantic_sha256",
     )}
@@ -4874,7 +5203,7 @@ def release_recorded_preparation_read_root_output_v1(
     try:
         cursor, pending, _previous = _recorded_root_control_state(
             ledger_fd, context, basis, basis_pin, plan, plan_pin, module,
-            deadline_ns=deadline_ns,
+            deadline_ns=deadline_ns, construction=construction,
         )
         _require(cursor > ordinal and pending is None,
                  "Root output release row is not a completed Root control pair")
@@ -4906,10 +5235,10 @@ def release_recorded_preparation_read_root_output_v1(
         "Root output release response",
         deadline_ns=deadline_ns,
     )
-    response = module.validate_recorded_preparation_read_response_v2(
-        response_raw, request_raw, basis, basis_pin, plan, plan_pin,
-        window_chunk,
-    )
+    response = _recorded_read_plan_member(
+        module, "validate_response", construction=construction,
+    )(response_raw, request_raw, basis, basis_pin, plan, plan_pin,
+      window_chunk)
     _require(response_sha == response_pin["raw_sha256"] and
              response["response_sha256"] == response_pin["semantic_sha256"],
              "Root output release response raw/semantic pins differ")
@@ -4973,16 +5302,49 @@ def release_recorded_preparation_read_root_output_v1(
             _write_recorded_root_failure_receipt(
                 context, basis, basis_pin, plan, plan_pin, ordinal, row,
                 retained_window=retained, deadline_ns=deadline_ns,
+                construction=construction,
             )
         raise
     finally:
         os.close(bundle_parent)
     return {
-        "schema": "allocatbelt.application-source5-recorded-preparation-root-output-release.v1",
+        "schema": (
+            "allocatbelt.application-source5-prepared-input-construction-root-output-release.v1"
+            if construction else
+            "allocatbelt.application-source5-recorded-preparation-root-output-release.v1"
+        ),
         "read_ordinal": ordinal,
         "response_pin": response_pin,
         "bundle_pin": bundle_pin,
     }
+
+
+def release_recorded_preparation_read_root_output_v1(
+    basis_raw: bytes, read_plan_raw: bytes, session_descriptor_raw: bytes,
+    source_root: str, selected_source_manifest_raw: bytes,
+    root_output_resource_declaration: object, read_ordinal: object,
+    response_pin_value: object, bundle_pin_value: object,
+) -> dict[str, Any]:
+    """Release one completed ordinary Root output pair after exact pin checks."""
+    return _release_source5_preparation_read_root_output(
+        basis_raw, read_plan_raw, session_descriptor_raw, source_root,
+        selected_source_manifest_raw, root_output_resource_declaration,
+        read_ordinal, response_pin_value, bundle_pin_value,
+    )
+
+
+def release_source5_prepared_input_construction_read_root_output_v1(
+    basis_raw: bytes, read_plan_raw: bytes, session_descriptor_raw: bytes,
+    source_root: str, selected_source_manifest_raw: bytes,
+    root_output_resource_declaration: object, read_ordinal: object,
+    response_pin_value: object, bundle_pin_value: object,
+) -> dict[str, Any]:
+    """Release one completed construction Root pair through its own ledger."""
+    return _release_source5_preparation_read_root_output(
+        basis_raw, read_plan_raw, session_descriptor_raw, source_root,
+        selected_source_manifest_raw, root_output_resource_declaration,
+        read_ordinal, response_pin_value, bundle_pin_value, construction=True,
+    )
 
 
 def _require_prepared_catalogue_storage_parity(
@@ -9723,7 +10085,7 @@ def _read_absolute_private_file(
 def _recorded_read_window_chunk(
     plan: dict[str, Any], plan_pin: dict[str, Any], plan_module: object,
     read_ordinal: int, *, deadline_ns: int | None = None,
-    cancel_event=None,
+    cancel_event=None, construction: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     ordinal = plan_module._uint(
         read_ordinal, "Root recorded-read chunk ordinal",
@@ -9754,9 +10116,9 @@ def _recorded_read_window_chunk(
         raw, "Root recorded-read current window metadata chunk",
         maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES,
     )
-    row = plan_module.validate_recorded_preparation_read_window_v2(
-        plan, plan_pin, chunk, ordinal,
-    )
+    row = _recorded_read_plan_member(
+        plan_module, "validate_window", construction=construction,
+    )(plan, plan_pin, chunk, ordinal)
     return chunk, row
 
 
