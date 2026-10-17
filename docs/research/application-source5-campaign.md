@@ -69,6 +69,21 @@ The native 150-test component gate covers these data boundaries, existing H
 and Soak behavior, and registration regressions. Genuine width/profile
 handoff, complete recorded replay and campaign qualification remain separate.
 
+## Private held campaign kernels
+
+Fixed jobs, Soak dispatch, analysis persistence and bounded ACK/reclaim have
+private kernels for an existing SourceA operation and its exact H context.
+The legacy pressure recipe and analysis writer share their data-building
+bodies with those kernels. The public `run_host` entry retains its existing
+routing.
+
+Owned pressure and fixed/pressure numeric analysis remain refused until
+SourceA supplies the closed capacity inputs and current completed-owner
+trace provider. Exploration and final analysis also require their actual
+owned replay projections. The 161-test component gate covers the extraction,
+legacy behavior, opaque certificate handoff and the explicit refusals; it
+does not establish complete recorded replay or APP permission.
+
 `scripts/application-source5-campaign.py` now has separate execution-manifest
 v1 and v2 paths. V1 retains the original capacity-stage registration
 contract. V2 accepts only the closed `final_prepared` scope: it replays the

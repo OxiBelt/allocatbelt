@@ -1617,9 +1617,11 @@ class Source5ControllerScopeTests(unittest.TestCase):
         self.assertIn("validate_probe_capture_receipt_envelope", capture)
         self.assertIn("compose_calibrated_policy_v5_offline", capture)
         self.assertIn("len(capture_pins) == len(bundle_members) == 2", capture)
-        builder = ast.unparse(function(tree, "_build_pressure_recipe"))
-        self.assertLess(builder.index("_capture_source5_probe_bundle"),
-                        builder.index("_validate_recipe_shape"))
+        data_builder = ast.unparse(function(tree, "_build_pressure_recipe_data_held"))
+        self.assertLess(data_builder.index("_capture_source5_probe_bundle"),
+                        data_builder.index("_validate_recipe_shape"))
+        wrapper = ast.unparse(function(tree, "_build_pressure_recipe"))
+        self.assertIn("_build_pressure_recipe_data_held", wrapper)
         runner = ast.unparse(function(tree, "run_pressure_phase"))
         self.assertLess(runner.index("_build_pressure_recipe"),
                         runner.index("authorize_source5_job_locked"))
@@ -1628,20 +1630,46 @@ class Source5ControllerScopeTests(unittest.TestCase):
 
     def test_pressure_predecessor_certificate_is_live_only_and_owner_read_is_ordered(self) -> None:
         tree = ast.parse(CONTROLLER_PATH.read_bytes(), filename=str(CONTROLLER_PATH))
-        builder_node = function(tree, "_build_pressure_recipe")
-        builder = ast.unparse(builder_node)
-        self.assertIn("build_source5_pressure_predecessor_replay_locked", builder)
-        self.assertIn("captured_evidence=captured_view", builder)
-        certificate_detail_accesses = [
-            node for node in ast.walk(builder_node)
-            if isinstance(node, ast.Subscript) and
-            isinstance(node.value, ast.Name) and node.value.id == "details" and
-            isinstance(node.slice, ast.Constant) and
-            node.slice.value == "pressure_predecessor_certificate"
+        wrapper_node = function(tree, "_build_pressure_recipe")
+        wrapper = ast.unparse(wrapper_node)
+        data_node = function(tree, "_build_pressure_recipe_data_held")
+        data_helper = ast.unparse(data_node)
+        self.assertIn("build_source5_pressure_predecessor_replay_locked", wrapper)
+        self.assertIn("captured_evidence=captured_view", wrapper)
+        data_helper_calls = [
+            node for node in ast.walk(wrapper_node)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and
+            node.func.id == "_build_pressure_recipe_data_held"
         ]
-        self.assertEqual(len(certificate_detail_accesses), 1)
+        self.assertEqual(len(data_helper_calls), 1)
+        data_kwargs = {item.arg: item.value for item in data_helper_calls[0].keywords}
+        self.assertIsInstance(data_kwargs["pressure_predecessor_certificate"], ast.Name)
+        self.assertEqual(data_kwargs["pressure_predecessor_certificate"].id,
+                         "pressure_predecessor_certificate")
+        certificate_detail_assignments = [
+            node for node in ast.walk(data_node)
+            if isinstance(node, ast.Assign) and
+            any(isinstance(target, ast.Subscript) and
+                isinstance(target.value, ast.Name) and target.value.id == "details" and
+                isinstance(target.slice, ast.Constant) and
+                target.slice.value == "pressure_predecessor_certificate"
+                for target in node.targets)
+        ]
+        self.assertEqual(len(certificate_detail_assignments), 1)
+        self.assertIsInstance(certificate_detail_assignments[0].value, ast.Name)
+        self.assertEqual(certificate_detail_assignments[0].value.id,
+                         "pressure_predecessor_certificate")
+        parents = {
+            child: parent for parent in ast.walk(data_node)
+            for child in ast.iter_child_nodes(parent)
+        }
+        ancestor = certificate_detail_assignments[0]
+        while ancestor in parents and not isinstance(ancestor, ast.If):
+            ancestor = parents[ancestor]
+        self.assertIsInstance(ancestor, ast.If)
+        self.assertIn("EXECUTION_SCHEMA_V4", ast.unparse(ancestor.test))
         issuer_calls = [
-            node for node in ast.walk(builder_node)
+            node for node in ast.walk(wrapper_node)
             if isinstance(node, ast.Call) and
             getattr(node.func, "attr", None) ==
                 "build_source5_pressure_predecessor_replay_locked"
@@ -1649,13 +1677,30 @@ class Source5ControllerScopeTests(unittest.TestCase):
         self.assertEqual(len(issuer_calls), 1)
         issuer = issuer_calls[0]
         self.assertEqual(len(issuer.args), 4)
+        self.assertIsInstance(issuer.args[0], ast.Name)
+        self.assertEqual(issuer.args[0].id, "lock")
+        self.assertIsInstance(issuer.args[1], ast.Call)
+        self.assertIsInstance(issuer.args[1].func, ast.Name)
+        self.assertEqual(issuer.args[1].func.id, "api_pin")
+        self.assertIsInstance(issuer.args[2], ast.Name)
+        self.assertEqual(issuer.args[2].id, "job")
+        self.assertIsInstance(issuer.args[3], ast.Name)
+        self.assertEqual(issuer.args[3].id, "fixed_record_pin")
         self.assertEqual(
             [item.arg for item in issuer.keywords], ["captured_evidence"],
         )
         self.assertIsInstance(issuer.keywords[0].value, ast.Name)
         self.assertEqual(issuer.keywords[0].value.id, "captured_view")
+        archive_calls = [
+            node for node in ast.walk(wrapper_node)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and
+            node.func.id == "archived_job_read_view"
+        ]
+        self.assertEqual(len(archive_calls), 1)
+        self.assertLess(archive_calls[0].lineno, issuer.lineno)
+        self.assertLess(issuer.lineno, data_helper_calls[0].lineno)
         recipe_assignments = [
-            node for node in builder_node.body
+            node for node in data_node.body
             if isinstance(node, ast.Assign) and
             any(isinstance(target, ast.Name) and target.id == "recipe"
                 for target in node.targets)

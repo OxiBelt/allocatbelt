@@ -159,6 +159,25 @@ def require(condition: bool, message: str) -> None:
         raise Source5CampaignError(message)
 
 
+def _source5_h_require_path_argument(value: object, label: str) -> Path:
+    """Accept pathlib's concrete platform Path subclasses without coercion."""
+    require(isinstance(value, Path),
+            f"{label} must be supplied as a pathlib.Path object")
+    return value
+
+
+def _source5_h_require_owned_pressure_capacity_seam_held() -> None:
+    """Keep owned pressure closed until SourceA supplies closed capacity facts."""
+    require(False,
+            "Source5 owned pressure remains refused until SourceA provides the exact scope-owned closed capacity projection")
+
+
+def _source5_h_require_owned_numeric_analysis_provider_held(phase: str) -> None:
+    """Refuse V5 numeric replay until SourceA supplies its current trace provider."""
+    require(phase not in {"fixed_analysis", "pressure_analysis"},
+            "Source5 owned fixed/pressure numeric analysis remains refused until SourceA provides the same-scope current completed-owner trace provider and bounded analyzer admission")
+
+
 def _source5_validate_prepared_execution_scope(
     schema: str, context_scope: str, manifest_scope: str,
 ) -> None:
@@ -6636,6 +6655,9 @@ def _validate_probe_capture_contract(
 def _pressure_materials_index(
     context: CampaignContext, index_path: Path,
 ) -> dict[str, dict[str, Any]]:
+    index_path = _source5_h_require_path_argument(
+        index_path, "Source5 pressure materials index",
+    )
     bounded = context.manifest["schema"] in BOUNDED_EXECUTION_SCHEMAS
     index_schema = (PRESSURE_MATERIAL_INDEX_SCHEMA_V2 if bounded
                     else PRESSURE_MATERIAL_INDEX_SCHEMA)
@@ -7217,6 +7239,67 @@ def _build_pressure_recipe(
     context: CampaignContext, lock: Any, job: dict[str, Any], job_index: int,
     material: dict[str, Any], phase_prerequisites: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], dict[str, str], Path, dict[str, Any]]:
+    chronology_snapshot = context.chronology.source5_chronology_snapshot_locked(
+        lock, api_pin(context.manifest_pin),
+    )
+    fixed_run_id = job.get("predecessor_run_ids")
+    require(type(fixed_run_id) is list and len(fixed_run_id) == 1,
+            "Source5 pressure job does not name exactly one fixed predecessor")
+    fixed_phase_root = _phase_root(context, "confirmation")
+    fixed_record_path = fixed_phase_root / "job-records" / f"{fixed_run_id[0]}.json"
+    fixed_record_raw, fixed_record_sha, _fixed_record_info = read_stable(
+        fixed_record_path, "Source5 successful fixed predecessor", 4 * 1024 * 1024,
+    )
+    fixed_record = json.loads(fixed_record_raw)
+    require(fixed_record_raw == canonical_bytes(fixed_record) and
+            fixed_record.get("state") == "valid_pair" and
+            fixed_record.get("job", {}).get("run_id") == fixed_run_id[0],
+            "Source5 pressure predecessor is absent or not a successful exact fixed record")
+    pressure_predecessor_certificate = None
+    if context.manifest["schema"] == EXECUTION_SCHEMA_V4:
+        fixed_jobs = [row for row in _host_jobs(context, "confirmation")
+                      if row["run_id"] == fixed_run_id[0]]
+        require(len(fixed_jobs) == 1 and
+                fixed_jobs[0] == fixed_record.get("job"),
+                "Source5 pressure predecessor record differs from its exact original Plan row")
+        fixed_record_pin = {
+            "path": str(fixed_record_path), "raw_sha256": fixed_record_sha,
+        }
+        with archived_job_read_view(
+                context, fixed_jobs[0], "pressure_analysis") as captured_view:
+            pressure_predecessor_certificate = (
+                context.chronology.build_source5_pressure_predecessor_replay_locked(
+                    lock, api_pin(context.manifest_pin), job, fixed_record_pin,
+                    captured_evidence=captured_view,
+                )
+            )
+    else:
+        fixed_record_pin = {
+            "path": str(fixed_record_path), "raw_sha256": fixed_record_sha,
+        }
+        context.chronology.verify_source5_completed_job_locked(
+            lock, api_pin(context.manifest_pin), None, fixed_record_pin,
+        )
+    return _build_pressure_recipe_data_held(
+        context, job, job_index, material, phase_prerequisites,
+        chronology_snapshot=chronology_snapshot,
+        fixed_record_path=fixed_record_path, fixed_record=fixed_record,
+        fixed_record_raw=fixed_record_raw, fixed_record_sha=fixed_record_sha,
+        pressure_predecessor_certificate=pressure_predecessor_certificate,
+    )
+
+
+def _build_pressure_recipe_data_held(
+    context: CampaignContext, job: dict[str, Any], job_index: int,
+    material: dict[str, Any], phase_prerequisites: list[dict[str, Any]], *,
+    chronology_snapshot: dict[str, Any], fixed_record_path: Path,
+    fixed_record: dict[str, Any], fixed_record_raw: bytes,
+    fixed_record_sha: str,
+    pressure_predecessor_certificate: object | None,
+) -> tuple[dict[str, Any], dict[str, str], Path, dict[str, Any]]:
+    fixed_record_path = _source5_h_require_path_argument(
+        fixed_record_path, "Source5 fixed predecessor record",
+    )
     pressure = context.pressure_pair
     descriptors = pressure.pressure_process_descriptors(job)
     require(len(descriptors) == 2 and len(material["members"]) == 2,
@@ -7242,9 +7325,6 @@ def _build_pressure_recipe(
                   **blueprint, "outputs": outputs}
         material_members.append(member)
 
-    chronology_snapshot = context.chronology.source5_chronology_snapshot_locked(
-        lock, api_pin(context.manifest_pin),
-    )
     source_manifest_pin = context.source_manifest_pins[context.host_id]
     runner_relative = "scripts/application-pressure-pair.py"
     runner_pin = context.manifest["modules"][context.host_id][runner_relative]
@@ -7298,40 +7378,18 @@ def _build_pressure_recipe(
         16 * 1024 * 1024, shared_policy["raw_sha256"],
     )
     fixed_run_id = job["predecessor_run_ids"]
-    require(type(fixed_run_id) is list and len(fixed_run_id) == 1,
-            "Source5 pressure job does not name exactly one fixed predecessor")
-    fixed_phase_root = _phase_root(context, "confirmation")
-    fixed_record_path = fixed_phase_root / "job-records" / f"{fixed_run_id[0]}.json"
-    fixed_record_raw, fixed_record_sha, _fixed_record_info = read_stable(
-        fixed_record_path, "Source5 successful fixed predecessor", 4 * 1024 * 1024,
-    )
-    fixed_record = json.loads(fixed_record_raw)
-    require(fixed_record_raw == canonical_bytes(fixed_record) and
+    require(type(fixed_run_id) is list and len(fixed_run_id) == 1 and
+            isinstance(fixed_record_path, Path) and type(fixed_record) is dict and
+            type(fixed_record_raw) is bytes and
+            type(fixed_record_sha) is str and
+            sha256(fixed_record_raw) == fixed_record_sha and
+            fixed_record_raw == canonical_bytes(fixed_record) and
             fixed_record.get("state") == "valid_pair" and
             fixed_record.get("job", {}).get("run_id") == fixed_run_id[0],
-            "Source5 pressure predecessor is absent or not a successful exact fixed record")
+            "Source5 pressure predecessor is not its exact immutable successful fixed record")
     fixed_record_pin = {
         "path": str(fixed_record_path), "raw_sha256": fixed_record_sha,
     }
-    pressure_predecessor_certificate = None
-    if context.manifest["schema"] == EXECUTION_SCHEMA_V4:
-        fixed_jobs = [row for row in _host_jobs(context, "confirmation")
-                      if row["run_id"] == fixed_run_id[0]]
-        require(len(fixed_jobs) == 1 and
-                fixed_jobs[0] == fixed_record.get("job"),
-                "Source5 pressure predecessor record differs from its exact original Plan row")
-        with archived_job_read_view(
-                context, fixed_jobs[0], "pressure_analysis") as captured_view:
-            pressure_predecessor_certificate = (
-                context.chronology.build_source5_pressure_predecessor_replay_locked(
-                    lock, api_pin(context.manifest_pin), job, fixed_record_pin,
-                    captured_evidence=captured_view,
-                )
-            )
-    else:
-        context.chronology.verify_source5_completed_job_locked(
-            lock, api_pin(context.manifest_pin), None, fixed_record_pin,
-        )
     deadlines = exact(material["deadlines"], {
         "trace_seconds", "drain_seconds", "shutdown_seconds", "process_seconds",
         "outer_seconds", "application_wall_timeout_seconds",
@@ -7571,6 +7629,59 @@ def _persist_analysis(
     source_phase: str, analysis_value: dict[str, Any],
     job_evidence_complete: bool, numeric_gates_passed: bool,
 ) -> dict[str, Any]:
+    record, analysis_pin = _source5_write_analysis_artifact_held(
+        context, phase, source_phase, analysis_value,
+        job_evidence_complete, numeric_gates_passed,
+    )
+    if context.manifest.get("schema") == EXECUTION_SCHEMA_V4:
+        registered = context.chronology.record_source5_analysis_locked(
+            lock, api_pin(context.manifest_pin), analysis_pin,
+            captured_read_context=source5_completed_archive_read_provider(
+                context,
+            ),
+        )
+    else:
+        registered = context.chronology.record_source5_analysis_locked(
+            lock, api_pin(context.manifest_pin), analysis_pin,
+        )
+    return {"record": record, "pin": analysis_pin,
+            "chronology": registered}
+
+
+def _source5_h_replay_phase_records_held(
+    session: object, scope: object, context: CampaignContext,
+    source_phase: str, *, analysis_phase: str,
+) -> list[dict[str, Any]]:
+    """Obtain actual current/detached owner rows through SourceA's held verifier."""
+    _source5_h_require_clean_frontier_held(session, scope, context)
+    require(source_phase in {
+                "exploration", "aa", "confirmation", "pressure", "soak",
+            } and analysis_phase in {
+                "exploration", "aa", "fixed_analysis",
+                "pressure_analysis", "soak", "final_analysis",
+            },
+            "Source5 owned analysis replay has an unsupported phase pair")
+    replay = getattr(
+        context.chronology, "_source5_owned_replay_phase_records_held", None,
+    )
+    require(callable(replay),
+            "Source5 owned phase-record replay held primitive is not installed")
+    records = replay(
+        session, scope, context, source_phase,
+        analysis_phase=analysis_phase,
+    )
+    require(type(records) is list and all(type(record) is dict for record in records),
+            "Source5 owned phase-record replay returned a malformed record list")
+    _source5_h_require_owned_context_held(session, scope, context)
+    return records
+
+
+def _source5_write_analysis_artifact_held(
+    context: CampaignContext, phase: str, source_phase: str,
+    analysis_value: dict[str, Any], job_evidence_complete: bool,
+    numeric_gates_passed: bool,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Write only the deterministic H analysis artifact; SourceA owns its event."""
     jobs = _host_jobs(context, source_phase)
     artifact_root = _private_directory(
         context.artifact_root / context.manifest["campaign_id"] /
@@ -7583,20 +7694,144 @@ def _persist_analysis(
     )
     raw = canonical_bytes(record)
     raw_sha = write_new(path, raw, "Source5 phase analysis")
-    analysis_pin = {"path": str(path), "raw_sha256": raw_sha}
-    if context.manifest.get("schema") == EXECUTION_SCHEMA_V4:
-        registered = context.chronology.record_source5_analysis_locked(
-            lock, api_pin(context.manifest_pin), analysis_pin,
-            captured_read_context=source5_completed_archive_read_provider(
-                context,
-            ),
+    return record, {"path": str(path), "raw_sha256": raw_sha}
+
+
+def _source5_h_refresh_phase_prerequisites_held(
+    session: object, scope: object, context: CampaignContext, phase: str,
+) -> list[dict[str, Any]]:
+    """Refresh the fixed prerequisite set inside the caller's existing scope."""
+    _source5_h_require_clean_frontier_held(session, scope, context)
+    required = {
+        "aa": ("exploration",),
+        "confirmation": ("exploration", "aa"),
+        "pressure": ("fixed_analysis",),
+        "soak": ("pressure_analysis",),
+    }.get(phase)
+    require(required is not None,
+            "Source5 owned job entry received an unsupported original phase")
+    refreshed = [
+        _source5_h_refresh_analysis_gate_held(
+            session, scope, context, analysis_phase,
+        ) for analysis_phase in required
+    ]
+    require(all(type(item) is dict and item.get("refreshed") is True and
+                item.get("phase") == analysis_phase and
+                item.get("qualification_eligible") is False
+                for analysis_phase, item in zip(required, refreshed, strict=True)),
+            "Source5 owned prerequisite refresh returned an incomplete data result")
+    return refreshed
+
+
+def _source5_h_phase_records_digest_held(
+    context: CampaignContext, phase: str,
+    expected_records: list[dict[str, Any]],
+) -> str:
+    """Bind verified held rows to their exact immutable local H ledger bytes."""
+    jobs = _host_jobs(context, phase)
+    require(type(expected_records) is list and len(expected_records) == len(jobs),
+            f"Source5 {phase} held replay differs from its complete H ledger prefix")
+    phase_root = _phase_root(context, phase)
+    ledger_path = phase_root / "controller-ledger.jsonl"
+    ledger_raw, _ledger_sha, _ledger_info = read_stable(
+        ledger_path, f"Source5 {phase} held analysis ledger",
+        _source5_phase_ledger_byte_bound(context, phase, jobs),
+    )
+    local_records = _phase_ledger_records(
+        ledger_path, _source5_phase_ledger_byte_bound(context, phase, jobs),
+    )
+    require(local_records == expected_records,
+            f"Source5 {phase} held replay differs from exact local controller rows")
+    record_raw_hashes = []
+    for job, record in zip(jobs, expected_records, strict=True):
+        record_path = phase_root / "job-records" / f"{job['run_id']}.json"
+        record_raw, record_sha, _record_info = read_stable(
+            record_path, f"Source5 {phase} held job record", 4 * 1024 * 1024,
         )
+        require(record_raw == canonical_bytes(record),
+                f"Source5 {phase} job record file differs from its held replay")
+        record_raw_hashes.append(record_sha)
+    return sha256(canonical_bytes({
+        "ledger_raw_sha256": sha256(ledger_raw),
+        "record_raw_sha256": record_raw_hashes,
+    }))
+
+
+def _source5_h_final_phase_results_held(
+    session: object, scope: object, context: CampaignContext,
+    current: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Refuse until the exact InputPrep-owned exploration projection is available."""
+    _source5_h_require_owned_context_held(session, scope, context)
+    require(False,
+            "Source5 owned final analysis requires the exact SourceA/InputPrep old-exploration pilot and frozen-rate projection")
+
+def _source5_h_analyze_phase_held(
+    session: object, scope: object, context: CampaignContext,
+    phase: str,
+) -> dict[str, Any]:
+    """Compute and record one supported analysis without reacquiring SourceA's lock."""
+    _source5_h_require_owned_numeric_analysis_provider_held(phase)
+    current = _source5_h_require_clean_frontier_held(session, scope, context)
+    require(phase in {
+                "aa", "fixed_analysis", "pressure_analysis", "soak",
+            },
+            "Source5 owned exploration/final analysis remains refused until its exact InputPrep-owned pilot projection is available")
+    source_phase = {
+        "fixed_analysis": "confirmation",
+        "pressure_analysis": "pressure",
+    }.get(phase, phase)
+    phase_root = _phase_root(context, source_phase)
+    ledger_path = phase_root / "controller-ledger.jsonl"
+    expected_jobs = _host_jobs(context, source_phase)
+    records = _source5_h_replay_phase_records_held(
+        session, scope, context, source_phase, analysis_phase=phase,
+    )
+    if source_phase == "soak":
+        require(len(records) == len(expected_jobs) == 1 and
+                records[0].get("job") == expected_jobs[0] and
+                records[0].get("state") in {"valid_soak", "invalid_soak"},
+                f"Source5 {phase} analysis lacks its exact original Soak ordinal")
     else:
-        registered = context.chronology.record_source5_analysis_locked(
-            lock, api_pin(context.manifest_pin), analysis_pin,
+        context.campaign.validate_phase_ledger(
+            records, expected_jobs, source_phase, context.host_id,
         )
-    return {"record": record, "pin": {"path": str(path), "raw_sha256": raw_sha},
-            "chronology": registered}
+        require(all(record.get("state") == "valid_pair" for record in records),
+                f"Source5 {phase} analysis is blocked by a failed original ordinal")
+    if phase == "aa":
+        value = context.campaign.validate_aa_records(
+            records, expected_jobs, context.host_id,
+            context.spec["protocol"]["bootstrap_draws"],
+            context.spec["protocol"]["bootstrap_seed"],
+        )
+        numeric = value.get("passed") is True
+    elif phase == "soak":
+        component_pin = raw_pin(
+            records[0]["evidence"]["soak_component"],
+            "Source5 Soak component",
+        )
+        value = {
+            "schema": "allocatbelt.application-source5-soak-analysis.v1",
+            "component": component_pin,
+            "readback": records[0]["process_metrics"][0],
+            "record_sha256": records[0]["record_sha256"],
+        }
+        numeric = value["readback"].get("passed") is True
+    else:
+        value = _source5_numeric_for_pairs(context, phase, records)
+        numeric = value.get("numeric_gates_passed") is True
+    record, analysis_pin = _source5_write_analysis_artifact_held(
+        context, phase, source_phase, value, True, numeric,
+    )
+    _source5_h_require_owned_context_held(session, scope, context)
+    registered = _source5_h_record_analysis_held(
+        session, scope, context, analysis_pin,
+    )
+    _source5_h_require_owned_context_held(session, scope, context)
+    if phase not in {"soak"}:
+        require(record["phase_gate_passed"] is True,
+                f"Source5 {phase} phase gate failed; later phases remain blocked")
+    return {"record": record, "pin": analysis_pin, "chronology": registered}
 
 
 def analyze_phase(context: CampaignContext, phase: str) -> dict[str, Any]:
@@ -7760,6 +7995,857 @@ def _source5_refresh_phase_prerequisite_gates_locked(
             lock, api_pin(context.manifest_pin), analysis_phase,
             captured_read_context=provider,
         )
+
+
+def _source5_h_require_owned_context_held(
+    session: object, scope: object, context: CampaignContext,
+) -> dict[str, Any]:
+    """Require the actual SourceA-bound V5 H context before any held callback."""
+    require(type(context) is CampaignContext and
+            type(context.manifest) is dict and
+            context.manifest.get("schema") == EXECUTION_SCHEMA_V5 and
+            context.scope == PREPARED_EXPLORATION_REUSE_SCOPE and
+            isinstance(context.chronology, types.ModuleType),
+            "Source5 owned H kernel requires the exact active V5 CampaignContext")
+    chronology = context.chronology
+    own_module = getattr(chronology, "_source5_own_chronology_module", None)
+    require(callable(own_module) and own_module() is chronology,
+            "Source5 owned H kernel cannot substitute a duplicate SourceA module instance")
+    check = getattr(chronology, "_source5_owned_require_h_context_held", None)
+    require(callable(check),
+            "Source5 owned H kernel requires the reviewed SourceA scope association")
+    current = check(session, scope, context)
+    require(type(current) is dict and set(current) == {
+                "manifest", "prepared", "state", "manifest_pin",
+            } and type(current["manifest"]) is dict and
+            current["manifest"] == context.manifest and
+            type(current["prepared"]) is dict and
+            type(current["state"]) is dict and
+            type(current["manifest_pin"]) is dict and
+            current["manifest_pin"] == context.manifest_pin and
+            current["prepared"].get("campaign_id") ==
+                context.manifest.get("campaign_id") and
+            current["prepared"].get("host_id") == context.host_id,
+            "Source5 owned H context differs from its exact current SourceA state")
+    return current
+
+
+def _source5_h_require_clean_frontier_held(
+    session: object, scope: object, context: CampaignContext,
+) -> dict[str, Any]:
+    """Require a clean boundary only before new work, never during active dispatch."""
+    current = _source5_h_require_owned_context_held(session, scope, context)
+    state = current["state"]
+    require(state.get("pending") is None and
+            state.get("source5_pending") is None and
+            state.get("cleanup_blocked") is False and
+            state.get("source5_cleanup_blocked") is False and
+            state.get("source5_failed_owner_window") is False,
+            "Source5 owned H operation is not at a clean journal/owner boundary")
+    return current
+
+
+def _source5_h_authorize_job_held(
+    session: object, scope: object, context: CampaignContext,
+    exact_job: dict[str, Any], helper_input_pin: dict[str, str], *,
+    pressure_predecessor_certificate: object | None = None,
+) -> Any:
+    _source5_h_require_clean_frontier_held(session, scope, context)
+    require(type(exact_job) is dict and exact_job.get("phase") in {
+                "aa", "confirmation", "pressure", "soak",
+            },
+            "Source5 owned H launch is closed to exploration and unknown phases")
+    authorize = getattr(
+        context.chronology, "_source5_owned_authorize_job_held", None,
+    )
+    require(callable(authorize),
+            "Source5 owned job authorization held primitive is not installed")
+    result = authorize(
+        session, scope, context, exact_job, helper_input_pin,
+        host_evidence_budget_pin=context.host_evidence_budget_pin,
+        pressure_predecessor_certificate=pressure_predecessor_certificate,
+    )
+    _source5_h_require_owned_context_held(session, scope, context)
+    return result
+
+
+def _source5_h_run_authorized_job_held(
+    session: object, scope: object, context: CampaignContext,
+    authorization: object,
+) -> dict[str, Any]:
+    _source5_h_require_owned_context_held(session, scope, context)
+    authorization_type = getattr(
+        context.chronology, "Source5JobAuthorization", None,
+    )
+    require(authorization_type is not None and
+            type(authorization) is authorization_type,
+            "Source5 owned H dispatch requires its exact active SourceA authorization type")
+    run = getattr(
+        context.chronology, "_source5_owned_run_authorized_job_held", None,
+    )
+    require(callable(run),
+            "Source5 owned authorized-job held primitive is not installed")
+    result = run(session, scope, context, authorization)
+    require(type(result) is dict and result.get("qualification_eligible") is False,
+            "Source5 owned H dispatch returned a malformed or qualifying result")
+    _source5_h_require_owned_context_held(session, scope, context)
+    return result
+
+
+def _source5_h_refresh_analysis_gate_held(
+    session: object, scope: object, context: CampaignContext, phase: str,
+) -> dict[str, Any]:
+    _source5_h_require_clean_frontier_held(session, scope, context)
+    require(phase in {
+                "exploration", "aa", "fixed_analysis",
+                "pressure_analysis", "soak", "final_analysis",
+            },
+            "Source5 owned H refresh phase is outside the exact analysis enum")
+    refresh = getattr(
+        context.chronology, "_source5_owned_refresh_analysis_gate_held", None,
+    )
+    require(callable(refresh),
+            "Source5 owned analysis refresh held primitive is not installed")
+    result = refresh(session, scope, context, phase)
+    _source5_h_require_owned_context_held(session, scope, context)
+    return result
+
+
+def _source5_h_record_analysis_held(
+    session: object, scope: object, context: CampaignContext,
+    analysis_pin: dict[str, str],
+) -> dict[str, Any]:
+    _source5_h_require_clean_frontier_held(session, scope, context)
+    require(type(analysis_pin) is dict and set(analysis_pin) == {
+                "path", "raw_sha256",
+            },
+            "Source5 owned H analysis recording requires one exact data pin")
+    record = getattr(
+        context.chronology, "_source5_owned_record_analysis_held", None,
+    )
+    require(callable(record),
+            "Source5 owned analysis recording held primitive is not installed")
+    result = record(session, scope, context, analysis_pin)
+    _source5_h_require_owned_context_held(session, scope, context)
+    return result
+
+
+def _source5_h_verify_completed_pressure_job_held(
+    session: object, scope: object, context: CampaignContext,
+    record_pin: dict[str, str],
+) -> dict[str, Any]:
+    _source5_h_require_clean_frontier_held(session, scope, context)
+    require(type(record_pin) is dict and set(record_pin) == {
+                "path", "raw_sha256",
+            },
+            "Source5 owned H pressure verification requires one exact record pin")
+    verify = getattr(
+        context.chronology,
+        "_source5_owned_verify_completed_pressure_job_held", None,
+    )
+    require(callable(verify),
+            "Source5 owned completed-pressure held verifier is not installed")
+    result = verify(session, scope, context, record_pin)
+    _source5_h_require_owned_context_held(session, scope, context)
+    return result
+
+
+def _source5_h_authorization_context_held(
+    session: object, scope: object, context: CampaignContext,
+    authorization_id: str,
+) -> dict[str, Any]:
+    _source5_h_require_owned_context_held(session, scope, context)
+    require(type(authorization_id) is str and authorization_id,
+            "Source5 owned authorization lookup requires one exact identifier")
+    lookup = getattr(
+        context.chronology, "_source5_owned_authorization_context_held", None,
+    )
+    require(callable(lookup),
+            "Source5 owned authorization-context held primitive is not installed")
+    result = lookup(session, scope, context, authorization_id)
+    _source5_h_require_owned_context_held(session, scope, context)
+    return result
+
+
+def _source5_h_verify_capacity_ancestor_held(
+    session: object, scope: object, context: CampaignContext,
+    authorization_id: str,
+) -> dict[str, Any]:
+    _source5_h_require_owned_context_held(session, scope, context)
+    require(type(authorization_id) is str and authorization_id,
+            "Source5 owned capacity-ancestor lookup requires one exact identifier")
+    verify = getattr(
+        context.chronology, "_source5_owned_verify_capacity_ancestor_held", None,
+    )
+    require(callable(verify),
+            "Source5 owned capacity-ancestor held primitive is not installed")
+    result = verify(session, scope, context, authorization_id)
+    _source5_h_require_owned_context_held(session, scope, context)
+    return result
+
+
+def _source5_h_phase_ledger_held(
+    context: CampaignContext, phase: str, jobs: list[dict[str, Any]],
+) -> tuple[Path, Path, int, int]:
+    """Open the exact private H phase ledger without acquiring a chronology lock."""
+    phase_root = _phase_root(context, phase)
+    _private_directory(phase_root)
+    _private_directory(phase_root / "job-records")
+    ledger_path = phase_root / "controller-ledger.jsonl"
+    ledger_bound = _source5_phase_ledger_byte_bound(context, phase, jobs)
+    flags = (os.O_WRONLY | os.O_APPEND |
+             getattr(os, "O_CLOEXEC", 0) |
+             getattr(os, "O_NOFOLLOW", 0))
+    created = not (ledger_path.exists() or ledger_path.is_symlink())
+    if not created:
+        info = ledger_path.lstat()
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+                info.st_size <= ledger_bound,
+                "Source5 owned phase ledger is not one bounded private file")
+    else:
+        flags |= os.O_CREAT | os.O_EXCL
+    fd = os.open(ledger_path, flags, 0o600)
+    try:
+        opened = os.fstat(fd)
+        path_info = ledger_path.lstat()
+        require(stat.S_ISREG(opened.st_mode) and
+                stat.S_IMODE(opened.st_mode) == 0o600 and
+                opened.st_uid == os.getuid() and opened.st_nlink == 1 and
+                (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_size) ==
+                (path_info.st_dev, path_info.st_ino, path_info.st_mode,
+                 path_info.st_size) and opened.st_size <= ledger_bound,
+                "Source5 owned phase ledger changed during held open")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if created:
+        directory_fd = os.open(
+            phase_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+            getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    return (phase_root, ledger_path, ledger_bound,
+            _source5_disposition_byte_bound(context, phase))
+
+
+def _source5_h_wait_verify_and_reclaim_archive_job_owned_held(
+    session: object, scope: object, context: CampaignContext,
+    handoff: dict[str, Any], predecessor_ack_pin: dict[str, str] | None,
+    job: dict[str, Any],
+) -> dict[str, Any]:
+    """Close one owned V5 Root ACK before its SourceA operation can continue."""
+    _source5_h_require_clean_frontier_held(session, scope, context)
+    require(context.manifest.get("schema") == EXECUTION_SCHEMA_V5 and
+            type(job) is dict and job.get("phase") in {
+                "aa", "confirmation", "pressure", "soak",
+            },
+            "Source5 owned ACK closure requires one current V5 original job")
+    phase = job["phase"]
+    jobs = _host_jobs(context, phase)
+    matching = [index for index, row in enumerate(jobs) if row == job]
+    require(len(matching) == 1 and type(handoff) is dict and
+            type(handoff.get("archive_context")) is dict and
+            handoff["archive_context"].get("phase") == phase and
+            handoff["archive_context"].get("job_index") == matching[0],
+            "Source5 owned ACK handoff differs from the exact original host job")
+    receiver = handoff.get("offer", {}).get("acknowledgement_receiver")
+    require(type(receiver) is dict and type(receiver.get("path")) is str and
+            type(receiver.get("maximum_bytes")) is int,
+            "Source5 owned ACK handoff lacks its exact finite receiver slot")
+    receiver_row = _source5_archive_role_row(
+        handoff["declarations"], "source5_ack_bundle",
+    )
+    require(receiver["path"] == receiver_row["path"] and
+            receiver["maximum_bytes"] == receiver_row["max_file_bytes"] ==
+                receiver_row["max_bytes"] and
+            receiver_row["max_inodes"] == 1,
+            "Source5 owned ACK receiver differs from its exact source-budget role")
+    deadline_ns = getattr(session, "deadline_ns", None)
+    cancel_event = getattr(session, "cancel_event", None)
+    require(type(deadline_ns) is int and deadline_ns > 0,
+            "Source5 owned ACK wait lacks the validated operation deadline")
+    wait = getattr(session, "check_deadline", None)
+    require(callable(wait),
+            "Source5 owned ACK wait lacks the validated session deadline checker")
+    wait("before owned Root ACK wait")
+    bundle_raw, bundle_pin = _source5_wait_for_ack_bundle_owned_bounded_held(
+        Path(receiver["path"]), receiver["maximum_bytes"],
+        deadline_ns=deadline_ns, cancel_event=cancel_event,
+    )
+    _source5_h_require_owned_context_held(session, scope, context)
+    result = _source5_verify_and_reclaim_archive_job_bundle(
+        context, handoff, predecessor_ack_pin, phase, job["run_id"],
+        bundle_raw, bundle_pin,
+    )
+    wait("after owned Root ACK verification and reclaim")
+    _source5_h_require_clean_frontier_held(session, scope, context)
+    return {
+        "schema": "allocatbelt.application-source5-owned-job-archive-closure.v1",
+        "phase": phase,
+        "job_index": matching[0],
+        "job_run_id": job["run_id"],
+        "job_record_pin": handoff["job_record_pin"],
+        "ack_pin": result["ack_pin"],
+        "checkpoint_pin": result["checkpoint_pin"],
+        "manifest_pin": result["manifest_pin"],
+        "signature_pin": result["signature_pin"],
+        "bundle_pin": bundle_pin,
+        "qualification_eligible": False,
+    }
+
+
+def _source5_h_chronology_snapshot_held(
+    context: CampaignContext, current: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the legacy pressure snapshot from already-validated held SourceA data."""
+    manifest = current["manifest"]
+    prepared = current["prepared"]
+    state = current["state"]
+    capacity_record = getattr(
+        context.chronology, "_source5_capacity_manifest_record", None,
+    )
+    require(callable(capacity_record),
+            "SourceA lacks its pure capacity-record projection for pressure overlay data")
+    capacity = capacity_record(manifest, context.host_id)
+    require(state.get("pending") is None and
+            state.get("source5_pending") is None and
+            state.get("cleanup_blocked") is False and
+            state.get("source5_cleanup_blocked") is False and
+            state.get("source5_failed_owner_window") is False,
+            "Source5 owned pressure snapshot is blocked by an unresolved owner")
+    return {
+        "schema": "allocatbelt.application-source5-chronology-snapshot.v1",
+        "campaign_id": prepared["campaign_id"],
+        "host_id": prepared["host_id"],
+        "execution_manifest": {
+            "path": context.manifest_pin["path"],
+            "raw_sha256": context.manifest_pin["raw_sha256"],
+        },
+        "observed_host": manifest["observed_hosts"][context.host_id]["artifact"],
+        "output_root": str(prepared["output_root"]),
+        "capacity_output_root": str(prepared["output_root"]),
+        "journal_head": state["head"],
+        "journal_record_count": state["record_count"],
+        "registration_head": state["registration_head"],
+        "dispatch_event_count": state["dispatch_event_count"],
+        "capacity_completion": capacity["artifact"],
+        "capacity_schedule_sha256": capacity["schedule_sha256"],
+        "capacity_ledger_raw_sha256": capacity["ledger_raw_sha256"],
+        "capacity_terminal_head": capacity["terminal_head"],
+        "qualification_eligible": False,
+    }
+
+
+def _source5_h_build_pressure_recipe_held(
+    session: object, scope: object, context: CampaignContext,
+    job: dict[str, Any], job_index: int,
+    material: dict[str, Any], phase_prerequisites: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, str], Path, dict[str, Any]]:
+    """Refuse V5 pressure until SourceA supplies closed capacity facts."""
+    _source5_h_require_owned_pressure_capacity_seam_held()
+    current = _source5_h_require_clean_frontier_held(session, scope, context)
+    require(context.manifest.get("schema") == EXECUTION_SCHEMA_V5 and
+            job.get("phase") == "pressure",
+            "Source5 owned pressure recipe is restricted to the current V5 pressure phase")
+    predecessor_ids = job.get("predecessor_run_ids")
+    require(type(predecessor_ids) is list and len(predecessor_ids) == 1,
+            "Source5 pressure job does not name one exact fixed predecessor")
+    fixed_jobs = [row for row in _host_jobs(context, "confirmation")
+                  if row.get("run_id") == predecessor_ids[0]]
+    require(len(fixed_jobs) == 1,
+            "Source5 pressure predecessor is not one exact original fixed Plan row")
+    fixed_job = fixed_jobs[0]
+    fixed_record_path = (
+        _phase_root(context, "confirmation") / "job-records" /
+        f"{fixed_job['run_id']}.json"
+    )
+    fixed_record_raw, fixed_record_sha, _fixed_info = read_stable(
+        fixed_record_path, "Source5 owned successful fixed predecessor",
+        4 * 1024 * 1024,
+    )
+    try:
+        fixed_record = json.loads(fixed_record_raw)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Source5CampaignError(
+            "Source5 owned fixed predecessor record is malformed",
+        ) from error
+    require(fixed_record_raw == canonical_bytes(fixed_record) and
+            fixed_record.get("state") == "valid_pair" and
+            fixed_record.get("job") == fixed_job and
+            fixed_record.get("chronology", {}).get("authorization_id"),
+            "Source5 pressure predecessor differs from its exact successful fixed record")
+    ancestor = _source5_h_verify_capacity_ancestor_held(
+        session, scope, context,
+        fixed_record["chronology"]["authorization_id"],
+    )
+    ancestor = exact(ancestor, {
+        "authorization_id", "authorization_state", "registration_head",
+        "capacity_completion_raw_sha256", "capacity_schedule_sha256",
+        "capacity_ledger_raw_sha256", "capacity_terminal_head", "entry_count",
+        "dispatch_event_count", "output_root", "journal_head",
+        "historical_journal_head", "historical_journal_record_count",
+        "pending_authorization", "cleanup_blocked", "qualification_eligible",
+    }, "Source5 owned fixed capacity-ancestor result")
+    capacity = context.capacity_completion
+    journal_heads = current["state"].get("journal_heads")
+    require(type(journal_heads) is list and
+            ancestor["authorization_id"] ==
+                fixed_record["chronology"]["authorization_id"] and
+            ancestor["authorization_state"] == "valid_pair" and
+            ancestor["registration_head"] == capacity["registration_head"] and
+            ancestor["capacity_completion_raw_sha256"] ==
+                capacity["artifact"]["raw_sha256"] and
+            ancestor["capacity_schedule_sha256"] == capacity["schedule_sha256"] and
+            ancestor["capacity_ledger_raw_sha256"] ==
+                capacity["ledger_raw_sha256"] and
+            ancestor["capacity_terminal_head"] == capacity["terminal_head"] and
+            ancestor["entry_count"] == 15 and
+            ancestor["dispatch_event_count"] ==
+                current["state"]["dispatch_event_count"] and
+            ancestor["output_root"] == str(context.output_root) and
+            ancestor["journal_head"] == current["state"]["head"] and
+            ancestor["historical_journal_head"] ==
+                fixed_record["chronology"]["job_terminal_head"] and
+            ancestor["historical_journal_head"] in journal_heads and
+            ancestor["historical_journal_record_count"] ==
+                journal_heads.index(ancestor["historical_journal_head"]) and
+            ancestor["pending_authorization"] is False and
+            ancestor["cleanup_blocked"] is False and
+            ancestor["qualification_eligible"] is False,
+            "SourceA held capacity-ancestor replay does not bind the exact fixed predecessor and capacity frontier")
+    recipe = _build_pressure_recipe_data_held(
+        context, job, job_index, material, phase_prerequisites,
+        chronology_snapshot=_source5_h_chronology_snapshot_held(context, current),
+        fixed_record_path=fixed_record_path,
+        fixed_record=fixed_record,
+        fixed_record_raw=fixed_record_raw,
+        fixed_record_sha=fixed_record_sha,
+        pressure_predecessor_certificate=None,
+    )
+    current_raw, current_sha, _current_info = read_stable(
+        fixed_record_path, "Source5 owned fixed predecessor recheck",
+        4 * 1024 * 1024,
+    )
+    require(current_raw == fixed_record_raw and current_sha == fixed_record_sha,
+            "Source5 fixed predecessor changed during pressure recipe assembly")
+    _source5_h_require_owned_context_held(session, scope, context)
+    recipe[3]["capacity_ancestor"] = ancestor
+    return recipe
+
+
+def _source5_h_pressure_job_held(
+    session: object, scope: object, context: CampaignContext,
+    job_index: int, exact_job: dict[str, Any],
+    materials_index_path: Path,
+) -> dict[str, Any]:
+    """Refuse V5 pressure before any material or capacity-origin read."""
+    _source5_h_require_owned_pressure_capacity_seam_held()
+    current = _source5_h_require_clean_frontier_held(session, scope, context)
+    require(context.manifest.get("schema") == EXECUTION_SCHEMA_V5 and
+            type(job_index) is int and job_index >= 0 and
+            type(exact_job) is dict and exact_job.get("phase") == "pressure" and
+            isinstance(materials_index_path, Path),
+            "Source5 owned pressure kernel requires one exact current V5 job/material pin")
+    jobs = _host_jobs(context, "pressure")
+    require(job_index < len(jobs) and jobs[job_index] == exact_job,
+            "Source5 owned pressure job is not the exact Source-selected Plan row")
+    phase_root, ledger_path, ledger_bound, disposition_bound =         _source5_h_phase_ledger_held(context, "pressure", jobs)
+    records = _phase_ledger_records(ledger_path, ledger_bound)
+    _source5_h_refresh_phase_prerequisites_held(
+        session, scope, context, "pressure",
+    )
+    current = _source5_h_require_clean_frontier_held(session, scope, context)
+    finished = current["state"].get("source5_finished")
+    require(type(finished) is dict and len(records) == job_index and
+            all(records[index].get("job") == jobs[index]
+                for index in range(job_index)) and
+            all(("pressure", jobs[index]["run_id"]) in finished
+                for index in range(job_index)) and
+            all(("pressure", jobs[index]["run_id"]) not in finished
+                for index in range(job_index, len(jobs))),
+            "Source5 owned pressure cursor differs from the exact H/SourceA completed prefix")
+    materials = _pressure_materials_index(context, materials_index_path)
+    require(exact_job["run_id"] in materials,
+            "Source5 owned pressure index lacks this exact Plan job")
+    prerequisites = _helper_prerequisites(current["state"], "pressure")
+    predecessor_ack_pin = _source5_predecessor_archive_ack_pin(context, exact_job)
+    current = _source5_h_require_clean_frontier_held(session, scope, context)
+    recipe, recipe_pin, recipe_root, details = _source5_h_build_pressure_recipe_held(
+        session, scope, context, exact_job, job_index,
+        materials[exact_job["run_id"]], prerequisites,
+    )
+    pressure_payload = {"recipe_pin": recipe_pin,
+                       "output_root": str(recipe_root)}
+    receipt_dir = _private_directory(
+        context.artifact_root / context.manifest["campaign_id"] /
+        "source5" / context.host_id / "pressure-host-receipts",
+    )
+    host_receipt_path = receipt_dir / f"{exact_job['run_id']}.json"
+    bundle = exact(details["probe_capture_bundle"], {"schema", "members"},
+                   "Source5 owned bounded pressure ProbeV2 bundle")
+    require(bundle["schema"] == PROBE_CAPTURE_BUNDLE_SCHEMA and
+            type(bundle["members"]) is list and len(bundle["members"]) == 2,
+            "Source5 owned pressure job lacks its exact two ProbeV2 members")
+    pressure_payload = {
+        "schema": PRESSURE_HELPER_PAYLOAD_SCHEMA_V2,
+        "recipe_pin": recipe_pin,
+        "output_root": str(recipe_root),
+        "probe_capture_bundle": bundle,
+        "host_receipt_path": str(host_receipt_path),
+    }
+    helper_value = _helper_input_value(
+        context, "pressure", job_index, exact_job,
+        [member["descriptor"] for member in recipe["members"]],
+        pressure_payload, prerequisites,
+        {"path": "scripts/application-pressure-pair.py",
+         "sha256": context.manifest["modules"][context.host_id][
+             "scripts/application-pressure-pair.py"]["sha256"],
+         "entrypoint": "run_pressure_pair_locked"},
+    )
+    helper_dir = _private_directory(
+        context.artifact_root / context.manifest["campaign_id"] /
+        "source5" / context.host_id / "helper-inputs",
+    )
+    helper_path = helper_dir / f"pressure-{exact_job['run_id']}.json"
+    helper_raw = canonical_bytes(helper_value)
+    require(len(helper_raw) <= _source5_helper_input_byte_bound(
+                context, "pressure", exact_job) and
+            len(helper_raw) > 0,
+            "Source5 owned pressure helper input exceeded its exact finite bound")
+    helper_sha = write_new(helper_path, helper_raw,
+                           "Source5 owned pressure helper input")
+    result = None
+    try:
+        authorization = _source5_h_authorize_job_held(
+            session, scope, context, exact_job,
+            {"path": str(helper_path), "raw_sha256": helper_sha},
+        )
+        result = _source5_h_run_authorized_job_held(
+            session, scope, context, authorization,
+        )
+        _source5_h_require_owned_context_held(session, scope, context)
+        if result.get("state") == "blocked":
+            dispositions = [{
+                "job": exact_job,
+                "reason": "blocked_after_pressure_readiness_or_cleanup_failure",
+                "authorization_id": result["chronology"]["authorization_id"],
+                "job_terminal_head": result["chronology"]["job_terminal_head"],
+                "error_sha256": result["error_sha256"],
+            }]
+            dispositions.extend({
+                "job": pending, "reason": "not_run_after_blocked_job",
+            } for pending in jobs[job_index + 1:])
+            _write_dispositions(
+                phase_root, dispositions,
+                f"blocked original pressure job {exact_job['run_id']}",
+                maximum_bytes=disposition_bound,
+            )
+            return {"phase": "pressure", "job_index": job_index,
+                    "job_run_id": exact_job["run_id"], "blocked": True,
+                    "qualification_eligible": False}
+        record = _pressure_record_from_result(
+            context, result, recipe, recipe_pin, recipe_root,
+        )
+        if record is None:
+            _write_job_disposition(
+                phase_root, exact_job, "invalid_pair",
+                "complete_invalid_pressure_component_consumes_original_ordinal",
+                maximum_bytes=_source5_job_disposition_byte_bound(exact_job),
+                authorization_id=result["chronology"]["authorization_id"],
+                terminal_head=result["chronology"]["job_terminal_head"],
+                component_sha256=result["component_sha256"],
+                error_sha256=result["error_sha256"],
+            )
+            dispositions = [{
+                "job": exact_job,
+                "reason": "failed_owner_stops_new_authorizations",
+                "authorization_id": result["chronology"]["authorization_id"],
+                "job_terminal_head": result["chronology"]["job_terminal_head"],
+                "component_sha256": result["component_sha256"],
+                "error_sha256": result["error_sha256"],
+            }]
+            dispositions.extend({
+                "job": pending, "reason": "not_run_after_failed_original_ordinal",
+            } for pending in jobs[job_index + 1:])
+            _write_dispositions(
+                phase_root, dispositions,
+                f"failed original pressure job {exact_job['run_id']}",
+                maximum_bytes=disposition_bound,
+            )
+            return {"phase": "pressure", "job_index": job_index,
+                    "job_run_id": exact_job["run_id"], "blocked": True,
+                    "qualification_eligible": False}
+        record_pin = _write_record_file(
+            phase_root, ledger_path, record,
+            _source5_job_record_byte_bound(context, "pressure", exact_job),
+            ledger_bound,
+        )
+        _source5_h_require_owned_context_held(session, scope, context)
+        handoff = _source5_create_transfer_offer(
+            context, "pressure", job_index, exact_job, record_pin,
+            canonical_bytes(record), predecessor_ack_pin,
+        )
+        archive_closure = _source5_h_wait_verify_and_reclaim_archive_job_owned_held(
+            session, scope, context, handoff, predecessor_ack_pin, exact_job,
+        )
+        completed = _source5_h_verify_completed_pressure_job_held(
+            session, scope, context, record_pin,
+        )
+        require(completed.get("qualification_eligible") is False,
+                "SourceA held pressure postcheck returned an invalid result")
+        return {
+            "schema": "allocatbelt.application-source5-owned-job-result.v1",
+            "phase": "pressure",
+            "job_index": job_index,
+            "job_run_id": exact_job["run_id"],
+            "state": result["state"],
+            "job_record_pin": record_pin,
+            "archive_closure": archive_closure,
+            "completed_pressure_postcheck": completed,
+            "qualification_eligible": False,
+        }
+    except BaseException as error:
+        dispositions = [{
+            "job": exact_job,
+            "reason": f"owned_pressure_job_failed:{type(error).__name__}",
+        }]
+        dispositions.extend({
+            "job": pending, "reason": "not_run_after_blocked_job",
+        } for pending in jobs[job_index + 1:])
+        _write_dispositions(
+            phase_root, dispositions,
+            f"blocked owned pressure job {exact_job['run_id']}",
+            maximum_bytes=disposition_bound,
+        )
+        raise
+
+
+def _source5_h_fixed_job_held(
+    session: object, scope: object, context: CampaignContext,
+    job_index: int, exact_job: dict[str, Any],
+) -> dict[str, Any]:
+    """Prepare, dispatch, persist and ACK one current V5 fixed APP job in-place."""
+    current = _source5_h_require_clean_frontier_held(session, scope, context)
+    require(type(job_index) is int and job_index >= 0 and
+            type(exact_job) is dict and exact_job.get("phase") in {
+                "aa", "confirmation",
+            },
+            "Source5 owned fixed kernel rejects exploration and malformed job ordinals")
+    phase = exact_job["phase"]
+    jobs = _host_jobs(context, phase)
+    require(job_index < len(jobs) and jobs[job_index] == exact_job,
+            "Source5 owned fixed job is not the exact Source-selected Plan row")
+    phase_root, ledger_path, ledger_bound, disposition_bound =         _source5_h_phase_ledger_held(context, phase, jobs)
+    records = _phase_ledger_records(
+        ledger_path, ledger_bound,
+    )
+    _source5_h_refresh_phase_prerequisites_held(
+        session, scope, context, phase,
+    )
+    current = _source5_h_require_clean_frontier_held(session, scope, context)
+    finished = current["state"].get("source5_finished")
+    require(type(finished) is dict and len(records) == job_index and
+            all(records[index].get("job") == jobs[index]
+                for index in range(job_index)) and
+            all((phase, jobs[index]["run_id"]) in finished
+                for index in range(job_index)) and
+            all((phase, jobs[index]["run_id"]) not in finished
+                for index in range(job_index, len(jobs))),
+            "Source5 owned fixed cursor differs from the exact H/SourceA completed prefix")
+    prerequisites = _helper_prerequisites(current["state"], phase)
+    helper_value, helper_pin, _job_root = _build_fixed_helper_input(
+        context, phase, job_index, exact_job, prerequisites,
+    )
+    del helper_value
+    result = None
+    try:
+        authorization = _source5_h_authorize_job_held(
+            session, scope, context, exact_job, helper_pin,
+        )
+        result = _source5_h_run_authorized_job_held(
+            session, scope, context, authorization,
+        )
+        _source5_h_require_owned_context_held(session, scope, context)
+        if result.get("state") == "blocked":
+            dispositions = [{
+                "job": exact_job,
+                "reason": "blocked_after_owned_process_or_preflight_failure",
+                "authorization_id": result["chronology"]["authorization_id"],
+                "job_terminal_head": result["chronology"]["job_terminal_head"],
+                "error_sha256": result["error_sha256"],
+            }]
+            dispositions.extend({
+                "job": pending, "reason": "not_run_after_blocked_job",
+            } for pending in jobs[job_index + 1:])
+            _write_dispositions(
+                phase_root, dispositions, f"blocked original job {exact_job['run_id']}",
+                maximum_bytes=disposition_bound,
+            )
+            return {"phase": phase, "job_index": job_index,
+                    "job_run_id": exact_job["run_id"], "blocked": True,
+                    "qualification_eligible": False}
+        if result.get("state") == "invalid_pair":
+            _write_job_disposition(
+                phase_root, exact_job, "invalid_pair",
+                "complete_invalid_fixed_component_consumes_original_ordinal",
+                maximum_bytes=_source5_job_disposition_byte_bound(exact_job),
+                authorization_id=result["chronology"]["authorization_id"],
+                terminal_head=result["chronology"]["job_terminal_head"],
+                component_sha256=result["component_sha256"],
+                error_sha256=result["error_sha256"],
+            )
+            dispositions = [{
+                "job": exact_job,
+                "reason": "failed_owner_stops_new_authorizations",
+                "authorization_id": result["chronology"]["authorization_id"],
+                "job_terminal_head": result["chronology"]["job_terminal_head"],
+                "component_sha256": result["component_sha256"],
+                "error_sha256": result["error_sha256"],
+            }]
+            dispositions.extend({
+                "job": pending, "reason": "not_run_after_failed_original_ordinal",
+            } for pending in jobs[job_index + 1:])
+            _write_dispositions(
+                phase_root, dispositions, f"failed original job {exact_job['run_id']}",
+                maximum_bytes=disposition_bound,
+            )
+            return {"phase": phase, "job_index": job_index,
+                    "job_run_id": exact_job["run_id"], "blocked": True,
+                    "qualification_eligible": False}
+        require(result.get("state") == "valid_pair",
+                "Source5 owned fixed kernel received an incomplete owner result")
+        record = _fixed_record_from_result(context, result, phase)
+        record_pin = _write_record_file(
+            phase_root, ledger_path, record,
+            _source5_job_record_byte_bound(context, phase, exact_job),
+            ledger_bound,
+        )
+        _source5_h_require_owned_context_held(session, scope, context)
+        handoff = _source5_create_transfer_offer(
+            context, phase, job_index, exact_job, record_pin,
+            canonical_bytes(record), None,
+        )
+        archive_closure = _source5_h_wait_verify_and_reclaim_archive_job_owned_held(
+            session, scope, context, handoff, None, exact_job,
+        )
+        return {
+            "schema": "allocatbelt.application-source5-owned-job-result.v1",
+            "phase": phase,
+            "job_index": job_index,
+            "job_run_id": exact_job["run_id"],
+            "state": result["state"],
+            "job_record_pin": record_pin,
+            "archive_closure": archive_closure,
+            "qualification_eligible": False,
+        }
+    except BaseException as error:
+        _seal_blocked_suffix(
+            phase_root, jobs, job_index, error, result,
+            maximum_bytes=disposition_bound,
+        )
+        raise
+
+
+def _source5_h_soak_job_held(
+    session: object, scope: object, context: CampaignContext,
+    job_index: int, exact_job: dict[str, Any],
+    materials_index_path: Path,
+) -> dict[str, Any]:
+    """Prepare, dispatch, persist and ACK the one original V5 Soak APP in-place."""
+    materials_index_path = _source5_h_require_path_argument(
+        materials_index_path, "Source5 owned Soak materials index",
+    )
+    current = _source5_h_require_clean_frontier_held(session, scope, context)
+    require(context.manifest.get("schema") == EXECUTION_SCHEMA_V5 and
+            type(job_index) is int and job_index == 0 and
+            type(exact_job) is dict and exact_job.get("phase") == "soak" and
+            isinstance(materials_index_path, Path),
+            "Source5 owned Soak kernel requires its one original current job")
+    jobs = _host_jobs(context, "soak")
+    require(len(jobs) == 1 and jobs[0] == exact_job,
+            "Source5 owned Soak job is not the exact one-row Plan schedule")
+    phase_root, ledger_path, ledger_bound, disposition_bound =         _source5_h_phase_ledger_held(context, "soak", jobs)
+    records = _phase_ledger_records(ledger_path, ledger_bound)
+    _source5_h_refresh_phase_prerequisites_held(
+        session, scope, context, "soak",
+    )
+    current = _source5_h_require_clean_frontier_held(session, scope, context)
+    finished = current["state"].get("source5_finished")
+    require(type(finished) is dict and not records and
+            ("soak", exact_job["run_id"]) not in finished,
+            "Source5 owned Soak cursor differs from its exact unstarted ordinal")
+    prerequisites = _helper_prerequisites(current["state"], "soak")
+    result = None
+    try:
+        _helper_value, helper_pin, _job_root = _build_soak_helper_input(
+            context, job_index, exact_job, prerequisites, materials_index_path,
+        )
+        authorization = _source5_h_authorize_job_held(
+            session, scope, context, exact_job, helper_pin,
+        )
+        result = _source5_h_run_authorized_job_held(
+            session, scope, context, authorization,
+        )
+        _source5_h_require_owned_context_held(session, scope, context)
+        if result.get("state") == "blocked":
+            dispositions = [{
+                "job": exact_job,
+                "reason": "blocked_after_original_soak_launch_or_cleanup_failure",
+                "authorization_id": result["chronology"]["authorization_id"],
+                "job_terminal_head": result["chronology"]["job_terminal_head"],
+                "component_sha256": result["component_sha256"],
+                "retained_failure": result["evidence"].get("soak_component"),
+                "error_sha256": result["error_sha256"],
+            }]
+            _write_dispositions(
+                phase_root, dispositions,
+                f"blocked original Soak job {exact_job['run_id']}",
+                maximum_bytes=disposition_bound,
+            )
+            return {"phase": "soak", "job_index": 0,
+                    "job_run_id": exact_job["run_id"], "blocked": True,
+                    "qualification_eligible": False}
+        require(result.get("state") in {"valid_soak", "invalid_soak"},
+                "Source5 owned Soak kernel received an incomplete owner result")
+        record = _soak_record_from_result(context, result)
+        record_pin = _write_record_file(
+            phase_root, ledger_path, record,
+            _source5_job_record_byte_bound(context, "soak", exact_job),
+            ledger_bound,
+        )
+        if record["state"] != "valid_soak":
+            return {"phase": "soak", "job_index": 0,
+                    "job_run_id": exact_job["run_id"], "blocked": True,
+                    "job_record_pin": record_pin,
+                    "qualification_eligible": False}
+        _source5_h_require_owned_context_held(session, scope, context)
+        handoff = _source5_create_transfer_offer(
+            context, "soak", 0, exact_job, record_pin,
+            canonical_bytes(record), None,
+        )
+        archive_closure = _source5_h_wait_verify_and_reclaim_archive_job_owned_held(
+            session, scope, context, handoff, None, exact_job,
+        )
+        return {
+            "schema": "allocatbelt.application-source5-owned-job-result.v1",
+            "phase": "soak",
+            "job_index": 0,
+            "job_run_id": exact_job["run_id"],
+            "state": result["state"],
+            "job_record_pin": record_pin,
+            "archive_closure": archive_closure,
+            "qualification_eligible": False,
+        }
+    except BaseException as error:
+        _seal_blocked_suffix(
+            phase_root, jobs, job_index, error, result,
+            maximum_bytes=disposition_bound,
+        )
+        raise
 
 
 def run_fixed_phase(context: CampaignContext, phase: str) -> dict[str, Any]:
@@ -9307,6 +10393,9 @@ def _build_soak_helper_input(
     context: CampaignContext, job_index: int, job: dict[str, Any],
     prerequisites: list[dict[str, Any]], materials_index_path: Path,
 ) -> tuple[dict[str, Any], dict[str, str], Path]:
+    materials_index_path = _source5_h_require_path_argument(
+        materials_index_path, "Source5 Soak materials index",
+    )
     soak = context.modules["scripts/application-source5-soak.py"]
     materials_path = materials_index_path.resolve(strict=True)
     require(materials_path.is_relative_to(context.artifact_root),
@@ -18388,6 +19477,58 @@ def _source5_wait_for_ack_bundle(
                      "byte_count": len(raw)}
 
 
+def _source5_wait_for_ack_bundle_owned_bounded_held(
+    path: Path, maximum_bytes: int, *, deadline_ns: int,
+    cancel_event: threading.Event | None,
+) -> tuple[bytes, dict[str, Any]]:
+    """Wait for one bounded ACK bundle under the current owned operation deadline."""
+    path = _source5_h_require_path_argument(
+        path, "Source5 owned ACK receiver",
+    )
+    require(isinstance(path, Path) and type(maximum_bytes) is int and
+            0 < maximum_bytes <= (1 << 48) and
+            type(deadline_ns) is int and deadline_ns > 0 and
+            (cancel_event is None or type(cancel_event) is threading.Event),
+            "Source5 owned ACK wait lacks exact finite source bounds")
+
+    def check_wait() -> None:
+        require(cancel_event is None or not cancel_event.is_set(),
+                "Source5 owned ACK wait was cancelled")
+        require(time.monotonic_ns() < deadline_ns,
+                "Source5 owned ACK wait exceeded its operation deadline")
+
+    while True:
+        check_wait()
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            remaining_ns = deadline_ns - time.monotonic_ns()
+            require(remaining_ns > 0,
+                    "Source5 owned ACK wait exceeded its operation deadline")
+            delay = min(0.25, remaining_ns / 1_000_000_000)
+            if cancel_event is None:
+                time.sleep(delay)
+            else:
+                cancel_event.wait(delay)
+            continue
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+                0 < info.st_size <= maximum_bytes,
+                "Source5 owned ACK receiver is not one bounded private regular file")
+        raw, raw_sha, stable = read_stable(
+            path, "Source5 owned published durable ACK bundle", maximum_bytes,
+        )
+        check_wait()
+        require((info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                 info.st_mtime_ns, info.st_ctime_ns, info.st_nlink, info.st_uid) ==
+                (stable.st_dev, stable.st_ino, stable.st_mode, stable.st_size,
+                 stable.st_mtime_ns, stable.st_ctime_ns, stable.st_nlink,
+                 stable.st_uid),
+                "Source5 owned ACK receiver changed during bounded stable read")
+        return raw, {"path": str(path), "raw_sha256": raw_sha,
+                     "byte_count": len(raw)}
+
+
 def _source5_unlink_exact_private_file(
     path_value: str | Path, expected_sha256: str, maximum_bytes: int,
     label: str, *, cancel_event: threading.Event | None = None,
@@ -18475,9 +19616,6 @@ def _source5_wait_verify_and_reclaim_archive_job(
             context.archive_signer_context is not None and
             context.archive_signer_context_pin is not None,
             "Source5 archive ACK verification lacks its exact local pins")
-    archive = context.modules[EVIDENCE_ARCHIVE_SOURCE_PATH]
-    packet = context.modules[EVIDENCE_TRANSFER_PACKET_SOURCE_PATH]
-    declarations = handoff["declarations"]
     receiver = handoff["offer"]["acknowledgement_receiver"]
     bundle_path = Path(receiver["path"])
     max_bundle_bytes = receiver["maximum_bytes"]
@@ -18486,6 +19624,45 @@ def _source5_wait_verify_and_reclaim_archive_job(
     bundle_raw, bundle_pin = _source5_wait_for_ack_bundle(
         bundle_path, max_bundle_bytes,
     )
+    return _source5_verify_and_reclaim_archive_job_bundle(
+        context, handoff, predecessor_ack_pin, phase, run_id,
+        bundle_raw, bundle_pin,
+    )
+
+
+def _source5_verify_and_reclaim_archive_job_bundle(
+    context: CampaignContext, handoff: dict[str, Any],
+    predecessor_ack_pin: dict[str, str] | None,
+    phase: str, run_id: str, bundle_raw: bytes,
+    bundle_pin: dict[str, Any],
+) -> dict[str, Any]:
+    """Verify a supplied exact ACK bundle and close its local transfer."""
+    require(context.host_evidence_budget_pin is not None and
+            context.host_evidence_budget_raw is not None and
+            context.archive_signer_context is not None and
+            context.archive_signer_context_pin is not None and
+            type(bundle_raw) is bytes and type(bundle_pin) is dict and
+            set(bundle_pin) == {"path", "raw_sha256", "byte_count"} and
+            type(bundle_pin["path"]) is str and
+            type(bundle_pin["raw_sha256"]) is str and
+            is_sha(bundle_pin["raw_sha256"]) and
+            type(bundle_pin["byte_count"]) is int and
+            type(handoff.get("offer", {}).get(
+                "acknowledgement_receiver", {}).get("maximum_bytes")) is int and
+            0 < bundle_pin["byte_count"] <= (1 << 48) and
+            len(bundle_raw) == bundle_pin["byte_count"] and
+            sha256(bundle_raw) == bundle_pin["raw_sha256"] and
+            bundle_pin["path"] == handoff["offer"][
+                "acknowledgement_receiver"]["path"] and
+            bundle_pin["byte_count"] <= handoff["offer"][
+                "acknowledgement_receiver"]["maximum_bytes"],
+            "Source5 ACK bundle processing lacks its exact local pins or bytes")
+    archive = context.modules[EVIDENCE_ARCHIVE_SOURCE_PATH]
+    packet = context.modules[EVIDENCE_TRANSFER_PACKET_SOURCE_PATH]
+    declarations = handoff["declarations"]
+    receiver = handoff["offer"]["acknowledgement_receiver"]
+    bundle_path = Path(receiver["path"])
+    max_bundle_bytes = receiver["maximum_bytes"]
     transferred = packet.read_ack_bundle(
         bundle_path, handoff["budget_raw"], handoff["budget_pin"],
         canonical_bytes(handoff["offer"]), handoff["offer_pin"], bundle_pin,
