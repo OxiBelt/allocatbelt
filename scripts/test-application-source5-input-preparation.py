@@ -4369,5 +4369,92 @@ class ClosedCompletionPublicationTests(unittest.TestCase):
         self.assertEqual(original["nested"]["value"], 1)
 
 
+class ClosedV2CompletionEnvelopeTests(unittest.TestCase):
+    """Exercise real envelope reads; generic JSON is not replay evidence."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_script(
+            SCRIPT_DIR / "application-source5-input-preparation.py",
+            "closed_v2_completion_envelope_target",
+        )
+
+    def _read_generic_envelope(self, byte_count):
+        module = self.module
+        padding = byte_count - len(module._canonical({"padding": ""}))
+        raw = module._canonical({"padding": "x" * padding})
+        self.assertEqual(len(raw), byte_count)
+        with tempfile.TemporaryDirectory(prefix="source5-completion-envelope-") as temporary:
+            path = Path(temporary).resolve() / "data.json"
+            path.write_bytes(raw)
+            digest = hashlib.sha256(raw).hexdigest()
+            value, actual_raw, actual_digest = module._read_closed_v2_prepared_input_completion({
+                "path": str(path), "raw_sha256": digest,
+                "semantic_sha256": "a" * 64,
+            })
+        self.assertEqual(actual_raw, raw)
+        self.assertEqual(actual_digest, digest)
+        self.assertEqual(value, {"padding": "x" * padding})
+        self.assertNotIn("complete", value)
+
+    def test_data_envelope_above_legacy_sixteen_mib_is_readable(self):
+        self._read_generic_envelope(16 * 1024 * 1024 + 1)
+
+    def test_data_envelope_at_closed_writer_limit_is_readable(self):
+        self.assertEqual(self.module.PREPARED_INPUT_COMPLETION_MAX_BYTES, 64 * 1024 * 1024)
+        self._read_generic_envelope(64 * 1024 * 1024)
+
+    def test_over_limit_is_rejected_before_read_or_json_allocation(self):
+        module = self.module
+        with tempfile.TemporaryDirectory(prefix="source5-completion-over-limit-") as temporary:
+            path = Path(temporary).resolve() / "data.json"
+            with path.open("wb") as stream:
+                stream.truncate(64 * 1024 * 1024 + 1)
+            with patch.object(module.os, "read", side_effect=AssertionError("payload read")) as reader, \
+                    patch.object(module.json, "loads", side_effect=AssertionError("JSON parse")) as parser:
+                with self.assertRaisesRegex(module.PreparationError, "exceeds its bound"):
+                    module._read_closed_v2_prepared_input_completion({
+                        "path": str(path), "raw_sha256": "a" * 64,
+                        "semantic_sha256": "b" * 64,
+                    })
+            reader.assert_not_called()
+            parser.assert_not_called()
+
+    def test_only_closed_v2_selects_the_fixed_envelope_reader(self):
+        module = self.module
+        completion = {"path": "/inputs/completion.json", "raw_sha256": "a" * 64,
+                      "semantic_sha256": "b" * 64}
+        arguments = (completion, {}, Path("/source"), Path("/inputs"))
+        reader = lambda *_args: (_ for _ in ()).throw(AssertionError("global read"))
+        cases = (
+            ({}, False),
+            ({"recorded_host": True, "captured_pilot_read_providers": {}}, False),
+            ({"recorded_host": True, "captured_pilot_read_providers": {},
+              "closed_recorded": True, "global_artifact_reader": reader}, False),
+            ({"recorded_host": True, "captured_pilot_read_providers": {},
+              "closed_recorded": True, "global_artifact_reader": reader,
+              "probe_capture_index_pin": {"path": "/inputs/probes.json",
+                                          "raw_sha256": "c" * 64}}, True),
+        )
+        for kwargs, closed_v2 in cases:
+            with self.subTest(closed_v2=closed_v2, keys=tuple(kwargs)):
+                with patch.object(module, "_read_closed_v2_prepared_input_completion",
+                                  side_effect=RuntimeError("fixed envelope")) as fixed, \
+                        patch.object(module, "_read_pinned_json",
+                                     side_effect=RuntimeError("legacy envelope")) as legacy:
+                    with self.assertRaisesRegex(RuntimeError,
+                                                "fixed envelope" if closed_v2 else "legacy envelope"):
+                        module._verify_prepared_inputs_completion_impl(*arguments, **kwargs)
+                if closed_v2:
+                    fixed.assert_called_once_with(completion)
+                    legacy.assert_not_called()
+                else:
+                    fixed.assert_not_called()
+                    legacy.assert_called_once_with(
+                        {"path": completion["path"], "sha256": completion["raw_sha256"]},
+                        "prepared-input completion", module.MAX_PLAN_BYTES,
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4916,6 +4916,16 @@ def _prepared_input_replay_arguments(completion: dict[str, Any]) -> dict[str, li
     return result
 
 
+def _read_closed_v2_prepared_input_completion(
+    completion_ref: dict[str, Any],
+) -> tuple[dict[str, Any], bytes, str]:
+    """Read the closed-v2 data envelope; full replay still validates its body."""
+    return _read_pinned_json(
+        {"path": completion_ref["path"], "sha256": completion_ref["raw_sha256"]},
+        "prepared-input completion", PREPARED_INPUT_COMPLETION_MAX_BYTES,
+    )
+
+
 def _verify_prepared_inputs_completion_impl(
     completion_pin: dict[str, Any], provenance_pins: dict[str, Any],
     source_root: Path, input_root: Path, *,
@@ -4948,10 +4958,15 @@ def _verify_prepared_inputs_completion_impl(
     completion_ref = _exact(completion_pin, {
         "path", "raw_sha256", "semantic_sha256",
     }, "prepared-input completion pin")
-    completion, completion_raw, completion_raw_sha = _read_pinned_json(
-        {"path": completion_ref["path"], "sha256": completion_ref["raw_sha256"]},
-        "prepared-input completion", MAX_PLAN_BYTES,
-    )
+    if closed_recorded and probe_capture_index_pin is not None:
+        completion, completion_raw, completion_raw_sha = (
+            _read_closed_v2_prepared_input_completion(completion_ref)
+        )
+    else:
+        completion, completion_raw, completion_raw_sha = _read_pinned_json(
+            {"path": completion_ref["path"], "sha256": completion_ref["raw_sha256"]},
+            "prepared-input completion", MAX_PLAN_BYTES,
+        )
     exact_completion_keys = {
         "schema", "complete", "qualification_eligible", "campaign_id", "preparation",
         "final_spec", "final_plan", "source_manifests", "capacity_preparations",
@@ -5118,6 +5133,8 @@ def verify_prepared_inputs_completion_closed_recorded_v2(
 
     This explicit SourceA route retains the V1 provenance shape while requiring
     the pinned ProbeV2 sidecar used by the typed closed pressure owner.
+    Its complete canonical receipt, including the self digest, is bounded to
+    the same 64 MiB envelope as the closed completion writer before parsing.
     """
     _require(type(captured_pilot_read_providers) is dict and
              callable(global_artifact_reader),
