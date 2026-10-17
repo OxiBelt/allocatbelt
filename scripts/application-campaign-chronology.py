@@ -17418,6 +17418,883 @@ def _source5_fixed_captured_reference(
     return Path(origin), raw, checksum
 
 
+
+_SOURCE5_RECORDED_NUMERIC_PLAN_PATH = (
+    "scripts/application-source5-recorded-preparation-read.py"
+)
+_SOURCE5_RECORDED_NUMERIC_CONTEXT_SCHEMA = (
+    "allocatbelt.application-source5-recorded-numeric-operation-context.v1"
+)
+_SOURCE5_RECORDED_NUMERIC_RESULT_SCHEMA = (
+    "allocatbelt.application-source5-recorded-numeric-observation.v1"
+)
+_SOURCE5_RECORDED_NUMERIC_V2_PLAN_SCHEMA = (
+    "allocatbelt.application-source5-recorded-preparation-read-plan.v2"
+)
+_SOURCE5_RECORDED_NUMERIC_CONSTRUCTION_PLAN_SCHEMA = (
+    "allocatbelt.application-source5-prepared-input-construction-read-plan.v1"
+)
+
+
+def _source5_recorded_numeric_reader_identity(
+    artifact_reader: Any,
+) -> tuple[int | None, int]:
+    owner = getattr(artifact_reader, "__self__", None)
+    implementation = getattr(artifact_reader, "__func__", artifact_reader)
+    return (None if owner is None else id(owner), id(implementation))
+
+
+def _source5_recorded_numeric_read_apis(
+    plan_module: types.ModuleType, plan_schema: object,
+) -> dict[str, Any]:
+    """Select only the typed validator family named by the actual plan schema."""
+    require(isinstance(plan_module, types.ModuleType),
+            "recorded numeric replay lacks its selected Source typed plan module")
+    if plan_schema == _SOURCE5_RECORDED_NUMERIC_V2_PLAN_SCHEMA:
+        expected_constants = {
+            "REPLAY_BASIS_SCHEMA_V1":
+                "allocatbelt.application-source5-recorded-preparation-replay-basis.v1",
+            "READ_PLAN_SCHEMA_V2": _SOURCE5_RECORDED_NUMERIC_V2_PLAN_SCHEMA,
+            "WINDOW_METADATA_CHUNK_SCHEMA_V1":
+                "allocatbelt.application-source5-recorded-preparation-read-window-chunk.v1",
+            "REQUEST_SCHEMA_V2":
+                "allocatbelt.application-source5-recorded-preparation-read-request.v2",
+            "RESPONSE_SCHEMA_V2":
+                "allocatbelt.application-source5-recorded-preparation-read-response.v2",
+            "CONTROL_EVENT_SCHEMA_V2":
+                "allocatbelt.application-source5-recorded-preparation-read-control-event.v2",
+            "PAYLOAD_VIEW_SCHEMA_V2":
+                "allocatbelt.application-source5-recorded-preparation-payload-view.v2",
+            "SESSION_DESCRIPTOR_SCHEMA_V2":
+                "allocatbelt.application-source5-recorded-preparation-read-session.v2",
+            "FAILURE_RECEIPT_SCHEMA_V2":
+                "allocatbelt.application-source5-recorded-preparation-read-failure.v2",
+        }
+        api_names = {
+            "basis": "_validate_basis",
+            "plan_self": "_validate_plan_self",
+            "plan_pin": "recorded_preparation_read_plan_pin_v2",
+            "window": "validate_recorded_preparation_read_window_v2",
+            "payload": "validate_recorded_preparation_payload_view_v2",
+            "full_plan": "validate_recorded_preparation_read_plan_v2",
+            "request": "build_recorded_preparation_read_request_v2",
+            "validate_request": "validate_recorded_preparation_read_request_v2",
+            "response": "validate_recorded_preparation_read_response_v2",
+            "control": "build_recorded_preparation_read_control_event_v2",
+            "session": "build_recorded_preparation_read_session_descriptor_v2",
+            "project_payload": "project_recorded_preparation_payload_view_v2",
+            "plan_context": "_validated_plan_context",
+        }
+        refusal = "selected Source recorded-read v2 typed API is incomplete"
+    elif plan_schema == _SOURCE5_RECORDED_NUMERIC_CONSTRUCTION_PLAN_SCHEMA:
+        expected_constants = {
+            "PREPARED_INPUT_CONSTRUCTION_BASIS_SCHEMA_V1":
+                "allocatbelt.application-source5-prepared-input-construction-basis.v1",
+            "PREPARED_INPUT_CONSTRUCTION_READ_PLAN_SCHEMA_V1":
+                _SOURCE5_RECORDED_NUMERIC_CONSTRUCTION_PLAN_SCHEMA,
+            "PREPARED_INPUT_CONSTRUCTION_WINDOW_CHUNK_SCHEMA_V1":
+                "allocatbelt.application-source5-prepared-input-construction-window-chunk.v1",
+            "PREPARED_INPUT_CONSTRUCTION_REQUEST_SCHEMA_V1":
+                "allocatbelt.application-source5-prepared-input-construction-read-request.v1",
+            "PREPARED_INPUT_CONSTRUCTION_RESPONSE_SCHEMA_V1":
+                "allocatbelt.application-source5-prepared-input-construction-read-response.v1",
+            "PREPARED_INPUT_CONSTRUCTION_CONTROL_EVENT_SCHEMA_V1":
+                "allocatbelt.application-source5-prepared-input-construction-read-control-event.v1",
+            "PREPARED_INPUT_CONSTRUCTION_PAYLOAD_VIEW_SCHEMA_V1":
+                "allocatbelt.application-source5-prepared-input-construction-payload-view.v1",
+            "PREPARED_INPUT_CONSTRUCTION_SESSION_DESCRIPTOR_SCHEMA_V1":
+                "allocatbelt.application-source5-prepared-input-construction-read-session.v1",
+            "PREPARED_INPUT_CONSTRUCTION_FAILURE_RECEIPT_SCHEMA_V1":
+                "allocatbelt.application-source5-prepared-input-construction-read-failure.v1",
+        }
+        api_names = {
+            "basis": "validate_prepared_input_construction_basis_v1",
+            "plan_self": "_validate_prepared_input_construction_plan_self",
+            "plan_pin": "prepared_input_construction_read_plan_pin_v1",
+            "window": "validate_prepared_input_construction_read_window_v1",
+            "payload": "validate_prepared_input_construction_payload_view_v1",
+            "full_plan": "validate_prepared_input_construction_read_plan_v1",
+            "request": "build_prepared_input_construction_read_request_v1",
+            "validate_request": "validate_prepared_input_construction_read_request_v1",
+            "response": "validate_prepared_input_construction_read_response_v1",
+            "control": "build_prepared_input_construction_read_control_event_v1",
+            "session": "build_prepared_input_construction_read_session_descriptor_v1",
+            "project_payload": "project_prepared_input_construction_payload_view_v1",
+            "plan_context": "_validated_prepared_input_construction_plan_context",
+        }
+        refusal = (
+            "selected Source construction-v1 typed API is incomplete; "
+            "refusing an ordinary v2 fallback"
+        )
+    else:
+        raise ChronologyError(
+            "recorded numeric replay refuses an unknown read-plan schema"
+        )
+    missing_constants = [
+        name for name, expected in expected_constants.items()
+        if getattr(plan_module, name, None) != expected
+    ]
+    missing_apis = [
+        name for name in api_names.values()
+        if not callable(getattr(plan_module, name, None))
+    ]
+    require(not missing_constants and not missing_apis,
+            f"{refusal}: constants={missing_constants}, APIs={missing_apis}")
+    return {key: getattr(plan_module, name)
+            for key, name in api_names.items()}
+
+
+def _source5_recorded_numeric_validate_source_bindings(
+    prepared: dict[str, Any], basis: dict[str, Any],
+    lineage_proofs: dict[str, Any], selected_module_sha256: str,
+) -> None:
+    """Join current typed code and both historical Source pins to the basis."""
+    hosts = basis["cohort_hosts"]
+    consumer = basis["consumer_host_id"]
+    require(consumer == prepared["host_id"] and hosts ==
+            [row["host_id"] for row in prepared["spec"]["hosts"]],
+            "recorded numeric basis consumer/cohort differs from the held Source inputs")
+    require(basis["current_roots"]["source_root"] ==
+            str(prepared["source_root"]),
+            "recorded numeric basis selects another current Source root")
+    current_source_rows = prepared["original_pins"]["source_manifests"]
+    current_rows = {row["host_id"]: row for row in current_source_rows}
+    require(set(current_rows) == set(hosts),
+            "recorded numeric current Source pins do not cover the held cohort")
+    basis_source_pins = basis["source_manifest_pins"]
+    require(set(basis_source_pins) == set(hosts),
+            "recorded numeric basis Source pins do not cover the exact cohort")
+    current_pin = current_rows[consumer]
+    require(basis_source_pins[consumer] == {
+                "path": current_pin["path"],
+                "raw_sha256": current_pin["raw_sha256"],
+                "semantic_sha256": current_pin["semantic_sha256"],
+            }, "recorded numeric basis Source pin differs from the selected consumer Source")
+    module_pin = _exact(
+        basis["source_module_pins"][consumer].get(
+            _SOURCE5_RECORDED_NUMERIC_PLAN_PATH,
+        ), {"path", "sha256"},
+        "recorded numeric selected typed module pin",
+    )
+    require(module_pin == {
+                "path": _SOURCE5_RECORDED_NUMERIC_PLAN_PATH,
+                "sha256": selected_module_sha256,
+            }, "recorded numeric plan module differs from the selected Source inventory pin")
+    require(type(lineage_proofs) is dict and list(lineage_proofs) == hosts,
+            "recorded numeric raw lineage proofs changed the exact host order")
+    for host_id in hosts:
+        lineage = lineage_proofs[host_id]
+        require(type(lineage) is dict and type(lineage.get("bridge_header")) is dict,
+                f"{host_id} recorded numeric lineage lacks its captured bridge header")
+        initial = lineage["bridge_header"].get("initial")
+        require(type(initial) is dict and
+                type(initial.get("source_manifest_pins")) is list,
+                f"{host_id} recorded numeric lineage lacks original Source pins")
+        pins = {}
+        for item in initial["source_manifest_pins"]:
+            pin = _exact(item, {
+                "host_id", "path", "raw_sha256", "semantic_sha256",
+                "source_tree_sha256",
+            }, f"{host_id} recorded numeric original Source pin")
+            require(pin["host_id"] not in pins,
+                    f"{host_id} recorded numeric lineage repeats a Source host pin")
+            pins[pin["host_id"]] = pin
+        require(set(pins) == set(hosts),
+                f"{host_id} recorded numeric lineage Source pins differ from the cohort")
+
+
+def _source5_recorded_numeric_h3_yield(value: object) -> dict[str, Any]:
+    """Accept only the real SourceA H client yield DTO."""
+    yielded = _exact(value, {
+        "payload_view", "objects_by_origin", "stage_root",
+    }, "recorded numeric H3 payload yield")
+    require(type(yielded["payload_view"]) is dict and
+            type(yielded["objects_by_origin"]) is dict and
+            type(yielded["stage_root"]) is str and
+            Path(yielded["stage_root"]).is_absolute(),
+            "recorded numeric H3 yield has a malformed payload, reference map, or stage root")
+    return yielded
+
+
+def _source5_recorded_numeric_bind_h3_window(
+    yielded_value: object, plan_row: dict[str, Any],
+    payload_view: dict[str, Any], index_row: dict[str, Any],
+    record: dict[str, Any], gpg_row: dict[str, Any], *,
+    expected_host_id: str, expected_job_index: int,
+    expected_read_ordinal: int,
+) -> dict[str, Any]:
+    """Join one actual H3 row to one already GPG-verified raw-lineage row."""
+    yielded = _source5_recorded_numeric_h3_yield(yielded_value)
+    view = _exact(payload_view, {
+        "schema", "basis_pin", "read_plan_pin", "session_nonce",
+        "consumer_host_id", "owner_host_id", "operation_kind",
+        "read_ordinal", "job_index", "job_sha256", "original_pins",
+        "outer_request_pin", "outer_response_pin", "bundle_pin",
+        "stage_root", "objects", "payload_bytes", "payload_view_sha256",
+    }, "typed recorded numeric payload view")
+    require(yielded["payload_view"] == view and
+            yielded["stage_root"] == view["stage_root"] and
+            plan_row["owner_host_id"] == expected_host_id and
+            plan_row["job_index"] == expected_job_index and
+            plan_row["read_ordinal"] == expected_read_ordinal and
+            view["owner_host_id"] == expected_host_id and
+            view["job_index"] == expected_job_index and
+            view["read_ordinal"] == expected_read_ordinal and
+            plan_row["job"] == index_row["job"] == record["job"] and
+            plan_row["job_sha256"] == index_row["job_sha256"] ==
+                sha256_bytes(canonical_bytes(record["job"])) and
+            view["job_sha256"] == plan_row["job_sha256"] and
+            view["consumer_host_id"] == plan_row["consumer_host_id"] and
+            view["operation_kind"] == plan_row["operation_kind"] and
+            view["original_pins"] == plan_row["original_pins"],
+            "recorded numeric H3/plan/lineage host, job, or ordinal differs")
+    replay_row = _exact(gpg_row, {
+        "job", "job_record_pin", "authority", "journal_authorization_head",
+        "journal_terminal_head", "component_replay_required",
+        "qualification_eligible",
+    }, "fresh GPG-verified recorded numeric row")
+    authority = _exact(replay_row["authority"], {
+        "ack_pin", "checkpoint_pin", "object_manifest_pin", "signature_pin",
+        "request_pin", "job_record_raw_sha256",
+        "component_replay_required", "qualification_eligible",
+    }, "recorded numeric GPG authority")
+    record_pin = _exact(index_row["job_record_pin"], {
+        "path", "raw_sha256",
+    }, "recorded numeric retained record pin")
+    evidence = record.get("evidence")
+    require(type(evidence) is dict and evidence.get("kind") == "source5_fixed_pair",
+            "recorded numeric ancestor is not a fixed-pair record")
+    host_pin = _exact(evidence.get("host_receipt"), {
+        "path", "raw_sha256", "host_verification_sha256",
+    }, "recorded numeric strict host receipt pin")
+    expected_original_pins = {
+        "job_record": record_pin,
+        "request": authority["request_pin"],
+        "checkpoint": authority["checkpoint_pin"],
+        "object_manifest": authority["object_manifest_pin"],
+        "ack": authority["ack_pin"],
+        "signature": authority["signature_pin"],
+        "host_receipt": host_pin,
+    }
+    require(replay_row["job"] == record["job"] and
+            replay_row["job_record_pin"] == record_pin and
+            authority["job_record_raw_sha256"] == record_pin["raw_sha256"] and
+            replay_row["journal_authorization_head"] ==
+                _digest_value(record["chronology"]["authorization_head"]) and
+            replay_row["component_replay_required"] is True and
+            replay_row["qualification_eligible"] is False and
+            authority["component_replay_required"] is True and
+            authority["qualification_eligible"] is False and
+            view["original_pins"] == expected_original_pins,
+            "recorded numeric H3 original pins differ from the actual ACK/GPG cohort")
+    references = yielded["objects_by_origin"]
+    require(type(view["objects"]) is list and
+            len(references) == len(view["objects"]),
+            "recorded numeric H3 references do not close the typed object list")
+    refs_by_origin = {}
+    for item in view["objects"]:
+        ref = _exact(item, {
+            "origin_path", "path", "role", "host_id", "raw_sha256",
+            "semantic_sha256", "byte_count", "maximum_bytes",
+        }, "recorded numeric H3 object reference")
+        require(ref["origin_path"] not in refs_by_origin,
+                "recorded numeric H3 object list repeats an origin")
+        refs_by_origin[ref["origin_path"]] = ref
+    require(set(references) == set(refs_by_origin) and
+            all(references[origin] == ref
+                for origin, ref in refs_by_origin.items()),
+            "recorded numeric H3 reference map differs from its typed payload view")
+
+    def require_role(pin_value: object, role: str, label: str,
+                     semantic_sha256: str | None = None) -> dict[str, Any]:
+        fields = ({"path", "raw_sha256", "host_verification_sha256"}
+                  if semantic_sha256 is not None else
+                  {"path", "raw_sha256"})
+        pin = _exact(pin_value, fields, f"{label} pin")
+        ref = refs_by_origin.get(pin["path"])
+        require(type(ref) is dict and ref["role"] == role and
+                ref["host_id"] == expected_host_id and
+                ref["raw_sha256"] == pin["raw_sha256"] and
+                (semantic_sha256 is None or
+                 ref["semantic_sha256"] == semantic_sha256),
+                f"recorded numeric H3 {label} role or raw pin differs")
+        return pin
+
+    overlay_pin = require_role(evidence.get("overlay"), "fixed_pair_artifact", "overlay")
+    receipt_pin = require_role(evidence.get("receipt"), "component_receipt", "receipt")
+    host_pin = require_role(host_pin, "fixed_pair_host_receipt", "strict host receipt",
+                            host_pin["host_verification_sha256"])
+    process_pin = require_role(evidence.get("processes"), "normal_app_output",
+                               "processes.tsv")
+    runtime_pin = require_role(evidence.get("runtime_bindings"), "normal_app_output",
+                               "runtime bindings")
+    return {
+        "yielded": yielded,
+        "payload_view": view,
+        "references": references,
+        "stage_root": yielded["stage_root"],
+        "evidence": evidence,
+        "authority": authority,
+        "record_pin": record_pin,
+        "checkpoint_pin": authority["checkpoint_pin"],
+        "overlay_pin": {
+            "path": overlay_pin["path"],
+            "sha256": overlay_pin["raw_sha256"],
+        },
+        "receipt_pin": {
+            "path": receipt_pin["path"],
+            "sha256": receipt_pin["raw_sha256"],
+        },
+        "host_receipt_pin": host_pin,
+        "process_pin": process_pin,
+        "runtime_pin": runtime_pin,
+    }
+
+
+def _digest_value(value: object) -> str:
+    """Validate a lower-case SHA-256 without adding a new public parser."""
+    return _digest(value, "recorded numeric digest")
+
+
+def _source5_recorded_numeric_validate_lifecycle(
+    index_row: dict[str, Any], record_value: dict[str, Any],
+    authorization: dict[str, Any], finished: dict[str, Any],
+    gpg_row: dict[str, Any], *, host_id: str, job_index: int,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    """Replay the original record hash and exact start/terminal process chain."""
+    record = _exact(record_value, {
+        "schema", "state", "job", "pair_directory", "process_metrics",
+        "evidence", "chronology", "qualification_eligible", "record_sha256",
+    }, "recorded numeric completed job record")
+    material = {key: value for key, value in record.items()
+                if key != "record_sha256"}
+    require(record["schema"] == SOURCE5_JOB_RECORD_SCHEMA and
+            record["record_sha256"] == sha256_bytes(canonical_bytes(material)) and
+            record["qualification_eligible"] is False and
+            record["state"] == "valid_pair",
+            "recorded numeric job record digest, state, or eligibility differs")
+    job = record["job"]
+    require(type(job) is dict and job.get("host_id") == host_id and
+            job.get("phase") == "exploration" and
+            job.get("run_id") == index_row["job"].get("run_id") and
+            job == index_row["job"],
+            "recorded numeric selected job differs from its Source Plan index")
+    metrics = record["process_metrics"]
+    require(type(metrics) is list and len(metrics) == 2 and
+            all(type(item) is dict for item in metrics),
+            "recorded numeric ancestor lacks its two original process metrics")
+    chronology = _exact(record["chronology"], {
+        "authorization_id", "authorization_head", "app_started_heads",
+        "app_terminal_heads", "job_terminal_head", "component_sha256",
+        "process_metrics_sha256", "app_start_events", "app_terminal_events",
+        "member_processes",
+    }, "recorded numeric job chronology")
+    for key in ("authorization_head", "job_terminal_head", "component_sha256",
+                "process_metrics_sha256"):
+        _digest(chronology[key], f"recorded numeric {key}")
+    require(chronology["process_metrics_sha256"] ==
+                sha256_bytes(canonical_bytes(metrics)) and
+            type(chronology["app_started_heads"]) is list and
+            type(chronology["app_terminal_heads"]) is list and
+            len(chronology["app_started_heads"]) ==
+                len(chronology["app_terminal_heads"]) == 2 and
+            type(chronology["app_start_events"]) is list and
+            type(chronology["app_terminal_events"]) is list and
+            len(chronology["app_start_events"]) ==
+                len(chronology["app_terminal_events"]) == 2,
+            "recorded numeric chronology does not retain both APP callbacks and metrics")
+    for value in (*chronology["app_started_heads"],
+                  *chronology["app_terminal_heads"]):
+        _digest(value, "recorded numeric APP lifecycle head")
+    require(type(authorization.get("starts")) is list and
+            type(authorization.get("terminals")) is list and
+            len(authorization["starts"]) == len(authorization["terminals"]) == 2,
+            "recorded numeric journal row lacks both original member lifecycles")
+    details = authorization["job_terminal"]["details"]
+    terminal_head = authorization["job_terminal"]["event_head"]
+    require(authorization["phase"] == "exploration" and
+            authorization["job_index"] == job_index and
+            authorization["job"] == job and
+            authorization["job_sha256"] == index_row["job_sha256"] ==
+                sha256_bytes(canonical_bytes(job)) and
+            authorization["job_terminal"]["state_claim"] == "valid_pair" and
+            chronology["authorization_id"] == authorization["authorization_id"] and
+            chronology["authorization_head"] == authorization["authorization_head"] and
+            chronology["job_terminal_head"] == terminal_head and
+            chronology["component_sha256"] == details["component_sha256"] and
+            chronology["process_metrics_sha256"] ==
+                details["process_metrics_sha256"] and
+            finished["phase"] == "exploration" and
+            finished["job_run_id"] == job["run_id"] and
+            finished["authorization_id"] == authorization["authorization_id"] and
+            finished["authorization_head"] == authorization["authorization_head"] and
+            finished["job_terminal"] == authorization["job_terminal"] and
+            gpg_row["journal_authorization_head"] ==
+                authorization["authorization_head"] and
+            gpg_row["journal_terminal_head"] == terminal_head,
+            "recorded numeric job differs from its exact GPG/journal terminal")
+    require(
+        [item["event_head"] for item in authorization["starts"]] ==
+            chronology["app_started_heads"] and
+        [item["event_head"] for item in authorization["terminals"]] ==
+            chronology["app_terminal_heads"] and
+        [item["proof"] for item in authorization["starts"]] ==
+            chronology["app_start_events"] and
+        [item.get("cleanup") for item in authorization["terminals"]] ==
+            [item.get("cleanup") for item in chronology["app_terminal_events"]] and
+        chronology["member_processes"] == [
+            {"descriptor": item["descriptor"], "pid": item["pid"],
+             "start_ticks": item["start_ticks"], "member_index": index}
+            for index, item in enumerate(authorization["starts"])
+        ],
+        "recorded numeric APP starts, terminals, descriptors, PIDs, or proofs differ",
+    )
+    return record, chronology, metrics
+
+
+def _source5_recorded_numeric_validate_fixed_result(
+    fixed_module: types.ModuleType, replay_value: object,
+    record: dict[str, Any], chronology: dict[str, Any],
+    authorization: dict[str, Any], evidence: dict[str, Any],
+    selected_host_id: str, expected_source_pin: dict[str, str],
+    expected_source_tree_sha256: str,
+    overlay_pin: dict[str, str], receipt_pin: dict[str, str],
+    host_receipt_pin: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """Check the exact closed Fixed result and unchanged component projection."""
+    replay = _exact(replay_value, {
+        "schema", "verification", "overlay", "execution_receipt",
+        "host_verification_pin", "full_replay_verified",
+        "resident_executable_verified", "app_launch_permitted",
+        "qualification_eligible",
+    }, "closed recorded numeric Fixed result")
+    require(replay["schema"] ==
+                fixed_module.CLOSED_RECORDED_CAPTURED_REPLAY_CONTEXT_SCHEMA_V1 and
+            replay["full_replay_verified"] is True and
+            replay["resident_executable_verified"] is False and
+            replay["app_launch_permitted"] is False and
+            replay["qualification_eligible"] is False and
+            replay["host_verification_pin"] == host_receipt_pin,
+            "closed recorded numeric Fixed result changed its strict owner flags or host pin")
+    verified = _exact(replay["verification"], {
+        "schema", "verified", "status", "qualification_eligible",
+        "receipt_sha256", "overlay_sha256", "run_id",
+    }, "closed recorded numeric Fixed verification projection")
+    receipt = replay["execution_receipt"]
+    overlay = replay["overlay"]
+    require(verified["schema"] == fixed_module.RECEIPT_SCHEMA and
+            verified["verified"] is True and
+            verified["status"] == "valid_pair" and
+            verified["qualification_eligible"] is False and
+            verified["receipt_sha256"] == receipt_pin["sha256"] and
+            verified["overlay_sha256"] == overlay_pin["sha256"] and
+            verified["run_id"] == record["job"]["run_id"] and
+            type(receipt) is dict and type(overlay) is dict and
+            receipt.get("process_metrics") == record["process_metrics"] and
+            receipt.get("process_validation_errors") == [None, None] and
+            receipt.get("inputs_unchanged") is True,
+            "closed recorded numeric receipt differs from its original metrics or pins")
+    component = {
+        "schema": "allocatbelt.application-source5-fixed-component.v1",
+        "overlay": {
+            "path": overlay_pin["path"],
+            "raw_sha256": overlay_pin["sha256"],
+        },
+        "receipt": {
+            "path": receipt_pin["path"],
+            "raw_sha256": receipt_pin["sha256"],
+        },
+        "verification": verified,
+    }
+    component_sha256 = sha256_bytes(canonical_bytes(component))
+    require(component_sha256 == chronology["component_sha256"] ==
+                authorization["job_terminal"]["details"]["component_sha256"],
+            "closed recorded numeric component digest differs from its source journal")
+    require(chronology["process_metrics_sha256"] ==
+                sha256_bytes(canonical_bytes(record["process_metrics"])) ==
+                authorization["job_terminal"]["details"]["process_metrics_sha256"],
+            "closed recorded numeric metric digest differs from its source journal")
+    expected_processes = {
+        "path": str(Path(overlay["output_root"]) / "processes.tsv"),
+        "raw_sha256": receipt["processes_sha256"],
+    }
+    runtime_pin = overlay["runtime_bindings"]["pin"]
+    expected_runtime = {
+        "path": runtime_pin["path"],
+        "raw_sha256": runtime_pin["sha256"],
+    }
+    selected_manifest = overlay["sources"]["manifests"][selected_host_id]
+    expected_source = {
+        "artifact": {
+            "path": selected_manifest["pin"]["path"],
+            "raw_sha256": selected_manifest["pin"]["sha256"],
+        },
+        "semantic_sha256": selected_manifest["manifest_sha256"],
+        "source_tree_sha256":
+            overlay["sources"]["selected"]["source_tree_sha256"],
+    }
+    expected_source_pin = _exact(
+        expected_source_pin, {"path", "raw_sha256", "semantic_sha256"},
+        "recorded numeric historical Source pin",
+    )
+    require(evidence["processes"] == expected_processes and
+            evidence["runtime_bindings"] == expected_runtime and
+            evidence["source_snapshot"] == expected_source and
+            expected_source["artifact"] == {
+                "path": expected_source_pin["path"],
+                "raw_sha256": expected_source_pin["raw_sha256"],
+            } and
+            expected_source["semantic_sha256"] ==
+                expected_source_pin["semantic_sha256"] and
+            expected_source["source_tree_sha256"] ==
+                expected_source_tree_sha256,
+            "closed recorded numeric processes/runtime/Source snapshot join differs")
+    return verified, component_sha256
+
+
+def _source5_recorded_numeric_ancestor_context_held(
+    current_lock: CampaignHostLock, prepared: dict[str, Any],
+    lineage_proofs: object, archived_authorities: object, *,
+    artifact_reader: Any,
+) -> dict[str, Any]:
+    """Bind one pre-manifest SourceA operation's one-time lineage/GPG cohort.
+
+    This private held helper is not a public authentication-proof API. Its
+    SourceA owner supplies the raw lineage and ACK replay DTOs returned by the
+    existing Source-owned lineage and GPG verifiers under this live lock.
+    """
+    require(_lock_token_is_live(current_lock) and type(prepared) is dict and
+            callable(artifact_reader),
+            "recorded numeric context requires the held SourceA lock and raw2 reader")
+    current_lock = _check_lock(
+        current_lock, prepared["output_root"], prepared["campaign_id"],
+        prepared["host_id"],
+    )
+    hosts = [row["host_id"] for row in prepared["spec"]["hosts"]]
+    _fixed_raw, selected_fixed_sha, _fixed_row = _source_file(
+        prepared["source_root"], prepared["source"],
+        "scripts/application-fixed-pair.py",
+        "recorded numeric selected Fixed owner module",
+        maximum=MAX_SCRIPT_BYTES,
+    )
+    require(len(hosts) == 2 and prepared["host_id"] in hosts and
+            type(lineage_proofs) is dict and list(lineage_proofs) == hosts and
+            type(archived_authorities) is dict and
+            list(archived_authorities) == hosts,
+            "recorded numeric context requires the exact two-host raw-lineage/GPG cohort")
+    rows_by_host: dict[str, list[tuple[dict[str, Any], ...]]] = {}
+    for host_id in hosts:
+        lineage = lineage_proofs[host_id]
+        joined = _source5_prepared_ack_window_inputs(lineage)
+        replay = _exact(archived_authorities[host_id], {
+            "schema", "campaign_id", "host_id", "rows", "job_count",
+            "fresh_gpg_verified", "component_replay_required",
+            "qualification_eligible",
+        }, f"{host_id} recorded numeric ACK replay cohort")
+        require(replay["schema"] ==
+                    "allocatbelt.application-source5-prepared-exploration-ack-replay.v1" and
+                replay["campaign_id"] == lineage["campaign_id"] and
+                replay["host_id"] == host_id and
+                replay["job_count"] == 360 and
+                replay["fresh_gpg_verified"] is True and
+                replay["component_replay_required"] is True and
+                replay["qualification_eligible"] is False and
+                type(replay["rows"]) is list and len(replay["rows"]) == 360 and
+                len(joined) == 360,
+                f"{host_id} recorded numeric GPG replay is not its exact fresh 360-row cohort")
+        selected_rows = []
+        for index, (index_row, record, authorization, finished) in enumerate(joined):
+            gpg_row = _exact(replay["rows"][index], {
+                "job", "job_record_pin", "authority",
+                "journal_authorization_head", "journal_terminal_head",
+                "component_replay_required", "qualification_eligible",
+            }, f"{host_id} recorded numeric GPG row[{index}]")
+            helper_module_pin = _exact(authorization["helper_module"], {
+                "path", "sha256",
+            }, f"{host_id} recorded numeric original Fixed module pin[{index}]")
+            require(helper_module_pin == {
+                        "path": "scripts/application-fixed-pair.py",
+                        "sha256": selected_fixed_sha,
+                    },
+                    f"{host_id} recorded numeric peer Fixed code epoch differs")
+            require(gpg_row["job"] == index_row["job"] == record["job"] and
+                    gpg_row["job_record_pin"] == index_row["job_record_pin"] and
+                    gpg_row["journal_authorization_head"] ==
+                        authorization["authorization_head"] and
+                    gpg_row["journal_terminal_head"] ==
+                        authorization["job_terminal"]["event_head"] and
+                    gpg_row["component_replay_required"] is True and
+                    gpg_row["qualification_eligible"] is False and
+                    finished["job_terminal"] == authorization["job_terminal"],
+                    f"{host_id} recorded numeric GPG row[{index}] differs from its raw lineage")
+            selected_rows.append(
+                (index_row, record, authorization, finished, gpg_row),
+            )
+        rows_by_host[host_id] = selected_rows
+    return {
+        "schema": _SOURCE5_RECORDED_NUMERIC_CONTEXT_SCHEMA,
+        "lock": current_lock,
+        "prepared": prepared,
+        "hosts": hosts,
+        "lineage_proofs": lineage_proofs,
+        "rows_by_host": rows_by_host,
+        "archived_authorities": archived_authorities,
+        "selected_fixed_module_sha256": selected_fixed_sha,
+        "artifact_reader_identity": _source5_recorded_numeric_reader_identity(artifact_reader),
+        "component_replay_required": True,
+        "qualification_eligible": False,
+    }
+
+
+def _source5_verify_recorded_numeric_ancestor_held(
+    context: dict[str, Any], selected_host_id: str, selected_job_index: object,
+    *, artifact_reader: Any, read_basis_value: object,
+    read_basis_pin_value: object, read_plan_value: object,
+    read_plan_pin_value: object, read_window_chunk_value: object,
+    h3_yield: object,
+) -> dict[str, Any]:
+    """Verify one numeric ancestor inside its SourceA-owned captured operation.
+
+    The caller performs the captured prepared-ACK cohort replay once for the
+    operation and passes its exact returned DTO map here. This helper rechecks
+    the selected row and scope without repeating all 720 GPG windows for every
+    selected numeric job.
+    """
+    require(type(context) is dict and
+            context.get("schema") == _SOURCE5_RECORDED_NUMERIC_CONTEXT_SCHEMA and
+            context.get("component_replay_required") is True and
+            context.get("qualification_eligible") is False and
+            _lock_token_is_live(context.get("lock")) and
+            callable(artifact_reader) and
+            _source5_recorded_numeric_reader_identity(artifact_reader) ==
+                context.get("artifact_reader_identity"),
+            "recorded numeric ancestor requires its held SourceA operation context")
+    prepared = context["prepared"]
+    hosts = context["hosts"]
+    require(selected_host_id in hosts and
+            list(context["lineage_proofs"]) == hosts and
+            list(context["rows_by_host"]) == hosts,
+            "recorded numeric selected owner is outside the captured Source cohort")
+    job_index = _uint(
+        selected_job_index, "recorded numeric selected job index",
+        maximum=359,
+    )
+    (index_row, record, authorization, finished, gpg_row) = \
+        context["rows_by_host"][selected_host_id][job_index]
+    require(type(record.get("evidence")) is dict and
+            type(record["evidence"].get("host_receipt")) is dict,
+            "recorded numeric ancestor lacks its strict fixed host receipt")
+    lineage_proofs = context["lineage_proofs"]
+
+    plan_value = read_plan_value
+    require(type(plan_value) is dict and type(plan_value.get("schema")) is str,
+            "recorded numeric read plan is malformed")
+    plan_raw, plan_sha, _plan_record = _source_file(
+        prepared["source_root"], prepared["source"],
+        _SOURCE5_RECORDED_NUMERIC_PLAN_PATH,
+        "recorded numeric selected typed plan module",
+        maximum=MAX_SCRIPT_BYTES,
+    )
+    plan_module = _load_module(
+        plan_raw,
+        prepared["source_root"] / _SOURCE5_RECORDED_NUMERIC_PLAN_PATH,
+        "source5_recorded_numeric_plan",
+    )
+    fixed_module = None
+    try:
+        apis = _source5_recorded_numeric_read_apis(
+            plan_module, plan_value["schema"],
+        )
+        apis["basis"](read_basis_value, read_basis_pin_value)
+        require(type(read_basis_value) is dict,
+                "recorded numeric basis is not an exact object")
+        basis = read_basis_value
+        _source5_recorded_numeric_validate_source_bindings(
+            prepared, basis, lineage_proofs, plan_sha,
+        )
+        plan = apis["plan_self"](plan_value)
+        plan_pin = _exact(read_plan_pin_value, {
+            "path", "raw_sha256", "semantic_sha256",
+        }, "recorded numeric read-plan pin")
+        require(apis["plan_pin"](plan) == plan_pin and
+                plan.get("basis_pin") == read_basis_pin_value and
+                type(getattr(plan_module, "READ_JOB_COUNT_PER_HOST", None)) is int and
+                plan_module.READ_JOB_COUNT_PER_HOST == 360 and
+                getattr(plan_module, "READ_COHORT_SIZE", None) == 2 and
+                getattr(plan_module, "READ_WINDOW_COUNT", None) == 720,
+                "recorded numeric plan pin or fixed 360-by-two window contract differs")
+        ordinal = hosts.index(selected_host_id) * 360 + job_index
+        window = apis["window"](
+            plan, plan_pin, read_window_chunk_value, ordinal,
+        )
+        yielded = _source5_recorded_numeric_h3_yield(h3_yield)
+        payload_view = apis["payload"](
+            yielded["payload_view"], plan, plan_pin,
+            read_window_chunk_value,
+        )
+        bound = _source5_recorded_numeric_bind_h3_window(
+            yielded, window, payload_view, index_row, record, gpg_row,
+            expected_host_id=selected_host_id,
+            expected_job_index=job_index,
+            expected_read_ordinal=ordinal,
+        )
+        evidence = bound["evidence"]
+        fixed_evidence_fields = {
+            "kind", "overlay", "receipt", "processes", "runtime_bindings",
+            "source_snapshot", "host_receipt",
+        }
+        common_evidence_fields = {
+            "execution_manifest", "helper_input", "helper_module",
+        }
+        evidence_fields = set(evidence)
+        require(evidence_fields == fixed_evidence_fields or
+                evidence_fields == fixed_evidence_fields | common_evidence_fields,
+                "recorded numeric fixed evidence has an unexpected field set")
+        if common_evidence_fields <= set(evidence):
+            require(evidence["execution_manifest"] ==
+                        authorization["execution_manifest"] and
+                    evidence["helper_input"] == authorization["helper_input"] and
+                    evidence["helper_module"] == authorization["helper_module"],
+                    "recorded numeric helper/source pins differ from their journal authorization")
+        helper_pin = _exact(authorization["helper_input"], {
+            "path", "raw_sha256",
+        }, "recorded numeric original helper-input pin")
+        checkpoint_pin = _exact(bound["checkpoint_pin"], {
+            "path", "raw_sha256", "semantic_sha256",
+        }, "recorded numeric authenticated checkpoint pin")
+        request_pin = bound["authority"]["request_pin"]
+        object_manifest_pin = bound["authority"]["object_manifest_pin"]
+        checkpoint_raw = _source5_read_captured_raw_pin(
+            artifact_reader, checkpoint_pin, MAX_PLAN_BYTES,
+            "recorded numeric original checkpoint",
+        )
+        request_raw = _source5_read_captured_raw_pin(
+            artifact_reader, request_pin, MAX_PLAN_BYTES,
+            "recorded numeric original checkpoint request",
+        )
+        object_manifest_raw = _source5_read_captured_raw_pin(
+            artifact_reader, object_manifest_pin, MAX_PLAN_BYTES,
+            "recorded numeric original object manifest",
+        )
+        checkpoint = _parse_object(
+            checkpoint_raw, "recorded numeric original checkpoint", MAX_PLAN_BYTES,
+        )
+        request = _parse_object(
+            request_raw, "recorded numeric original request", MAX_PLAN_BYTES,
+        )
+        object_manifest = _parse_object(
+            object_manifest_raw, "recorded numeric original object manifest",
+            MAX_PLAN_BYTES,
+        )
+        require(checkpoint.get("checkpoint_sha256") ==
+                    checkpoint_pin["semantic_sha256"] and
+                request.get("request_sha256") ==
+                    request_pin["semantic_sha256"] and
+                object_manifest.get("manifest_sha256") ==
+                    object_manifest_pin["semantic_sha256"] and
+                checkpoint.get("request_pin") == request_pin and
+                checkpoint.get("object_manifest_pin") == object_manifest_pin and
+                checkpoint.get("job_record_pin") == bound["record_pin"],
+                "recorded numeric checkpoint/request/object-manifest raw2 pins do not join")
+        record, chronology, metrics = _source5_recorded_numeric_validate_lifecycle(
+            index_row, record, authorization, finished, gpg_row,
+            host_id=selected_host_id, job_index=job_index,
+        )
+        fixed_raw, fixed_sha, _fixed_record = _source_file(
+            prepared["source_root"], prepared["source"],
+            "scripts/application-fixed-pair.py",
+            "recorded numeric fixed-pair verifier",
+            maximum=MAX_SCRIPT_BYTES,
+        )
+        helper_module_pin = _exact(authorization["helper_module"], {
+            "path", "sha256",
+        }, "recorded numeric original fixed helper pin")
+        require(helper_module_pin["path"] == "scripts/application-fixed-pair.py" and
+                helper_module_pin["sha256"] == fixed_sha ==
+                    context["selected_fixed_module_sha256"],
+                "recorded numeric fixed verifier differs from its original helper-module pin")
+        fixed_module = _load_module(
+            fixed_raw,
+            prepared["source_root"] / "scripts/application-fixed-pair.py",
+            "source5_recorded_numeric_fixed",
+        )
+        helper_path, helper_raw, helper_sha = _source5_fixed_captured_reference(
+            helper_pin, "recorded numeric original helper input",
+            {"objects": bound["references"],
+             "stage_root": bound["stage_root"]},
+            fixed_module, MAX_PLAN_BYTES,
+        )
+        require(helper_sha == helper_pin["raw_sha256"],
+                "recorded numeric captured helper input differs from its raw pin")
+        helper_input = _parse_object(
+            helper_raw, "recorded numeric original helper input", MAX_PLAN_BYTES,
+        )
+        helper_payload = helper_input.get("payload")
+        require(type(helper_payload) is dict,
+                "recorded numeric helper input lacks its exact payload")
+        helper_overlay_pin = _exact(
+            helper_payload.get("overlay_pin"), {"path", "sha256"},
+            "recorded numeric authorized overlay pin",
+        )
+        require(helper_overlay_pin == bound["overlay_pin"],
+                "recorded numeric overlay differs from its authorized helper input")
+        fixed_api = getattr(
+            fixed_module,
+            "verify_fixed_pair_overlay_closed_recorded_captured_v1",
+            None,
+        )
+        require(callable(fixed_api),
+                "selected Source Fixed module lacks the closed recorded numeric owner")
+        try:
+            replay = fixed_api(
+                bound["overlay_pin"], bound["receipt_pin"],
+                bound["host_receipt_pin"], bound["references"],
+                Path(bound["stage_root"]),
+                checkpoint_pin=checkpoint_pin,
+                checkpoint_raw=checkpoint_raw,
+                global_artifact_reader=artifact_reader,
+            )
+        except getattr(fixed_module, "FixedPairError", Exception) as error:
+            raise ChronologyError(
+                f"closed recorded numeric Fixed owner rejected the ancestor: {error}",
+            ) from error
+        historical_source_rows = lineage_proofs[selected_host_id][
+            "bridge_header"
+        ]["initial"]["source_manifest_pins"]
+        historical_source = next(
+            row for row in historical_source_rows
+            if row["host_id"] == selected_host_id
+        )
+        verified, component_sha256 = \
+            _source5_recorded_numeric_validate_fixed_result(
+                fixed_module, replay, record, chronology, authorization,
+                bound["evidence"], selected_host_id,
+                {
+                    "path": historical_source["path"],
+                    "raw_sha256": historical_source["raw_sha256"],
+                    "semantic_sha256": historical_source["semantic_sha256"],
+                },
+                historical_source["source_tree_sha256"],
+                bound["overlay_pin"], bound["receipt_pin"],
+                bound["host_receipt_pin"],
+            )
+        return {
+            "schema": _SOURCE5_RECORDED_NUMERIC_RESULT_SCHEMA,
+            "host_id": selected_host_id,
+            "job_index": job_index,
+            "run_id": record["job"]["run_id"],
+            "process_metrics": metrics,
+            "process_metrics_sha256": chronology["process_metrics_sha256"],
+            "component_sha256": component_sha256,
+            "fixed_verification": verified,
+            "qualification_eligible": False,
+        }
+    finally:
+        if isinstance(fixed_module, types.ModuleType):
+            _close_module(fixed_module)
+        _close_module(plan_module)
+
+
 def _verify_source5_completed_job_locked_impl(
     lock: CampaignHostLock, execution_manifest_pin: object,
     active_authorization_context: object | None, record_pin: object,

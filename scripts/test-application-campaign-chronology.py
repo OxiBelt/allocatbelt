@@ -5369,5 +5369,537 @@ class Source5V5ExplorationLaunchGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(chronology.ChronologyError, "two hosts"):
             structural_index(malformed)
 
+
+class Source5RecordedNumericScalarSeamTests(unittest.TestCase):
+    """One-owner validator seams; no GPG or Fixed success mock."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.chronology = load_script(
+            SCRIPT_DIR / "application-campaign-chronology.py",
+            "recorded_numeric_chronology_target",
+        )
+
+    def _window_fixture(self):
+        c = self.chronology
+        host = "host-kvm-a"
+        job = {
+            "phase": "exploration",
+            "host_id": host,
+            "ordinal": 1,
+            "run_id": "numeric-run-000",
+        }
+        job_sha = c.sha256_bytes(c.canonical_bytes(job))
+
+        def pin(name, digit, semantic_digit=None):
+            value = {
+                "path": f"/old/source5/{name}.json",
+                "raw_sha256": digit * 64,
+            }
+            if semantic_digit is not None:
+                value["semantic_sha256"] = semantic_digit * 64
+            return value
+
+        job_record = pin("record", "a")
+        request = pin("request", "b", "c")
+        checkpoint = pin("checkpoint", "d", "e")
+        object_manifest = pin("objects", "f", "1")
+        ack = pin("ack", "2", "3")
+        signature = {
+            "path": "/old/source5/signature.asc",
+            "raw_sha256": "4" * 64,
+            "signer_fingerprint": "A" * 40,
+        }
+        host_receipt = {
+            "path": "/old/strict-host.json",
+            "raw_sha256": "5" * 64,
+            "host_verification_sha256": "6" * 64,
+        }
+        paths = {
+            "overlay": ("/old/pair/fixed-pair-execution-overlay.json",
+                        "7" * 64, "fixed_pair_artifact", None),
+            "receipt": ("/old/pair/fixed-pair-execution-receipt.json",
+                        "8" * 64, "component_receipt", None),
+            "host": (host_receipt["path"], host_receipt["raw_sha256"],
+                     "fixed_pair_host_receipt",
+                     host_receipt["host_verification_sha256"]),
+            "processes": ("/old/pair/processes.tsv", "9" * 64,
+                          "normal_app_output", None),
+            "runtime": ("/old/pair/.fixed-pair-runtime-bindings.json",
+                        "0" * 64, "normal_app_output", None),
+        }
+        stage_root = "/tmp/recorded-numeric-stage"
+        refs = []
+        for name, (origin, raw_sha, role, semantic) in paths.items():
+            refs.append({
+                "origin_path": origin,
+                "path": f"{stage_root}/{name}",
+                "role": role,
+                "host_id": host,
+                "raw_sha256": raw_sha,
+                "semantic_sha256": semantic,
+                "byte_count": 1,
+                "maximum_bytes": 1,
+            })
+        pins = {
+            "job_record": job_record,
+            "request": request,
+            "checkpoint": checkpoint,
+            "object_manifest": object_manifest,
+            "ack": ack,
+            "signature": signature,
+            "host_receipt": host_receipt,
+        }
+        evidence = {
+            "kind": "source5_fixed_pair",
+            "overlay": {"path": paths["overlay"][0],
+                        "raw_sha256": paths["overlay"][1]},
+            "receipt": {"path": paths["receipt"][0],
+                        "raw_sha256": paths["receipt"][1]},
+            "host_receipt": host_receipt,
+            "processes": {"path": paths["processes"][0],
+                          "raw_sha256": paths["processes"][1]},
+            "runtime_bindings": {"path": paths["runtime"][0],
+                                 "raw_sha256": paths["runtime"][1]},
+            "source_snapshot": {},
+        }
+        authorization_head = "1" * 64
+        terminal_head = "2" * 64
+        gpg_authority = {
+            "ack_pin": ack,
+            "checkpoint_pin": checkpoint,
+            "object_manifest_pin": object_manifest,
+            "signature_pin": signature,
+            "request_pin": request,
+            "job_record_raw_sha256": job_record["raw_sha256"],
+            "component_replay_required": True,
+            "qualification_eligible": False,
+        }
+        gpg_row = {
+            "job": job,
+            "job_record_pin": job_record,
+            "authority": gpg_authority,
+            "journal_authorization_head": authorization_head,
+            "journal_terminal_head": terminal_head,
+            "component_replay_required": True,
+            "qualification_eligible": False,
+        }
+        original_pins = pins
+        plan_row = {
+            "consumer_host_id": host,
+            "owner_host_id": host,
+            "operation_kind": "registration_replay",
+            "read_ordinal": 0,
+            "job_index": 0,
+            "job": job,
+            "job_sha256": job_sha,
+            "original_pins": original_pins,
+            "objects": [],
+        }
+        payload_view = {
+            "schema":
+                "allocatbelt.application-source5-recorded-preparation-payload-view.v2",
+            "basis_pin": {"path": "/old/basis.json",
+                          "raw_sha256": "3" * 64,
+                          "semantic_sha256": "4" * 64},
+            "read_plan_pin": {"path": "/old/read-plan.json",
+                              "raw_sha256": "5" * 64,
+                              "semantic_sha256": "6" * 64},
+            "session_nonce": "a" * 32,
+            "consumer_host_id": host,
+            "owner_host_id": host,
+            "operation_kind": "registration_replay",
+            "read_ordinal": 0,
+            "job_index": 0,
+            "job_sha256": job_sha,
+            "original_pins": pins,
+            "outer_request_pin": {"path": "/old/request.json",
+                                  "raw_sha256": "7" * 64,
+                                  "semantic_sha256": "8" * 64},
+            "outer_response_pin": {"path": "/old/response.json",
+                                   "raw_sha256": "9" * 64,
+                                   "semantic_sha256": "0" * 64},
+            "bundle_pin": {"path": "/old/bundle.tar",
+                           "raw_sha256": "1" * 64,
+                           "byte_count": 1},
+            "stage_root": stage_root,
+            "objects": refs,
+            "payload_bytes": len(refs),
+            "payload_view_sha256": "a" * 64,
+        }
+        yielded = {
+            "payload_view": payload_view,
+            "objects_by_origin": {
+                ref["origin_path"]: ref for ref in refs
+            },
+            "stage_root": stage_root,
+        }
+        index_row = {
+            "job": job,
+            "job_sha256": job_sha,
+            "job_record_pin": job_record,
+        }
+        record = {
+            "job": job,
+            "evidence": evidence,
+            "chronology": {"authorization_head": authorization_head},
+        }
+        return {
+            "host": host,
+            "job": job,
+            "job_sha": job_sha,
+            "plan_row": plan_row,
+            "payload_view": payload_view,
+            "yielded": yielded,
+            "index_row": index_row,
+            "record": record,
+            "gpg_row": gpg_row,
+            "refs": refs,
+            "pins": pins,
+            "evidence": evidence,
+            "paths": paths,
+            "stage_root": stage_root,
+        }
+
+    def _bound_window(self, fixture=None):
+        c = self.chronology
+        fixture = fixture or self._window_fixture()
+        return c._source5_recorded_numeric_bind_h3_window(
+            fixture["yielded"], fixture["plan_row"],
+            fixture["payload_view"], fixture["index_row"],
+            fixture["record"], fixture["gpg_row"],
+            expected_host_id=fixture["host"],
+            expected_job_index=0,
+            expected_read_ordinal=0,
+        )
+
+    def test_h3_yield_rejects_archived_job_view_shape_and_extra_fields(self):
+        c = self.chronology
+        with self.assertRaises(c.ChronologyError):
+            c._source5_recorded_numeric_h3_yield({
+                "schema": "allocatbelt.application-source5-archived-job-view.v1",
+                "objects": {},
+                "stage_root": "/tmp/stage",
+            })
+        malformed = self._window_fixture()["yielded"] | {"legacy_view": {}}
+        with self.assertRaises(c.ChronologyError):
+            c._source5_recorded_numeric_h3_yield(malformed)
+
+    def test_h3_original_raw_pin_must_match_gpg_authority(self):
+        fixture = self._window_fixture()
+        fixture["payload_view"]["original_pins"]["checkpoint"] = {
+            **fixture["pins"]["checkpoint"],
+            "raw_sha256": "e" * 64,
+        }
+        with self.assertRaisesRegex(self.chronology.ChronologyError,
+                                    "actual ACK/GPG cohort"):
+            self._bound_window(fixture)
+
+    def test_h3_raw_pin_must_match_independent_plan_projection(self):
+        fixture = self._window_fixture()
+        fixture["plan_row"]["original_pins"] = copy.deepcopy(
+            fixture["plan_row"]["original_pins"],
+        )
+        fixture["payload_view"]["original_pins"]["checkpoint"] = {
+            **fixture["pins"]["checkpoint"],
+            "raw_sha256": "e" * 64,
+        }
+        with self.assertRaisesRegex(self.chronology.ChronologyError,
+                                    "H3/plan/lineage"):
+            self._bound_window(fixture)
+
+    def test_h3_fixed_object_role_must_match_original_record(self):
+        fixture = self._window_fixture()
+        fixture["refs"][2]["role"] = "normal_app_output"
+        fixture["yielded"]["objects_by_origin"][
+            fixture["paths"]["host"][0]
+        ] = fixture["refs"][2]
+        fixture["payload_view"]["objects"][2] = fixture["refs"][2]
+        with self.assertRaisesRegex(self.chronology.ChronologyError,
+                                    "role or raw pin"):
+            self._bound_window(fixture)
+
+    def test_h3_ordinal_must_match_selected_source_job(self):
+        fixture = self._window_fixture()
+        with self.assertRaisesRegex(self.chronology.ChronologyError,
+                                    "ordinal"):
+            self.chronology._source5_recorded_numeric_bind_h3_window(
+                fixture["yielded"], fixture["plan_row"],
+                fixture["payload_view"], fixture["index_row"],
+                fixture["record"], fixture["gpg_row"],
+                expected_host_id=fixture["host"],
+                expected_job_index=0,
+                expected_read_ordinal=1,
+            )
+
+    def test_current_typed_source_and_module_pins_must_match(self):
+        c = self.chronology
+        hosts = ["host-kvm-a", "host-kvm-b"]
+        source_rows = {
+            host: {
+                "host_id": host,
+                "path": f"/source/{host}/manifest.json",
+                "raw_sha256": ("a" if i == 0 else "b") * 64,
+                "semantic_sha256": ("c" if i == 0 else "d") * 64,
+                "source_tree_sha256": ("e" if i == 0 else "f") * 64,
+            }
+            for i, host in enumerate(hosts)
+        }
+        module_path = "scripts/application-source5-recorded-preparation-read.py"
+        module_sha = "1" * 64
+        prepared = {
+            "host_id": hosts[0],
+            "source_root": Path("/source/host-kvm-a"),
+            "spec": {"hosts": [{"host_id": host} for host in hosts]},
+            "original_pins": {"source_manifests": list(source_rows.values())},
+        }
+        lineages = {
+            host: {
+                "bridge_header": {
+                    "initial": {
+                        "source_manifest_pins": copy.deepcopy(list(source_rows.values())),
+                    },
+                },
+            }
+            for host in hosts
+        }
+        basis = {
+            "cohort_hosts": hosts,
+            "consumer_host_id": hosts[0],
+            "current_roots": {"source_root": str(prepared["source_root"])},
+            "source_manifest_pins": {
+                host: {key: source_rows[host][key]
+                       for key in ("path", "raw_sha256", "semantic_sha256")}
+                for host in hosts
+            },
+            "source_module_pins": {
+                hosts[0]: {module_path: {"path": module_path,
+                                         "sha256": module_sha}},
+                hosts[1]: {},
+            },
+        }
+        c._source5_recorded_numeric_validate_source_bindings(
+            prepared, basis, lineages, module_sha,
+        )
+        broken_basis = dict(basis)
+        broken_basis["source_manifest_pins"] = dict(
+            basis["source_manifest_pins"],
+        )
+        broken_basis["source_manifest_pins"][hosts[0]] = {
+            **basis["source_manifest_pins"][hosts[0]],
+            "raw_sha256": "9" * 64,
+        }
+        with self.assertRaisesRegex(c.ChronologyError, "consumer Source"):
+            c._source5_recorded_numeric_validate_source_bindings(
+                prepared, broken_basis, lineages, module_sha,
+            )
+        broken_module_basis = dict(basis)
+        broken_module_basis["source_module_pins"] = copy.deepcopy(
+            basis["source_module_pins"],
+        )
+        broken_module_basis["source_module_pins"][hosts[0]][
+            module_path
+        ]["sha256"] = "9" * 64
+        with self.assertRaisesRegex(c.ChronologyError, "module"):
+            c._source5_recorded_numeric_validate_source_bindings(
+                prepared, broken_module_basis, lineages, module_sha,
+            )
+
+    def _fixed_projection_fixture(self):
+        c = self.chronology
+        host = "host-kvm-a"
+        metrics = [{"member_index": 0, "p50_ns": 10},
+                   {"member_index": 1, "p50_ns": 11}]
+        overlay_pin = {"path": "/old/pair/fixed-pair-execution-overlay.json",
+                       "sha256": "a" * 64}
+        receipt_pin = {"path": "/old/pair/fixed-pair-execution-receipt.json",
+                       "sha256": "b" * 64}
+        host_pin = {
+            "path": "/old/strict-host.json",
+            "raw_sha256": "c" * 64,
+            "host_verification_sha256": "d" * 64,
+        }
+        source_pin = {
+            "host_id": host,
+            "path": "/source/host-kvm-a/manifest.json",
+            "raw_sha256": "e" * 64,
+            "semantic_sha256": "f" * 64,
+            "source_tree_sha256": "1" * 64,
+        }
+        overlay = {
+            "output_root": "/old/pair",
+            "runtime_bindings": {
+                "pin": {"path": "/old/pair/.fixed-pair-runtime-bindings.json",
+                        "sha256": "2" * 64},
+            },
+            "sources": {
+                "manifests": {
+                    host: {
+                        "pin": {"path": source_pin["path"],
+                                "sha256": source_pin["raw_sha256"]},
+                        "manifest_sha256": source_pin["semantic_sha256"],
+                    },
+                },
+                "selected": {"source_tree_sha256":
+                             source_pin["source_tree_sha256"]},
+            },
+        }
+        receipt = {
+            "process_metrics": metrics,
+            "process_validation_errors": [None, None],
+            "inputs_unchanged": True,
+            "processes_sha256": "3" * 64,
+        }
+        verified = {
+            "schema": "fixed-receipt-schema",
+            "verified": True,
+            "status": "valid_pair",
+            "qualification_eligible": False,
+            "receipt_sha256": receipt_pin["sha256"],
+            "overlay_sha256": overlay_pin["sha256"],
+            "run_id": "numeric-run-000",
+        }
+        fixed = types.ModuleType("fixed_numeric_projection_fixture")
+        fixed.CLOSED_RECORDED_CAPTURED_REPLAY_CONTEXT_SCHEMA_V1 = "closed-v1"
+        fixed.RECEIPT_SCHEMA = "fixed-receipt-schema"
+        replay = {
+            "schema": "closed-v1",
+            "verification": verified,
+            "overlay": overlay,
+            "execution_receipt": receipt,
+            "host_verification_pin": host_pin,
+            "full_replay_verified": True,
+            "resident_executable_verified": False,
+            "app_launch_permitted": False,
+            "qualification_eligible": False,
+        }
+        record = {
+            "job": {"run_id": "numeric-run-000"},
+            "process_metrics": metrics,
+        }
+        chronology = {
+            "component_sha256": "",
+            "process_metrics_sha256": c.sha256_bytes(c.canonical_bytes(metrics)),
+        }
+        authorization = {
+            "job_terminal": {"details": {
+                "component_sha256": "",
+                "process_metrics_sha256": chronology["process_metrics_sha256"],
+            }},
+        }
+        evidence = {
+            "processes": {
+                "path": "/old/pair/processes.tsv",
+                "raw_sha256": receipt["processes_sha256"],
+            },
+            "runtime_bindings": {
+                "path": "/old/pair/.fixed-pair-runtime-bindings.json",
+                "raw_sha256": overlay["runtime_bindings"]["pin"]["sha256"],
+            },
+            "source_snapshot": {
+                "artifact": {"path": source_pin["path"],
+                             "raw_sha256": source_pin["raw_sha256"]},
+                "semantic_sha256": source_pin["semantic_sha256"],
+                "source_tree_sha256": source_pin["source_tree_sha256"],
+            },
+        }
+        component = {
+            "schema": "allocatbelt.application-source5-fixed-component.v1",
+            "overlay": {"path": overlay_pin["path"],
+                        "raw_sha256": overlay_pin["sha256"]},
+            "receipt": {"path": receipt_pin["path"],
+                        "raw_sha256": receipt_pin["sha256"]},
+            "verification": verified,
+        }
+        component_sha = c.sha256_bytes(c.canonical_bytes(component))
+        chronology["component_sha256"] = component_sha
+        authorization["job_terminal"]["details"]["component_sha256"] = component_sha
+        historical_source_pin = {
+            key: source_pin[key]
+            for key in ("path", "raw_sha256", "semantic_sha256")
+        }
+        return (fixed, replay, record, chronology, authorization, evidence,
+                host, historical_source_pin, source_pin["source_tree_sha256"],
+                overlay_pin, receipt_pin, host_pin)
+
+    def test_fixed_component_digest_must_match_original_journal(self):
+        args = list(self._fixed_projection_fixture())
+        args[3] = {**args[3], "component_sha256": "9" * 64}
+        with self.assertRaisesRegex(self.chronology.ChronologyError,
+                                    "component digest"):
+            self.chronology._source5_recorded_numeric_validate_fixed_result(*args)
+
+    def test_fixed_source_snapshot_must_match_historical_lineage_pin(self):
+        args = list(self._fixed_projection_fixture())
+        args[7] = {
+            **args[7],
+            "raw_sha256": "9" * 64,
+        }
+        with self.assertRaisesRegex(self.chronology.ChronologyError,
+                                    "Source snapshot join"):
+            self.chronology._source5_recorded_numeric_validate_fixed_result(*args)
+
+    def test_fixed_receipt_metrics_must_match_recorded_metrics(self):
+        args = list(self._fixed_projection_fixture())
+        replay = dict(args[1])
+        receipt = dict(replay["execution_receipt"])
+        receipt["process_metrics"] = [{"member_index": 0, "p50_ns": 99}]
+        replay["execution_receipt"] = receipt
+        args[1] = replay
+        with self.assertRaisesRegex(self.chronology.ChronologyError,
+                                    "receipt differs"):
+            self.chronology._source5_recorded_numeric_validate_fixed_result(*args)
+
+    def test_construction_schema_fails_closed_without_named_typed_apis(self):
+        c = self.chronology
+        module = types.ModuleType("incomplete_construction_plan")
+        module.PREPARED_INPUT_CONSTRUCTION_READ_PLAN_SCHEMA_V1 = (
+            "allocatbelt.application-source5-prepared-input-construction-read-plan.v1"
+        )
+        with self.assertRaisesRegex(c.ChronologyError,
+                                    "refusing an ordinary v2 fallback"):
+            c._source5_recorded_numeric_read_apis(
+                module,
+                "allocatbelt.application-source5-prepared-input-construction-read-plan.v1",
+            )
+
+    def test_construction_dispatch_tracks_selected_source_capability(self):
+        c = self.chronology
+        module = load_script(
+            SCRIPT_DIR / "application-source5-recorded-preparation-read.py",
+            "recorded_numeric_selected_construction_plan",
+        )
+        schema = (
+            "allocatbelt.application-source5-prepared-input-construction-read-plan.v1"
+        )
+        if callable(getattr(
+                module, "validate_prepared_input_construction_payload_view_v1", None)):
+            api = c._source5_recorded_numeric_read_apis(module, schema)
+            self.assertEqual(
+                api["payload"].__name__,
+                "validate_prepared_input_construction_payload_view_v1",
+            )
+        else:
+            with self.assertRaisesRegex(
+                    c.ChronologyError, "refusing an ordinary v2 fallback"):
+                c._source5_recorded_numeric_read_apis(module, schema)
+
+    def test_current_v2_dispatch_uses_selected_typed_validator_family(self):
+        c = self.chronology
+        module = load_script(
+            SCRIPT_DIR / "application-source5-recorded-preparation-read.py",
+            "recorded_numeric_current_v2_plan",
+        )
+        api = c._source5_recorded_numeric_read_apis(
+            module,
+            "allocatbelt.application-source5-recorded-preparation-read-plan.v2",
+        )
+        self.assertTrue(callable(api["payload"]))
+        self.assertEqual(
+            api["payload"].__name__,
+            "validate_recorded_preparation_payload_view_v2",
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
