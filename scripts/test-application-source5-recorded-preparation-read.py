@@ -261,6 +261,142 @@ def _make_basis(
     return basis, basis_pin
 
 
+def _make_construction_basis(
+    view, projections: dict[str, dict[str, Any]],
+    actual_ancestors: dict[str, dict[str, Any]],
+    scratch_root: Path, nonce: str,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    hosts = list(view.host_order)
+    campaign_id = view.spec["campaign_id"]
+    consumer = view.host_id
+    source_maps = {host: _source_manifest_pin(view, host) for host in hosts}
+    module_maps = {
+        host: copy.deepcopy(projections[host]["view"].module_pins)
+        for host in hosts
+    }
+    ancestors = {
+        host: {
+            "bridge_header": copy.deepcopy(
+                actual_ancestors[host]["bridge_header_pin"],
+            ),
+            "record_index": copy.deepcopy(
+                actual_ancestors[host]["record_index_pin"],
+            ),
+        }
+        for host in hosts
+    }
+    final_plan_path = Path(view.plan_path)
+    output_path = final_plan_path.parent / \
+        read_plan.PREPARED_INPUT_COMPLETION_PATH_NAME
+    filesystem = os.statvfs(final_plan_path.parent)
+    output_block = filesystem.f_frsize or filesystem.f_bsize
+    directory_growth = 4096
+    output_required = (
+        read_plan._round_file_allocation_bytes(
+            read_plan.PREPARED_INPUT_COMPLETION_MAX_BYTES, output_block,
+        ) + directory_growth
+    )
+    output_reservation = {
+        "schema": read_plan.PREPARED_INPUT_COMPLETION_RESERVATION_SCHEMA_V1,
+        "path": str(output_path),
+        "device_id": final_plan_path.parent.stat().st_dev,
+        "allocation_block_bytes": output_block,
+        "maximum_file_bytes":
+            read_plan.PREPARED_INPUT_COMPLETION_MAX_BYTES,
+        "directory_growth_reserve_bytes": directory_growth,
+        "reserved_bytes": output_required,
+        "reserved_inodes": 1,
+    }
+    basis = {
+        "schema": read_plan.PREPARED_INPUT_CONSTRUCTION_BASIS_SCHEMA_V1,
+        "campaign_id": campaign_id,
+        "consumer_host_id": consumer,
+        "cohort_hosts": hosts,
+        "operation_kind": read_plan.PREPARED_INPUT_CONSTRUCTION_OPERATION,
+        "spec_pin": {
+            "path": str(view.spec_path),
+            "raw_sha256": digest(view.spec_raw),
+            "semantic_sha256": view.spec_semantic,
+        },
+        "plan_pin": {
+            "path": str(view.plan_path),
+            "raw_sha256": digest(view.plan_raw),
+            "semantic_sha256": view.plan_semantic,
+        },
+        "source_manifest_pins": source_maps,
+        "source_module_pins": module_maps,
+        "construction_inputs": {
+            "preparation_pin": {
+                "path": view.preparation_pin["path"],
+                "raw_sha256": view.preparation_pin["sha256"],
+            },
+            "capacity_generation_pin": {
+                "path": str(view.fixture.input_root /
+                            "preparatory/capacity-generation.json"),
+                "raw_sha256": "1" * 64,
+                "semantic_sha256": "2" * 64,
+            },
+            "pressure_bindings_pin": {
+                "path": str(view.evidence_root / "pressure-bindings.json"),
+                "raw_sha256": "3" * 64,
+            },
+            "probe_capture_index_pin": {
+                "path": str(view.evidence_root / "probe-capture-index.json"),
+                "raw_sha256": "4" * 64,
+            },
+            "pilot_pins": {
+                host: {
+                    "path": str(view.evidence_root / f"{host}-pilot.json"),
+                    "raw_sha256": "5" * 64,
+                    "semantic_sha256": "6" * 64,
+                }
+                for host in hosts
+            },
+            "oracle_inputs": {
+                host: {
+                    "manifest_pin": {
+                        "path": str(view.evidence_root /
+                                    f"{host}-oracle-manifest.json"),
+                        "raw_sha256": "7" * 64,
+                        "semantic_sha256": "8" * 64,
+                    },
+                    "artifact_root": str(view.artifact_root),
+                }
+                for host in hosts
+            },
+            "completion_output_reservation": output_reservation,
+        },
+        "ancestor_pins": ancestors,
+        "metadata_capture_manifest_pin": {
+            "path": str(view.evidence_root / "closed-metadata-capture.json"),
+            "raw_sha256": "9" * 64,
+        },
+        "current_roots": {
+            "source_root": str(view.fixture.root),
+            "input_root": str(view.fixture.input_root),
+            "metadata_capture_root": str(view.evidence_root),
+            "archive_root": str(view.output_root / "root-archive"),
+            "artifact_root": str(view.artifact_root),
+            "output_root": str(view.output_root),
+            "journal_root": str(view.output_root / campaign_id /
+                                 "chronology" / consumer),
+        },
+        "current_journal_frontier": {
+            "head_sha256": "0" * 64,
+            "record_count": 0,
+        },
+        "basis_sha256": "",
+    }
+    basis = sealed(basis, "basis_sha256")
+    basis_pin = {
+        "path": str(scratch_root / campaign_id / "source5" / consumer /
+                    "prepared-input-construction" / nonce / "basis.json"),
+        "raw_sha256": digest(canonical(basis)),
+        "semantic_sha256": basis["basis_sha256"],
+    }
+    return basis, basis_pin
+
+
 def _metadata_pin(view, rows, role: str, host: str, job: dict[str, Any], *,
                   semantic: str | None = None) -> dict[str, str]:
     matches = [row for row in rows
@@ -532,6 +668,7 @@ class ActualH6RecordedReadPlanTests(unittest.TestCase):
             cls.plan_pin = read_plan.recorded_preparation_read_plan_pin_v2(
                 cls.plan,
             )
+            cls._construction_fixture_cache = None
         except BaseException:
             if cls._source_fixture_started:
                 cls.source_fixture_class.tearDownClass()
@@ -569,6 +706,30 @@ class ActualH6RecordedReadPlanTests(unittest.TestCase):
             scratch_declaration=arguments.pop("scratch_declaration"),
             timeout_declaration=arguments.pop("timeout_declaration"),
         )
+
+    @classmethod
+    def construction_fixture(cls):
+        if cls._construction_fixture_cache is None:
+            basis, basis_pin = _make_construction_basis(
+                cls.views[cls.consumer], cls.projections,
+                cls.actual_ancestors, cls.scratch_root, cls.nonce,
+            )
+            plan, chunks = read_plan.build_prepared_input_construction_read_plan_v1(
+                basis, basis_pin,
+                old_catalogues_by_host=cls.catalogues,
+                old_readback_caps_by_host=cls.readback_caps,
+                window_metadata_by_host=cls.windows,
+                session_nonce=cls.nonce,
+                scratch_declaration=cls.scratch,
+                timeout_declaration=cls.timeouts,
+            )
+            plan_pin = read_plan.prepared_input_construction_read_plan_pin_v1(
+                plan,
+            )
+            cls._construction_fixture_cache = (
+                basis, basis_pin, plan, chunks, plan_pin,
+            )
+        return cls._construction_fixture_cache
 
     def window_chunk_for(self, ordinal, *, plan=None, chunks=None):
         plan = self.plan if plan is None else plan
@@ -1037,6 +1198,348 @@ class ActualH6RecordedReadPlanTests(unittest.TestCase):
                 "raw_sha256": "d" * 64,
                 "signer_fingerprint": "a" * 40,
             }, "lowercase Source fingerprint")
+
+    def test_construction_basis_and_plan_rebuild_the_distinct_structural_720(self) -> None:
+        basis, basis_pin, plan, chunks, plan_pin = self.construction_fixture()
+        self.assertEqual((
+            read_plan.PREPARED_INPUT_CONSTRUCTION_BASIS_SCHEMA_V1,
+            read_plan.PREPARED_INPUT_CONSTRUCTION_READ_PLAN_SCHEMA_V1,
+            read_plan.PREPARED_INPUT_CONSTRUCTION_WINDOW_CHUNK_SCHEMA_V1,
+            read_plan.PREPARED_INPUT_CONSTRUCTION_REQUEST_SCHEMA_V1,
+            read_plan.PREPARED_INPUT_CONSTRUCTION_RESPONSE_SCHEMA_V1,
+            read_plan.PREPARED_INPUT_CONSTRUCTION_CONTROL_EVENT_SCHEMA_V1,
+            read_plan.PREPARED_INPUT_CONSTRUCTION_SESSION_DESCRIPTOR_SCHEMA_V1,
+            read_plan.PREPARED_INPUT_CONSTRUCTION_FAILURE_RECEIPT_SCHEMA_V1,
+            read_plan.PREPARED_INPUT_CONSTRUCTION_PAYLOAD_VIEW_SCHEMA_V1,
+            read_plan.PREPARED_INPUT_COMPLETION_RESERVATION_SCHEMA_V1,
+        ), (
+            "allocatbelt.application-source5-prepared-input-construction-basis.v1",
+            "allocatbelt.application-source5-prepared-input-construction-read-plan.v1",
+            "allocatbelt.application-source5-prepared-input-construction-window-chunk.v1",
+            "allocatbelt.application-source5-prepared-input-construction-read-request.v1",
+            "allocatbelt.application-source5-prepared-input-construction-read-response.v1",
+            "allocatbelt.application-source5-prepared-input-construction-read-control-event.v1",
+            "allocatbelt.application-source5-prepared-input-construction-read-session.v1",
+            "allocatbelt.application-source5-prepared-input-construction-read-failure.v1",
+            "allocatbelt.application-source5-prepared-input-construction-payload-view.v1",
+            "allocatbelt.application-source5-prepared-input-completion-reservation.v1",
+        ))
+        checked_basis, checked_pin, hosts = \
+            read_plan.validate_prepared_input_construction_basis_v1(
+                basis, basis_pin,
+            )
+        self.assertEqual(checked_basis, basis)
+        self.assertEqual(checked_pin, basis_pin)
+        self.assertEqual(hosts, self.hosts)
+        self.assertEqual(basis["operation_kind"], "completion_construction")
+        self.assertEqual(set(basis), {
+            "schema", "campaign_id", "consumer_host_id", "cohort_hosts",
+            "operation_kind", "spec_pin", "plan_pin", "source_manifest_pins",
+            "source_module_pins", "construction_inputs", "ancestor_pins",
+            "metadata_capture_manifest_pin", "current_roots",
+            "current_journal_frontier", "basis_sha256",
+        })
+        self.assertEqual(set(basis["construction_inputs"]), {
+            "preparation_pin", "capacity_generation_pin", "pressure_bindings_pin",
+            "probe_capture_index_pin", "pilot_pins", "oracle_inputs",
+            "completion_output_reservation",
+        })
+        self.assertEqual(set(basis["construction_inputs"][
+            "completion_output_reservation"]), {
+                "schema", "path", "device_id", "allocation_block_bytes",
+                "maximum_file_bytes", "directory_growth_reserve_bytes",
+                "reserved_bytes", "reserved_inodes",
+            })
+        self.assertNotIn("prepared_input_generation", basis)
+        self.assertNotIn("width_contract_pin", basis)
+        self.assertNotIn("execution_manifest_pin", basis)
+        self.assertNotIn("registration_head", basis)
+        self.assertIn("completion_output_reservation",
+                      basis["construction_inputs"])
+        with self.assertRaises(read_plan.RecordedPreparationReadPlanError):
+            read_plan._validate_basis(basis, basis_pin)
+
+        self.assertEqual(
+            plan["schema"],
+            read_plan.PREPARED_INPUT_CONSTRUCTION_READ_PLAN_SCHEMA_V1,
+        )
+        self.assertEqual(plan["operation_kind"], "completion_construction")
+        self.assertEqual(len(plan["window_index"]), 720)
+        self.assertEqual(
+            [row["owner_host_id"] for row in plan["window_index"][:360]],
+            [hosts[0]] * 360,
+        )
+        self.assertEqual(
+            [row["owner_host_id"] for row in plan["window_index"][360:]],
+            [hosts[1]] * 360,
+        )
+        self.assertEqual(len(chunks), len(plan["window_chunks"]))
+        self.assertTrue(all(
+            chunk["schema"] ==
+            read_plan.PREPARED_INPUT_CONSTRUCTION_WINDOW_CHUNK_SCHEMA_V1 and
+            0 < len(canonical(chunk)) <= read_plan.MAX_METADATA_BYTES and
+            len(chunk["rows"]) <= read_plan.MAX_WINDOWS_PER_METADATA_CHUNK
+            for chunk in chunks
+        ))
+        self.assertEqual(
+            plan_pin,
+            read_plan.prepared_input_construction_read_plan_pin_v1(plan),
+        )
+        self.assertEqual(
+            read_plan.validate_prepared_input_construction_read_plan_v1(
+                plan, chunks, basis, basis_pin,
+                old_catalogues_by_host=self.catalogues,
+                old_readback_caps_by_host=self.readback_caps,
+                window_metadata_by_host=self.windows,
+                session_nonce=self.nonce,
+                scratch_declaration=self.scratch,
+                timeout_declaration=self.timeouts,
+            ),
+            plan,
+        )
+        first = read_plan.validate_prepared_input_construction_read_window_v1(
+            plan, plan_pin, chunks[0], 0,
+        )
+        second_host = read_plan.validate_prepared_input_construction_read_window_v1(
+            plan, plan_pin, chunks[
+                plan["window_index"][360]["chunk_ordinal"]
+            ], 360,
+        )
+        self.assertEqual(first["owner_host_id"], hosts[0])
+        self.assertEqual(second_host["owner_host_id"], hosts[1])
+
+        output = plan["completion_output_reservation"]
+        self.assertEqual(set(output), {
+            "schema", "path", "device_id", "allocation_block_bytes",
+            "maximum_file_bytes", "directory_growth_reserve_bytes",
+            "required_bytes", "required_inodes", "declared_reserved_bytes",
+            "declared_reserved_inodes", "same_device_as_scratch",
+            "same_device_required_bytes", "same_device_required_inodes",
+        })
+        self.assertEqual(output["path"], str(
+            Path(self.views[self.consumer].plan_path).parent /
+            read_plan.PREPARED_INPUT_COMPLETION_PATH_NAME
+        ))
+        self.assertEqual(output["maximum_file_bytes"], 64 * 1024 * 1024)
+        self.assertEqual(output["required_inodes"], 1)
+        self.assertEqual(
+            output["required_bytes"],
+            read_plan._round_file_allocation_bytes(
+                output["maximum_file_bytes"],
+                output["allocation_block_bytes"],
+            ) + output["directory_growth_reserve_bytes"],
+        )
+        self.assertNotEqual(
+            read_plan.PREPARED_INPUT_CONSTRUCTION_FAILURE_RECEIPT_SCHEMA_V1,
+            read_plan.FAILURE_RECEIPT_SCHEMA_V2,
+        )
+        if output["same_device_as_scratch"]:
+            self.assertEqual(
+                output["same_device_required_bytes"],
+                plan["resource_projection"]["required_bytes"] +
+                output["required_bytes"],
+            )
+            self.assertEqual(
+                output["same_device_required_inodes"],
+                plan["resource_projection"]["required_inodes"] + 1,
+            )
+        else:
+            self.assertEqual(output["same_device_required_bytes"], 0)
+            self.assertEqual(output["same_device_required_inodes"], 0)
+        for forbidden in (
+            "completion_pin", "width_contract_pin", "execution_manifest_pin",
+            "registration_head", "final_execution_manifest", "verified", "ready",
+        ):
+            self.assertNotIn(forbidden, plan)
+
+        with self.assertRaises(read_plan.RecordedPreparationReadPlanError):
+            read_plan.recorded_preparation_read_plan_pin_v2(plan)
+
+    def test_construction_basis_rejects_future_fields_and_short_output_allowances(self) -> None:
+        basis, basis_pin, plan, chunks, _plan_pin = \
+            self.construction_fixture()
+
+        def reseal(candidate):
+            candidate = sealed(candidate, "basis_sha256")
+            return candidate, {
+                **basis_pin,
+                "raw_sha256": digest(canonical(candidate)),
+                "semantic_sha256": candidate["basis_sha256"],
+            }
+
+        for field, value in (
+            ("width_contract_pin", {
+                "path": "/tmp/width.json", "raw_sha256": "a" * 64,
+                "semantic_sha256": "b" * 64,
+            }),
+            ("execution_manifest_pin", {
+                "path": "/tmp/future-manifest.json", "raw_sha256": "c" * 64,
+                "semantic_sha256": "d" * 64,
+            }),
+            ("registration_head", "e" * 64),
+            ("prepared_input_generation", {"completion_pin": {}, "provenance": {}}),
+        ):
+            changed = copy.deepcopy(basis)
+            changed[field] = value
+            changed, changed_pin = reseal(changed)
+            with self.subTest(field=field), self.assertRaises(
+                    read_plan.RecordedPreparationReadPlanError):
+                read_plan.validate_prepared_input_construction_basis_v1(
+                    changed, changed_pin,
+                )
+
+        changed = copy.deepcopy(basis)
+        reservation = changed["construction_inputs"][
+            "completion_output_reservation"]
+        reservation["reserved_bytes"] -= 1
+        changed, changed_pin = reseal(changed)
+        with self.assertRaisesRegex(
+                read_plan.RecordedPreparationReadPlanError,
+                "below its exact finite output bound"):
+            read_plan.validate_prepared_input_construction_basis_v1(
+                changed, changed_pin,
+            )
+
+        changed = copy.deepcopy(basis)
+        changed["construction_inputs"]["completion_output_reservation"][
+            "maximum_file_bytes"] += 1
+        changed, changed_pin = reseal(changed)
+        with self.assertRaisesRegex(
+                read_plan.RecordedPreparationReadPlanError,
+                "fixed 64 MiB ceiling"):
+            read_plan.validate_prepared_input_construction_basis_v1(
+                changed, changed_pin,
+            )
+
+        changed = copy.deepcopy(basis)
+        changed["construction_inputs"]["completion_output_reservation"][
+            "reserved_inodes"] = 0
+        changed, changed_pin = reseal(changed)
+        with self.assertRaises(read_plan.RecordedPreparationReadPlanError):
+            read_plan.validate_prepared_input_construction_basis_v1(
+                changed, changed_pin,
+            )
+
+        changed_plan = copy.deepcopy(plan)
+        changed_plan["completion_output_reservation"][
+            "declared_reserved_bytes"] -= 1
+        changed_plan = sealed(changed_plan, "read_plan_sha256")
+        with self.assertRaises(read_plan.RecordedPreparationReadPlanError):
+            read_plan._validate_prepared_input_construction_plan_self(
+                changed_plan,
+            )
+        with self.assertRaises(read_plan.RecordedPreparationReadPlanError):
+            read_plan._validate_plan_row(plan, chunks[0]["rows"][0], 0)
+
+    def test_construction_envelopes_keep_separate_schemas_and_exact_window_joins(self) -> None:
+        basis, basis_pin, plan, chunks, plan_pin = self.construction_fixture()
+        ordinal = 0
+        chunk = chunks[plan["window_index"][ordinal]["chunk_ordinal"]]
+        row = read_plan.validate_prepared_input_construction_read_window_v1(
+            plan, plan_pin, chunk, ordinal,
+        )
+        request, request_raw, request_pin = \
+            read_plan.build_prepared_input_construction_read_request_v1(
+                basis, basis_pin, plan, plan_pin, ordinal, chunk,
+            )
+        self.assertEqual(
+            request["schema"],
+            read_plan.PREPARED_INPUT_CONSTRUCTION_REQUEST_SCHEMA_V1,
+        )
+        self.assertEqual(
+            read_plan.validate_prepared_input_construction_read_request_v1(
+                request_raw, basis, basis_pin, plan, plan_pin, chunk,
+            ),
+            request,
+        )
+        with self.assertRaises(read_plan.RecordedPreparationReadPlanError):
+            read_plan.validate_recorded_preparation_read_request_v2(
+                request_raw, basis, basis_pin, plan, plan_pin, chunk,
+            )
+
+        legacy_response = read_plan._legacy_response(
+            request["legacy_request"], "a" * 64,
+            row["resource_bounds"]["tar_bytes"],
+        )
+        legacy_response_raw = canonical(legacy_response)
+        response, response_raw, response_pin = \
+            read_plan.build_prepared_input_construction_read_response_v1(
+                request_raw, legacy_response, legacy_response_raw,
+                basis, basis_pin, plan, plan_pin, chunk,
+            )
+        self.assertEqual(
+            response["schema"],
+            read_plan.PREPARED_INPUT_CONSTRUCTION_RESPONSE_SCHEMA_V1,
+        )
+        self.assertEqual(
+            read_plan.validate_prepared_input_construction_read_response_v1(
+                response_raw, request_raw, basis, basis_pin,
+                plan, plan_pin, chunk,
+            ),
+            response,
+        )
+
+        session, session_raw, _session_pin = \
+            read_plan.build_prepared_input_construction_read_session_descriptor_v1(
+                plan, plan_pin,
+            )
+        self.assertEqual(
+            session["schema"],
+            read_plan.PREPARED_INPUT_CONSTRUCTION_SESSION_DESCRIPTOR_SCHEMA_V1,
+        )
+        self.assertLessEqual(len(session_raw), read_plan.MAX_METADATA_BYTES)
+        published = read_plan.build_prepared_input_construction_read_control_event_v1(
+            plan, plan_pin, ordinal, chunk, "request_published",
+            request_pin=request_pin,
+        )
+        self.assertEqual(
+            published["schema"],
+            read_plan.PREPARED_INPUT_CONSTRUCTION_CONTROL_EVENT_SCHEMA_V1,
+        )
+        bundle_pin = {
+            "path": row["session_paths"]["bundle"],
+            "raw_sha256": "b" * 64,
+            "byte_count": row["resource_bounds"]["tar_bytes"],
+        }
+        released = read_plan.build_prepared_input_construction_read_control_event_v1(
+            plan, plan_pin, ordinal, chunk, "view_released",
+            request_pin=request_pin, response_pin=response_pin,
+            bundle_pin=bundle_pin,
+        )
+        self.assertEqual(released["action"], "view_released")
+
+        refs = {}
+        for obj in row["objects"]:
+            origin_digest = read_plan.sha256(
+                obj["origin_path"].encode("utf-8", "strict"),
+            )
+            refs[obj["origin_path"]] = {
+                "origin_path": obj["origin_path"],
+                "path": str(Path(row["session_paths"]["stage"]) /
+                             f"{origin_digest}-{obj['raw_sha256']}"),
+                "role": obj["role"],
+                "host_id": row["owner_host_id"],
+                "raw_sha256": obj["raw_sha256"],
+                "semantic_sha256": obj["semantic_sha256"],
+                "byte_count": obj["byte_count"],
+                "maximum_bytes": obj["byte_count"],
+            }
+        view = read_plan.project_prepared_input_construction_payload_view_v1(
+            plan, plan_pin, ordinal, chunk,
+            outer_request_pin=request_pin, outer_response_pin=response_pin,
+            bundle_pin=bundle_pin, stage_root=row["session_paths"]["stage"],
+            refs_by_origin=refs,
+        )
+        self.assertEqual(
+            view["schema"],
+            read_plan.PREPARED_INPUT_CONSTRUCTION_PAYLOAD_VIEW_SCHEMA_V1,
+        )
+        self.assertEqual(
+            read_plan.validate_prepared_input_construction_payload_view_v1(
+                view, plan, plan_pin, chunk,
+            ),
+            view,
+        )
 
     def test_nonce_is_exact_and_changes_every_derived_session_path(self) -> None:
         with self.assertRaises(read_plan.RecordedPreparationReadPlanError):

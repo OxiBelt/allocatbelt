@@ -21,6 +21,12 @@ those source-owned validations or filesystem checks.
 The 300-second per-window and 24-hour per-operation maxima below are new
 bounded-I/O policy ceilings. They are not measured transfer times and do not
 change an Original APP deadline or claim a campaign timing result.
+
+The additive prepared-input construction schema has its own acyclic basis,
+plan, chunk, and envelope versions. It reuses the same ordered 720-row Source
+projection and bounded physical-window accounting, while keeping the final
+completion-output reservation separate from payload scratch. Construction
+plans remain data-only and do not represent an authenticated completion.
 """
 from __future__ import annotations
 
@@ -34,30 +40,63 @@ from typing import Any
 REPLAY_BASIS_SCHEMA_V1 = (
     "allocatbelt.application-source5-recorded-preparation-replay-basis.v1"
 )
+PREPARED_INPUT_CONSTRUCTION_BASIS_SCHEMA_V1 = (
+    "allocatbelt.application-source5-prepared-input-construction-basis.v1"
+)
 READ_PLAN_SCHEMA_V2 = (
     "allocatbelt.application-source5-recorded-preparation-read-plan.v2"
+)
+PREPARED_INPUT_CONSTRUCTION_READ_PLAN_SCHEMA_V1 = (
+    "allocatbelt.application-source5-prepared-input-construction-read-plan.v1"
 )
 WINDOW_METADATA_CHUNK_SCHEMA_V1 = (
     "allocatbelt.application-source5-recorded-preparation-read-window-chunk.v1"
 )
+PREPARED_INPUT_CONSTRUCTION_WINDOW_CHUNK_SCHEMA_V1 = (
+    "allocatbelt.application-source5-prepared-input-construction-window-chunk.v1"
+)
 REQUEST_SCHEMA_V2 = (
     "allocatbelt.application-source5-recorded-preparation-read-request.v2"
+)
+PREPARED_INPUT_CONSTRUCTION_REQUEST_SCHEMA_V1 = (
+    "allocatbelt.application-source5-prepared-input-construction-read-request.v1"
 )
 RESPONSE_SCHEMA_V2 = (
     "allocatbelt.application-source5-recorded-preparation-read-response.v2"
 )
+PREPARED_INPUT_CONSTRUCTION_RESPONSE_SCHEMA_V1 = (
+    "allocatbelt.application-source5-prepared-input-construction-read-response.v1"
+)
 CONTROL_EVENT_SCHEMA_V2 = (
     "allocatbelt.application-source5-recorded-preparation-read-control-event.v2"
+)
+PREPARED_INPUT_CONSTRUCTION_CONTROL_EVENT_SCHEMA_V1 = (
+    "allocatbelt.application-source5-prepared-input-construction-read-control-event.v1"
 )
 PAYLOAD_VIEW_SCHEMA_V2 = (
     "allocatbelt.application-source5-recorded-preparation-payload-view.v2"
 )
+PREPARED_INPUT_CONSTRUCTION_PAYLOAD_VIEW_SCHEMA_V1 = (
+    "allocatbelt.application-source5-prepared-input-construction-payload-view.v1"
+)
 SESSION_DESCRIPTOR_SCHEMA_V2 = (
     "allocatbelt.application-source5-recorded-preparation-read-session.v2"
+)
+PREPARED_INPUT_CONSTRUCTION_SESSION_DESCRIPTOR_SCHEMA_V1 = (
+    "allocatbelt.application-source5-prepared-input-construction-read-session.v1"
 )
 FAILURE_RECEIPT_SCHEMA_V2 = (
     "allocatbelt.application-source5-recorded-preparation-read-failure.v2"
 )
+PREPARED_INPUT_CONSTRUCTION_FAILURE_RECEIPT_SCHEMA_V1 = (
+    "allocatbelt.application-source5-prepared-input-construction-read-failure.v1"
+)
+PREPARED_INPUT_COMPLETION_RESERVATION_SCHEMA_V1 = (
+    "allocatbelt.application-source5-prepared-input-completion-reservation.v1"
+)
+PREPARED_INPUT_CONSTRUCTION_OPERATION = "completion_construction"
+PREPARED_INPUT_COMPLETION_MAX_BYTES = 64 * 1024 * 1024
+PREPARED_INPUT_COMPLETION_PATH_NAME = "prepared-inputs-completion.json"
 
 LEGACY_REQUEST_SCHEMA_V1 = (
     "allocatbelt.application-source5-archive-read-request.v1"
@@ -117,6 +156,55 @@ _BASIS_COMMON_FIELDS = {
     "current_journal_frontier", "basis_sha256",
 }
 _BASIS_REFRESH_FIELDS = {"execution_manifest_pin", "registration_head"}
+_CONSTRUCTION_BASIS_FIELDS = {
+    "schema", "campaign_id", "consumer_host_id", "cohort_hosts",
+    "operation_kind", "spec_pin", "plan_pin", "source_manifest_pins",
+    "source_module_pins", "construction_inputs", "ancestor_pins",
+    "metadata_capture_manifest_pin", "current_roots",
+    "current_journal_frontier", "basis_sha256",
+}
+_CONSTRUCTION_INPUT_FIELDS = {
+    "preparation_pin", "capacity_generation_pin", "pressure_bindings_pin",
+    "probe_capture_index_pin", "pilot_pins", "oracle_inputs",
+    "completion_output_reservation",
+}
+_COMPLETION_OUTPUT_INPUT_FIELDS = {
+    "schema", "path", "device_id", "allocation_block_bytes",
+    "maximum_file_bytes", "directory_growth_reserve_bytes",
+    "reserved_bytes", "reserved_inodes",
+}
+_COMPLETION_OUTPUT_PLAN_FIELDS = {
+    "schema", "path", "device_id", "allocation_block_bytes",
+    "maximum_file_bytes", "directory_growth_reserve_bytes",
+    "required_bytes", "required_inodes",
+    "declared_reserved_bytes", "declared_reserved_inodes",
+    "same_device_as_scratch", "same_device_required_bytes",
+    "same_device_required_inodes",
+}
+
+
+def _plan_schema_set(*, construction: bool) -> dict[str, str]:
+    if construction:
+        return {
+            "plan": PREPARED_INPUT_CONSTRUCTION_READ_PLAN_SCHEMA_V1,
+            "chunk": PREPARED_INPUT_CONSTRUCTION_WINDOW_CHUNK_SCHEMA_V1,
+            "request": PREPARED_INPUT_CONSTRUCTION_REQUEST_SCHEMA_V1,
+            "response": PREPARED_INPUT_CONSTRUCTION_RESPONSE_SCHEMA_V1,
+            "control": PREPARED_INPUT_CONSTRUCTION_CONTROL_EVENT_SCHEMA_V1,
+            "session": PREPARED_INPUT_CONSTRUCTION_SESSION_DESCRIPTOR_SCHEMA_V1,
+            "failure": PREPARED_INPUT_CONSTRUCTION_FAILURE_RECEIPT_SCHEMA_V1,
+            "payload_view": PREPARED_INPUT_CONSTRUCTION_PAYLOAD_VIEW_SCHEMA_V1,
+        }
+    return {
+        "plan": READ_PLAN_SCHEMA_V2,
+        "chunk": WINDOW_METADATA_CHUNK_SCHEMA_V1,
+        "request": REQUEST_SCHEMA_V2,
+        "response": RESPONSE_SCHEMA_V2,
+        "control": CONTROL_EVENT_SCHEMA_V2,
+        "session": SESSION_DESCRIPTOR_SCHEMA_V2,
+        "failure": FAILURE_RECEIPT_SCHEMA_V2,
+        "payload_view": PAYLOAD_VIEW_SCHEMA_V2,
+    }
 _CURRENT_ROOT_FIELDS = {
     "source_root", "input_root", "metadata_capture_root", "archive_root",
     "artifact_root", "output_root", "journal_root",
@@ -453,6 +541,234 @@ def _validate_basis(
     return basis, basis_pin, hosts
 
 
+def _validate_completion_output_reservation(
+    value: object, plan_path: str, input_root: str, source_root: str,
+) -> dict[str, Any]:
+    declaration = _exact(
+        value, _COMPLETION_OUTPUT_INPUT_FIELDS,
+        "construction final-completion output reservation",
+    )
+    expected_path = str(
+        PurePosixPath(plan_path).parent / PREPARED_INPUT_COMPLETION_PATH_NAME,
+    )
+    path = _absolute_path(
+        declaration["path"], "construction final-completion output path",
+    )
+    root_parts = PurePosixPath(input_root).parts
+    output_parts = PurePosixPath(path).parts
+    source_parts = PurePosixPath(source_root).parts
+    _require(path == expected_path and len(output_parts) > len(root_parts) and
+             output_parts[:len(root_parts)] == root_parts and
+             output_parts[:len(source_parts)] != source_parts,
+             "construction completion reservation differs from the fixed InputPrep path outside Source")
+    _require(declaration["schema"] ==
+             PREPARED_INPUT_COMPLETION_RESERVATION_SCHEMA_V1,
+             "construction final-completion output reservation schema differs")
+    device_id = _uint(
+        declaration["device_id"], "completion-output filesystem device ID",
+    )
+    allocation_block = _uint(
+        declaration["allocation_block_bytes"],
+        "completion-output filesystem allocation block", positive=True,
+        maximum=MAX_METADATA_BYTES,
+    )
+    maximum_file_bytes = _uint(
+        declaration["maximum_file_bytes"],
+        "completion-output maximum file bytes", positive=True,
+    )
+    _require(maximum_file_bytes == PREPARED_INPUT_COMPLETION_MAX_BYTES,
+             "completion-output declaration differs from the fixed 64 MiB ceiling")
+    directory_growth_reserve = _uint(
+        declaration["directory_growth_reserve_bytes"],
+        "completion-output parent-directory growth reserve", positive=True,
+    )
+    declared_bytes = _uint(
+        declaration["reserved_bytes"],
+        "completion-output byte reservation", positive=True,
+    )
+    declared_inodes = _uint(
+        declaration["reserved_inodes"],
+        "completion-output inode reservation", positive=True,
+    )
+    required_bytes = (
+        _round_file_allocation_bytes(
+            maximum_file_bytes, allocation_block,
+        ) + directory_growth_reserve
+    )
+    required_inodes = 1
+    _require(declared_bytes >= required_bytes and
+             declared_inodes >= required_inodes,
+             "construction final-completion output reservation is below its exact finite output bound")
+    return {
+        "schema": PREPARED_INPUT_COMPLETION_RESERVATION_SCHEMA_V1,
+        "path": path,
+        "device_id": device_id,
+        "allocation_block_bytes": allocation_block,
+        "maximum_file_bytes": maximum_file_bytes,
+        "directory_growth_reserve_bytes": directory_growth_reserve,
+        "required_bytes": required_bytes,
+        "required_inodes": required_inodes,
+        "declared_reserved_bytes": declared_bytes,
+        "declared_reserved_inodes": declared_inodes,
+    }
+
+
+def _validate_construction_basis(
+    basis_value: object, basis_pin_value: object,
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    """Validate the acyclic completion-construction basis schema only."""
+    basis = _exact(
+        basis_value, _CONSTRUCTION_BASIS_FIELDS,
+        "prepared-input construction basis",
+    )
+    _require(basis["schema"] == PREPARED_INPUT_CONSTRUCTION_BASIS_SCHEMA_V1 and
+             basis["operation_kind"] == PREPARED_INPUT_CONSTRUCTION_OPERATION,
+             "prepared-input construction basis schema or operation differs")
+    campaign_id = _token(basis["campaign_id"], "construction basis campaign ID")
+    consumer = _token(
+        basis["consumer_host_id"], "construction basis consumer host ID",
+    )
+    hosts_value = basis["cohort_hosts"]
+    _require(type(hosts_value) is list and len(hosts_value) == READ_COHORT_SIZE,
+             "prepared-input construction basis requires the exact two-host cohort")
+    hosts = [_token(host, f"construction basis host[{index}]")
+             for index, host in enumerate(hosts_value)]
+    _require(len(set(hosts)) == READ_COHORT_SIZE and consumer in hosts,
+             "prepared-input construction basis repeats or omits its consumer")
+    spec_pin = _pin3(basis["spec_pin"], "construction final Spec pin")
+    plan_pin = _pin3(basis["plan_pin"], "construction final Plan pin")
+
+    source_pins = _exact(
+        basis["source_manifest_pins"], set(hosts),
+        "construction Source manifest map",
+    )
+    module_pins = _exact(
+        basis["source_module_pins"], set(hosts),
+        "construction typed Source module maps",
+    )
+    ancestors = _exact(
+        basis["ancestor_pins"], set(hosts),
+        "construction two-host ancestor map",
+    )
+    inputs = _exact(
+        basis["construction_inputs"], _CONSTRUCTION_INPUT_FIELDS,
+        "prepared-input construction inputs",
+    )
+    _pin2(inputs["preparation_pin"], "construction preparation pin")
+    _pin3(inputs["capacity_generation_pin"],
+          "construction capacity-generation pin")
+    _pin2(inputs["pressure_bindings_pin"],
+          "construction pressure-bindings pin")
+    _pin2(inputs["probe_capture_index_pin"],
+          "construction ProbeV2 capture-index pin")
+    pilot_pins = _exact(
+        inputs["pilot_pins"], set(hosts), "construction ordered-host pilot pins",
+    )
+    oracle_inputs = _exact(
+        inputs["oracle_inputs"], set(hosts),
+        "construction ordered-host oracle inputs",
+    )
+    for host in hosts:
+        _pin3(source_pins[host], f"construction {host} Source manifest pin")
+        modules = module_pins[host]
+        _require(type(modules) is dict and
+                 0 < len(modules) <= MAX_SOURCE_MODULES_PER_HOST,
+                 f"construction {host} typed Source module set is empty or oversized")
+        for path, pin_value in modules.items():
+            _relative_module_path(path, f"construction {host} module key")
+            module_pin = _exact(
+                pin_value, {"path", "sha256"},
+                f"construction {host} module pin {path}",
+            )
+            _require(module_pin["path"] == path,
+                     f"construction {host} module key and pin path differ")
+            _sha(module_pin["sha256"],
+                 f"construction {host} module digest {path}")
+        _pin3(pilot_pins[host], f"construction {host} pilot pin")
+        oracle = _exact(oracle_inputs[host], {
+            "manifest_pin", "artifact_root",
+        }, f"construction {host} oracle input")
+        _pin3(oracle["manifest_pin"],
+              f"construction {host} oracle manifest pin")
+        _absolute_path(oracle["artifact_root"],
+                       f"construction {host} oracle artifact root")
+        ancestor = _exact(ancestors[host], {
+            "bridge_header", "record_index",
+        }, f"construction {host} old ancestor pins")
+        _pin2(ancestor["bridge_header"],
+              f"construction {host} bridge-header pin")
+        _pin2(ancestor["record_index"],
+              f"construction {host} record-index pin")
+
+    _pin2(basis["metadata_capture_manifest_pin"],
+          "construction closed metadata-capture manifest pin")
+    roots = _exact(basis["current_roots"], _CURRENT_ROOT_FIELDS,
+                   "construction current root map")
+    for name, path in roots.items():
+        _absolute_path(path, f"construction current {name}")
+    _validate_completion_output_reservation(
+        inputs["completion_output_reservation"], plan_pin["path"],
+        roots["input_root"], roots["source_root"],
+    )
+    frontier = _exact(basis["current_journal_frontier"], {
+        "head_sha256", "record_count",
+    }, "construction held-journal frontier")
+    _sha(frontier["head_sha256"], "construction current journal head")
+    _uint(frontier["record_count"], "construction current journal count")
+
+    _sha(basis["basis_sha256"], "construction basis self digest")
+    _require(basis["basis_sha256"] == sha256(canonical_bytes({
+        key: value for key, value in basis.items() if key != "basis_sha256"
+    })), "prepared-input construction basis self digest differs")
+    basis_raw = canonical_bytes(basis)
+    _require(0 < len(basis_raw) <= MAX_METADATA_BYTES,
+             "prepared-input construction basis exceeds the 16 MiB metadata ceiling")
+    basis_pin = _pin3(basis_pin_value, "construction basis pin")
+    _require(basis_pin["raw_sha256"] == sha256(basis_raw) and
+             basis_pin["semantic_sha256"] == basis["basis_sha256"],
+             "prepared-input construction basis raw/semantic pin differs")
+    _require(campaign_id == basis["campaign_id"],
+             "prepared-input construction campaign identity changed")
+    return basis, basis_pin, hosts
+
+
+def validate_prepared_input_construction_basis_v1(
+    basis_value: object, basis_pin_value: object,
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    """Validate the exact acyclic basis used only for completion construction."""
+    return _validate_construction_basis(basis_value, basis_pin_value)
+
+
+def _construction_output_plan_reservation(
+    basis: dict[str, Any], scratch: dict[str, Any],
+    resource_projection: dict[str, Any],
+) -> dict[str, Any]:
+    roots = basis["current_roots"]
+    reservation = _validate_completion_output_reservation(
+        basis["construction_inputs"]["completion_output_reservation"],
+        basis["plan_pin"]["path"], roots["input_root"],
+        roots["source_root"],
+    )
+    same_device = reservation["device_id"] == scratch["device_id"]
+    if same_device:
+        _require(reservation["allocation_block_bytes"] ==
+                 scratch["allocation_block_bytes"],
+                 "same-device scratch and completion reservations disagree on allocation block size")
+        combined_bytes = (resource_projection["required_bytes"] +
+                          reservation["required_bytes"])
+        combined_inodes = (resource_projection["required_inodes"] +
+                           reservation["required_inodes"])
+    else:
+        combined_bytes = 0
+        combined_inodes = 0
+    return {
+        **reservation,
+        "same_device_as_scratch": same_device,
+        "same_device_required_bytes": combined_bytes,
+        "same_device_required_inodes": combined_inodes,
+    }
+
+
 def _validate_scratch(value: object) -> dict[str, Any]:
     scratch = _exact(value, {
         "schema", "root", "device_id", "allocation_block_bytes",
@@ -532,6 +848,39 @@ def _layout(root: str, campaign_id: str, consumer: str, nonce: str) -> dict[str,
         str(PurePosixPath(root) / campaign_id / "source5" / consumer),
         str(PurePosixPath(root) / campaign_id / "source5" / consumer /
             "recorded-preparation"),
+        str(session), str(session / "window-metadata"),
+        str(slot), str(slot / "stage"),
+    ]
+    return session_paths
+
+
+def _construction_layout(
+    root: str, campaign_id: str, consumer: str, nonce: str,
+) -> dict[str, Any]:
+    session = (PurePosixPath(root) / campaign_id / "source5" / consumer /
+               "prepared-input-construction" / nonce)
+    slot = session / "slot"
+    session_paths = {
+        "basis": str(session / "basis.json"),
+        "read_plan": str(session / "read-plan.json"),
+        "session": str(session / "session.json"),
+        "control_ledger": str(session / "control-ledger.jsonl"),
+        "failure_receipt": str(session / "failure-receipt.json"),
+        "window_metadata_root": str(session / "window-metadata"),
+        "slot": str(slot),
+        "request": str(slot / "request.json"),
+        "response_incoming": str(slot / "response.json.incoming"),
+        "response": str(slot / "response.json"),
+        "bundle_incoming": str(slot / "response.tar.incoming"),
+        "bundle": str(slot / "response.tar"),
+        "stage": str(slot / "stage"),
+    }
+    session_paths["directories"] = [
+        str(PurePosixPath(root) / campaign_id),
+        str(PurePosixPath(root) / campaign_id / "source5"),
+        str(PurePosixPath(root) / campaign_id / "source5" / consumer),
+        str(PurePosixPath(root) / campaign_id / "source5" / consumer /
+            "prepared-input-construction"),
         str(session), str(session / "window-metadata"),
         str(slot), str(slot / "stage"),
     ]
@@ -1169,9 +1518,10 @@ def _outer_request(
     basis_pin: dict[str, Any], plan_pin: dict[str, Any], nonce: str,
     consumer: str, operation: str, read_ordinal: int,
     row: dict[str, Any], *, request_sha256: str,
+    schema: str = REQUEST_SCHEMA_V2,
 ) -> dict[str, Any]:
     return {
-        "schema": REQUEST_SCHEMA_V2,
+        "schema": schema,
         "basis_pin": basis_pin,
         "read_plan_pin": plan_pin,
         "session_nonce": nonce,
@@ -1191,10 +1541,10 @@ def _outer_response(
     basis_pin: dict[str, Any], plan_pin: dict[str, Any], nonce: str,
     consumer: str, operation: str, read_ordinal: int,
     request_pin: dict[str, Any], legacy_response: dict[str, Any], *,
-    response_sha256: str,
+    response_sha256: str, schema: str = RESPONSE_SCHEMA_V2,
 ) -> dict[str, Any]:
     return {
-        "schema": RESPONSE_SCHEMA_V2,
+        "schema": schema,
         "basis_pin": basis_pin,
         "read_plan_pin": plan_pin,
         "session_nonce": nonce,
@@ -1243,6 +1593,8 @@ def _project_source_window(
     plan_path: str, nonce: str, consumer: str,
     read_ordinal: int, owner_host_id: str, host_position: int,
     window: dict[str, Any], caps: dict[str, int],
+    request_schema: str = REQUEST_SCHEMA_V2,
+    response_schema: str = RESPONSE_SCHEMA_V2,
 ) -> dict[str, Any]:
     schedule = window["schedule_row"]
     job_index = window["job_index"]
@@ -1283,6 +1635,7 @@ def _project_source_window(
             "original_pins": window["pins"],
             "legacy_request": legacy_request,
         }, request_sha256="f" * 64,
+        schema=request_schema,
     )
     outer_request["request_sha256"] = sha256(canonical_bytes({
         key: value for key, value in outer_request.items()
@@ -1298,7 +1651,7 @@ def _project_source_window(
         basis_pin, plan_pin_placeholder, nonce, consumer,
         basis["operation_kind"], read_ordinal,
         outer_request_pin_placeholder, legacy_response,
-        response_sha256="f" * 64,
+        response_sha256="f" * 64, schema=response_schema,
     )
     outer_response["response_sha256"] = sha256(canonical_bytes({
         key: value for key, value in outer_response.items()
@@ -1376,10 +1729,10 @@ def _project_source_window(
 
 def _session_descriptor(
     basis: dict[str, Any], basis_pin: dict[str, Any],
-    plan_path: str, nonce: str,
+    plan_path: str, nonce: str, *, schema: str = SESSION_DESCRIPTOR_SCHEMA_V2,
 ) -> dict[str, Any]:
     return _seal({
-        "schema": SESSION_DESCRIPTOR_SCHEMA_V2,
+        "schema": schema,
         "basis_pin": basis_pin,
         "read_plan_pin": _read_plan_pin_placeholder(plan_path),
         "session_nonce": nonce,
@@ -1395,13 +1748,14 @@ def _control_event_value(
     plan_pin: dict[str, Any], nonce: str, action: str, sequence: int,
     *, request_pin: dict[str, Any], response_pin: dict[str, Any] | None,
     bundle_pin: dict[str, Any] | None,
+    schema: str = CONTROL_EVENT_SCHEMA_V2,
 ) -> dict[str, Any]:
     _require(action in {"request_published", "view_released"},
              "recorded-preparation control action is outside the exact schedule")
     row = plan_row
     bounds = row["resource_bounds"]
     return {
-        "schema": CONTROL_EVENT_SCHEMA_V2,
+        "schema": schema,
         "sequence": sequence,
         "basis_pin": basis_pin,
         "read_plan_pin": plan_pin,
@@ -1428,7 +1782,8 @@ def _control_event_value(
 
 def _control_ledger_width(
     rows: list[dict[str, Any]], basis_pin: dict[str, Any],
-    plan_path: str, nonce: str, consumer: str,
+    plan_path: str, nonce: str, consumer: str, *,
+    schema: str = CONTROL_EVENT_SCHEMA_V2,
 ) -> dict[str, int]:
     plan_pin = _read_plan_pin_placeholder(plan_path)
     total = 0
@@ -1444,7 +1799,7 @@ def _control_ledger_width(
         request_record = _control_event_value(
             row, basis_pin, plan_pin, nonce, "request_published",
             2 * ordinal + 1, request_pin=request_pin,
-            response_pin=None, bundle_pin=None,
+            response_pin=None, bundle_pin=None, schema=schema,
         )
         response_pin = {
             "path": slot_paths["response"],
@@ -1459,7 +1814,7 @@ def _control_ledger_width(
         release_record = _control_event_value(
             row, basis_pin, plan_pin, nonce, "view_released",
             2 * ordinal + 2, request_pin=request_pin,
-            response_pin=response_pin, bundle_pin=bundle_pin,
+            response_pin=response_pin, bundle_pin=bundle_pin, schema=schema,
         )
         for record in (request_record, release_record):
             line = canonical_bytes({
@@ -1483,10 +1838,11 @@ def _control_ledger_width(
 
 def _failure_receipt_size(
     basis_pin: dict[str, Any], plan_path: str, nonce: str,
-    consumer: str, operation: str, bounds: dict[str, int],
+    consumer: str, operation: str, bounds: dict[str, int], *,
+    schema: str = FAILURE_RECEIPT_SCHEMA_V2,
 ) -> int:
     receipt = _seal({
-        "schema": FAILURE_RECEIPT_SCHEMA_V2,
+        "schema": schema,
         "basis_pin": basis_pin,
         "read_plan_pin": _read_plan_pin_placeholder(plan_path),
         "session_nonce": nonce,
@@ -1508,7 +1864,8 @@ def _failure_receipt_size(
 def _make_window_metadata_chunks(
     read_rows: list[dict[str, Any]], basis_pin: dict[str, Any],
     campaign_id: str, consumer: str, hosts: list[str], operation: str,
-    nonce: str, chunk_root: str,
+    nonce: str, chunk_root: str, *,
+    schema: str = WINDOW_METADATA_CHUNK_SCHEMA_V1,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Seal ordered bounded chunks and their compact 720-entry index."""
     index: list[dict[str, Any]] = []
@@ -1522,7 +1879,7 @@ def _make_window_metadata_chunks(
             ordinals = [row["read_ordinal"] for row in rows]
             chunk_ordinal = len(chunks)
             body = {
-                "schema": WINDOW_METADATA_CHUNK_SCHEMA_V1,
+                "schema": schema,
                 "basis_pin": basis_pin,
                 "campaign_id": campaign_id,
                 "consumer_host_id": consumer,
@@ -1574,7 +1931,7 @@ def _make_window_metadata_chunks(
     return index, refs, chunks
 
 
-def build_recorded_preparation_read_plan_v2(
+def _build_recorded_preparation_read_plan_core(
     basis_value: object,
     basis_pin: object,
     *,
@@ -1584,6 +1941,7 @@ def build_recorded_preparation_read_plan_v2(
     session_nonce: object,
     scratch_declaration: object,
     timeout_declaration: object,
+    _construction: bool,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Build a compact 720-window index and separately pinned row chunks.
 
@@ -1599,8 +1957,19 @@ def build_recorded_preparation_read_plan_v2(
     also call the typed ``source5_indexed_reservation_binding_v1`` for all six
     indexed roles. This pure projection checks the supplied results and grants
     no authority or verification claim.
+
     """
-    basis, checked_basis_pin, hosts = _validate_basis(basis_value, basis_pin)
+    _require(type(_construction) is bool,
+             "recorded-preparation schema selector is malformed")
+    if _construction:
+        basis, checked_basis_pin, hosts = _validate_construction_basis(
+            basis_value, basis_pin,
+        )
+    else:
+        basis, checked_basis_pin, hosts = _validate_basis(
+            basis_value, basis_pin,
+        )
+    schemas = _plan_schema_set(construction=_construction)
     nonce = session_nonce
     _require(type(nonce) is str and _NONCE.fullmatch(nonce) is not None,
              "recorded-preparation session nonce must be fresh lowercase 32-hex text")
@@ -1608,7 +1977,8 @@ def build_recorded_preparation_read_plan_v2(
     timeouts = _validate_timeouts(timeout_declaration)
     _require(scratch["root"] != "/",
              "recorded-preparation scratch cannot be a filesystem root")
-    layout = _layout(
+    layout_builder = _construction_layout if _construction else _layout
+    layout = layout_builder(
         scratch["root"], basis["campaign_id"], basis["consumer_host_id"], nonce,
     )
     _require(checked_basis_pin["path"] == layout["basis"],
@@ -1677,6 +2047,8 @@ def build_recorded_preparation_read_plan_v2(
                 consumer=basis["consumer_host_id"],
                 read_ordinal=read_ordinal, owner_host_id=host,
                 host_position=host_position, window=window, caps=caps,
+                request_schema=schemas["request"],
+                response_schema=schemas["response"],
             )
             projected["session_stage_root"] = layout["stage"]
             projected["session_paths"] = {
@@ -1711,6 +2083,7 @@ def build_recorded_preparation_read_plan_v2(
     )
     session_descriptor = _session_descriptor(
         basis, checked_basis_pin, layout["read_plan"], nonce,
+        schema=schemas["session"],
     )
     session_descriptor_bytes = len(canonical_bytes(session_descriptor))
     session_descriptor_allocated_bytes = _round_file_allocation_bytes(
@@ -1718,7 +2091,7 @@ def build_recorded_preparation_read_plan_v2(
     )
     control = _control_ledger_width(
         read_rows, checked_basis_pin, layout["read_plan"], nonce,
-        basis["consumer_host_id"],
+        basis["consumer_host_id"], schema=schemas["control"],
     )
     _require(control["maximum_bytes"] <= MAX_METADATA_BYTES,
              "recorded-preparation control ledger exceeds the 16 MiB document ceiling")
@@ -1728,6 +2101,7 @@ def build_recorded_preparation_read_plan_v2(
             "window_bytes": window_bytes,
             "window_inodes": window_inodes,
         },
+        schema=schemas["failure"],
     )
     control_allocated_bytes = _round_file_allocation_bytes(
         control["maximum_bytes"], allocation_block,
@@ -1738,7 +2112,7 @@ def build_recorded_preparation_read_plan_v2(
     window_index, window_chunks, chunk_values = _make_window_metadata_chunks(
         read_rows, checked_basis_pin, basis["campaign_id"],
         basis["consumer_host_id"], hosts, basis["operation_kind"], nonce,
-        layout["window_metadata_root"],
+        layout["window_metadata_root"], schema=schemas["chunk"],
     )
     chunk_bytes = sum(ref["byte_count"] for ref in window_chunks)
     chunk_count = len(window_chunks)
@@ -1817,7 +2191,7 @@ def build_recorded_preparation_read_plan_v2(
             "declared_reserved_inodes": scratch["reserved_inodes"],
         }
         plan_body = {
-            "schema": READ_PLAN_SCHEMA_V2,
+            "schema": schemas["plan"],
             "campaign_id": basis["campaign_id"],
             "consumer_host_id": basis["consumer_host_id"],
             "cohort_hosts": hosts,
@@ -1838,6 +2212,11 @@ def build_recorded_preparation_read_plan_v2(
             },
             "read_plan_sha256": "",
         }
+        if _construction:
+            plan_body["completion_output_reservation"] = \
+                _construction_output_plan_reservation(
+                    basis, scratch, projection,
+                )
         plan_value = _seal(plan_body, "read_plan_sha256")
         raw = canonical_bytes(plan_value)
         _require(0 < len(raw) <= MAX_METADATA_BYTES,
@@ -1863,11 +2242,76 @@ def build_recorded_preparation_read_plan_v2(
     _require(scratch["reserved_bytes"] >= required_bytes and
              scratch["reserved_inodes"] >= required_inodes,
              "recorded-preparation scratch reservation is below its exact finite plan")
+    if _construction:
+        output_reservation = plan_value["completion_output_reservation"]
+        if output_reservation["same_device_as_scratch"]:
+            _require(scratch["reserved_bytes"] +
+                     output_reservation["declared_reserved_bytes"] >=
+                     output_reservation["same_device_required_bytes"] and
+                     scratch["reserved_inodes"] +
+                     output_reservation["declared_reserved_inodes"] >=
+                     output_reservation["same_device_required_inodes"],
+                     "same-device scratch/output allowances are below their combined finite plan")
     _require("execution_manifest_pin" not in plan_value and
              "registration_head" not in plan_value and
              "final_execution_manifest" not in plan_value,
              "recorded-preparation plan contains a future manifest/registration pin")
+    if _construction:
+        _validate_prepared_input_construction_plan_self(plan_value)
     return plan_value, chunk_values
+
+
+def build_recorded_preparation_read_plan_v2(
+    basis_value: object,
+    basis_pin: object,
+    *,
+    old_catalogues_by_host: object,
+    old_readback_caps_by_host: object,
+    window_metadata_by_host: object,
+    session_nonce: object,
+    scratch_declaration: object,
+    timeout_declaration: object,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Build the unchanged registration/refresh v2 plan and exact row chunks."""
+    return _build_recorded_preparation_read_plan_core(
+        basis_value, basis_pin,
+        old_catalogues_by_host=old_catalogues_by_host,
+        old_readback_caps_by_host=old_readback_caps_by_host,
+        window_metadata_by_host=window_metadata_by_host,
+        session_nonce=session_nonce,
+        scratch_declaration=scratch_declaration,
+        timeout_declaration=timeout_declaration,
+        _construction=False,
+    )
+
+
+def build_prepared_input_construction_read_plan_v1(
+    basis_value: object,
+    basis_pin: object,
+    *,
+    old_catalogues_by_host: object,
+    old_readback_caps_by_host: object,
+    window_metadata_by_host: object,
+    session_nonce: object,
+    scratch_declaration: object,
+    timeout_declaration: object,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Build the distinct acyclic construction plan from the same 720 projections.
+
+    The returned resource declaration includes the separate fixed-path final
+    completion reservation. It is data for SourceA's own device/free-space
+    checks and grants no read, publication, or qualification authority.
+    """
+    return _build_recorded_preparation_read_plan_core(
+        basis_value, basis_pin,
+        old_catalogues_by_host=old_catalogues_by_host,
+        old_readback_caps_by_host=old_readback_caps_by_host,
+        window_metadata_by_host=window_metadata_by_host,
+        session_nonce=session_nonce,
+        scratch_declaration=scratch_declaration,
+        timeout_declaration=timeout_declaration,
+        _construction=True,
+    )
 
 
 def validate_recorded_preparation_read_plan_v2(
@@ -1909,6 +2353,57 @@ def validate_recorded_preparation_read_plan_v2(
     return value
 
 
+def validate_prepared_input_construction_read_plan_v1(
+    value: object,
+    window_chunk_values: object,
+    basis_value: object,
+    basis_pin: object,
+    *,
+    old_catalogues_by_host: object,
+    old_readback_caps_by_host: object,
+    window_metadata_by_host: object,
+    session_nonce: object,
+    scratch_declaration: object,
+    timeout_declaration: object,
+) -> dict[str, Any]:
+    """Rebuild the construction plan and chunks from the same Source inputs."""
+    rebuilt, expected_chunks = build_prepared_input_construction_read_plan_v1(
+        basis_value, basis_pin,
+        old_catalogues_by_host=old_catalogues_by_host,
+        old_readback_caps_by_host=old_readback_caps_by_host,
+        window_metadata_by_host=window_metadata_by_host,
+        session_nonce=session_nonce,
+        scratch_declaration=scratch_declaration,
+        timeout_declaration=timeout_declaration,
+    )
+    _require(type(value) is dict and canonical_bytes(value) ==
+             canonical_bytes(rebuilt),
+             "prepared-input construction plan differs from exact Source inputs")
+    _require(type(window_chunk_values) is list and
+             len(window_chunk_values) == len(expected_chunks),
+             "prepared-input construction chunk count differs")
+    for ordinal, (actual, expected) in enumerate(zip(
+        window_chunk_values, expected_chunks,
+    )):
+        _require(type(actual) is dict and
+                 0 < len(canonical_bytes(actual)) <= MAX_METADATA_BYTES and
+                 canonical_bytes(actual) == canonical_bytes(expected),
+                 f"prepared-input construction chunk[{ordinal}] differs")
+    return value
+
+
+def prepared_input_construction_read_plan_pin_v1(
+    plan_value: object,
+) -> dict[str, str]:
+    plan = _validate_prepared_input_construction_plan_self(plan_value)
+    raw = canonical_bytes(plan)
+    return {
+        "path": plan["session_paths"]["read_plan"],
+        "raw_sha256": sha256(raw),
+        "semantic_sha256": plan["read_plan_sha256"],
+    }
+
+
 def recorded_preparation_read_plan_pin_v2(
     plan_value: object,
 ) -> dict[str, str]:
@@ -1921,17 +2416,31 @@ def recorded_preparation_read_plan_pin_v2(
     }
 
 
-def _validate_plan_self(value: object) -> dict[str, Any]:
-    plan = _exact(value, {
+def _validate_plan_self_common(
+    value: object, *, construction: bool,
+) -> dict[str, Any]:
+    schemas = _plan_schema_set(construction=construction)
+    fields = {
         "schema", "campaign_id", "consumer_host_id", "cohort_hosts",
         "operation_kind", "basis_pin", "session_nonce",
         "scratch_declaration", "timeout_declaration", "session_paths",
         "current_journal_frontier", "window_index", "window_chunks",
         "resource_projection", "failed_window_policy", "read_plan_sha256",
-    }, "recorded-preparation read plan")
-    _require(plan["schema"] == READ_PLAN_SCHEMA_V2 and
-             plan["operation_kind"] in {"registration_replay", "refresh_replay"},
-             "recorded-preparation read-plan schema or operation differs")
+    }
+    if construction:
+        fields.add("completion_output_reservation")
+    plan_label = ("prepared-input construction read plan" if construction else
+                  "recorded-preparation read plan")
+    plan = _exact(value, fields, plan_label)
+    expected_operations = (
+        {PREPARED_INPUT_CONSTRUCTION_OPERATION} if construction else
+        {"registration_replay", "refresh_replay"}
+    )
+    _require(plan["schema"] == schemas["plan"] and
+             plan["operation_kind"] in expected_operations,
+             ("prepared-input construction read-plan schema or operation differs"
+              if construction else
+              "recorded-preparation read-plan schema or operation differs"))
     _sha(plan["read_plan_sha256"], "read-plan self digest")
     _require(plan["read_plan_sha256"] == sha256(canonical_bytes({
         key: item for key, item in plan.items() if key != "read_plan_sha256"
@@ -1954,7 +2463,8 @@ def _validate_plan_self(value: object) -> dict[str, Any]:
              "read-plan session nonce is malformed")
     _validate_timeouts(plan["timeout_declaration"])
     scratch = _validate_scratch(plan["scratch_declaration"])
-    expected_layout = _layout(
+    layout_builder = _construction_layout if construction else _layout
+    expected_layout = layout_builder(
         scratch["root"], plan["campaign_id"], plan["consumer_host_id"],
         plan["session_nonce"],
     )
@@ -2144,11 +2654,100 @@ def _validate_plan_self(value: object) -> dict[str, Any]:
              projection["required_bytes"] <= scratch["reserved_bytes"] and
              projection["required_inodes"] <= scratch["reserved_inodes"],
              "recorded-preparation resource declaration or chunk size closure differs")
+    if construction:
+        output = _exact(
+            plan["completion_output_reservation"],
+            _COMPLETION_OUTPUT_PLAN_FIELDS,
+            "construction completion-output plan reservation",
+        )
+        output_path = _absolute_path(
+            output["path"], "construction completion-output plan path",
+        )
+        _require(PurePosixPath(output_path).name ==
+                 PREPARED_INPUT_COMPLETION_PATH_NAME and
+                 output["schema"] ==
+                 PREPARED_INPUT_COMPLETION_RESERVATION_SCHEMA_V1,
+                 "construction completion-output plan path or schema differs")
+        output_device = _uint(
+            output["device_id"], "completion-output plan device ID",
+        )
+        output_block = _uint(
+            output["allocation_block_bytes"],
+            "completion-output plan allocation block", positive=True,
+            maximum=MAX_METADATA_BYTES,
+        )
+        output_max = _uint(
+            output["maximum_file_bytes"],
+            "completion-output maximum file bytes", positive=True,
+        )
+        output_directory_growth = _uint(
+            output["directory_growth_reserve_bytes"],
+            "completion-output parent-directory growth reserve",
+            positive=True,
+        )
+        output_bytes = _uint(
+            output["required_bytes"],
+            "completion-output required bytes", positive=True,
+        )
+        output_inodes = _uint(
+            output["required_inodes"],
+            "completion-output required inodes", positive=True,
+        )
+        output_reserved_bytes = _uint(
+            output["declared_reserved_bytes"],
+            "completion-output declared bytes", positive=True,
+        )
+        output_reserved_inodes = _uint(
+            output["declared_reserved_inodes"],
+            "completion-output declared inodes", positive=True,
+        )
+        same_device = output_device == scratch["device_id"]
+        same_device_bytes = _uint(
+            output["same_device_required_bytes"],
+            "same-device combined required bytes",
+        )
+        same_device_inodes = _uint(
+            output["same_device_required_inodes"],
+            "same-device combined required inodes",
+        )
+        _require(type(output["same_device_as_scratch"]) is bool and
+                 output["same_device_as_scratch"] is same_device and
+                 output_max == PREPARED_INPUT_COMPLETION_MAX_BYTES and
+                 output_bytes == (_round_file_allocation_bytes(
+                     output_max, output_block,
+                 ) + output_directory_growth) and output_inodes == 1 and
+                 output_reserved_bytes >= output_bytes and
+                 output_reserved_inodes >= output_inodes and
+                 (not same_device or
+                  (output_block == allocation_block and
+                   same_device_bytes == projection["required_bytes"] +
+                       output_bytes and
+                   same_device_inodes == projection["required_inodes"] +
+                       output_inodes)) and
+                 (same_device or
+                  (same_device_bytes == 0 and same_device_inodes == 0)),
+                 "construction completion-output byte/inode/device allowance differs")
     return plan
 
-def _validate_plan_row(
-    plan: dict[str, Any], row_value: object, ordinal: int,
+
+def _validate_plan_self(value: object) -> dict[str, Any]:
+    return _validate_plan_self_common(value, construction=False)
+
+
+def _validate_prepared_input_construction_plan_self(
+    value: object,
 ) -> dict[str, Any]:
+    return _validate_plan_self_common(value, construction=True)
+
+def _validate_plan_row_common(
+    plan: dict[str, Any], row_value: object, ordinal: int, *,
+    construction: bool | None,
+) -> dict[str, Any]:
+    if construction is not None:
+        expected_schema = PREPARED_INPUT_CONSTRUCTION_READ_PLAN_SCHEMA_V1 \
+            if construction else READ_PLAN_SCHEMA_V2
+        _require(plan.get("schema") == expected_schema,
+                 "read-plan row validator received a different plan schema")
     row = _exact(row_value, _PLAN_ROW_FIELDS,
                  f"recorded-preparation plan row[{ordinal}]")
     _uint(row["read_ordinal"],
@@ -2363,12 +2962,34 @@ def _validate_plan_row(
     return row
 
 
-def validate_recorded_preparation_read_window_v2(
+def _validate_plan_row(
+    plan: dict[str, Any], row_value: object, ordinal: int,
+) -> dict[str, Any]:
+    return _validate_plan_row_common(
+        plan, row_value, ordinal, construction=False,
+    )
+
+
+def _validate_prepared_input_construction_plan_row(
+    plan: dict[str, Any], row_value: object, ordinal: int,
+) -> dict[str, Any]:
+    return _validate_plan_row_common(
+        plan, row_value, ordinal, construction=True,
+    )
+
+
+def _validate_read_window_common(
     plan_value: object, plan_pin_value: object,
     window_chunk_value: object, read_ordinal: object,
+    *, construction: bool,
 ) -> dict[str, Any]:
     """Resolve one row only from its exact plan-pinned metadata chunk."""
-    plan = _validate_plan_self(plan_value)
+    schemas = _plan_schema_set(construction=construction)
+    plan_validator = (_validate_prepared_input_construction_plan_self
+                      if construction else _validate_plan_self)
+    row_validator = (_validate_prepared_input_construction_plan_row
+                     if construction else _validate_plan_row)
+    plan = plan_validator(plan_value)
     plan_pin = _pin3(plan_pin_value, "recorded-preparation window plan pin")
     plan_raw = canonical_bytes(plan)
     _require(plan_pin["path"] == plan["session_paths"]["read_plan"] and
@@ -2386,7 +3007,7 @@ def validate_recorded_preparation_read_window_v2(
     _require(0 < len(chunk_raw) <= MAX_METADATA_BYTES and
              len(chunk_raw) == ref["byte_count"] and
              sha256(chunk_raw) == pin["raw_sha256"] and
-             chunk["schema"] == WINDOW_METADATA_CHUNK_SCHEMA_V1 and
+              chunk["schema"] == schemas["chunk"] and
              chunk["basis_pin"] == plan["basis_pin"] and
              chunk["campaign_id"] == plan["campaign_id"] and
              chunk["consumer_host_id"] == plan["consumer_host_id"] and
@@ -2413,7 +3034,7 @@ def validate_recorded_preparation_read_window_v2(
         ref["read_ordinals"], chunk["rows"],
     )):
         compact = plan["window_index"][current_ordinal]
-        row = _validate_plan_row(plan, raw_row, current_ordinal)
+        row = row_validator(plan, raw_row, current_ordinal)
         _require(compact["chunk_ordinal"] == ref["chunk_ordinal"] and
                  compact["chunk_row"] == chunk_row and
                  compact["row_sha256"] == sha256(canonical_bytes(row)) and
@@ -2428,12 +3049,37 @@ def validate_recorded_preparation_read_window_v2(
     return selected
 
 
-def _validated_plan_context(
+def validate_recorded_preparation_read_window_v2(
+    plan_value: object, plan_pin_value: object,
+    window_chunk_value: object, read_ordinal: object,
+) -> dict[str, Any]:
+    return _validate_read_window_common(
+        plan_value, plan_pin_value, window_chunk_value, read_ordinal,
+        construction=False,
+    )
+
+
+def validate_prepared_input_construction_read_window_v1(
+    plan_value: object, plan_pin_value: object,
+    window_chunk_value: object, read_ordinal: object,
+) -> dict[str, Any]:
+    return _validate_read_window_common(
+        plan_value, plan_pin_value, window_chunk_value, read_ordinal,
+        construction=True,
+    )
+
+
+def _validated_plan_context_common(
     basis_value: object, basis_pin_value: object,
     plan_value: object, plan_pin_value: object,
+    *, construction: bool,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
-    basis, basis_pin, hosts = _validate_basis(basis_value, basis_pin_value)
-    plan = _validate_plan_self(plan_value)
+    basis_validator = (_validate_construction_basis if construction else
+                       _validate_basis)
+    plan_validator = (_validate_prepared_input_construction_plan_self
+                      if construction else _validate_plan_self)
+    basis, basis_pin, hosts = basis_validator(basis_value, basis_pin_value)
+    plan = plan_validator(plan_value)
     plan_pin = _pin3(plan_pin_value, "recorded-preparation read-plan pin")
     raw = canonical_bytes(plan)
     _require(plan_pin["path"] == plan["session_paths"]["read_plan"] and
@@ -2446,24 +3092,54 @@ def _validated_plan_context(
              plan["operation_kind"] == basis["operation_kind"] and
              plan["current_journal_frontier"] ==
                  basis["current_journal_frontier"],
-             "recorded-preparation plan pin or basis identity differs")
+              "recorded-preparation plan pin or basis identity differs")
+    if construction:
+        _require(plan["completion_output_reservation"] ==
+                 _construction_output_plan_reservation(
+                     basis, plan["scratch_declaration"],
+                     plan["resource_projection"],
+                 ),
+                 "construction completion-output reservation differs from its basis")
     return basis, basis_pin, plan, plan_pin
 
 
-def build_recorded_preparation_read_request_v2(
+def _validated_plan_context(
+    basis_value: object, basis_pin_value: object,
+    plan_value: object, plan_pin_value: object,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    return _validated_plan_context_common(
+        basis_value, basis_pin_value, plan_value, plan_pin_value,
+        construction=False,
+    )
+
+
+def _validated_prepared_input_construction_plan_context(
+    basis_value: object, basis_pin_value: object,
+    plan_value: object, plan_pin_value: object,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    return _validated_plan_context_common(
+        basis_value, basis_pin_value, plan_value, plan_pin_value,
+        construction=True,
+    )
+
+
+def _build_preparation_read_request_common(
     basis_value: object, basis_pin_value: object,
     plan_value: object, plan_pin_value: object, read_ordinal: object,
-    window_chunk_value: object,
+    window_chunk_value: object, *, construction: bool,
 ) -> tuple[dict[str, Any], bytes, dict[str, str]]:
-    """Build one exact outer request plus the unchanged legacy v1 inner request."""
-    basis, basis_pin, plan, plan_pin = _validated_plan_context(
+    context_validator = (_validated_prepared_input_construction_plan_context
+                         if construction else _validated_plan_context)
+    window_validator = (validate_prepared_input_construction_read_window_v1
+                        if construction else
+                        validate_recorded_preparation_read_window_v2)
+    schemas = _plan_schema_set(construction=construction)
+    basis, basis_pin, plan, plan_pin = context_validator(
         basis_value, basis_pin_value, plan_value, plan_pin_value,
     )
     ordinal = _uint(read_ordinal, "recorded-preparation request ordinal",
                     maximum=READ_WINDOW_COUNT - 1)
-    row = validate_recorded_preparation_read_window_v2(
-        plan, plan_pin, window_chunk_value, ordinal,
-    )
+    row = window_validator(plan, plan_pin, window_chunk_value, ordinal)
     outer_row = {
         **row,
         "legacy_request": _legacy_request_for_plan_row(plan, row),
@@ -2471,7 +3147,7 @@ def build_recorded_preparation_read_request_v2(
     body = _outer_request(
         basis_pin, plan_pin, plan["session_nonce"],
         plan["consumer_host_id"], plan["operation_kind"], ordinal,
-        outer_row, request_sha256="",
+        outer_row, request_sha256="", schema=schemas["request"],
     )
     request = _seal(body, "request_sha256")
     raw = canonical_bytes(request)
@@ -2487,15 +3163,39 @@ def build_recorded_preparation_read_request_v2(
     return request, raw, pin
 
 
-def validate_recorded_preparation_read_request_v2(
-    raw: object,
-    basis_value: object,
-    basis_pin_value: object,
-    plan_value: object,
-    plan_pin_value: object,
+def build_recorded_preparation_read_request_v2(
+    basis_value: object, basis_pin_value: object,
+    plan_value: object, plan_pin_value: object, read_ordinal: object,
     window_chunk_value: object,
+) -> tuple[dict[str, Any], bytes, dict[str, str]]:
+    return _build_preparation_read_request_common(
+        basis_value, basis_pin_value, plan_value, plan_pin_value,
+        read_ordinal, window_chunk_value, construction=False,
+    )
+
+
+def build_prepared_input_construction_read_request_v1(
+    basis_value: object, basis_pin_value: object,
+    plan_value: object, plan_pin_value: object, read_ordinal: object,
+    window_chunk_value: object,
+) -> tuple[dict[str, Any], bytes, dict[str, str]]:
+    return _build_preparation_read_request_common(
+        basis_value, basis_pin_value, plan_value, plan_pin_value,
+        read_ordinal, window_chunk_value, construction=True,
+    )
+
+
+def _validate_preparation_read_request_common(
+    raw: object, basis_value: object, basis_pin_value: object,
+    plan_value: object, plan_pin_value: object, window_chunk_value: object,
+    *, construction: bool,
 ) -> dict[str, Any]:
-    """Validate the exact outer request against one recomputed plan row."""
+    context_validator = (_validated_prepared_input_construction_plan_context
+                         if construction else _validated_plan_context)
+    window_validator = (validate_prepared_input_construction_read_window_v1
+                        if construction else
+                        validate_recorded_preparation_read_window_v2)
+    schemas = _plan_schema_set(construction=construction)
     _require(type(raw) is bytes and 0 < len(raw) <= MAX_METADATA_BYTES,
              "recorded-preparation request is outside its metadata ceiling")
     try:
@@ -2510,23 +3210,21 @@ def validate_recorded_preparation_read_request_v2(
         "read_ordinal", "job_index", "job_sha256", "object_manifest_pin",
         "legacy_request", "request_sha256",
     }, "recorded-preparation request")
-    basis, basis_pin, plan, plan_pin = _validated_plan_context(
+    basis, basis_pin, plan, plan_pin = context_validator(
         basis_value, basis_pin_value, plan_value, plan_pin_value,
     )
     ordinal = _uint(request["read_ordinal"],
                     "recorded-preparation request ordinal",
                     maximum=READ_WINDOW_COUNT - 1)
     _require(raw == canonical_bytes(request) and
-             request["schema"] == REQUEST_SCHEMA_V2 and
+             request["schema"] == schemas["request"] and
              request["basis_pin"] == basis_pin and
              request["read_plan_pin"] == plan_pin and
              request["session_nonce"] == plan["session_nonce"] and
              request["consumer_host_id"] == basis["consumer_host_id"] and
              request["operation_kind"] == basis["operation_kind"],
              "recorded-preparation request outer identity or raw encoding differs")
-    row = validate_recorded_preparation_read_window_v2(
-        plan, plan_pin, window_chunk_value, ordinal,
-    )
+    row = window_validator(plan, plan_pin, window_chunk_value, ordinal)
     _require(request["owner_host_id"] == row["owner_host_id"] and
              request["job_index"] == row["job_index"] and
              request["job_sha256"] == row["job_sha256"] and
@@ -2542,6 +3240,26 @@ def validate_recorded_preparation_read_request_v2(
     _require(len(raw) <= row["resource_bounds"]["outer_request_bytes"],
              "recorded-preparation request exceeds its exact planned bound")
     return request
+
+
+def validate_recorded_preparation_read_request_v2(
+    raw: object, basis_value: object, basis_pin_value: object,
+    plan_value: object, plan_pin_value: object, window_chunk_value: object,
+) -> dict[str, Any]:
+    return _validate_preparation_read_request_common(
+        raw, basis_value, basis_pin_value, plan_value, plan_pin_value,
+        window_chunk_value, construction=False,
+    )
+
+
+def validate_prepared_input_construction_read_request_v1(
+    raw: object, basis_value: object, basis_pin_value: object,
+    plan_value: object, plan_pin_value: object, window_chunk_value: object,
+) -> dict[str, Any]:
+    return _validate_preparation_read_request_common(
+        raw, basis_value, basis_pin_value, plan_value, plan_pin_value,
+        window_chunk_value, construction=True,
+    )
 
 
 def _validate_legacy_response_for_request(
@@ -2585,7 +3303,7 @@ def _validate_legacy_response_for_request(
     return response
 
 
-def build_recorded_preparation_read_response_v2(
+def _build_preparation_read_response_common(
     request_raw: object,
     legacy_response_value: object,
     legacy_response_raw: object,
@@ -2594,20 +3312,29 @@ def build_recorded_preparation_read_response_v2(
     plan_value: object,
     plan_pin_value: object,
     window_chunk_value: object,
+    *, construction: bool,
 ) -> tuple[dict[str, Any], bytes, dict[str, str]]:
-    """Wrap an actual unchanged legacy response in the nonce-bound v1 envelope."""
-    request = validate_recorded_preparation_read_request_v2(
+    request_validator = (validate_prepared_input_construction_read_request_v1
+                         if construction else
+                         validate_recorded_preparation_read_request_v2)
+    context_validator = (_validated_prepared_input_construction_plan_context
+                         if construction else _validated_plan_context)
+    window_validator = (validate_prepared_input_construction_read_window_v1
+                        if construction else
+                        validate_recorded_preparation_read_window_v2)
+    schemas = _plan_schema_set(construction=construction)
+    request = request_validator(
         request_raw, basis_value, basis_pin_value, plan_value, plan_pin_value,
         window_chunk_value,
     )
-    basis, basis_pin, plan, plan_pin = _validated_plan_context(
+    basis, basis_pin, plan, plan_pin = context_validator(
         basis_value, basis_pin_value, plan_value, plan_pin_value,
     )
     _require(type(legacy_response_raw) is bytes and
              0 < len(legacy_response_raw) <= MAX_METADATA_BYTES and
              legacy_response_raw == canonical_bytes(legacy_response_value),
              "legacy response raw bytes differ from their canonical document")
-    row = validate_recorded_preparation_read_window_v2(
+    row = window_validator(
         plan, plan_pin, window_chunk_value, request["read_ordinal"],
     )
     legacy_response = _validate_legacy_response_for_request(
@@ -2622,7 +3349,7 @@ def build_recorded_preparation_read_response_v2(
         basis_pin, plan_pin, plan["session_nonce"],
         basis["consumer_host_id"], basis["operation_kind"],
         request["read_ordinal"], outer_request_pin,
-        legacy_response, response_sha256="",
+        legacy_response, response_sha256="", schema=schemas["response"],
     )
     response = _seal(outer, "response_sha256")
     raw = canonical_bytes(response)
@@ -2637,7 +3364,33 @@ def build_recorded_preparation_read_response_v2(
     return response, raw, pin
 
 
-def validate_recorded_preparation_read_response_v2(
+def build_recorded_preparation_read_response_v2(
+    request_raw: object, legacy_response_value: object,
+    legacy_response_raw: object, basis_value: object,
+    basis_pin_value: object, plan_value: object,
+    plan_pin_value: object, window_chunk_value: object,
+) -> tuple[dict[str, Any], bytes, dict[str, str]]:
+    return _build_preparation_read_response_common(
+        request_raw, legacy_response_value, legacy_response_raw,
+        basis_value, basis_pin_value, plan_value, plan_pin_value,
+        window_chunk_value, construction=False,
+    )
+
+
+def build_prepared_input_construction_read_response_v1(
+    request_raw: object, legacy_response_value: object,
+    legacy_response_raw: object, basis_value: object,
+    basis_pin_value: object, plan_value: object,
+    plan_pin_value: object, window_chunk_value: object,
+) -> tuple[dict[str, Any], bytes, dict[str, str]]:
+    return _build_preparation_read_response_common(
+        request_raw, legacy_response_value, legacy_response_raw,
+        basis_value, basis_pin_value, plan_value, plan_pin_value,
+        window_chunk_value, construction=True,
+    )
+
+
+def _validate_preparation_read_response_common(
     response_raw: object,
     request_raw: object,
     basis_value: object,
@@ -2645,9 +3398,18 @@ def validate_recorded_preparation_read_response_v2(
     plan_value: object,
     plan_pin_value: object,
     window_chunk_value: object,
+    *, construction: bool,
 ) -> dict[str, Any]:
-    """Validate both response layers and their exact request/plan identities."""
-    request = validate_recorded_preparation_read_request_v2(
+    request_validator = (validate_prepared_input_construction_read_request_v1
+                         if construction else
+                         validate_recorded_preparation_read_request_v2)
+    context_validator = (_validated_prepared_input_construction_plan_context
+                         if construction else _validated_plan_context)
+    window_validator = (validate_prepared_input_construction_read_window_v1
+                        if construction else
+                        validate_recorded_preparation_read_window_v2)
+    schemas = _plan_schema_set(construction=construction)
+    request = request_validator(
         request_raw, basis_value, basis_pin_value, plan_value, plan_pin_value,
         window_chunk_value,
     )
@@ -2665,17 +3427,15 @@ def validate_recorded_preparation_read_response_v2(
         "consumer_host_id", "owner_host_id", "operation_kind",
         "read_ordinal", "request_pin", "legacy_response", "response_sha256",
     }, "recorded-preparation response")
-    basis, basis_pin, plan, plan_pin = _validated_plan_context(
+    basis, basis_pin, plan, plan_pin = context_validator(
         basis_value, basis_pin_value, plan_value, plan_pin_value,
     )
     ordinal = request["read_ordinal"]
-    row = validate_recorded_preparation_read_window_v2(
-        plan, plan_pin, window_chunk_value, ordinal,
-    )
+    row = window_validator(plan, plan_pin, window_chunk_value, ordinal)
     request_pin = _pin3(response["request_pin"],
                         "recorded-preparation response request pin")
     _require(response_raw == canonical_bytes(response) and
-             response["schema"] == RESPONSE_SCHEMA_V2 and
+              response["schema"] == schemas["response"] and
              response["basis_pin"] == basis_pin and
              response["read_plan_pin"] == plan_pin and
              response["session_nonce"] == plan["session_nonce"] and
@@ -2702,14 +3462,47 @@ def validate_recorded_preparation_read_response_v2(
     return response
 
 
-def build_recorded_preparation_read_control_event_v2(
+def validate_recorded_preparation_read_response_v2(
+    response_raw: object, request_raw: object,
+    basis_value: object, basis_pin_value: object,
+    plan_value: object, plan_pin_value: object,
+    window_chunk_value: object,
+) -> dict[str, Any]:
+    return _validate_preparation_read_response_common(
+        response_raw, request_raw, basis_value, basis_pin_value,
+        plan_value, plan_pin_value, window_chunk_value,
+        construction=False,
+    )
+
+
+def validate_prepared_input_construction_read_response_v1(
+    response_raw: object, request_raw: object,
+    basis_value: object, basis_pin_value: object,
+    plan_value: object, plan_pin_value: object,
+    window_chunk_value: object,
+) -> dict[str, Any]:
+    return _validate_preparation_read_response_common(
+        response_raw, request_raw, basis_value, basis_pin_value,
+        plan_value, plan_pin_value, window_chunk_value,
+        construction=True,
+    )
+
+
+def _build_preparation_read_control_event_common(
     plan_value: object, plan_pin_value: object, read_ordinal: object,
     window_chunk_value: object,
     action: object, *, request_pin: object,
     response_pin: object = None, bundle_pin: object = None,
+    construction: bool,
 ) -> dict[str, Any]:
     """Project one scheduled control event; it is not an admission fact."""
-    plan = _validate_plan_self(plan_value)
+    plan_validator = (_validate_prepared_input_construction_plan_self
+                      if construction else _validate_plan_self)
+    window_validator = (validate_prepared_input_construction_read_window_v1
+                        if construction else
+                        validate_recorded_preparation_read_window_v2)
+    schemas = _plan_schema_set(construction=construction)
+    plan = plan_validator(plan_value)
     plan_pin = _pin3(plan_pin_value, "recorded-preparation control plan pin")
     _require(plan_pin["path"] == plan["session_paths"]["read_plan"] and
              plan_pin["raw_sha256"] == sha256(canonical_bytes(plan)) and
@@ -2717,9 +3510,7 @@ def build_recorded_preparation_read_control_event_v2(
              "recorded-preparation control plan pin differs")
     ordinal = _uint(read_ordinal, "recorded-preparation control ordinal",
                     maximum=READ_WINDOW_COUNT - 1)
-    row = validate_recorded_preparation_read_window_v2(
-        plan, plan_pin, window_chunk_value, ordinal,
-    )
+    row = window_validator(plan, plan_pin, window_chunk_value, ordinal)
     request = _pin3(request_pin, "recorded-preparation control request pin")
     _require(request["path"] == row["session_paths"]["request"],
              "recorded-preparation control request path differs")
@@ -2753,22 +3544,50 @@ def build_recorded_preparation_read_control_event_v2(
     return _control_event_value(
         row, plan["basis_pin"], plan_pin, plan["session_nonce"],
         action, sequence, request_pin=request,
-        response_pin=response, bundle_pin=bundle,
+        response_pin=response, bundle_pin=bundle, schema=schemas["control"],
     )
 
 
-def build_recorded_preparation_read_session_descriptor_v2(
+def build_recorded_preparation_read_control_event_v2(
+    plan_value: object, plan_pin_value: object, read_ordinal: object,
+    window_chunk_value: object, action: object, *, request_pin: object,
+    response_pin: object = None, bundle_pin: object = None,
+) -> dict[str, Any]:
+    return _build_preparation_read_control_event_common(
+        plan_value, plan_pin_value, read_ordinal, window_chunk_value,
+        action, request_pin=request_pin, response_pin=response_pin,
+        bundle_pin=bundle_pin, construction=False,
+    )
+
+
+def build_prepared_input_construction_read_control_event_v1(
+    plan_value: object, plan_pin_value: object, read_ordinal: object,
+    window_chunk_value: object, action: object, *, request_pin: object,
+    response_pin: object = None, bundle_pin: object = None,
+) -> dict[str, Any]:
+    return _build_preparation_read_control_event_common(
+        plan_value, plan_pin_value, read_ordinal, window_chunk_value,
+        action, request_pin=request_pin, response_pin=response_pin,
+        bundle_pin=bundle_pin, construction=True,
+    )
+
+
+def _build_preparation_read_session_descriptor_common(
     plan_value: object, plan_pin_value: object,
+    *, construction: bool,
 ) -> tuple[dict[str, Any], bytes, dict[str, str]]:
     """Serialize plan pins for Root transport; the descriptor is not a capability."""
-    plan = _validate_plan_self(plan_value)
+    plan_validator = (_validate_prepared_input_construction_plan_self
+                      if construction else _validate_plan_self)
+    schemas = _plan_schema_set(construction=construction)
+    plan = plan_validator(plan_value)
     plan_pin = _pin3(plan_pin_value, "recorded-preparation session plan pin")
     _require(plan_pin["path"] == plan["session_paths"]["read_plan"] and
              plan_pin["raw_sha256"] == sha256(canonical_bytes(plan)) and
              plan_pin["semantic_sha256"] == plan["read_plan_sha256"],
              "recorded-preparation session descriptor plan pin differs")
     descriptor = _seal({
-        "schema": SESSION_DESCRIPTOR_SCHEMA_V2,
+        "schema": schemas["session"],
         "basis_pin": plan["basis_pin"],
         "read_plan_pin": plan_pin,
         "session_nonce": plan["session_nonce"],
@@ -2789,7 +3608,23 @@ def build_recorded_preparation_read_session_descriptor_v2(
     return descriptor, raw, pin
 
 
-def project_recorded_preparation_payload_view_v2(
+def build_recorded_preparation_read_session_descriptor_v2(
+    plan_value: object, plan_pin_value: object,
+) -> tuple[dict[str, Any], bytes, dict[str, str]]:
+    return _build_preparation_read_session_descriptor_common(
+        plan_value, plan_pin_value, construction=False,
+    )
+
+
+def build_prepared_input_construction_read_session_descriptor_v1(
+    plan_value: object, plan_pin_value: object,
+) -> tuple[dict[str, Any], bytes, dict[str, str]]:
+    return _build_preparation_read_session_descriptor_common(
+        plan_value, plan_pin_value, construction=True,
+    )
+
+
+def _project_preparation_payload_view_common(
     plan_value: object,
     plan_pin_value: object,
     read_ordinal: object,
@@ -2800,6 +3635,7 @@ def project_recorded_preparation_payload_view_v2(
     bundle_pin: object,
     stage_root: object,
     refs_by_origin: object,
+    construction: bool,
 ) -> dict[str, Any]:
     """Project validated SourceH refs into an exact data-only payload-view DTO.
 
@@ -2807,7 +3643,13 @@ def project_recorded_preparation_payload_view_v2(
     and cleanup checks before using this projection. This function checks only
     schema and plan joins and conveys no proof that those checks occurred.
     """
-    plan = _validate_plan_self(plan_value)
+    plan_validator = (_validate_prepared_input_construction_plan_self
+                      if construction else _validate_plan_self)
+    window_validator = (validate_prepared_input_construction_read_window_v1
+                        if construction else
+                        validate_recorded_preparation_read_window_v2)
+    schemas = _plan_schema_set(construction=construction)
+    plan = plan_validator(plan_value)
     plan_pin = _pin3(plan_pin_value, "recorded-preparation payload-view plan pin")
     _require(plan_pin["path"] == plan["session_paths"]["read_plan"] and
              plan_pin["raw_sha256"] == sha256(canonical_bytes(plan)) and
@@ -2815,9 +3657,7 @@ def project_recorded_preparation_payload_view_v2(
              "recorded-preparation payload-view plan pin differs")
     ordinal = _uint(read_ordinal, "recorded-preparation payload-view ordinal",
                     maximum=READ_WINDOW_COUNT - 1)
-    row = validate_recorded_preparation_read_window_v2(
-        plan, plan_pin, window_chunk_value, ordinal,
-    )
+    row = window_validator(plan, plan_pin, window_chunk_value, ordinal)
     request_pin = _pin3(outer_request_pin,
                         "recorded-preparation payload-view outer request pin")
     response_pin = _pin3(outer_response_pin,
@@ -2866,7 +3706,7 @@ def project_recorded_preparation_payload_view_v2(
     _require(payload_bytes == row["resource_bounds"]["payload_bytes"],
              "recorded-preparation payload-view byte total differs")
     view_body = {
-        "schema": PAYLOAD_VIEW_SCHEMA_V2,
+        "schema": schemas["payload_view"],
         "basis_pin": plan["basis_pin"],
         "read_plan_pin": plan_pin,
         "session_nonce": plan["session_nonce"],
@@ -2888,11 +3728,50 @@ def project_recorded_preparation_payload_view_v2(
     return _seal(view_body, "payload_view_sha256")
 
 
-def validate_recorded_preparation_payload_view_v2(
+def project_recorded_preparation_payload_view_v2(
+    plan_value: object, plan_pin_value: object, read_ordinal: object,
+    window_chunk_value: object, *, outer_request_pin: object,
+    outer_response_pin: object, bundle_pin: object, stage_root: object,
+    refs_by_origin: object,
+) -> dict[str, Any]:
+    return _project_preparation_payload_view_common(
+        plan_value, plan_pin_value, read_ordinal, window_chunk_value,
+        outer_request_pin=outer_request_pin,
+        outer_response_pin=outer_response_pin, bundle_pin=bundle_pin,
+        stage_root=stage_root, refs_by_origin=refs_by_origin,
+        construction=False,
+    )
+
+
+def project_prepared_input_construction_payload_view_v1(
+    plan_value: object, plan_pin_value: object, read_ordinal: object,
+    window_chunk_value: object, *, outer_request_pin: object,
+    outer_response_pin: object, bundle_pin: object, stage_root: object,
+    refs_by_origin: object,
+) -> dict[str, Any]:
+    return _project_preparation_payload_view_common(
+        plan_value, plan_pin_value, read_ordinal, window_chunk_value,
+        outer_request_pin=outer_request_pin,
+        outer_response_pin=outer_response_pin, bundle_pin=bundle_pin,
+        stage_root=stage_root, refs_by_origin=refs_by_origin,
+        construction=True,
+    )
+
+
+def _validate_preparation_payload_view_common(
     value: object, plan_value: object, plan_pin_value: object,
-    window_chunk_value: object,
+    window_chunk_value: object, *, construction: bool,
 ) -> dict[str, Any]:
     """Validate only the closed payload-view schema and plan identity."""
+    plan_validator = (_validate_prepared_input_construction_plan_self
+                      if construction else _validate_plan_self)
+    window_validator = (validate_prepared_input_construction_read_window_v1
+                        if construction else
+                        validate_recorded_preparation_read_window_v2)
+    projector = (project_prepared_input_construction_payload_view_v1
+                 if construction else
+                 project_recorded_preparation_payload_view_v2)
+    schemas = _plan_schema_set(construction=construction)
     view = _exact(value, {
         "schema", "basis_pin", "read_plan_pin", "session_nonce",
         "consumer_host_id", "owner_host_id", "operation_kind",
@@ -2900,14 +3779,12 @@ def validate_recorded_preparation_payload_view_v2(
         "outer_request_pin", "outer_response_pin", "bundle_pin",
         "stage_root", "objects", "payload_bytes", "payload_view_sha256",
     }, "recorded-preparation payload view")
-    plan = _validate_plan_self(plan_value)
+    plan = plan_validator(plan_value)
     plan_pin = _pin3(plan_pin_value, "payload-view read-plan pin")
     ordinal = _uint(view["read_ordinal"], "payload-view ordinal",
                     maximum=READ_WINDOW_COUNT - 1)
-    row = validate_recorded_preparation_read_window_v2(
-        plan, plan_pin, window_chunk_value, ordinal,
-    )
-    _require(view["schema"] == PAYLOAD_VIEW_SCHEMA_V2 and
+    row = window_validator(plan, plan_pin, window_chunk_value, ordinal)
+    _require(view["schema"] == schemas["payload_view"] and
              view["basis_pin"] == plan["basis_pin"] and
              view["read_plan_pin"] == plan_pin and
              view["session_nonce"] == plan["session_nonce"] and
@@ -2935,7 +3812,7 @@ def validate_recorded_preparation_payload_view_v2(
                  ref["origin_path"] not in refs,
                  f"recorded-preparation payload-view ref[{index}] repeats an origin")
         refs[ref["origin_path"]] = ref
-    rebuilt = project_recorded_preparation_payload_view_v2(
+    rebuilt = projector(
         plan, plan_pin, ordinal, window_chunk_value,
         outer_request_pin=view["outer_request_pin"],
         outer_response_pin=view["outer_response_pin"],
@@ -2945,3 +3822,23 @@ def validate_recorded_preparation_payload_view_v2(
     _require(canonical_bytes(view) == canonical_bytes(rebuilt),
              "recorded-preparation payload-view differs from its exact plan projection")
     return view
+
+
+def validate_recorded_preparation_payload_view_v2(
+    value: object, plan_value: object, plan_pin_value: object,
+    window_chunk_value: object,
+) -> dict[str, Any]:
+    return _validate_preparation_payload_view_common(
+        value, plan_value, plan_pin_value, window_chunk_value,
+        construction=False,
+    )
+
+
+def validate_prepared_input_construction_payload_view_v1(
+    value: object, plan_value: object, plan_pin_value: object,
+    window_chunk_value: object,
+) -> dict[str, Any]:
+    return _validate_preparation_payload_view_common(
+        value, plan_value, plan_pin_value, window_chunk_value,
+        construction=True,
+    )
