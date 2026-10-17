@@ -1000,7 +1000,7 @@ class Source5OwnedWidthProfileContracts(unittest.TestCase):
             "output_path.is_relative_to(identity['roots']['artifact_root'])",
             profile,
         )
-        load = ast.unparse(module_function(self.tree, "load_context"))
+        load = ast.unparse(module_function(self.tree, "_load_context_impl"))
         self.assertIn("profile_path.is_relative_to(input_root)", load)
         self.assertIn("_source5_width_require_current_input_control(", load)
         self.assertIn(
@@ -1250,7 +1250,7 @@ class Source5OwnedWidthProfileContracts(unittest.TestCase):
         self.assertEqual(ast.unparse(self.tree.body[-1].test), "__name__ == '__main__'")
 
     def test_v5_load_keeps_structural_completion_out_of_replay_field(self) -> None:
-        load = module_function(self.tree, "load_context")
+        load = module_function(self.tree, "_load_context_impl")
         calls = {
             node.func.id if isinstance(node.func, ast.Name) else
             ast.unparse(node.func)

@@ -73,11 +73,152 @@ def load_script(path: Path, name: str):
     if spec is None:
         raise RuntimeError(f"cannot load native chronology fixture {path}")
     module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
+    previous = sys.modules.get(name)
+    sys.modules[name] = module
+    try:
+        loader.exec_module(module)
+    except BaseException:
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+        raise
     return module
 
 
 capacity_fixtures = load_script(CAPACITY_TEST_PATH, "campaign_chronology_capacity_fixtures")
+
+
+_SOURCEA_SHARED_H6_PLAN_FIXTURE = None
+_SOURCEA_SHARED_H6_PLAN_FIXTURE_USERS = 0
+_SOURCEA_SHARED_H6_PLAN_FIXTURE_SETUP_COUNT = 0
+_SOURCEA_SHARED_H6_PLAN_FIXTURE_TEARDOWN_COUNT = 0
+_SOURCEA_SHARED_H6_PLAN_FIXTURE_FIELDS = (
+    "basis", "basis_pin", "hosts", "consumer", "provenance", "proofs",
+    "catalogues", "readback_caps", "windows", "scratch", "timeouts",
+)
+_SOURCEA_SHARED_H6_FIXTURE_LIFECYCLE = {
+    "setup_calls": 0,
+    "teardown_calls": 0,
+    "resource_paths": (),
+    "setup_paths_present": (),
+    "teardown_paths_present": (),
+    "teardown_paths_absent": (),
+    "module": None,
+    "cleanup_registered": False,
+}
+
+
+def _sourcea_assert_h6_fixture_lifecycle_completed() -> None:
+    lifecycle = _SOURCEA_SHARED_H6_FIXTURE_LIFECYCLE
+    paths = lifecycle["resource_paths"]
+    if not lifecycle["cleanup_registered"]:
+        raise AssertionError("SourceA H6 module cleanup observer was not registered")
+    if lifecycle["setup_calls"] != 1 or lifecycle["setup_paths_present"] != (True, True):
+        raise AssertionError("the actual shared H6 setup did not create both fixture roots once")
+    if lifecycle["teardown_calls"] != 1:
+        raise AssertionError("the actual shared H6 teardown was not called exactly once")
+    if lifecycle["teardown_paths_present"] != (True, True):
+        raise AssertionError("the real H6 fixture roots were not alive before shared teardown")
+    if lifecycle["teardown_paths_absent"] != (True, True):
+        raise AssertionError("the real H6 fixture teardown did not remove both temporary roots")
+    if len(paths) != 2 or any(path.exists() for path in paths):
+        raise AssertionError("an actual H6 fixture temporary root survived module cleanup")
+    if _SOURCEA_SHARED_H6_PLAN_FIXTURE is not None or \
+            _SOURCEA_SHARED_H6_PLAN_FIXTURE_USERS != 0:
+        raise AssertionError("the shared H6 fixture retained consumers after module cleanup")
+    fixture_module = lifecycle["module"]
+    if fixture_module is None or sys.modules.get(fixture_module.__name__) is not fixture_module:
+        raise AssertionError("the actual H6 fixture module lost normal registry identity")
+
+
+def _sourcea_h6_plan_fixture_copy():
+    """Create one actual H6 fixture base and give each consumer private DTO copies."""
+    global _SOURCEA_SHARED_H6_PLAN_FIXTURE
+    global _SOURCEA_SHARED_H6_PLAN_FIXTURE_USERS
+    global _SOURCEA_SHARED_H6_PLAN_FIXTURE_SETUP_COUNT
+    if _SOURCEA_SHARED_H6_PLAN_FIXTURE is None:
+        fixture_module = load_script(
+            SCRIPT_DIR / "test-application-source5-recorded-preparation-read.py",
+            "sourcea_c2r6_shared_h6_plan_fixture",
+        )
+        fixture_class = fixture_module.ActualH6RecordedReadPlanTests
+        real_set_up_class = fixture_class.setUpClass
+        real_tear_down_class = fixture_class.tearDownClass
+
+        def _observed_set_up_class(cls):
+            if cls is not fixture_class:
+                raise AssertionError("unexpected class used for the shared H6 setup")
+            lifecycle = _SOURCEA_SHARED_H6_FIXTURE_LIFECYCLE
+            lifecycle["setup_calls"] += 1
+            result = real_set_up_class()
+            roots = (
+                Path(cls.temporary.name),
+                Path(cls.source_fixture_class._temporary.name),
+            )
+            lifecycle["resource_paths"] = roots
+            lifecycle["setup_paths_present"] = tuple(path.is_dir() for path in roots)
+            lifecycle["module"] = fixture_module
+            return result
+
+        def _observed_tear_down_class(cls):
+            if cls is not fixture_class:
+                raise AssertionError("unexpected class used for the shared H6 teardown")
+            lifecycle = _SOURCEA_SHARED_H6_FIXTURE_LIFECYCLE
+            lifecycle["teardown_calls"] += 1
+            roots = lifecycle["resource_paths"]
+            lifecycle["teardown_paths_present"] = tuple(path.is_dir() for path in roots)
+            try:
+                return real_tear_down_class()
+            finally:
+                lifecycle["teardown_paths_absent"] = tuple(
+                    not path.exists() for path in roots
+                )
+
+        fixture_class.setUpClass = classmethod(_observed_set_up_class)
+        fixture_class.tearDownClass = classmethod(_observed_tear_down_class)
+        fixture_class.setUpClass()
+        _SOURCEA_SHARED_H6_PLAN_FIXTURE = (fixture_module, fixture_class)
+        _SOURCEA_SHARED_H6_PLAN_FIXTURE_SETUP_COUNT += 1
+        unittest.addModuleCleanup(_sourcea_assert_h6_fixture_lifecycle_completed)
+        _SOURCEA_SHARED_H6_FIXTURE_LIFECYCLE["cleanup_registered"] = True
+    fixture_module, fixture_class = _SOURCEA_SHARED_H6_PLAN_FIXTURE
+    copied = {
+        name: copy.deepcopy(getattr(fixture_class, name))
+        for name in _SOURCEA_SHARED_H6_PLAN_FIXTURE_FIELDS
+    }
+    _SOURCEA_SHARED_H6_PLAN_FIXTURE_USERS += 1
+    return fixture_module, types.SimpleNamespace(**copied)
+
+
+def _sourcea_h6_plan_fixture_release() -> None:
+    global _SOURCEA_SHARED_H6_PLAN_FIXTURE_USERS
+    if _SOURCEA_SHARED_H6_PLAN_FIXTURE_USERS <= 0:
+        raise AssertionError("SourceA H6 shared fixture consumer underflow")
+    _SOURCEA_SHARED_H6_PLAN_FIXTURE_USERS -= 1
+
+
+def tearDownModule() -> None:
+    """Close the one shared generated H6 fixture after every consumer ends."""
+    global _SOURCEA_SHARED_H6_PLAN_FIXTURE
+    global _SOURCEA_SHARED_H6_PLAN_FIXTURE_TEARDOWN_COUNT
+    fixture = _SOURCEA_SHARED_H6_PLAN_FIXTURE
+    if fixture is None:
+        return
+    fixture_module, fixture_class = fixture
+    outstanding_users = _SOURCEA_SHARED_H6_PLAN_FIXTURE_USERS
+    try:
+        fixture_class.tearDownClass()
+    finally:
+        _SOURCEA_SHARED_H6_PLAN_FIXTURE = None
+        _SOURCEA_SHARED_H6_PLAN_FIXTURE_TEARDOWN_COUNT += 1
+    if outstanding_users != 0:
+        raise AssertionError("SourceA H6 shared fixture was closed with active consumers")
+    if _SOURCEA_SHARED_H6_PLAN_FIXTURE_SETUP_COUNT != 1 or \
+            _SOURCEA_SHARED_H6_PLAN_FIXTURE_TEARDOWN_COUNT != 1:
+        raise AssertionError("SourceA H6 shared fixture setup/cleanup was not exactly once")
+    if sys.modules.get(fixture_module.__name__) is not fixture_module:
+        raise AssertionError("SourceA H6 fixture module lost normal sys.modules identity")
 
 
 CHRONOLOGY_SITECUSTOMIZE = r"""
@@ -5924,6 +6065,10 @@ class SourceAOwnedRegistrationProfileTests(unittest.TestCase):
             SCRIPT_DIR / "application-campaign-chronology.py",
             "sourcea_owned_registration_profile_tests",
         )
+        cls.archive = load_script(
+            SCRIPT_DIR / "application-source5-evidence-archive.py",
+            "sourcea_owned_registration_selected_archive",
+        )
 
     def _profile_fixture(self):
         c = self.chronology
@@ -6053,15 +6198,46 @@ class SourceAOwnedRegistrationProfileTests(unittest.TestCase):
         self.assertNotIn("captured_pilot_read_providers", parameters)
 
 
-    def test_owned_plan_builder_reuses_the_source_v2_structural_fixture(self) -> None:
-        fixture_module = load_script(
-            SCRIPT_DIR / "test-application-source5-recorded-preparation-read.py",
-            "sourcea_owned_registration_real_v2_plan_fixture",
-        )
-        fixture_class = fixture_module.ActualH6RecordedReadPlanTests
-        fixture_class.setUpClass()
+    def test_shared_h6_fixture_is_setup_once_and_returns_independent_dtos(self) -> None:
+        fixture_module, first = _sourcea_h6_plan_fixture_copy()
+        second_module = None
+        third_module = None
+        releases = 1
         try:
-            f = fixture_class
+            second_module, second = _sourcea_h6_plan_fixture_copy()
+            releases += 1
+            third_module, third = _sourcea_h6_plan_fixture_copy()
+            releases += 1
+            self.assertIs(fixture_module, second_module)
+            self.assertIs(fixture_module, third_module)
+            self.assertIs(sys.modules.get(fixture_module.__name__), fixture_module)
+            self.assertEqual(_SOURCEA_SHARED_H6_PLAN_FIXTURE_SETUP_COUNT, 1)
+            self.assertEqual(_SOURCEA_SHARED_H6_PLAN_FIXTURE_TEARDOWN_COUNT, 0)
+            lifecycle = _SOURCEA_SHARED_H6_FIXTURE_LIFECYCLE
+            self.assertEqual(lifecycle["setup_calls"], 1)
+            self.assertEqual(lifecycle["setup_paths_present"], (True, True))
+            self.assertTrue(all(path.is_dir() for path in lifecycle["resource_paths"]))
+            self.assertEqual(lifecycle["teardown_calls"], 0)
+            host = first.hosts[0]
+            self.assertIsNot(first.windows, second.windows)
+            self.assertIsNot(first.windows[host], second.windows[host])
+            self.assertIsNot(first.windows[host][0], second.windows[host][0])
+            first.windows[host][0]["host_id"] = "test-only-mutated-window"
+            first.basis["campaign_id"] = "test-only-mutated-basis"
+            self.assertEqual(second.windows[host][0]["host_id"], host)
+            self.assertNotEqual(second.basis["campaign_id"],
+                                "test-only-mutated-basis")
+            self.assertEqual(third.windows[host][0]["host_id"], host)
+            self.assertNotEqual(third.basis["campaign_id"],
+                                "test-only-mutated-basis")
+            self.assertEqual(_SOURCEA_SHARED_H6_PLAN_FIXTURE_USERS, releases)
+        finally:
+            for _ in range(releases):
+                _sourcea_h6_plan_fixture_release()
+
+    def test_owned_plan_builder_reuses_the_source_v2_structural_fixture(self) -> None:
+        fixture_module, f = _sourcea_h6_plan_fixture_copy()
+        try:
             basis = f.basis
             hosts = list(f.hosts)
             prepared = {
@@ -6080,6 +6256,7 @@ class SourceAOwnedRegistrationProfileTests(unittest.TestCase):
             }
             session = types.SimpleNamespace(
                 plan_module=fixture_module.read_plan,
+                modules={"archive": self.archive},
                 prepared=prepared,
                 hosts=hosts,
                 source_module_pins=copy.deepcopy(basis["source_module_pins"]),
@@ -6095,6 +6272,8 @@ class SourceAOwnedRegistrationProfileTests(unittest.TestCase):
                 },
                 width_pin=copy.deepcopy(basis["width_contract_pin"]),
                 frontier=copy.deepcopy(basis["current_journal_frontier"]),
+                route=self.chronology._Source5OwnedReplayRoute.REGISTRATION,
+                execution_manifest_pin=None, registration_head=None,
             )
             self.chronology._source5_owned_registration_build_plan(
                 session, copy.deepcopy(basis["current_roots"]),
@@ -6132,7 +6311,98 @@ class SourceAOwnedRegistrationProfileTests(unittest.TestCase):
             )
             self.assertEqual(checked, session.plan)
         finally:
-            fixture_class.tearDownClass()
+            _sourcea_h6_plan_fixture_release()
+
+    def test_owned_plan_builder_uses_nonzero_sealed_refresh_frontier(self) -> None:
+        c = self.chronology
+        fixture_module, f = _sourcea_h6_plan_fixture_copy()
+        try:
+            basis = f.basis
+            hosts = list(f.hosts)
+            prepared = {
+                "campaign_id": basis["campaign_id"],
+                "host_id": f.consumer,
+                "original_pins": {
+                    "spec": copy.deepcopy(basis["spec_pin"]),
+                    "plan": copy.deepcopy(basis["plan_pin"]),
+                    "source_manifests": [
+                        {"host_id": host, **copy.deepcopy(
+                            basis["source_manifest_pins"][host],
+                        )}
+                        for host in hosts
+                    ],
+                },
+            }
+            with tempfile.TemporaryDirectory(prefix="sourcea-refresh-basis-") as temporary:
+                registration_head = c.sha256_bytes(b"registration-head-fixture")
+                manifest_body = {
+                    "schema": c.SOURCE5_EXECUTION_SCHEMA_V5,
+                    "scope": "bounded-pure-plan-fixture",
+                    "registration_head": registration_head,
+                }
+                manifest_sha = c.sha256_bytes(c.canonical_bytes(manifest_body))
+                manifest = {**manifest_body, "manifest_sha256": manifest_sha}
+                manifest_raw = c.canonical_bytes(manifest)
+                manifest_path = Path(temporary) / "execution-manifest.json"
+                manifest_path.write_bytes(manifest_raw)
+                manifest_path.chmod(0o600)
+                manifest_pin = {
+                    "path": str(manifest_path),
+                    "raw_sha256": c.sha256_bytes(manifest_raw),
+                    "semantic_sha256": manifest_sha,
+                }
+                self.assertLessEqual(len(manifest_raw), c.MAX_PLAN_BYTES)
+                self.assertEqual(c.sha256_bytes(manifest_path.read_bytes()),
+                                 manifest_pin["raw_sha256"])
+                frontier = {
+                    "head_sha256": c.sha256_bytes(b"actual-current-frontier-fixture"),
+                    "record_count": 2,
+                }
+                self.assertEqual(manifest["registration_head"], registration_head)
+                session = types.SimpleNamespace(
+                    plan_module=fixture_module.read_plan,
+                    modules={"archive": self.archive},
+                    prepared=prepared,
+                    hosts=hosts,
+                    source_module_pins=copy.deepcopy(basis["source_module_pins"]),
+                    completion_pin=copy.deepcopy(
+                        basis["prepared_input_generation"]["completion_pin"],
+                    ),
+                    provenance=copy.deepcopy(f.provenance),
+                    lineage_proofs=f.proofs,
+                    profile={
+                        "metadata_capture_manifest_pin": copy.deepcopy(
+                            basis["metadata_capture_manifest_pin"],
+                        ),
+                    },
+                    width_pin=copy.deepcopy(basis["width_contract_pin"]),
+                    frontier=frontier,
+                    route=c._Source5OwnedReplayRoute.SEALED_REFRESH,
+                    execution_manifest_pin=manifest_pin,
+                    registration_head=registration_head,
+                )
+                c._source5_owned_registration_build_plan(
+                    session, copy.deepcopy(basis["current_roots"]),
+                    f.catalogues, f.readback_caps, f.windows, f.scratch, f.timeouts,
+                )
+                planner = fixture_module.read_plan
+                self.assertEqual(session.plan["operation_kind"], "refresh_replay")
+                self.assertEqual(session.basis["execution_manifest_pin"], manifest_pin)
+                self.assertEqual(session.basis["registration_head"], registration_head)
+                self.assertEqual(session.basis["current_journal_frontier"], frontier)
+                self.assertRegex(session.plan["session_nonce"], r"^[0-9a-f]{32}$")
+                checked = planner.validate_recorded_preparation_read_plan_v2(
+                    session.plan, session.chunks, session.basis, session.basis_pin,
+                    old_catalogues_by_host=f.catalogues,
+                    old_readback_caps_by_host=f.readback_caps,
+                    window_metadata_by_host=f.windows,
+                    session_nonce=session.plan["session_nonce"],
+                    scratch_declaration=f.scratch,
+                    timeout_declaration=f.timeouts,
+                )
+                self.assertEqual(checked, session.plan)
+        finally:
+            _sourcea_h6_plan_fixture_release()
 
     def test_owned_source_is_top_level_code_and_uses_current_pins(self) -> None:
         source = (SCRIPT_DIR / "application-campaign-chronology.py").read_text()
@@ -6146,10 +6416,20 @@ class SourceAOwnedRegistrationProfileTests(unittest.TestCase):
         self.assertIn(api_name, top_level_functions)
         self.assertTrue(callable(getattr(self.chronology, api_name, None)))
         api_source = ast.get_source_segment(source, top_level_functions[api_name])
+        replay_source = ast.get_source_segment(
+            source, top_level_functions["_source5_owned_input_generation_replay_held"],
+        )
+        append_source = ast.get_source_segment(
+            source, top_level_functions["_source5_owned_registration_append_held"],
+        )
         self.assertIsNotNone(api_source)
-        self.assertIn("verify_prepared_inputs_completion_closed_recorded_v2", api_source)
-        self.assertIn("_source5_recorded_numeric_ancestor_context_held", api_source)
-        self.assertIn("checked_width_pin", api_source)
+        self.assertIsNotNone(replay_source)
+        self.assertIsNotNone(append_source)
+        self.assertIn("_source5_owned_operation_scope_held", api_source)
+        self.assertIn("_source5_owned_input_generation_replay_held", api_source)
+        self.assertIn("verify_prepared_inputs_completion_closed_recorded_v2", replay_source)
+        self.assertIn("_source5_recorded_numeric_ancestor_context_held", replay_source)
+        self.assertIn("checked_width_pin", replay_source)
         provider_class = next(
             node for node in module.body
             if isinstance(node, ast.ClassDef) and
@@ -6173,11 +6453,12 @@ class SourceAOwnedRegistrationProfileTests(unittest.TestCase):
         self.assertIn("capture_reader", api_source)
         self.assertIn("session.h_client", api_source)
         self.assertIn('getattr(session.h_client, "plan_module", None)', api_source)
-        self.assertIn('getattr(capture_reader, "close", None)', api_source)
-        self.assertIn('"registration_record"', api_source)
-        self.assertIn('after_state["registration_head"]', api_source)
-        self.assertIn('after_state["prepared_capacity_registration"]', api_source)
-        self.assertIn("owned-registration-replay-result.v1", api_source)
+        self.assertIn("close_optional_reader(reader)", api_source)
+        self.assertIn("lambda reader=capture_reader", api_source)
+        self.assertIn('"registration_record"', append_source)
+        self.assertIn('after_state["registration_head"]', append_source)
+        self.assertIn('after_state["prepared_capacity_registration"]', append_source)
+        self.assertIn("owned-registration-replay-result.v1", append_source)
         self.assertFalse(any(
             isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
             for node in module.body
@@ -6211,18 +6492,29 @@ class SourceAOwnedRegistrationProfileTests(unittest.TestCase):
         proof_check = ast.get_source_segment(
             source, top_level_functions["_source5_prepared_registration_proof_check"],
         )
-        consume_offset = proof_check.index('session.check_deadline("registration append consume")')
-        consume_source = proof_check[consume_offset:]
-        ledger_offset = consume_source.index("_source5_owned_registration_verify_h_ledger(session)")
-        final_check_offset = consume_source.index(
+        self.assertIn('session.check_deadline("registration append consume")', proof_check)
+        self.assertIn("_source5_owned_registration_verify_h_ledger(session)", proof_check)
+        consume_offset = proof_check.index(
+            "_source5_prepared_registration_finalize_consume(",
+        )
+        state_offset = proof_check.index('entry["state"] = "consumed"')
+        self.assertLess(consume_offset, state_offset)
+        final_guard = ast.get_source_segment(
+            source,
+            top_level_functions["_source5_prepared_registration_finalize_consume"],
+        )
+        input_scan = final_guard.index(
             "_source5_prepared_registration_recheck_inputs_callback_free(",
         )
-        consume_offset = consume_source.index('entry["state"] = "consumed"')
-        self.assertLess(ledger_offset, final_check_offset)
-        clock_offset = consume_source.index("time.monotonic_ns() < session.deadline_ns")
-        self.assertLess(final_check_offset, clock_offset)
-        self.assertLess(clock_offset, consume_offset)
-        self.assertIn("registration append postwrite", api_source)
+        journal_scan = final_guard.index(
+            "_source5_prepared_registration_recheck_empty_frontier_held(",
+        )
+        direct_clock = final_guard.index("time.monotonic_ns() < session.deadline_ns")
+        scope_consume = final_guard.index("_source5_owned_scope_consume_sink(")
+        self.assertLess(input_scan, journal_scan)
+        self.assertLess(journal_scan, direct_clock)
+        self.assertLess(direct_clock, scope_consume)
+        self.assertIn("registration append postwrite", append_source)
 
     def test_last_cancel_callback_mutation_fails_the_final_prewrite_snapshot(self) -> None:
         c = self.chronology
@@ -6357,6 +6649,929 @@ class SourceAOwnedRegistrationProfileTests(unittest.TestCase):
         )
         self.assertLess(owned_api, guard)
         self.assertEqual(source.count('if __name__ == "__main__":'), 1)
+
+
+class SourceAOwnedOperationScopeNegativeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.chronology = load_script(
+            SCRIPT_DIR / "application-campaign-chronology.py",
+            "sourcea_owned_operation_scope_negative_test_target",
+        )
+        cls.archive = load_script(
+            SCRIPT_DIR / "application-source5-evidence-archive.py",
+            "sourcea_owned_operation_scope_selected_archive",
+        )
+
+    def test_source_loader_uses_normal_module_identity_and_failure_restore(self) -> None:
+        c = self.chronology
+        self.assertIs(c._SOURCE5_OWN_MODULE, c)
+        self.assertIs(sys.modules.get(c.__name__), c)
+        module_name = f"_sourcea_loader_lifecycle_{os.getpid()}"
+        previous = sys.modules.get(module_name)
+        try:
+            with tempfile.TemporaryDirectory(prefix="sourcea-loader-lifecycle-") as temporary:
+                root = Path(temporary)
+                successful_path = root / "successful_fixture.py"
+                successful_path.write_text(
+                    "import sys\nOBSERVED_MODULE = sys.modules[__name__]\n",
+                )
+                existing = types.ModuleType(module_name)
+                sys.modules[module_name] = existing
+                loaded = load_script(successful_path, module_name)
+                self.assertIs(sys.modules.get(module_name), loaded)
+                self.assertIs(loaded.OBSERVED_MODULE, loaded)
+                self.assertIsNot(loaded, existing)
+
+                failing_path = root / "failing_fixture.py"
+                failing_path.write_text(
+                    "raise RuntimeError('loader fixture failure')\n",
+                )
+                prior_on_failure = types.ModuleType(module_name)
+                sys.modules[module_name] = prior_on_failure
+                with self.assertRaisesRegex(RuntimeError, "loader fixture failure"):
+                    load_script(failing_path, module_name)
+                self.assertIs(sys.modules.get(module_name), prior_on_failure)
+        finally:
+            if previous is None:
+                sys.modules.pop(module_name, None)
+            else:
+                sys.modules[module_name] = previous
+
+    def _install_test_scope(self):
+        c = self.chronology
+        scope = c._Source5OwnedOperationScope(
+            c._SOURCE5_OWNED_OPERATION_SCOPE_SECRET,
+        )
+        operation_lock = c.threading.Lock()
+        operation_lock.acquire()
+        lock = types.SimpleNamespace(
+            _creator_pid=os.getpid(), _operation_lock=operation_lock,
+        )
+        session = object.__new__(c._Source5PreparedExplorationRegistrationSession)
+        session.lock = lock
+        session.prepared = {
+            "output_root": Path(__file__).resolve().parent,
+            "campaign_id": "scope-negative-fixture",
+            "host_id": "host-a",
+        }
+        session.operation_scope = scope
+        session.frontier = {"head_sha256": "0" * 64, "record_count": 0}
+        session.journal_file_key = None
+        session.route = c._Source5OwnedReplayRoute.REGISTRATION
+        session.execution_manifest_pin = None
+        session.registration_head = None
+        session.archived_authorities = {}
+        session.numeric_context = None
+        session.basis = None
+        session.basis_pin = None
+        session.plan = None
+        session.plan_pin = None
+        session.modules = {}
+        session.h_client = None
+        entry = {
+            "scope": scope, "creator_pid": os.getpid(),
+            "sourcea_module": c._source5_own_chronology_module(),
+            "session": session, "prepared": session.prepared,
+            "lock": lock, "thread_id": c.threading.get_ident(),
+            "route": session.route,
+            "allowed_sinks": c._SOURCE5_OWNED_OPERATION_ROUTE_SINKS[
+                session.route
+            ],
+            "state": c._Source5OwnedScopeState.REPLAYING,
+            "binding": {
+                "deadline_ns": c.time.monotonic_ns() + 60_000_000_000,
+                "allowed_sink_names": tuple(sorted(
+                    sink.name for sink in
+                    c._SOURCE5_OWNED_OPERATION_ROUTE_SINKS[session.route]
+                )),
+            },
+            "frontier": {
+                "head_sha256": "0" * 64, "record_count": 0,
+                "file_stat": None,
+            },
+            "old_owner_binding": None, "plan_binding": None,
+            "h_binding": None,
+        }
+        with c._SOURCE5_OWNED_OPERATION_SCOPE_LOCK:
+            c._SOURCE5_OWNED_OPERATION_SCOPES[scope] = entry
+        return scope, session, entry, operation_lock
+
+    def _remove_test_scope(self, scope, session, entry, operation_lock) -> None:
+        c = self.chronology
+        c._source5_owned_scope_expire(scope, session, entry)
+        if operation_lock.locked():
+            operation_lock.release()
+
+    def test_incomplete_bind_then_mark_fails_as_typed_error_without_gpg_fixture(self) -> None:
+        c = self.chronology
+        scope, session, entry, operation_lock = self._install_test_scope()
+        session.hosts = ["host-a", "host-b"]
+        session.archived_authorities = {}
+        session.numeric_context = None
+        session.failed = False
+        session.closed = False
+        session.active = False
+        session.global_cursor = 719
+        session.provider_cursors = {"host-a": 359, "host-b": 360}
+        session.numeric_replay_count = 719
+        session.verified_completion = None
+        session.completion_value = None
+        try:
+            with patch.object(c, "_source5_owned_scope_require", return_value=entry):
+                # No signed/GPG rows are supplied: binding must reject the incomplete owner DTO.
+                with self.assertRaisesRegex(c.ChronologyError, "fresh two-host GPG ledger"):
+                    c._source5_owned_scope_bind_old_owner_state(scope, session)
+                with self.assertRaisesRegex(c.ChronologyError,
+                                            "no producer-time owner/plan/H bindings"):
+                    c._source5_owned_scope_mark_replay_complete(scope, session)
+                # This minimal incomplete seam has no positive owner/GPG/replay claim.
+                entry["old_owner_binding"] = {
+                    "numeric_binding": {"rows_per_host": [1, 1]},
+                }
+                entry["plan_binding"] = {"window_count": 0}
+                entry["h_binding"] = {}
+                with self.assertRaisesRegex(c.ChronologyError,
+                                            "did not close exactly 720 H3 and Fixed windows"):
+                    c._source5_owned_scope_mark_replay_complete(scope, session)
+            self.assertEqual(entry["state"], c._Source5OwnedScopeState.REPLAYING)
+        finally:
+            self._remove_test_scope(scope, session, entry, operation_lock)
+
+    def test_bound_plan_and_h_context_reject_postbind_replacement_and_mutation(self) -> None:
+        c = self.chronology
+        fixture_module, f = _sourcea_h6_plan_fixture_copy()
+        scope_bundle = None
+        try:
+            scope_bundle = self._install_test_scope()
+            scope, session, entry, operation_lock = scope_bundle
+            basis = f.basis
+            hosts = list(f.hosts)
+            session.plan_module = fixture_module.read_plan
+            session.prepared = {
+                "output_root": Path(__file__).resolve().parent,
+                "campaign_id": basis["campaign_id"],
+                "host_id": f.consumer,
+                "original_pins": {
+                    "spec": copy.deepcopy(basis["spec_pin"]),
+                    "plan": copy.deepcopy(basis["plan_pin"]),
+                    "source_manifests": [
+                        {"host_id": host, **copy.deepcopy(
+                            basis["source_manifest_pins"][host],
+                        )}
+                        for host in hosts
+                    ],
+                },
+            }
+            entry["prepared"] = session.prepared
+            session.hosts = hosts
+            session.source_module_pins = copy.deepcopy(basis["source_module_pins"])
+            session.completion_pin = copy.deepcopy(
+                basis["prepared_input_generation"]["completion_pin"],
+            )
+            session.provenance = copy.deepcopy(f.provenance)
+            session.lineage_proofs = f.proofs
+            session.profile = {
+                "metadata_capture_manifest_pin": copy.deepcopy(
+                    basis["metadata_capture_manifest_pin"],
+                ),
+            }
+            session.width_pin = copy.deepcopy(basis["width_contract_pin"])
+            session.frontier = copy.deepcopy(basis["current_journal_frontier"])
+            entry["frontier"] = {**session.frontier, "file_stat": None}
+            with tempfile.TemporaryDirectory(prefix="sourcea-c2r2-hbinding-") as temporary:
+                source_root = Path(temporary) / "source"
+                h_relative = c._SOURCE5_PREPARED_INPUT_CONSTRUCTION_MODULE_PATHS[
+                    "source5_campaign"
+                ]
+                h_path = source_root / h_relative
+                h_path.parent.mkdir(parents=True, mode=0o700)
+                h_raw = b"scope-test-only selected H source bytes"
+                h_path.write_bytes(h_raw)
+                h_path.chmod(0o600)
+                h_sha = c.sha256_bytes(h_raw)
+                h_module = types.ModuleType("sourcea_c2r2_scope_test_h_module")
+                h_module.__file__ = str(h_path)
+                session.prepared.update({
+                    "source_root": source_root,
+                    "source": {"source": {"files": [{
+                        "path": h_relative, "sha256": h_sha,
+                    }]}},
+                })
+                session.source_module_pins[f.consumer][h_relative] = {
+                    "path": h_relative, "sha256": h_sha,
+                }
+                session.modules = {"archive": self.archive, "source5_campaign": h_module}
+                h_context = {
+                    "scope_test_only": True,
+                    "nonce": "not-an-owner-replay",
+                }
+                session.h_client = types.SimpleNamespace(
+                    session=h_context, plan_module=fixture_module.read_plan,
+                )
+                c._source5_owned_registration_build_plan(
+                    session, copy.deepcopy(basis["current_roots"]),
+                    f.catalogues, f.readback_caps, f.windows, f.scratch, f.timeouts,
+                )
+                with (
+                    patch.object(c, "_check_lock"),
+                    patch.object(c, "_source5_owned_scope_binding_value",
+                                 return_value=entry["binding"]),
+                ):
+                    c._source5_owned_scope_bind_plan(scope, session)
+                    c._source5_owned_scope_bind_h_client(scope, session)
+                    c._source5_owned_scope_require(scope, session)
+                    original_plan = session.plan
+                    session.plan = copy.deepcopy(original_plan)
+                    with self.assertRaisesRegex(c.ChronologyError,
+                                                "changed its fresh H3 plan identity"):
+                        c._source5_owned_scope_require(scope, session)
+                    session.plan = original_plan
+                    h_context["scope_test_only"] = False
+                    with self.assertRaisesRegex(c.ChronologyError,
+                                                "changed its actual H client/context/module identity"):
+                        c._source5_owned_scope_require(scope, session)
+        finally:
+            try:
+                if scope_bundle is not None:
+                    self._remove_test_scope(scope, session, entry, operation_lock)
+            finally:
+                _sourcea_h6_plan_fixture_release()
+
+    def test_old_owner_binding_rejects_test_only_postbind_replacement_and_mutation(self) -> None:
+        c = self.chronology
+        scope, session, entry, operation_lock = self._install_test_scope()
+        hosts = ["host-a", "host-b"]
+        authorities = {}
+        numeric = {
+            "schema": c._SOURCE5_RECORDED_NUMERIC_CONTEXT_SCHEMA,
+            "hosts": hosts,
+            "selected_fixed_module_sha256": "a" * 64,
+            "artifact_reader_identity": "test-only-incomplete-context",
+            "component_replay_required": True,
+            "qualification_eligible": False,
+            "lineage_proofs": {}, "archived_authorities": {},
+            "rows_by_host": {host: [{"test_only_row": 0}] for host in hosts},
+        }
+        session.archived_authorities = authorities
+        session.numeric_context = numeric
+        entry["old_owner_binding"] = {
+            "authorities": authorities, "numeric_context": numeric,
+            "authorities_id": id(authorities),
+            "authorities_sha256": c._source5_owned_scope_digest(
+                authorities, "test-only incomplete authority data",
+            ),
+            "numeric_context_id": id(numeric),
+            "numeric_binding": c._source5_owned_scope_numeric_binding(session),
+            "hosts": tuple(hosts),
+        }
+        try:
+            with (
+                patch.object(c, "_check_lock"),
+                patch.object(c, "_source5_owned_scope_binding_value",
+                             return_value=entry["binding"]),
+            ):
+                c._source5_owned_scope_require(scope, session)
+                original = session.numeric_context
+                session.numeric_context = copy.deepcopy(original)
+                with self.assertRaisesRegex(c.ChronologyError,
+                                            "changed its exact old replay ledger"):
+                    c._source5_owned_scope_require(scope, session)
+                session.numeric_context = original
+                original["rows_by_host"][hosts[0]].append({"test_only_row": 1})
+                with self.assertRaisesRegex(c.ChronologyError,
+                                            "changed its exact old replay ledger"):
+                    c._source5_owned_scope_require(scope, session)
+        finally:
+            self._remove_test_scope(scope, session, entry, operation_lock)
+
+    def test_scope_sink_set_is_bound_to_its_fixed_route(self) -> None:
+        c = self.chronology
+        scope, session, entry, operation_lock = self._install_test_scope()
+        try:
+            with (
+                patch.object(c, "_check_lock"),
+                patch.object(c, "_source5_owned_scope_binding_value",
+                             return_value=entry["binding"]),
+            ):
+                c._source5_owned_scope_require(scope, session)
+                entry["allowed_sinks"] = frozenset()
+                with self.assertRaisesRegex(c.ChronologyError, "sink set or frontier"):
+                    c._source5_owned_scope_require(scope, session)
+        finally:
+            self._remove_test_scope(scope, session, entry, operation_lock)
+
+    def test_scope_cleanup_continues_after_reader_close_error(self) -> None:
+        c = self.chronology
+        scope, session, entry, operation_lock = self._install_test_scope()
+        completed = []
+        close_error = OSError("test bootstrap close failure")
+
+        def failing_bootstrap_close():
+            completed.append("bootstrap")
+            raise close_error
+
+        def failing_capture_close():
+            completed.append("capture")
+            raise ValueError("test capture close failure")
+
+        def failing_h_plan_module_close():
+            completed.append("h_plan_module")
+            raise RuntimeError("test H plan module close failure")
+
+        try:
+            error = c._source5_run_cleanups_independently([
+                lambda: c._source5_owned_scope_expire(scope, session, entry),
+                failing_bootstrap_close,
+                failing_capture_close,
+                failing_h_plan_module_close,
+                lambda: completed.append("prepared"),
+            ])
+            self.assertIs(error, close_error)
+            self.assertEqual(completed,
+                             ["bootstrap", "capture", "h_plan_module", "prepared"])
+            self.assertNotIn(scope, c._SOURCE5_OWNED_OPERATION_SCOPES)
+            self.assertIsNone(session.operation_scope)
+        finally:
+            self._remove_test_scope(scope, session, entry, operation_lock)
+
+    def test_prepared_module_cleanup_attempts_all_unique_modules_and_other_actions(self) -> None:
+        c = self.chronology
+        scope, session, entry, operation_lock = self._install_test_scope()
+        proof = c._Source5PreparedRegistrationProof(
+            c._SOURCE5_PREPARED_REGISTRATION_PROOF_SECRET,
+        )
+        with c._SOURCE5_PREPARED_REGISTRATION_PROOF_LOCK:
+            c._SOURCE5_PREPARED_REGISTRATION_PROOFS[proof] = {
+                "creator_pid": os.getpid(),
+            }
+        modules = [
+            types.ModuleType(f"sourcea_c2r3_cleanup_{index}_{os.getpid()}")
+            for index in range(3)
+        ]
+        for module in modules:
+            c.sys.modules[module.__name__] = module
+        prepared = {
+            "stage": modules[0], "controller": modules[1],
+            "prepared": {"stack": {
+                "first": modules[0], "later": modules[2],
+            }},
+        }
+        attempted = []
+        first_error = OSError("first prepared module close failed")
+        later_error = RuntimeError("later prepared module close also failed")
+        original_close = c._close_module
+
+        def close_module(module):
+            attempted.append(module)
+            if module is modules[0]:
+                raise first_error
+            if module is modules[1]:
+                raise later_error
+            original_close(module)
+
+        class Reader:
+            def __init__(self) -> None:
+                self.close_count = 0
+
+            def close(self) -> None:
+                self.close_count += 1
+
+        bootstrap_reader = Reader()
+        capture_reader = Reader()
+        role_cleanup = []
+        try:
+            with patch.object(c, "_close_module", side_effect=close_module):
+                cleanup_error = c._source5_run_cleanups_independently([
+                    lambda: c._source5_owned_scope_expire(scope, session, entry),
+                    lambda: c._source5_discard_prepared_registration_proof(proof),
+                    bootstrap_reader.close,
+                    capture_reader.close,
+                    lambda: role_cleanup.append("role-data-cleared"),
+                    lambda: c._source5_construction_close_prepared(prepared),
+                ])
+            self.assertIs(cleanup_error, first_error)
+            self.assertEqual([id(module) for module in attempted],
+                             [id(module) for module in modules])
+            self.assertEqual(len({id(module) for module in attempted}), len(modules))
+            self.assertEqual(bootstrap_reader.close_count, 1)
+            self.assertEqual(capture_reader.close_count, 1)
+            self.assertEqual(role_cleanup, ["role-data-cleared"])
+            self.assertNotIn(scope, c._SOURCE5_OWNED_OPERATION_SCOPES)
+            self.assertIsNone(session.operation_scope)
+            self.assertNotIn(proof, c._SOURCE5_PREPARED_REGISTRATION_PROOFS)
+            self.assertIs(c.sys.modules.get(modules[0].__name__), modules[0])
+            self.assertIs(c.sys.modules.get(modules[1].__name__), modules[1])
+            self.assertNotIn(modules[2].__name__, c.sys.modules)
+        finally:
+            self._remove_test_scope(scope, session, entry, operation_lock)
+            with c._SOURCE5_PREPARED_REGISTRATION_PROOF_LOCK:
+                c._SOURCE5_PREPARED_REGISTRATION_PROOFS.pop(proof, None)
+            for module in modules:
+                if c.sys.modules.get(module.__name__) is module:
+                    c.sys.modules.pop(module.__name__, None)
+
+    def test_held_empty_journal_recheck_rejects_last_callback_append_before_own_bytes(self) -> None:
+        c = self.chronology
+        with tempfile.TemporaryDirectory(prefix="sourcea-c2r2-late-journal-") as temporary:
+            root = Path(temporary)
+            path = root / "dispatch-journal.jsonl"
+            path.write_bytes(b"")
+            path.chmod(0o600)
+            fd = os.open(path, os.O_RDWR | os.O_APPEND)
+            lock = types.SimpleNamespace(
+                _creator_pid=os.getpid(), directory=root,
+                output_root=root, campaign_id="late-journal", host_id="host-a",
+            )
+            prepared = {
+                "output_root": root, "campaign_id": "late-journal", "host_id": "host-a",
+            }
+            session = types.SimpleNamespace(
+                lock=lock, prepared=prepared,
+                frontier={"head_sha256": "0" * 64, "record_count": 0},
+                journal_file_key=(
+                    os.fstat(fd).st_dev, os.fstat(fd).st_ino, os.fstat(fd).st_mode,
+                    os.fstat(fd).st_size, os.fstat(fd).st_mtime_ns,
+                    os.fstat(fd).st_ctime_ns,
+                ),
+            )
+            expected = session.journal_file_key
+            state = {
+                "head": "0" * 64, "record_count": 0,
+                "registration_head": None, "prepared_capacity_registration": None,
+                "file_stat": expected,
+            }
+            entry = {
+                "frontier": {"head_sha256": "0" * 64, "record_count": 0},
+                "journal_file_key": expected,
+            }
+            initial = os.fstat(fd)
+            append_attempts = []
+            try:
+                # Simulate the last cancellation/H callback mutating the journal.
+                os.write(fd, b"late-callback-append")
+                os.fsync(fd)
+                with patch.object(c, "_check_lock"):
+                    try:
+                        c._source5_prepared_registration_recheck_empty_frontier_held(
+                            lock, prepared, session, entry, state, fd, path,
+                            initial, False,
+                        )
+                    except c.ChronologyError as error:
+                        self.assertRegex(str(error),
+                                         "path/stat changed after its final callback")
+                    else:
+                        append_attempts.append(os.write(fd, b"own-record"))
+                self.assertEqual(append_attempts, [])
+                self.assertEqual(os.pread(fd, 128, 0), b"late-callback-append")
+            finally:
+                os.close(fd)
+
+    def test_deadline_after_final_callback_free_scan_prevents_scope_consume(self) -> None:
+        c = self.chronology
+        with tempfile.TemporaryDirectory(prefix="sourcea-c2r2-final-deadline-") as temporary:
+            path = Path(temporary) / "dispatch-journal.jsonl"
+            path.write_bytes(b"")
+            path.chmod(0o600)
+            fd = os.open(path, os.O_RDWR | os.O_APPEND)
+            try:
+                info = os.fstat(fd)
+                session = types.SimpleNamespace(deadline_ns=100)
+                events = []
+                append_attempts = []
+                def scan(*_args):
+                    events.append("input-scan")
+                def scope_scan(*_args):
+                    events.append("scope-scan")
+                def journal_scan(*_args):
+                    events.append("journal-scan")
+                    return info
+                def clock_after_scan():
+                    events.append("direct-clock")
+                    return 101
+                def consume(*_args):
+                    events.append("consume")
+                with (
+                    patch.object(c, "_source5_prepared_registration_recheck_inputs_callback_free",
+                                 side_effect=scan),
+                    patch.object(c, "_source5_owned_scope_recheck_callback_free",
+                                 side_effect=scope_scan),
+                    patch.object(c, "_source5_prepared_registration_recheck_empty_frontier_held",
+                                 side_effect=journal_scan),
+                    patch.object(c.time, "monotonic_ns", side_effect=clock_after_scan),
+                    patch.object(c, "_source5_owned_scope_consume_sink",
+                                 side_effect=consume),
+                ):
+                    try:
+                        c._source5_prepared_registration_finalize_consume(
+                            object(), {}, session, object(), {}, {}, info,
+                            1, False, fd, path,
+                        )
+                    except c.ChronologyError as error:
+                        self.assertRegex(str(error), "expired immediately before proof consumption")
+                    else:
+                        append_attempts.append("own-write")
+                self.assertEqual(events,
+                                 ["input-scan", "scope-scan", "journal-scan", "direct-clock"])
+                self.assertEqual(append_attempts, [])
+            finally:
+                os.close(fd)
+
+    def test_fork_child_fails_before_mutex_and_close_preserves_parent_flock(self) -> None:
+        c = self.chronology
+        with tempfile.TemporaryDirectory(prefix="sourcea-c2r2-fork-") as temporary:
+            root = Path(temporary) / "output"
+            root.mkdir(mode=0o700)
+            with c.campaign_host_lock(root, "fork-campaign", "host-a",
+                                      timeout_seconds=2) as lock:
+                # These registry sentinels contain no session, owner, GPG, or sink evidence.
+                scope = c._Source5OwnedOperationScope(
+                    c._SOURCE5_OWNED_OPERATION_SCOPE_SECRET,
+                )
+                proof = c._Source5PreparedRegistrationProof(
+                    c._SOURCE5_PREPARED_REGISTRATION_PROOF_SECRET,
+                )
+                with c._SOURCE5_OWNED_OPERATION_SCOPE_LOCK:
+                    c._SOURCE5_OWNED_OPERATION_SCOPES[scope] = {
+                        "scope": scope, "creator_pid": os.getpid(), "lock": lock,
+                    }
+                with c._SOURCE5_PREPARED_REGISTRATION_PROOF_LOCK:
+                    c._SOURCE5_PREPARED_REGISTRATION_PROOFS[proof] = {
+                        "creator_pid": os.getpid(), "lock": lock,
+                    }
+                self.assertTrue(lock._operation_lock.acquire(blocking=False))
+                read_fd = write_fd = -1
+                child_pid = None
+                reaped = False
+                try:
+                    read_fd, write_fd = os.pipe()
+                    child_pid = os.fork()
+                    if child_pid == 0:
+                        os.close(read_fd)
+                        result = b"unexpected"
+                        try:
+                            c.register_source5_prepared_exploration_owned_locked(lock)
+                        except c.ChronologyError:
+                            result = b"rejected"
+                        except BaseException:
+                            result = b"wrong-error"
+                        try:
+                            lock.__exit__(None, None, None)
+                        except BaseException:
+                            result = b"close-error"
+                        copied_entries_cleared = (
+                            scope not in c._SOURCE5_OWNED_OPERATION_SCOPES and
+                            proof not in c._SOURCE5_PREPARED_REGISTRATION_PROOFS
+                        )
+                        if result == b"rejected" and copied_entries_cleared:
+                            result = b"rejected-cleared"
+                        elif not copied_entries_cleared:
+                            result = b"not-cleared"
+                        try:
+                            os.write(write_fd, result)
+                        except OSError:
+                            pass
+                        os._exit(0)
+                    os.close(write_fd)
+                    write_fd = -1
+                    deadline = time.monotonic() + 5.0
+                    child_status = None
+                    while time.monotonic() < deadline:
+                        waited, status = os.waitpid(child_pid, os.WNOHANG)
+                        if waited == child_pid:
+                            child_status = status
+                            reaped = True
+                            break
+                        time.sleep(0.01)
+                    if child_status is None:
+                        os.kill(child_pid, signal.SIGKILL)
+                        os.waitpid(child_pid, 0)
+                        reaped = True
+                        self.fail("forked child blocked on the inherited operation mutex")
+                    result = os.read(read_fd, 64)
+                    os.close(read_fd)
+                    read_fd = -1
+                    self.assertTrue(os.WIFEXITED(child_status))
+                    self.assertEqual(result, b"rejected-cleared")
+                    with c._SOURCE5_OWNED_OPERATION_SCOPE_LOCK:
+                        self.assertIn(scope, c._SOURCE5_OWNED_OPERATION_SCOPES)
+                    with c._SOURCE5_PREPARED_REGISTRATION_PROOF_LOCK:
+                        self.assertIn(proof, c._SOURCE5_PREPARED_REGISTRATION_PROOFS)
+                    self.assertGreaterEqual(lock.fd, 0)
+                    self.assertTrue(c._lock_token_is_live(lock))
+                    self.assertTrue(lock._operation_lock.locked())
+                    lock._operation_lock.release()
+                    probe = os.open(
+                        lock.lock_path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+                    )
+                    try:
+                        try:
+                            c.fcntl.flock(probe, c.fcntl.LOCK_EX | c.fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            parent_flock_retained = True
+                        else:
+                            parent_flock_retained = False
+                            c.fcntl.flock(probe, c.fcntl.LOCK_UN)
+                    finally:
+                        os.close(probe)
+                    self.assertTrue(parent_flock_retained)
+                finally:
+                    if child_pid is not None and not reaped:
+                        try:
+                            os.kill(child_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            os.waitpid(child_pid, 0)
+                        except ChildProcessError:
+                            pass
+                    for descriptor in (read_fd, write_fd):
+                        if descriptor >= 0:
+                            os.close(descriptor)
+                    if lock._operation_lock.locked():
+                        lock._operation_lock.release()
+                    with c._SOURCE5_OWNED_OPERATION_SCOPE_LOCK:
+                        c._SOURCE5_OWNED_OPERATION_SCOPES.pop(scope, None)
+                    with c._SOURCE5_PREPARED_REGISTRATION_PROOF_LOCK:
+                        c._SOURCE5_PREPARED_REGISTRATION_PROOFS.pop(proof, None)
+
+    def test_scope_token_cannot_be_forged_or_copied(self) -> None:
+        c = self.chronology
+        with self.assertRaisesRegex(c.ChronologyError, "must be issued by its creating module"):
+            c._Source5OwnedOperationScope()
+        with self.assertRaisesRegex(c.ChronologyError, "foreign exact type"):
+            c._source5_owned_scope_entry(object())
+
+    def test_structural_context_cannot_start_a_live_scope(self) -> None:
+        c = self.chronology
+        with self.assertRaisesRegex(c.ChronologyError, "one live lock with exact current inputs"):
+            with c._source5_owned_operation_scope_held(object()):
+                self.fail("a structural DTO must never open an operation scope")
+
+    def test_public_registration_has_no_route_or_scope_selector(self) -> None:
+        c = self.chronology
+        parameters = inspect.signature(
+            c.register_source5_prepared_exploration_owned_locked,
+        ).parameters
+        self.assertNotIn("route", parameters)
+        self.assertNotIn("scope", parameters)
+        self.assertNotIn("allowed_sinks", parameters)
+        self.assertEqual(
+            c._SOURCE5_OWNED_OPERATION_ROUTE_SINKS[
+                c._Source5OwnedReplayRoute.SEALED_REFRESH
+            ], frozenset(),
+        )
+
+    def test_only_fixed_registration_sink_exists_in_c2_route_policy(self) -> None:
+        c = self.chronology
+        self.assertEqual(
+            c._SOURCE5_OWNED_OPERATION_ROUTE_SINKS[
+                c._Source5OwnedReplayRoute.REGISTRATION
+            ],
+            frozenset({c._Source5OwnedOperationSink.PREPARED_CAPACITY_REGISTRATION}),
+        )
+        self.assertEqual(len(c._SOURCE5_OWNED_OPERATION_SCOPES), 0)
+
+
+class Source5Root45PlanAdmissionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.chronology = load_script(
+            SCRIPT_DIR / "application-campaign-chronology.py",
+            "source5_root45_plan_admission_target",
+        )
+        cls.planner = load_script(
+            SCRIPT_DIR / "application-source5-recorded-preparation-read.py",
+            "source5_root45_selected_planner",
+        )
+        cls.archive = load_script(
+            SCRIPT_DIR / "application-source5-evidence-archive.py",
+            "source5_root45_selected_archive",
+        )
+        cls.source = (SCRIPT_DIR / "application-campaign-chronology.py").read_text()
+        cls.tree = ast.parse(cls.source, filename=str(SCRIPT_DIR / "application-campaign-chronology.py"))
+        cls.functions = {
+            node.name: node for node in cls.tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+
+    def _actual_chunker_fixture(self):
+        planner = self.planner
+        hosts = ["root-host-a", "root-host-b"]
+        rows = [{
+            "read_ordinal": ordinal,
+            "owner_host_id": hosts[ordinal // planner.READ_JOB_COUNT_PER_HOST],
+            "job_index": ordinal % planner.READ_JOB_COUNT_PER_HOST,
+            "job_sha256": "a" * 64,
+        } for ordinal in range(planner.READ_WINDOW_COUNT)]
+        basis_pin = {
+            "path": "/private/root45/basis.json",
+            "raw_sha256": "b" * 64,
+            "semantic_sha256": "c" * 64,
+        }
+        window_index, refs, chunks = planner._make_window_metadata_chunks(
+            rows, basis_pin, "root45-campaign", hosts[0], hosts,
+            "registration_replay", "d" * 32, "/private/root45/window-metadata",
+        )
+        plan = {
+            "cohort_hosts": hosts,
+            "window_index": window_index,
+            "window_chunks": refs,
+        }
+        session = types.SimpleNamespace(
+            plan_module=planner,
+            modules={"archive": self.archive},
+        )
+        return session, plan, chunks
+
+    def _require_plan_admission(self, session, plan, chunks):
+        return self.chronology._source5_require_root_inline_plan_admission_held(
+            session, plan, chunks,
+        )
+
+    def test_actual_global_chunker_accepts_exact45_with_cross_host_chunk22(self) -> None:
+        session, plan, chunks = self._actual_chunker_fixture()
+        self.assertEqual(len(plan["window_index"]), 720)
+        self.assertEqual(len(plan["window_chunks"]), 45)
+        self.assertTrue(all(ref["window_count"] == 16
+                            for ref in plan["window_chunks"]))
+        middle = chunks[22]
+        self.assertEqual(middle["first_read_ordinal"], 352)
+        self.assertEqual(middle["read_ordinals"], list(range(352, 368)))
+        self.assertEqual(
+            [row["owner_host_id"] for row in middle["rows"]],
+            ["root-host-a"] * 8 + ["root-host-b"] * 8,
+        )
+        self.assertIsNone(self._require_plan_admission(session, plan, chunks))
+
+    def test_root45_admission_rejects_46_underfilled_missing_and_reordered(self) -> None:
+        cases = ("46", "underfilled", "missing", "reordered")
+        for case in cases:
+            session, plan, chunks = self._actual_chunker_fixture()
+            if case == "46":
+                plan["window_chunks"].append(copy.deepcopy(plan["window_chunks"][-1]))
+                chunks.append(copy.deepcopy(chunks[-1]))
+            elif case == "underfilled":
+                plan["window_chunks"][22]["window_count"] = 15
+                plan["window_chunks"][22]["read_ordinals"] = list(range(352, 367))
+                chunks[22]["read_ordinals"] = list(range(352, 367))
+                chunks[22]["rows"] = chunks[22]["rows"][:15]
+            elif case == "missing":
+                plan["window_chunks"].pop()
+                chunks.pop()
+            else:
+                plan["window_chunks"][0], plan["window_chunks"][1] = (
+                    plan["window_chunks"][1], plan["window_chunks"][0],
+                )
+                chunks[0], chunks[1] = chunks[1], chunks[0]
+            with self.subTest(case=case):
+                with self.assertRaises(self.chronology.ChronologyError):
+                    self._require_plan_admission(session, plan, chunks)
+
+    def test_selected_archive_rejects_raw_hash_and_exact_byte_count_mismatch(self) -> None:
+        for mutation in ("raw_hash", "byte_count"):
+            session, plan, chunks = self._actual_chunker_fixture()
+            if mutation == "raw_hash":
+                plan["window_chunks"][0]["pin"]["raw_sha256"] = "f" * 64
+            else:
+                plan["window_chunks"][0]["byte_count"] += 1
+            with self.subTest(mutation=mutation):
+                with self.assertRaisesRegex(
+                        self.chronology.ChronologyError,
+                        "Source-selected Archive rejected"):
+                    self._require_plan_admission(session, plan, chunks)
+
+    def test_both_owned_builders_admit_after_validation_before_plan_or_h_publication(self) -> None:
+        def calls(node, name):
+            return [item for item in ast.walk(node)
+                    if isinstance(item, ast.Call) and (
+                        isinstance(item.func, ast.Name) and item.func.id == name or
+                        isinstance(item.func, ast.Attribute) and item.func.attr == name
+                    )]
+
+        cases = (
+            ("_source5_construction_build_plan",
+             "validate_prepared_input_construction_read_plan_v1",
+             "construct_source5_prepared_inputs_locked",
+             "_source5_construction_build_plan",
+             "source5_prepared_input_construction_read_client_v1"),
+            ("_source5_owned_registration_build_plan",
+             "validate_recorded_preparation_read_plan_v2",
+             "_source5_owned_input_generation_replay_held",
+             "_source5_owned_registration_build_plan",
+             "source5_recorded_preparation_read_client_v1"),
+        )
+        for (builder_name, validator_name, outer_name, build_call_name,
+             h_factory_name) in cases:
+            with self.subTest(builder=builder_name):
+                builder = self.functions[builder_name]
+                validator_calls = calls(builder, validator_name)
+                admission_calls = calls(
+                    builder, "_source5_require_root_inline_plan_admission_held",
+                )
+                self.assertEqual(len(validator_calls), 1)
+                self.assertEqual(len(admission_calls), 1)
+                self.assertLess(validator_calls[0].lineno, admission_calls[0].lineno)
+                admission_statements = [
+                    (index, statement) for index, statement in enumerate(builder.body)
+                    if isinstance(statement, ast.Expr) and
+                    isinstance(statement.value, ast.Call) and
+                    isinstance(statement.value.func, ast.Name) and
+                    statement.value.func.id ==
+                        "_source5_require_root_inline_plan_admission_held"
+                ]
+                self.assertEqual(len(admission_statements), 1)
+                admission_index, _admission_statement = admission_statements[0]
+                self.assertGreater(admission_index, 0)
+                preceding = builder.body[admission_index - 1]
+                self.assertIsInstance(preceding, ast.Expr)
+                self.assertIsInstance(preceding.value, ast.Call)
+                self.assertIsInstance(preceding.value.func, ast.Name)
+                self.assertEqual(preceding.value.func.id, "require")
+                self.assertIn("checked_plan", ast.unparse(preceding.value))
+                plan_stores = [
+                    node for node in ast.walk(builder)
+                    if isinstance(node, ast.Assign) and
+                    any(isinstance(target, ast.Attribute) and
+                        isinstance(target.value, ast.Name) and
+                        target.value.id == "session" and target.attr in {"plan", "chunks"}
+                        for target in node.targets)
+                ]
+                self.assertTrue(plan_stores)
+                self.assertLess(admission_calls[0].lineno,
+                                min(node.lineno for node in plan_stores))
+                outer = self.functions[outer_name]
+                plan_build = calls(outer, build_call_name)
+                self.assertEqual(len(plan_build), 1)
+                h_factory_assignments = [
+                    node for node in ast.walk(outer)
+                    if isinstance(node, ast.Assign) and
+                    any(isinstance(target, ast.Name) and target.id == "h_factory"
+                        for target in node.targets) and
+                    isinstance(node.value, ast.Call) and
+                    isinstance(node.value.func, ast.Name) and
+                    node.value.func.id == "getattr" and len(node.value.args) >= 2 and
+                    isinstance(node.value.args[1], ast.Constant) and
+                    node.value.args[1].value == h_factory_name
+                ]
+                h_calls = [
+                    node for node in ast.walk(outer)
+                    if isinstance(node, ast.Call) and
+                    isinstance(node.func, ast.Name) and node.func.id == "h_factory"
+                ]
+                self.assertEqual(len(h_factory_assignments), 1)
+                self.assertEqual(len(h_calls), 1)
+                self.assertLess(plan_build[0].lineno,
+                                h_factory_assignments[0].lineno)
+                self.assertLess(h_factory_assignments[0].lineno,
+                                h_calls[0].lineno)
+        helper = self.functions["_source5_require_root_inline_plan_admission_held"]
+
+        def assigned_value(name):
+            matches = [
+                node for node in ast.walk(helper)
+                if isinstance(node, ast.Assign) and len(node.targets) == 1 and
+                isinstance(node.targets[0], ast.Name) and node.targets[0].id == name
+            ]
+            self.assertEqual(len(matches), 1, f"expected one {name} binding in admission helper")
+            return matches[0].value
+
+        modules_value = assigned_value("modules")
+        self.assertIsInstance(modules_value, ast.Call)
+        self.assertIsInstance(modules_value.func, ast.Name)
+        self.assertEqual(modules_value.func.id, "getattr")
+        self.assertEqual(len(modules_value.args), 3)
+        self.assertIsInstance(modules_value.args[0], ast.Name)
+        self.assertEqual(modules_value.args[0].id, "session")
+        self.assertEqual(modules_value.args[1].value, "modules")
+        self.assertIsNone(modules_value.args[2].value)
+
+        archive_value = assigned_value("archive")
+        self.assertIsInstance(archive_value, ast.Subscript)
+        self.assertIsInstance(archive_value.value, ast.Name)
+        self.assertEqual(archive_value.value.id, "modules")
+        self.assertEqual(archive_value.slice.value, "archive")
+
+        validator_value = assigned_value("validate_inline_chunks")
+        self.assertIsInstance(validator_value, ast.Call)
+        self.assertIsInstance(validator_value.func, ast.Name)
+        self.assertEqual(validator_value.func.id, "getattr")
+        self.assertIsInstance(validator_value.args[0], ast.Name)
+        self.assertEqual(validator_value.args[0].id, "archive")
+        self.assertEqual(validator_value.args[1].value,
+                         "_validate_root_inline_window_chunk_sequence")
+        validator_calls = calls(helper, "validate_inline_chunks")
+        self.assertEqual(len(validator_calls), 1)
+        self.assertEqual(len(validator_calls[0].args), 2)
+        self.assertEqual([arg.id for arg in validator_calls[0].args],
+                         ["plan", "chunk_raws"])
+        self.assertFalse(validator_calls[0].keywords)
+        self.assertFalse(any(
+            isinstance(node, ast.Call) and
+            ((isinstance(node.func, ast.Name) and node.func.id == "load_script") or
+             (isinstance(node.func, ast.Attribute) and node.func.attr == "load_script"))
+            for node in ast.walk(helper)
+        ))
 
 
 if __name__ == "__main__":

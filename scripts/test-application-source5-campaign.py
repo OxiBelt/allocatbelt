@@ -63,6 +63,58 @@ class Source5ChronologyApiTests(unittest.TestCase):
             "source5_campaign_metadata_handoff_test", CONTROLLER_PATH,
         )
 
+    def _public_context_implementation(self, tree):
+        public = function(tree, "load_context")
+        transactions = [node for node in ast.walk(public)
+                        if isinstance(node, ast.Call) and
+                        isinstance(node.func, ast.Name) and
+                        node.func.id == "_source5_context_load_transaction"]
+        self.assertEqual(len(transactions), 1)
+        call = transactions[0]
+        self.assertEqual([ast.unparse(arg) for arg in call.args],
+                         ["manifest_path", "host_id"])
+        legacy = {"manifest_value", "manifest_raw_sha256",
+                  "allow_preparatory_core", "lineage_artifact_reader"}
+        self.assertEqual({kw.arg for kw in call.keywords}, legacy)
+        self.assertTrue(all(isinstance(kw.value, ast.Name) and
+                            kw.value.id == kw.arg for kw in call.keywords))
+        public_returns = [node for node in ast.walk(public)
+                          if isinstance(node, ast.Return)]
+        self.assertEqual(len(public_returns), 1)
+        self.assertIs(public_returns[0].value, call)
+        transaction = function(tree, "_source5_context_load_transaction")
+        defaults = dict(zip((arg.arg for arg in transaction.args.kwonlyargs),
+                            transaction.args.kw_defaults))
+        for name in ("active_sourcea_module", "active_sourcea_lock"):
+            self.assertIsInstance(defaults[name], ast.Constant)
+            self.assertIsNone(defaults[name].value)
+        implementations = [node for node in ast.walk(transaction)
+                           if isinstance(node, ast.Call) and
+                           isinstance(node.func, ast.Name) and
+                           node.func.id == "_load_context_impl"]
+        self.assertEqual(len(implementations), 1)
+        inner = implementations[0]
+        self.assertEqual([ast.unparse(arg) for arg in inner.args],
+                         ["manifest_path", "host_id"])
+        self.assertEqual({kw.arg for kw in inner.keywords}, legacy | {
+            "_active_sourcea_module", "_active_sourcea_lock",
+        })
+        for kw in inner.keywords:
+            expected = kw.arg if kw.arg in legacy else kw.arg.removeprefix("_")
+            self.assertIsInstance(kw.value, ast.Name)
+            self.assertEqual(kw.value.id, expected)
+        bindings = [node for node in ast.walk(transaction)
+                    if isinstance(node, ast.Assign) and node.value is inner and
+                    len(node.targets) == 1 and
+                    isinstance(node.targets[0], ast.Name) and
+                    node.targets[0].id == "context"]
+        self.assertEqual(len(bindings), 1)
+        transaction_returns = [node for node in ast.walk(transaction)
+                               if isinstance(node, ast.Return)]
+        self.assertEqual(len(transaction_returns), 1)
+        self.assertEqual(ast.unparse(transaction_returns[0].value), "context")
+        return function(tree, "_load_context_impl")
+
     def test_app_cleanup_gate_rejects_unverified_pressure_or_fixed_cleanup(self) -> None:
         clean_fixed = {
             "cleanup_status": "verified", "leader_reaped": True,
@@ -247,7 +299,7 @@ class Source5ChronologyApiTests(unittest.TestCase):
             "registration_head": "7" * 64,
         })
         controller_tree = ast.parse(CONTROLLER_PATH.read_bytes(), filename=str(CONTROLLER_PATH))
-        load_context = function(controller_tree, "load_context")
+        load_context = self._public_context_implementation(controller_tree)
         controller = ast.unparse(load_context)
         self.assertIn("EXECUTION_SCHEMA_V3", controller)
         self.assertIn("application-source5-preparation-completion.v2", controller)
@@ -974,9 +1026,8 @@ class Source5ChronologyApiTests(unittest.TestCase):
         self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, set()), old_mask)
 
     def test_preparatory_loader_names_only_metadata_generation_and_binding_apis(self) -> None:
-        load_context = function(
+        load_context = self._public_context_implementation(
             ast.parse(CONTROLLER_PATH.read_bytes(), filename=str(CONTROLLER_PATH)),
-            "load_context",
         )
         context_calls = {
             node.func.attr for node in ast.walk(load_context)

@@ -5,15 +5,17 @@ from __future__ import annotations
 import ast
 import importlib.util
 import inspect
+import os
 import sys
 import tempfile
 import threading
 import time
-from contextlib import nullcontext
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+_SOURCE5_CHRONOLOGY_SOURCE_PATH = "scripts/application-campaign-chronology.py"
 
 
 CONTROLLER_PATH = Path(__file__).with_name("application-source5-campaign.py")
@@ -142,6 +144,169 @@ class Source5OwnedHeldKernelContracts(unittest.TestCase):
         for name, parameters in expected.items():
             function = getattr(self.module, name)
             self.assertEqual(list(inspect.signature(function).parameters), parameters)
+        public_load = inspect.signature(self.module.load_context)
+        self.assertEqual(list(public_load.parameters), [
+            "manifest_path", "host_id", "manifest_value", "manifest_raw_sha256",
+            "allow_preparatory_core", "lineage_artifact_reader",
+        ])
+        self.assertEqual(public_load.parameters["manifest_value"].default, None)
+        self.assertEqual(public_load.parameters["manifest_raw_sha256"].default, None)
+        self.assertIs(public_load.parameters["allow_preparatory_core"].default, False)
+        self.assertEqual(public_load.parameters["lineage_artifact_reader"].default, None)
+
+    def test_failed_context_load_closes_every_tracked_module(self) -> None:
+        primary_error = RuntimeError("selected H context load failed")
+        created = []
+        closed = []
+        original_close = self.module._source5_h_close_modules_independently
+
+        def fail_after_loading(*_args, **_kwargs):
+            created.append(self.module._load_module(
+                b"loaded = True", Path("/synthetic/c3a-first.py"), "c3a_first",
+            ))
+            created.append(self.module._load_module(
+                b"loaded = False", Path("/synthetic/c3a-second.py"), "c3a_second",
+            ))
+            raise primary_error
+
+        def close_every_module(modules):
+            modules = list(modules)
+            closed.extend(modules)
+            return original_close(modules)
+
+        try:
+            with patch.object(self.module, "_load_context_impl",
+                              side_effect=fail_after_loading), \
+                    patch.object(self.module, "_source5_h_close_modules_independently",
+                                 side_effect=close_every_module):
+                with self.assertRaises(RuntimeError) as caught:
+                    self.module._source5_context_load_transaction(
+                        Path("/synthetic/manifest.json"), "host-a",
+                    )
+            self.assertIs(caught.exception, primary_error)
+            self.assertEqual(closed, created)
+            self.assertTrue(all(sys.modules.get(module.__name__) is not module
+                                for module in created))
+        finally:
+            for module in created:
+                if sys.modules.get(module.__name__) is module:
+                    sys.modules.pop(module.__name__, None)
+
+    def test_private_context_modules_use_isolated_registry_names(self) -> None:
+        names = []
+        for index in range(2):
+            created = []
+
+            def build_private_module(*_args, **_kwargs):
+                module = self.module._load_module(
+                    b"loaded = True", Path(f"/synthetic/c3a-scope-{index}.py"),
+                    "c3a_scope_shared_source",
+                )
+                created.append(module)
+                return SimpleNamespace()
+
+            try:
+                with patch.object(self.module, "_load_context_impl",
+                                  side_effect=build_private_module):
+                    self.module._source5_context_load_transaction(
+                        Path("/synthetic/manifest.json"), "host-a",
+                        active_sourcea_module=self.module,
+                        active_sourcea_lock=object(),
+                    )
+                self.assertEqual(len(created), 1)
+                names.append(created[0].__name__)
+            finally:
+                self.module._source5_h_close_modules_independently(created)
+        self.assertNotEqual(names[0], names[1])
+        self.assertIn("source5ctx_", names[0])
+
+    def test_private_context_constructor_injects_the_active_sourcea_module(self) -> None:
+        sourcea_path = CONTROLLER_PATH.with_name("application-campaign-chronology.py")
+        sourcea_name = f"sourcea_c3a_context_identity_{os.getpid()}"
+        previous = sys.modules.get(sourcea_name)
+        sourcea_spec = importlib.util.spec_from_file_location(
+            sourcea_name, sourcea_path,
+        )
+        self.assertIsNotNone(sourcea_spec)
+        self.assertIsNotNone(sourcea_spec.loader)
+        sourcea = importlib.util.module_from_spec(sourcea_spec)
+        sys.modules[sourcea_name] = sourcea
+        foreign_name = f"sourcea_c3a_same_bytes_foreign_{os.getpid()}"
+        foreign_previous = sys.modules.get(foreign_name)
+        foreign = None
+        try:
+            sourcea_spec.loader.exec_module(sourcea)
+            raw = sourcea_path.read_bytes()
+            pin = {
+                "path": _SOURCE5_CHRONOLOGY_SOURCE_PATH,
+                "sha256": sourcea.sha256_bytes(raw),
+            }
+            with tempfile.TemporaryDirectory(prefix="sourcea-c3a-lock-") as temporary:
+                output_root = Path(temporary) / "output"
+                output_root.mkdir(mode=0o700)
+                with sourcea.campaign_host_lock(
+                        output_root, "c3a-context", "host-a") as lock:
+                    with self.assertRaisesRegex(
+                            self.module.Source5CampaignError,
+                            "host differs from its exact active SourceA lock"):
+                        self.module._source5_load_context_with_active_sourcea_held(
+                            Path("/not-read-by-host-mismatch"), "host-b", sourcea, lock,
+                        )
+                    selected = self.module._source5_context_chronology_from_active_sourcea(
+                        sourcea, lock, _SOURCE5_CHRONOLOGY_SOURCE_PATH,
+                        sourcea_path, pin, raw,
+                    )
+                    self.assertIs(selected, sourcea)
+                    self.assertIs(sourcea._source5_own_chronology_module(), sourcea)
+                    foreign_spec = importlib.util.spec_from_file_location(
+                        foreign_name, sourcea_path,
+                    )
+                    self.assertIsNotNone(foreign_spec)
+                    self.assertIsNotNone(foreign_spec.loader)
+                    foreign = importlib.util.module_from_spec(foreign_spec)
+                    sys.modules[foreign_name] = foreign
+                    foreign_spec.loader.exec_module(foreign)
+                    with self.assertRaisesRegex(
+                            self.module.Source5CampaignError,
+                            "actual active SourceA module and its live lock"):
+                        self.module._source5_context_chronology_from_active_sourcea(
+                            foreign, lock, _SOURCE5_CHRONOLOGY_SOURCE_PATH,
+                            sourcea_path, pin, raw,
+                        )
+                    implementation = ast.get_source_segment(
+                        self.source, self.functions["_load_context_impl"],
+                    )
+                    public_loader = ast.get_source_segment(
+                        self.source, self.functions["load_context"],
+                    )
+                    private_loader = ast.get_source_segment(
+                        self.source,
+                        self.functions["_source5_load_context_with_active_sourcea_held"],
+                    )
+                    self.assertIn("_source5_context_chronology_from_active_sourcea", implementation)
+                    self.assertIn("_active_sourcea_module is not None", implementation)
+                    self.assertNotIn("_active_sourcea_module", public_loader)
+                    self.assertIn("_source5_context_load_transaction", public_loader)
+                    self.assertIn("active_sourcea_module=active_sourcea_module", private_loader)
+                    self.assertEqual(
+                        list(inspect.signature(
+                            self.module._source5_load_context_with_active_sourcea_held,
+                        ).parameters),
+                        ["manifest_path", "host_id", "active_sourcea_module",
+                         "active_sourcea_lock"],
+                    )
+        finally:
+            if previous is None:
+                if sys.modules.get(sourcea_name) is sourcea:
+                    sys.modules.pop(sourcea_name, None)
+            else:
+                sys.modules[sourcea_name] = previous
+            if foreign is not None:
+                if foreign_previous is None:
+                    if sys.modules.get(foreign_name) is foreign:
+                        sys.modules.pop(foreign_name, None)
+                else:
+                    sys.modules[foreign_name] = foreign_previous
 
     def test_owned_held_bridges_are_real_and_use_only_c3_primitives(self) -> None:
         pairs = {
@@ -424,82 +589,6 @@ class Source5OwnedHeldKernelContracts(unittest.TestCase):
                 )
         materials_reader.assert_not_called()
         capacity_reader.assert_not_called()
-
-    def test_legacy_pressure_wrapper_forwards_opaque_issuer_result_unchanged(self) -> None:
-        """Check wrapper value flow only; the stub is not a replay or grant."""
-        fixed_job = {"run_id": "fixed-predecessor"}
-        job = {
-            "run_id": "pressure-job",
-            "predecessor_run_ids": [fixed_job["run_id"]],
-        }
-        fixed_record = {"state": "valid_pair", "job": fixed_job}
-        fixed_raw = self.module.canonical_bytes(fixed_record)
-        fixed_sha = self.module.sha256(fixed_raw)
-        manifest_pin = {"path": "/private/manifest.json", "raw_sha256": "a" * 64}
-        lock = object()
-        captured_view = object()
-        opaque_certificate = object()
-        built_result = object()
-        events = []
-
-        def chronology_snapshot(actual_lock, execution_pin):
-            events.append("snapshot")
-            self.assertIs(actual_lock, lock)
-            self.assertEqual(execution_pin, self.module.api_pin(manifest_pin))
-            return {"journal_head": "b" * 64}
-
-        def issue_predecessor(actual_lock, execution_pin, exact_job, fixed_pin,
-                              *, captured_evidence):
-            events.append("issuer")
-            self.assertIs(actual_lock, lock)
-            self.assertEqual(execution_pin, self.module.api_pin(manifest_pin))
-            self.assertIs(exact_job, job)
-            self.assertEqual(fixed_pin, {
-                "path": "/private/confirmation/job-records/fixed-predecessor.json",
-                "raw_sha256": fixed_sha,
-            })
-            self.assertIs(captured_evidence, captured_view)
-            return opaque_certificate
-
-        chronology = SimpleNamespace(
-            source5_chronology_snapshot_locked=chronology_snapshot,
-            build_source5_pressure_predecessor_replay_locked=issue_predecessor,
-        )
-        context = SimpleNamespace(
-            chronology=chronology,
-            manifest={"schema": self.module.EXECUTION_SCHEMA_V4},
-            manifest_pin=manifest_pin,
-        )
-        phase_root = Path("/private/confirmation")
-
-        def data_builder(*args, **kwargs):
-            events.append("data_helper")
-            self.assertIs(kwargs["pressure_predecessor_certificate"],
-                          opaque_certificate)
-            return built_result
-
-        with patch.object(self.module, "_phase_root", return_value=phase_root), \
-                patch.object(self.module, "read_stable",
-                             return_value=(fixed_raw, fixed_sha, None)), \
-                patch.object(self.module, "_host_jobs", return_value=[fixed_job]), \
-                patch.object(
-                    self.module, "archived_job_read_view",
-                    side_effect=lambda *_args, **_kwargs: nullcontext(captured_view),
-                ) as archive_view, \
-                patch.object(
-                    self.module, "_build_pressure_recipe_data_held",
-                    side_effect=data_builder,
-                ) as data_helper:
-            result = self.module._build_pressure_recipe(
-                context, lock, job, 0, {"members": []}, [],
-            )
-
-        self.assertIs(result, built_result)
-        self.assertEqual(events, ["snapshot", "issuer", "data_helper"])
-        archive_view.assert_called_once_with(
-            context, fixed_job, "pressure_analysis",
-        )
-        data_helper.assert_called_once()
 
     def test_owned_refusal_guards_precede_the_new_origin_consumers(self) -> None:
         expected_first_calls = {

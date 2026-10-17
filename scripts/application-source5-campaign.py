@@ -301,17 +301,199 @@ def write_new(path: Path, raw: bytes, label: str) -> str:
     return sha256(raw)
 
 
+_SOURCE5_CONTEXT_LOAD_TRACKER = threading.local()
+_SOURCE5_CHRONOLOGY_SOURCE_PATH = "scripts/application-campaign-chronology.py"
+
+
+def _source5_h_close_modules_independently(
+    modules: list[types.ModuleType],
+) -> BaseException | None:
+    """Remove every exact module object, returning the first close failure."""
+    first_error = None
+    seen: set[int] = set()
+    for module in modules:
+        if not isinstance(module, types.ModuleType) or id(module) in seen:
+            continue
+        seen.add(id(module))
+        try:
+            name = module.__name__
+            if sys.modules.get(name) is module:
+                sys.modules.pop(name, None)
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    return first_error
+
+
 def _load_module(raw: bytes, path: Path, name: str) -> types.ModuleType:
-    module = types.ModuleType(f"source5_{name}_{sha256(raw)}")
+    base_module_name = f"source5_{name}_{sha256(raw)}"
+    namespace = getattr(_SOURCE5_CONTEXT_LOAD_TRACKER, "module_namespace", None)
+    module_name = (f"{namespace}_{base_module_name}"
+                   if type(namespace) is str else base_module_name)
+    module = types.ModuleType(module_name)
     module.__file__ = str(path)
     module.__package__ = ""
-    sys.modules[module.__name__] = module
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    tracker = getattr(_SOURCE5_CONTEXT_LOAD_TRACKER, "modules", None)
+    if isinstance(tracker, list):
+        tracker.append(module)
     try:
         exec(compile(raw, str(path), "exec", dont_inherit=True), module.__dict__)
     except (SyntaxError, TypeError, ValueError) as error:
-        sys.modules.pop(module.__name__, None)
+        if previous is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
         raise Source5CampaignError(f"pinned {name} module cannot be loaded: {error}") from error
+    except BaseException:
+        if previous is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
+        raise
     return module
+
+
+def _source5_context_load_transaction(
+    manifest_path: Path, host_id: str, *,
+    manifest_value: dict[str, Any] | None = None,
+    manifest_raw_sha256: str | None = None,
+    allow_preparatory_core: bool = False,
+    lineage_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
+    active_sourcea_module: types.ModuleType | None = None,
+    active_sourcea_lock: Any = None,
+) -> CampaignContext:
+    parent_modules = getattr(_SOURCE5_CONTEXT_LOAD_TRACKER, "modules", None)
+    parent_namespace = getattr(
+        _SOURCE5_CONTEXT_LOAD_TRACKER, "module_namespace", None,
+    )
+    context_namespace = parent_namespace
+    if active_sourcea_module is not None:
+        context_namespace = (
+            f"source5ctx_{os.getpid()}_{threading.get_ident()}_"
+            f"{os.urandom(12).hex()}"
+        )
+    loaded_modules: list[types.ModuleType] = []
+    _SOURCE5_CONTEXT_LOAD_TRACKER.modules = loaded_modules
+    if context_namespace is None:
+        try:
+            del _SOURCE5_CONTEXT_LOAD_TRACKER.module_namespace
+        except AttributeError:
+            pass
+    else:
+        _SOURCE5_CONTEXT_LOAD_TRACKER.module_namespace = context_namespace
+    try:
+        context = _load_context_impl(
+            manifest_path, host_id,
+            manifest_value=manifest_value,
+            manifest_raw_sha256=manifest_raw_sha256,
+            allow_preparatory_core=allow_preparatory_core,
+            lineage_artifact_reader=lineage_artifact_reader,
+            _active_sourcea_module=active_sourcea_module,
+            _active_sourcea_lock=active_sourcea_lock,
+        )
+        if isinstance(parent_modules, list):
+            parent_modules.extend(loaded_modules)
+        return context
+    except BaseException:
+        # Keep the original load/validation failure while still attempting each
+        # module cleanup. A successful context instead owns these via modules.
+        _source5_h_close_modules_independently(loaded_modules)
+        raise
+    finally:
+        if parent_modules is None:
+            try:
+                del _SOURCE5_CONTEXT_LOAD_TRACKER.modules
+            except AttributeError:
+                pass
+        else:
+            _SOURCE5_CONTEXT_LOAD_TRACKER.modules = parent_modules
+        if parent_namespace is None:
+            try:
+                del _SOURCE5_CONTEXT_LOAD_TRACKER.module_namespace
+            except AttributeError:
+                pass
+        else:
+            _SOURCE5_CONTEXT_LOAD_TRACKER.module_namespace = parent_namespace
+
+
+def _source5_context_chronology_from_active_sourcea(
+    active_sourcea_module: types.ModuleType, active_sourcea_lock: Any,
+    relative: str, path: Path, pin: object, raw: bytes,
+) -> types.ModuleType:
+    expected_pin = exact(pin, {"path", "sha256"},
+                         "active SourceA chronology typed pin")
+    require(relative == _SOURCE5_CHRONOLOGY_SOURCE_PATH and
+            expected_pin == {"path": relative, "sha256": sha256(raw)} and
+            isinstance(active_sourcea_module, types.ModuleType) and
+            Path(getattr(active_sourcea_module, "__file__", "")).resolve(strict=True) ==
+                path.resolve(strict=True),
+            "active SourceA module differs from the selected typed chronology source")
+    own_module = getattr(active_sourcea_module,
+                         "_source5_own_chronology_module", None)
+    lock_type = getattr(active_sourcea_module, "CampaignHostLock", None)
+    lock_live = getattr(active_sourcea_module, "_lock_token_is_live", None)
+    require(callable(own_module) and own_module() is active_sourcea_module and
+            isinstance(lock_type, type) and type(active_sourcea_lock) is lock_type and
+            callable(lock_live) and lock_live(active_sourcea_lock) and
+            getattr(active_sourcea_lock, "_creator_pid", None) == os.getpid(),
+            "private H context construction requires the actual active SourceA module and its live lock")
+    return active_sourcea_module
+
+
+def _source5_load_context_with_active_sourcea_held(
+    manifest_path: Path, host_id: str,
+    active_sourcea_module: types.ModuleType, active_sourcea_lock: Any,
+) -> CampaignContext:
+    """Build a private H context using SourceA's actual lock-owning module."""
+    require(isinstance(manifest_path, Path) and manifest_path.is_absolute() and
+            isinstance(active_sourcea_module, types.ModuleType),
+            "private H context constructor lacks its current manifest path or SourceA module")
+    own_module = getattr(active_sourcea_module,
+                         "_source5_own_chronology_module", None)
+    lock_type = getattr(active_sourcea_module, "CampaignHostLock", None)
+    lock_live = getattr(active_sourcea_module, "_lock_token_is_live", None)
+    require(callable(own_module) and own_module() is active_sourcea_module and
+            isinstance(lock_type, type) and type(active_sourcea_lock) is lock_type and
+            callable(lock_live) and lock_live(active_sourcea_lock) and
+            getattr(active_sourcea_lock, "_creator_pid", None) == os.getpid(),
+            "private H context constructor rejected a duplicate SourceA module or foreign lock")
+    require(type(host_id) is str and host_id == active_sourcea_lock.host_id,
+            "private H context constructor host differs from its exact active SourceA lock")
+    context = None
+    try:
+        context = _source5_context_load_transaction(
+            manifest_path, active_sourcea_lock.host_id,
+            active_sourcea_module=active_sourcea_module,
+            active_sourcea_lock=active_sourcea_lock,
+        )
+        require(type(context) is CampaignContext and
+                context.chronology is active_sourcea_module and
+                context.host_id == active_sourcea_lock.host_id and
+                context.manifest.get("campaign_id") == active_sourcea_lock.campaign_id and
+                context.output_root == active_sourcea_lock.output_root and
+                context.lineage_artifact_reader is None,
+                "private H context differs from the active SourceA lock identity or retains an unowned reader")
+        return context
+    except BaseException:
+        if context is not None:
+            context_modules = list(context.modules.values())
+            context_modules.extend((context.campaign, context.chronology,
+                                    context.fixed_pair, context.pressure_pair))
+            shared = {id(active_sourcea_module), id(sys.modules.get(__name__))}
+            _source5_h_close_modules_independently([
+                module for module in context_modules
+                if isinstance(module, types.ModuleType) and id(module) not in shared
+            ])
+            reader = context.lineage_artifact_reader
+            close_reader = getattr(reader, "close", None)
+            if callable(close_reader):
+                try:
+                    close_reader()
+                except BaseException:
+                    pass
+        raise
 
 
 @dataclass
@@ -1376,13 +1558,17 @@ def _load_archive_signer_context(
     }
 
 
-def load_context(
+def _load_context_impl(
     manifest_path: Path, host_id: str, *,
     manifest_value: dict[str, Any] | None = None,
     manifest_raw_sha256: str | None = None,
     allow_preparatory_core: bool = False,
     lineage_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
+    _active_sourcea_module: types.ModuleType | None = None,
+    _active_sourcea_lock: Any = None,
 ) -> CampaignContext:
+    require((_active_sourcea_module is None) == (_active_sourcea_lock is None),
+            "private H chronology injection requires the active SourceA module and lock together")
     if manifest_value is None:
         manifest_path = manifest_path.resolve(strict=True)
         manifest, manifest_raw, manifest_sha = read_json(
@@ -1721,8 +1907,15 @@ def load_context(
                 modules[relative] == {"path": relative, "sha256": actual},
                 f"Source5 execution source {relative} differs from its typed inventory pin")
         if relative in execution_paths:
-            module = _load_module(raw, path, relative.replace("/", "_"))
-            module.__source5_typed_pin__ = dict(modules[relative])
+            if (relative == _SOURCE5_CHRONOLOGY_SOURCE_PATH and
+                    _active_sourcea_module is not None):
+                module = _source5_context_chronology_from_active_sourcea(
+                    _active_sourcea_module, _active_sourcea_lock,
+                    relative, path, modules[relative], raw,
+                )
+            else:
+                module = _load_module(raw, path, relative.replace("/", "_"))
+                module.__source5_typed_pin__ = dict(modules[relative])
             loaded[relative] = module
             execution_source_bytes[relative] = raw
     require(execution_paths <= set(loaded),
@@ -2485,6 +2678,23 @@ def load_context(
             preparatory_budget_pin,
         )
     return result
+
+
+def load_context(
+    manifest_path: Path, host_id: str, *,
+    manifest_value: dict[str, Any] | None = None,
+    manifest_raw_sha256: str | None = None,
+    allow_preparatory_core: bool = False,
+    lineage_artifact_reader: Callable[[dict[str, str], int], bytes] | None = None,
+) -> CampaignContext:
+    """Keep the public structural loader signature/defaults unchanged."""
+    return _source5_context_load_transaction(
+        manifest_path, host_id,
+        manifest_value=manifest_value,
+        manifest_raw_sha256=manifest_raw_sha256,
+        allow_preparatory_core=allow_preparatory_core,
+        lineage_artifact_reader=lineage_artifact_reader,
+    )
 
 
 def _source5_validate_prepared_exploration_context(
