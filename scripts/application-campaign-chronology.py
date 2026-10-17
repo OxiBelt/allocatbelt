@@ -73,6 +73,9 @@ SOURCE5_EXECUTION_V5_FIELDS = frozenset({
     "prepared_input_generation", "prepared_capacity_registration",
     "archive_signer_contexts", "journal_width_contracts",
 })
+_SOURCE5_EXECUTION_V5_OWNED_FIELDS = frozenset(
+    set(SOURCE5_EXECUTION_V5_FIELDS) | {"prepared_replay_inputs"}
+)
 SOURCE5_PREPARED_INPUTS_PROVENANCE_V2_FIELDS = frozenset({
     "schema", "preparation_pin", "final_spec_pin", "final_plan_pin",
     "exploration_lineage",
@@ -137,6 +140,7 @@ MAX_SOURCE_BYTES = 64 * 1024 * 1024
 MAX_SCRIPT_BYTES = 8 * 1024 * 1024
 MAX_ANALYZER_BYTES = 1024 * 1024 * 1024
 MAX_COMPLETION_BYTES = 16 * 1024 * 1024
+MAX_SOURCE5_OWNED_PREPARED_COMPLETION_BYTES = 64 * 1024 * 1024
 MAX_JOURNAL_BYTES = 256 * 1024 * 1024
 MAX_JOURNAL_EVENTS = 100_000
 MAX_EVENT_BYTES = 4 * 1024 * 1024
@@ -997,6 +1001,34 @@ class _Source5CapturedAnalysisProof:
     def __new__(cls, secret: object = None):
         require(secret is _SOURCE5_ANALYSIS_PROOF_SECRET,
                 "captured analysis proof must be issued by its Source chronology")
+        return super().__new__(cls)
+
+
+_SOURCE5_PREPARED_REGISTRATION_PROOF_SECRET = object()
+_SOURCE5_PREPARED_REGISTRATION_PROOFS: Any = weakref.WeakKeyDictionary()
+_SOURCE5_PREPARED_REGISTRATION_PROOF_LOCK = threading.Lock()
+
+
+class _Source5PreparedRegistrationProof:
+    __slots__ = ("__weakref__",)
+
+    def __new__(cls, secret: object = None):
+        require(secret is _SOURCE5_PREPARED_REGISTRATION_PROOF_SECRET,
+                "prepared registration proof must be issued by its Source chronology")
+        return super().__new__(cls)
+
+
+_SOURCE5_OWNED_COMPLETION_ROLE_CONTEXT_SECRET = object()
+_SOURCE5_OWNED_COMPLETION_ROLE_CONTEXTS: Any = weakref.WeakKeyDictionary()
+_SOURCE5_OWNED_COMPLETION_ROLE_CONTEXT_LOCK = threading.Lock()
+
+
+class _Source5OwnedPreparedCompletionRoleContext:
+    __slots__ = ("__weakref__",)
+
+    def __new__(cls, secret: object = None):
+        require(secret is _SOURCE5_OWNED_COMPLETION_ROLE_CONTEXT_SECRET,
+                "owned prepared-completion role context must be issued by SourceA")
         return super().__new__(cls)
 
 
@@ -3018,14 +3050,57 @@ def _verify_source5_prepared_input_generation(
             "prepared-inputs-completion.json" and
             _within(prepared["input_root"], completion_path),
             "prepared-input completion is not beside the exact final PlanV3 inside the original input root")
+    raw_provenance = generation["provenance"]
+    completion_maximum = MAX_COMPLETION_BYTES
+    owned_profile_pin = None
+    if (manifest is not None and
+            manifest.get("schema") == SOURCE5_EXECUTION_SCHEMA_V5 and
+            "prepared_replay_inputs" in manifest):
+        owned_profiles = _source5_owned_replay_input_pin_map(manifest)
+        owned_profile_pin = owned_profiles[prepared["host_id"]]
+        lineage_module = _source5_captured_source_module(
+            prepared, SOURCE5_PREPARED_LINEAGE_SOURCE_PATH,
+            "Source5 owned replay profile provenance validator",
+        )
+        validate_profile_provenance = getattr(
+            lineage_module, "validate_prepared_input_provenance_v2", None,
+        )
+        require(callable(validate_profile_provenance),
+                "Source-selected lineage module lacks its V2 profile validator")
+        try:
+            profile_provenance = validate_profile_provenance(
+                raw_provenance,
+                expected_hosts=[host["host_id"] for host in prepared["spec"]["hosts"]],
+            )
+        except Exception as error:
+            raise ChronologyError(
+                f"SourceA owned replay manifest provenance was rejected: {error}",
+            ) from error
+        _owned_profile, _owned_profile_raw, owned_profile_pin =             _source5_read_owned_replay_input_profile(
+                owned_profile_pin, prepared, completion_pin,
+                profile_provenance, lineage_module,
+            )
+        prepared["source5_execution_schema"] = SOURCE5_EXECUTION_SCHEMA_V5
+        prepared["source5_owned_replay_profile_pin"] = copy.deepcopy(
+            owned_profile_pin,
+        )
+        owned_inputprep_module = _source5_captured_source_module(
+            prepared, "scripts/application-source5-input-preparation.py",
+            "Source5 owned prepared-completion typed InputPrep module",
+        )
+        _source5_issue_owned_prepared_completion_role_context(
+            prepared, _owned_profile, owned_profile_pin, completion_pin,
+            profile_provenance, owned_inputprep_module,
+        )
+        completion_maximum = MAX_SOURCE5_OWNED_PREPARED_COMPLETION_BYTES
     completion_raw, _completion_info = _read_stable(
-        completion_path, "Source5 prepared-input completion", MAX_COMPLETION_BYTES,
+        completion_path, "Source5 prepared-input completion", completion_maximum,
     )
     completion_raw_sha = sha256_bytes(completion_raw)
     require(completion_raw_sha == raw_pin["raw_sha256"],
             "prepared-input completion differs from its raw pin")
     completion_value = _parse_object(
-        completion_raw, "Source5 prepared-input completion", MAX_COMPLETION_BYTES,
+        completion_raw, "Source5 prepared-input completion", completion_maximum,
     )
     bounded_completion = completion_value.get("schema") == \
         "allocatbelt.application-source5-preparation-completion.v2"
@@ -3045,7 +3120,6 @@ def _verify_source5_prepared_input_generation(
             completion_value.get("complete") is True and
             completion_value.get("qualification_eligible") is False,
             "prepared-input completion schema, semantic digest, or eligibility differs")
-    raw_provenance = generation["provenance"]
     v5_reuse = (type(raw_provenance) is dict and
                 raw_provenance.get("schema") ==
                     SOURCE5_PREPARED_INPUTS_PROVENANCE_SCHEMA_V2)
@@ -3125,16 +3199,22 @@ def _verify_source5_prepared_input_generation(
     # the completion body alone does not prove that referenced producer,
     # source, host-verification, calibration, pilot, or oracle bytes remain
     # available and unchanged since an earlier registration.
-    helper_raw, helper_sha, _helper_record = _source_file(
-        prepared["source_root"], prepared["source"],
-        "scripts/application-source5-input-preparation.py",
-        "Source5 prepared-input verifier", maximum=MAX_SOURCE_BYTES,
-    )
-    helper = _load_module(
-        helper_raw,
-        prepared["source_root"] / "scripts/application-source5-input-preparation.py",
-        f"source5_prepared_input_verifier_{helper_sha}",
-    )
+    helper = prepared.get("_source5_owned_prepared_completion_inputprep_module")
+    if helper is None:
+        helper_raw, helper_sha, _helper_record = _source_file(
+            prepared["source_root"], prepared["source"],
+            "scripts/application-source5-input-preparation.py",
+            "Source5 prepared-input verifier", maximum=MAX_SOURCE_BYTES,
+        )
+        helper = _load_module(
+            helper_raw,
+            prepared["source_root"] / "scripts/application-source5-input-preparation.py",
+            f"source5_prepared_input_verifier_{helper_sha}",
+        )
+    require(isinstance(helper, types.ModuleType) and
+            Path(getattr(helper, "__file__", "")).resolve(strict=True) ==
+                prepared["source_root"] / "scripts/application-source5-input-preparation.py",
+            "SourceA selected prepared-input helper lost its exact Source path")
     verify_name = ("verify_prepared_inputs_completion_recorded_host"
                    if v5_reuse else "verify_prepared_inputs_completion")
     verify = getattr(helper, verify_name, None)
@@ -3355,10 +3435,22 @@ def _validate_source5_prepared_capacity_registration(
                 } and _within(
                     prepared["input_root"], Path(provenance["preparation_pin"]["path"]),
                 ), "prepared-capacity provenance v2 changed its final inputs/cohort roots")
-    verified = _verify_source5_prepared_input_generation(
-        None, prepared,
-        {"completion": completion, "provenance": provenance},
-    )
+    owned_replay = prepared.get("source5_owned_registration_completion")
+    if v5_reuse and type(owned_replay) is dict:
+        owned_replay = _exact(owned_replay, {
+            "completion_pin", "provenance", "verified_completion",
+        }, "SourceA live prepared-input replay binding")
+        require(owned_replay["completion_pin"] == completion and
+                canonical_bytes(owned_replay["provenance"]) ==
+                    canonical_bytes(provenance) and
+                type(owned_replay["verified_completion"]) is dict,
+                "SourceA owned replay changed its exact completion/provenance pins")
+        verified = owned_replay["verified_completion"]
+    else:
+        verified = _verify_source5_prepared_input_generation(
+            None, prepared,
+            {"completion": completion, "provenance": provenance},
+        )
     host_ids = [item["host_id"] for item in prepared["spec"]["hosts"]]
     selected_index = host_ids.index(prepared["host_id"])
     row = verified["capacity_preparations"][selected_index]
@@ -3604,10 +3696,22 @@ def _validate_source5_manifest_value(
         require(manifest["scope"] == "final_prepared_bounded",
                 "Source5 manifest v4 only accepts the closed bounded final-prepared scope")
     elif schema == SOURCE5_EXECUTION_SCHEMA_V5:
-        manifest = _exact(
-            manifest_value, set(SOURCE5_EXECUTION_V5_FIELDS),
-            "Source5 prepared-exploration reuse execution manifest v5",
-        )
+        fields = set(SOURCE5_EXECUTION_V5_FIELDS)
+        owned_fields = set(_SOURCE5_EXECUTION_V5_OWNED_FIELDS)
+        if type(manifest_value) is dict and set(manifest_value) == owned_fields:
+            manifest = _exact(
+                manifest_value, owned_fields,
+                "Source5 owned-profile prepared-exploration execution manifest v5",
+            )
+            _source5_owned_replay_input_pin_map(manifest)
+            prepared["source5_owned_replay_profile_pin"] = copy.deepcopy(
+                _source5_owned_replay_input_pin_map(manifest)[prepared["host_id"]],
+            )
+        else:
+            manifest = _exact(
+                manifest_value, fields,
+                "Source5 legacy structural prepared-exploration execution manifest v5",
+            )
         prepared_v2 = True
         require(manifest["scope"] == SOURCE5_EXECUTION_SCOPE_V5 and
                 manifest["qualification_eligible"] is False,
@@ -8379,7 +8483,12 @@ def _validate_chronology_original_pins(value: object) -> dict[str, Any]:
     return pins
 
 
-def _source5_journal_role_limit(role: str) -> int:
+def _source5_journal_role_limit(
+    role: str, prepared: dict[str, Any] | None = None,
+) -> int:
+    owned_limit = _source5_owned_prepared_completion_role_limit(role, prepared)
+    if owned_limit is not None:
+        return owned_limit
     return SOURCE5_JOURNAL_ROLE_LIMITS[role]
 
 
@@ -8426,7 +8535,8 @@ SOURCE5_JOURNAL_ROLE_LIMITS = {
 def _validate_source5_journal_index_document(
     value: object, campaign_id: str, host_id: str,
     source_root: str, input_root: str, output_root: str,
-    host_evidence_budget_pin: dict[str, str] | None = None,
+    host_evidence_budget_pin: dict[str, str] | None = None, *,
+    prepared: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     fields = {
         "schema", "campaign_id", "host_id", "source_root", "input_root",
@@ -8487,7 +8597,7 @@ def _validate_source5_journal_index_document(
                 (type(semantic) is str and re.fullmatch(r"[0-9a-f]{64}", semantic) is not None),
                 "evidence entry semantic digest is malformed")
         _uint(row["byte_count"], "evidence entry byte count",
-              maximum=_source5_journal_role_limit(row["role"]))
+              maximum=_source5_journal_role_limit(row["role"], prepared))
     budget_rows = [row for row in entries
                    if row["role"] == "host_evidence_budget"]
     if host_evidence_budget_pin is None:
@@ -8818,6 +8928,7 @@ def _validate_live_evidence_index_pin(
             value, prepared["campaign_id"], prepared["host_id"],
             str(prepared["source_root"]), str(prepared["input_root"]),
             str(prepared["output_root"]), host_evidence_budget_pin,
+            prepared=prepared,
         )
         require(index["index_sha256"] == pin["semantic_sha256"],
                 "Source5 evidence index semantic pin differs")
@@ -9171,8 +9282,14 @@ def _source5_verify_evidence_bytes(
     entry: dict[str, Any], label: str, *,
     catalogue_authority: object = None,
     catalogue_row: dict[str, Any] | None = None,
+    prepared: dict[str, Any] | None = None,
 ) -> str:
     maximum = SOURCE5_JOURNAL_ROLE_LIMITS.get(entry["role"])
+    owned_maximum = _source5_owned_prepared_completion_role_limit(
+        entry["role"], prepared,
+    )
+    if owned_maximum is not None:
+        maximum = owned_maximum
     if catalogue_authority is not None:
         require(type(catalogue_authority) is _Source5V3CatalogueAuthority and
                 catalogue_authority.token is _SOURCE5_V3_CATALOGUE_AUTHORITY_TOKEN,
@@ -9209,7 +9326,9 @@ def _source5_verify_evidence_bytes(
     return digest
 
 
-def _source5_captured_evidence_store(value: object) -> dict[str, dict[str, Any]]:
+def _source5_captured_evidence_store(
+    value: object, *, prepared: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
     if (getattr(value, "schema", None) ==
             "allocatbelt.application-source5-captured-evidence.v2" and
             callable(getattr(value, "get", None)) and
@@ -9249,7 +9368,7 @@ def _source5_captured_evidence_store(value: object) -> dict[str, dict[str, Any]]
                  re.fullmatch(r"[0-9a-f]{64}", semantic) is not None),
                 "captured evidence semantic digest is malformed")
         _uint(row["byte_count"], "captured evidence byte count",
-              maximum=_source5_journal_role_limit(role))
+              maximum=_source5_journal_role_limit(role, prepared))
         data = row["raw_bytes"]
         require(type(data) is bytes or
                 (type(data) is io.BufferedReader and type(data.raw) is io.FileIO and
@@ -9961,6 +10080,17 @@ def _source5_execution_manifest_document(
             _exact(manifest, legacy_v4_fields,
                    "Source5 legacy signer-only execution manifest v4")
         expected_scope = "final_prepared_bounded"
+    elif schema == SOURCE5_EXECUTION_SCHEMA_V5:
+        legacy_v5_fields = set(SOURCE5_EXECUTION_V5_FIELDS)
+        owned_v5_fields = set(_SOURCE5_EXECUTION_V5_OWNED_FIELDS)
+        if type(manifest) is dict and set(manifest) == owned_v5_fields:
+            _exact(manifest, owned_v5_fields,
+                   "Source5 owned-profile execution manifest v5")
+            _source5_owned_replay_input_pin_map(manifest)
+        else:
+            _exact(manifest, legacy_v5_fields,
+                   "Source5 legacy structural execution manifest v5")
+        expected_scope = SOURCE5_EXECUTION_SCOPE_V5
     else:
         raise ChronologyError("unsupported Source5 execution-manifest schema")
     semantic = sha256_bytes(canonical_bytes({
@@ -9985,7 +10115,7 @@ def _source5_execution_manifest_document(
                 "exploration", "aa", "confirmation", "fixed_analysis",
                 "pressure", "pressure_analysis", "soak", "final_analysis",
             ], "Source5 execution manifest changed original roots/phase order")
-    if (schema == SOURCE5_EXECUTION_SCHEMA_V4 and
+    if (schema in {SOURCE5_EXECUTION_SCHEMA_V4, SOURCE5_EXECUTION_SCHEMA_V5} and
             "journal_width_contracts" in manifest):
         _source5_journal_width_contract_pin_map(manifest)
     _digest(manifest["protocol_sha256"], "Source5 original protocol digest")
@@ -10025,6 +10155,27 @@ def _source5_journal_width_contract_pin_map(
             "path": path, "raw_sha256": raw_sha,
             "semantic_sha256": semantic,
         }
+    return result
+
+
+def _source5_owned_replay_input_pin_map(
+    manifest: dict[str, Any],
+) -> dict[str, dict[str, str]]:
+    hosts = manifest.get("hosts")
+    require(type(hosts) is list and len(hosts) == 2 and
+            all(type(host) is str and bool(host) for host in hosts) and
+            len(hosts) == len(set(hosts)),
+            "Source5 owned replay-profile host order is malformed")
+    values = _exact(manifest.get("prepared_replay_inputs"), set(hosts),
+                    "Source5 owned replay-input profile map")
+    require(list(values) == hosts,
+            "Source5 owned replay profile map changed its exact host order")
+    result = {}
+    for host in hosts:
+        pin = _source5_construction_pin3(
+            values[host], f"Source5 {host} owned replay-input profile pin",
+        )
+        result[host] = pin
     return result
 
 
@@ -14575,8 +14726,10 @@ def _source5_event_width_projection(prepared: dict[str, Any]) -> dict[str, Any] 
     return projection
 
 
-def _append_event(lock: CampaignHostLock, prepared: dict[str, Any], event: str,
-                  details: dict[str, Any], *, captured_analysis_proof: object | None = None) -> dict[str, Any]:
+def _append_event_impl(lock: CampaignHostLock, prepared: dict[str, Any], event: str,
+                       details: dict[str, Any], *,
+                       captured_analysis_proof: object | None = None,
+                       source5_registration_proof: object | None = None) -> dict[str, Any]:
     _check_lock(lock, prepared["output_root"], prepared["campaign_id"], prepared["host_id"])
     if prepared.get("source5_execution_schema") == SOURCE5_PREPARATORY_EXECUTION_SCHEMA_V1:
         require(event in {"source5_prepared_capacity_registered", "source5_authorized",
@@ -14589,6 +14742,14 @@ def _append_event(lock: CampaignHostLock, prepared: dict[str, Any], event: str,
     require(event in DETAIL_FIELDS, f"unknown chronology event {event}")
     require(captured_analysis_proof is None or event == "source5_analysis",
             "captured analysis proof cannot authorize another event kind")
+    v5_registration = (
+        event == "source5_prepared_capacity_registered" and
+        type(details) is dict and type(details.get("provenance")) is dict and
+        details["provenance"].get("schema") ==
+            SOURCE5_PREPARED_INPUTS_PROVENANCE_SCHEMA_V2
+    )
+    require((source5_registration_proof is not None) == v5_registration,
+            "V5 prepared registration append requires its exact live SourceA owner proof")
     record = {
         "schema": JOURNAL_SCHEMA, "sequence": state["record_count"] + 1,
         "monotonic_ns": max(time.monotonic_ns(), state["last_monotonic_ns"] + 1),
@@ -14603,6 +14764,11 @@ def _append_event(lock: CampaignHostLock, prepared: dict[str, Any], event: str,
                            prepared, replay=False, apply=False,
                            analysis_gate_lock=lock,
                            captured_analysis_proof=captured_analysis_proof)
+    if source5_registration_proof is not None:
+        _source5_prepared_registration_proof_check(
+            source5_registration_proof, lock, prepared, state,
+            record["details"], record_sha, mode="precheck",
+        )
     line = canonical_bytes({**unsigned, "record_sha256": record_sha})
     require(len(line) <= MAX_EVENT_BYTES, f"chronology {event} record exceeds its finite line bound")
     width_projection = _source5_event_width_projection(prepared)
@@ -14633,6 +14799,13 @@ def _append_event(lock: CampaignHostLock, prepared: dict[str, Any], event: str,
                 "chronology journal must remain an owned mode-0600 regular file")
         require(info.st_size + len(line) <= maximum_bytes,
                 "chronology journal exceeds its finite byte bound")
+        if source5_registration_proof is not None:
+            _source5_prepared_registration_proof_check(
+                source5_registration_proof, lock, prepared, state,
+                record["details"], record_sha, mode="consume",
+                journal_info=info, append_bytes=len(line),
+                journal_created=created,
+            )
         offset = 0
         while offset < len(line):
             offset += os.write(descriptor, line[offset:])
@@ -14654,6 +14827,12 @@ def _append_event(lock: CampaignHostLock, prepared: dict[str, Any], event: str,
     _check_event_semantics(state, event, record["details"], record_sha,
                            prepared, replay=False, analysis_gate_lock=lock,
                            captured_analysis_proof=captured_analysis_proof)
+    if source5_registration_proof is not None:
+        _source5_prepared_registration_proof_check(
+            source5_registration_proof, lock, prepared, state,
+            record["details"], record_sha, mode="postapply",
+            journal_info=after_info, append_bytes=len(line),
+        )
     state["record_count"] += 1
     if event.startswith("dispatch_"):
         state["dispatch_event_count"] += 1
@@ -14667,6 +14846,474 @@ def _append_event(lock: CampaignHostLock, prepared: dict[str, Any], event: str,
     _set_cached_lock_state(lock, state)
     return {**record, "record_sha256": record_sha}
 
+
+def _append_event(lock: CampaignHostLock, prepared: dict[str, Any], event: str,
+                  details: dict[str, Any], *,
+                  captured_analysis_proof: object | None = None,
+                  source5_registration_proof: object | None = None) -> dict[str, Any]:
+    try:
+        return _append_event_impl(
+            lock, prepared, event, details,
+            captured_analysis_proof=captured_analysis_proof,
+            source5_registration_proof=source5_registration_proof,
+        )
+    finally:
+        if type(source5_registration_proof) is _Source5PreparedRegistrationProof:
+            _source5_discard_prepared_registration_proof(source5_registration_proof)
+
+
+_SOURCE5_OWNED_REPLAY_INPUT_PROFILE_SCHEMA = (
+    "allocatbelt.application-source5-owned-replay-inputs.v1"
+)
+_SOURCE5_OWNED_REPLAY_INPUT_PROFILE_FIELDS = {
+    "schema", "campaign_id", "consumer_host_id", "cohort_hosts",
+    "completion_pin", "provenance_v2", "metadata_capture_manifest_pin",
+    "metadata_capture_stage_root", "probe_capture_index_pin",
+    "scratch_declaration", "timeout_declaration", "profile_sha256",
+}
+_SOURCE5_OWNED_REPLAY_INPUT_PROFILE_BINDING_FIELDS = {
+    "campaign_id", "consumer_host_id", "cohort_hosts", "completion_pin",
+    "provenance_v2",
+}
+
+
+def validate_source5_owned_replay_input_profile_v1(
+    value: object, expected_bindings: object,
+) -> dict[str, Any]:
+    """Validate the fixed data-only ordinary replay profile without issuing authority."""
+    profile = _exact(value, _SOURCE5_OWNED_REPLAY_INPUT_PROFILE_FIELDS,
+                     "Source5 owned replay-input profile")
+    expected = copy.deepcopy(_exact(
+        expected_bindings,
+        _SOURCE5_OWNED_REPLAY_INPUT_PROFILE_BINDING_FIELDS,
+        "Source5 owned replay profile expected bindings",
+    ))
+    hosts = expected["cohort_hosts"]
+    consumer = _token(expected["consumer_host_id"],
+                      "Source5 owned replay expected consumer")
+    require(profile["schema"] == _SOURCE5_OWNED_REPLAY_INPUT_PROFILE_SCHEMA and
+            type(hosts) is list and len(hosts) == 2 and
+            all(type(host) is str and bool(host) for host in hosts) and
+            len(set(hosts)) == 2 and consumer in hosts and
+            profile["campaign_id"] == _token(expected["campaign_id"],
+                                             "Source5 owned replay expected campaign") and
+            profile["consumer_host_id"] == consumer and
+            profile["cohort_hosts"] == hosts,
+            "Source5 owned replay profile changed its exact campaign or ordered two-host identity")
+    completion = _source5_construction_pin3(
+        profile["completion_pin"], "Source5 owned replay profile completion pin",
+    )
+    expected_completion = _source5_construction_pin3(
+        expected["completion_pin"], "Source5 expected owned completion pin",
+    )
+    require(completion == expected_completion,
+            "Source5 owned replay profile changed its exact completion pin")
+    provenance = _exact(
+        profile["provenance_v2"],
+        set(SOURCE5_PREPARED_INPUTS_PROVENANCE_V2_FIELDS),
+        "Source5 owned replay profile V2 provenance",
+    )
+    expected_provenance = _exact(
+        expected["provenance_v2"],
+        set(SOURCE5_PREPARED_INPUTS_PROVENANCE_V2_FIELDS),
+        "Source5 expected owned replay V2 provenance",
+    )
+    require(provenance["schema"] == SOURCE5_PREPARED_INPUTS_PROVENANCE_SCHEMA_V2 and
+            canonical_bytes(provenance) == canonical_bytes(expected_provenance),
+            "Source5 owned replay profile changed its exact V2 provenance")
+    for name in ("preparation_pin", "final_spec_pin", "final_plan_pin"):
+        _source5_construction_pin2(
+            provenance[name], f"Source5 owned replay profile provenance {name}",
+        )
+    lineage = _exact(provenance["exploration_lineage"], set(hosts),
+                     "Source5 owned replay profile lineage cohort")
+    for host in hosts:
+        row = _exact(lineage[host], {"bridge_header", "record_index"},
+                     f"Source5 owned replay profile {host} lineage pins")
+        for name, pin in row.items():
+            _source5_construction_pin2(
+                pin, f"Source5 owned replay profile {host} {name}",
+            )
+    for name in ("metadata_capture_manifest_pin", "probe_capture_index_pin"):
+        pin = _source5_construction_pin2(
+            profile[name], f"Source5 owned replay profile {name}",
+        )
+        require(pin["path"] == profile[name]["path"] and
+                pin["raw_sha256"] == profile[name]["raw_sha256"],
+                f"Source5 owned replay profile {name} is malformed")
+    _source5_construction_normalized_root(
+        profile["metadata_capture_stage_root"],
+        "Source5 owned replay profile metadata-capture stage root",
+    )
+    scratch = _exact(profile["scratch_declaration"], {
+        "schema", "root", "device_id", "allocation_block_bytes",
+        "directory_metadata_reserve_bytes", "reserved_bytes", "reserved_inodes",
+    }, "Source5 owned replay profile scratch declaration")
+    require(scratch["schema"] ==
+                "allocatbelt.application-source5-recorded-preparation-scratch.v3",
+            "Source5 owned replay profile scratch schema differs")
+    _source5_construction_normalized_root(
+        scratch["root"], "Source5 owned replay profile scratch root",
+    )
+    _uint(scratch["device_id"], "Source5 owned replay profile scratch device")
+    _uint(scratch["allocation_block_bytes"],
+          "Source5 owned replay profile allocation block", positive=True,
+          maximum=MAX_PLAN_BYTES)
+    for name in ("directory_metadata_reserve_bytes", "reserved_bytes", "reserved_inodes"):
+        _uint(scratch[name], f"Source5 owned replay profile {name}", positive=True)
+    timeouts = _exact(profile["timeout_declaration"], {
+        "maximum_io_window_seconds", "maximum_operation_seconds",
+    }, "Source5 owned replay profile timeout declaration")
+    io_seconds = _uint(timeouts["maximum_io_window_seconds"],
+                        "Source5 owned replay profile I/O timeout", positive=True)
+    operation_seconds = _uint(
+        timeouts["maximum_operation_seconds"],
+        "Source5 owned replay profile operation timeout", positive=True,
+    )
+    require(io_seconds <= 300 and operation_seconds <= 86400 and
+            operation_seconds >= io_seconds,
+            "Source5 owned replay profile timeout declaration exceeds fixed H policy")
+    body = {key: item for key, item in profile.items()
+            if key != "profile_sha256"}
+    profile_sha = _digest(profile["profile_sha256"],
+                          "Source5 owned replay profile digest")
+    require(profile_sha == sha256_bytes(canonical_bytes(body)),
+            "Source5 owned replay profile self-digest differs")
+    return _json_copy(profile)
+
+
+def source5_owned_prepared_completion_max_bytes_v1(
+    profile_value: object, expected_bindings: object,
+) -> int:
+    """Return the fixed data-only V5 completion cap after exact profile validation."""
+    validate_source5_owned_replay_input_profile_v1(
+        profile_value, expected_bindings,
+    )
+    return MAX_SOURCE5_OWNED_PREPARED_COMPLETION_BYTES
+
+
+def _source5_issue_owned_prepared_completion_role_context(
+    prepared: dict[str, Any], profile_value: object,
+    profile_pin_value: object, completion_pin_value: object,
+    provenance_value: object, inputprep_module: Any,
+) -> _Source5OwnedPreparedCompletionRoleContext:
+    profile_pin = _source5_construction_pin3(
+        profile_pin_value, "SourceA owned completion role profile pin",
+    )
+    completion_pin = _source5_construction_pin3(
+        completion_pin_value, "SourceA owned completion role completion pin",
+    )
+    provenance = _exact(
+        provenance_value, set(SOURCE5_PREPARED_INPUTS_PROVENANCE_V2_FIELDS),
+        "SourceA owned completion role V2 provenance",
+    )
+    hosts = [row["host_id"] for row in prepared["spec"]["hosts"]]
+    expected_bindings = {
+        "campaign_id": prepared["campaign_id"],
+        "consumer_host_id": prepared["host_id"],
+        "cohort_hosts": hosts,
+        "completion_pin": completion_pin,
+        "provenance_v2": provenance,
+    }
+    maximum = source5_owned_prepared_completion_max_bytes_v1(
+        profile_value, expected_bindings,
+    )
+    require(prepared.get("source5_execution_schema") ==
+                SOURCE5_EXECUTION_SCHEMA_V5 and
+            maximum == MAX_SOURCE5_OWNED_PREPARED_COMPLETION_BYTES and
+            type(getattr(inputprep_module,
+                         "PREPARED_INPUT_COMPLETION_MAX_BYTES", None)) is int and
+            inputprep_module.PREPARED_INPUT_COMPLETION_MAX_BYTES == maximum and
+            prepared.get("source5_owned_replay_profile_pin") == profile_pin,
+            "SourceA selected InputPrep writer or owned profile changed its exact completion cap")
+    inputprep_path = "scripts/application-source5-input-preparation.py"
+    typed = next((row for row in prepared["source"]["source"]["files"]
+                  if type(row) is dict and row.get("path") == inputprep_path), None)
+    _inputprep_raw, inputprep_sha, inputprep_record = _source_file(
+        prepared["source_root"], prepared["source"], inputprep_path,
+        "SourceA owned prepared-completion selected InputPrep module",
+        maximum=MAX_SCRIPT_BYTES,
+    )
+    require(type(typed) is dict and typed.get("kind") == "file" and
+            inputprep_record == typed and inputprep_sha == typed["sha256"] and
+            Path(getattr(inputprep_module, "__file__", "")).resolve(strict=True) ==
+                prepared["source_root"] / inputprep_path,
+            "SourceA owned completion cap is not bound to the selected typed InputPrep module")
+    context = _Source5OwnedPreparedCompletionRoleContext(
+        _SOURCE5_OWNED_COMPLETION_ROLE_CONTEXT_SECRET,
+    )
+    with _SOURCE5_OWNED_COMPLETION_ROLE_CONTEXT_LOCK:
+        _SOURCE5_OWNED_COMPLETION_ROLE_CONTEXTS[context] = {
+            "prepared_id": id(prepared),
+            "profile_pin": copy.deepcopy(profile_pin),
+            "completion_pin": copy.deepcopy(completion_pin),
+            "provenance_raw": canonical_bytes(provenance),
+            "original_pins_sha256": prepared["original_pins_sha256"],
+            "source_manifest_pin": copy.deepcopy(
+                next(row for row in prepared["original_pins"]["source_manifests"]
+                     if row["host_id"] == prepared["host_id"]),
+            ),
+            "inputprep_module_id": id(inputprep_module),
+            "inputprep_source_sha256": inputprep_sha,
+            "maximum_bytes": maximum,
+        }
+    prepared["source5_owned_replay_profile"] = \
+        validate_source5_owned_replay_input_profile_v1(
+            profile_value, expected_bindings,
+        )
+    prepared["_source5_owned_prepared_completion_role_context"] = context
+    prepared["_source5_owned_prepared_completion_inputprep_module"] = inputprep_module
+    return context
+
+
+def _source5_owned_prepared_completion_role_limit(
+    role: str, prepared: dict[str, Any] | None,
+) -> int | None:
+    if role != "prepared_completion" or type(prepared) is not dict:
+        return None
+    context = prepared.get("_source5_owned_prepared_completion_role_context")
+    if type(context) is not _Source5OwnedPreparedCompletionRoleContext:
+        return None
+    with _SOURCE5_OWNED_COMPLETION_ROLE_CONTEXT_LOCK:
+        entry = _SOURCE5_OWNED_COMPLETION_ROLE_CONTEXTS.get(context)
+    completion_pin = prepared.get("source5_owned_registration_completion", {}).get(
+        "completion_pin", prepared.get("source5_execution_manifest", {}).get(
+            "prepared_input_generation", {}).get("completion"),
+    )
+    provenance = prepared.get(
+        "source5_prepared_input_provenance_v2",
+        prepared.get("source5_execution_manifest", {}).get(
+            "prepared_input_generation", {}).get("provenance", {}),
+    )
+    inputprep_module = prepared.get(
+        "_source5_owned_prepared_completion_inputprep_module",
+    )
+    require(type(entry) is dict and entry.get("prepared_id") == id(prepared) and
+            prepared.get("source5_execution_schema") == SOURCE5_EXECUTION_SCHEMA_V5 and
+            prepared.get("source5_owned_replay_profile_pin") == entry["profile_pin"] and
+            completion_pin == entry["completion_pin"] and
+            prepared.get("original_pins_sha256") == entry["original_pins_sha256"] and
+            canonical_bytes(provenance) == entry["provenance_raw"] and
+            isinstance(inputprep_module, types.ModuleType) and
+            id(inputprep_module) == entry["inputprep_module_id"] and
+            inputprep_module.PREPARED_INPUT_COMPLETION_MAX_BYTES ==
+                entry["maximum_bytes"] == MAX_SOURCE5_OWNED_PREPARED_COMPLETION_BYTES,
+            "SourceA owned prepared-completion role context changed its profile, Source or module pins")
+    selected_source = next(
+        row for row in prepared["original_pins"]["source_manifests"]
+        if row["host_id"] == prepared["host_id"]
+    )
+    require(selected_source == entry["source_manifest_pin"],
+            "SourceA owned prepared-completion cap crossed a current Source epoch")
+    profile_path = Path(entry["profile_pin"]["path"])
+    require(_within(prepared["input_root"], profile_path),
+            "SourceA owned prepared-completion profile escaped its current input root")
+    profile_raw, profile_info = _read_stable(
+        profile_path, "SourceA owned prepared-completion replay profile",
+        MAX_PLAN_BYTES,
+    )
+    profile = _parse_object(
+        profile_raw, "SourceA owned prepared-completion replay profile",
+        MAX_PLAN_BYTES,
+    )
+    expected_bindings = {
+        "campaign_id": prepared["campaign_id"],
+        "consumer_host_id": prepared["host_id"],
+        "cohort_hosts": [row["host_id"] for row in prepared["spec"]["hosts"]],
+        "completion_pin": entry["completion_pin"],
+        "provenance_v2": json.loads(entry["provenance_raw"].decode("ascii")),
+    }
+    require(profile_path.is_absolute() and profile_path.as_posix() ==
+                entry["profile_pin"]["path"] and
+            profile_path.resolve(strict=True) == profile_path and
+            stat.S_ISREG(profile_info.st_mode) and
+            profile_raw == canonical_bytes(profile) and
+            profile_info.st_uid == os.getuid() and
+            stat.S_IMODE(profile_info.st_mode) == 0o600 and
+            profile_info.st_nlink == 1 and
+            sha256_bytes(profile_raw) == entry["profile_pin"]["raw_sha256"] and
+            profile.get("profile_sha256") == entry["profile_pin"]["semantic_sha256"] and
+            source5_owned_prepared_completion_max_bytes_v1(
+                profile, expected_bindings,
+            ) == entry["maximum_bytes"],
+            "SourceA owned prepared-completion profile bytes changed during role readback")
+    inputprep_path = "scripts/application-source5-input-preparation.py"
+    _raw, inputprep_sha, typed = _source_file(
+        prepared["source_root"], prepared["source"], inputprep_path,
+        "SourceA owned prepared-completion role InputPrep module",
+        maximum=MAX_SCRIPT_BYTES,
+    )
+    require(typed["sha256"] == entry["inputprep_source_sha256"] == inputprep_sha and
+            typed["kind"] == "file" and
+            Path(inputprep_module.__file__).resolve(strict=True) ==
+                prepared["source_root"] / inputprep_path,
+            "SourceA owned prepared-completion role InputPrep Source pin changed")
+    return entry["maximum_bytes"]
+
+
+def _source5_issue_prepared_registration_proof(
+    session: Any, details: dict[str, Any],
+) -> _Source5PreparedRegistrationProof:
+    require(type(session) is _Source5PreparedExplorationRegistrationSession and
+            type(details) is dict and session.require_complete() is None,
+            "Source5 prepared registration proof requires a completed private owner session")
+    session.check_live("registration proof issue")
+    _source5_owned_registration_verify_h_ledger(session)
+    require(session.capture_reader.storage_usage() == session.capture_storage_usage,
+            "SourceA registration proof issue changed the exact old capture closure")
+    fd_info = os.fstat(session.lock.fd)
+    require(_lock_token_is_live(session.lock) and
+            (fd_info.st_dev, fd_info.st_ino) == session.lock._fd_key,
+            "Source5 prepared registration proof lost its exact live lock fd")
+    require(session.prepared["source5_owned_replay_profile_pin"] ==
+                session.profile_pin and
+            session.prepared["source5_owned_width_contract_pin"] ==
+                session.width_pin and
+            session.prepared["source5_owned_registration_completion"][
+                "completion_pin"] == session.completion_pin,
+            "Source5 prepared registration proof lost its source-owned input binding")
+    proof = _Source5PreparedRegistrationProof(
+        _SOURCE5_PREPARED_REGISTRATION_PROOF_SECRET,
+    )
+    entry = {
+        "session": session, "lock": session.lock,
+        "lock_fd": session.lock.fd,
+        "lock_fd_key": session.lock._fd_key,
+        "frontier": dict(session.frontier),
+        "journal_file_key": session.journal_file_key,
+        "original_pins_sha256": session.prepared["original_pins_sha256"],
+        "profile_pin": copy.deepcopy(session.profile_pin),
+        "width_pin": copy.deepcopy(session.width_pin),
+        "completion_pin": copy.deepcopy(session.completion_pin),
+        "provenance_raw": canonical_bytes(session.provenance),
+        "details_raw": canonical_bytes(details),
+        "state": "unused", "record_sha256": None,
+        "pre_append_file_key": None, "append_bytes": None,
+    }
+    with _SOURCE5_PREPARED_REGISTRATION_PROOF_LOCK:
+        _SOURCE5_PREPARED_REGISTRATION_PROOFS[proof] = entry
+    return proof
+
+
+def _source5_discard_prepared_registration_proof(proof: object) -> None:
+    if type(proof) is not _Source5PreparedRegistrationProof:
+        return
+    with _SOURCE5_PREPARED_REGISTRATION_PROOF_LOCK:
+        _SOURCE5_PREPARED_REGISTRATION_PROOFS.pop(proof, None)
+
+
+def _source5_prepared_registration_proof_check(
+    proof: object, lock: CampaignHostLock, prepared: dict[str, Any],
+    state: dict[str, Any], details: dict[str, Any], record_sha256: str, *,
+    mode: str, journal_info: os.stat_result | None = None,
+    append_bytes: int | None = None, journal_created: bool | None = None,
+) -> None:
+    require(type(proof) is _Source5PreparedRegistrationProof and
+            mode in {"precheck", "consume", "postapply"},
+            "Source5 V5 registration has no exact private one-use owner proof")
+    with _SOURCE5_PREPARED_REGISTRATION_PROOF_LOCK:
+        entry = _SOURCE5_PREPARED_REGISTRATION_PROOFS.get(proof)
+    require(type(entry) is dict,
+            "Source5 V5 registration owner proof is forged, copied, consumed, or expired")
+    session = entry.get("session")
+    require(type(session) is _Source5PreparedExplorationRegistrationSession and
+            entry.get("lock") is lock and session.lock is lock and
+            entry.get("lock_fd") == lock.fd and
+            entry.get("lock_fd_key") == lock._fd_key and
+            _lock_token_is_live(lock),
+            "Source5 V5 registration proof differs from its live lock/fd identity")
+    fd_info = os.fstat(lock.fd)
+    lock_path_info = lock.lock_path.lstat()
+    require((fd_info.st_dev, fd_info.st_ino) ==
+                (lock_path_info.st_dev, lock_path_info.st_ino) == lock._fd_key and
+            stat.S_ISREG(fd_info.st_mode) and stat.S_ISREG(lock_path_info.st_mode) and
+            stat.S_IMODE(fd_info.st_mode) == stat.S_IMODE(lock_path_info.st_mode) == 0o600 and
+            fd_info.st_uid == lock_path_info.st_uid == os.getuid(),
+            "Source5 V5 registration lock or fd changed identity")
+    require(prepared is session.prepared and
+            prepared.get("source5_owned_replay_profile_pin") == entry["profile_pin"] ==
+                session.profile_pin and
+            prepared.get("source5_owned_width_contract_pin") == entry["width_pin"] ==
+                session.width_pin and
+            prepared.get("source5_owned_registration_completion", {}).get(
+                "completion_pin") == entry["completion_pin"] == session.completion_pin and
+            prepared.get("original_pins_sha256") == entry["original_pins_sha256"] and
+            canonical_bytes(prepared["original_pins"]) ==
+                canonical_bytes(session.prepared["original_pins"]) and
+            canonical_bytes(session.provenance) == entry["provenance_raw"] and
+            canonical_bytes(details) == entry["details_raw"] and
+            type(record_sha256) is str and
+            re.fullmatch(r"[0-9a-f]{64}", record_sha256) is not None,
+            "Source5 V5 registration proof input/source/details binding changed")
+    if mode in {"precheck", "consume"}:
+        require(entry["state"] == "unused" and
+                state.get("head") == entry["frontier"]["head_sha256"] and
+                state.get("record_count") == entry["frontier"]["record_count"] and
+                state.get("file_stat") == entry["journal_file_key"] and
+                session.frontier == entry["frontier"] and
+                session.journal_file_key == entry["journal_file_key"],
+                "Source5 V5 registration proof is outside its exact old journal frontier")
+        if entry["record_sha256"] is None:
+            entry["record_sha256"] = record_sha256
+        require(entry["record_sha256"] == record_sha256,
+                "Source5 V5 registration proof was rebound to another record")
+        session.require_complete()
+        if mode == "precheck":
+            session.check_live("registration append precheck")
+            _source5_owned_registration_verify_h_ledger(session)
+            require(session.capture_reader.storage_usage() == session.capture_storage_usage,
+                    "SourceA registration precheck changed the old capture closure")
+            return
+        session.check_deadline("registration append consume")
+        _source5_prepared_registration_recheck_inputs(
+            session, "registration append consume",
+        )
+        _source5_owned_registration_verify_h_ledger(session)
+        require(session.capture_reader.storage_usage() == session.capture_storage_usage,
+                "SourceA registration consume changed the old capture closure")
+        _source5_prepared_registration_recheck_inputs_callback_free(
+            session, "registration append final prewrite",
+        )
+        require(journal_info is not None and type(append_bytes) is int and
+                type(journal_created) is bool and
+                append_bytes > 0 and stat.S_ISREG(journal_info.st_mode) and
+                stat.S_IMODE(journal_info.st_mode) == 0o600 and
+                journal_info.st_uid == os.getuid(),
+                "Source5 V5 registration append lacks its held private journal fd")
+        expected = entry["journal_file_key"]
+        if expected is None:
+            require(journal_created is True and journal_info.st_size == 0,
+                    "Source5 V5 registration journal appeared before its first durable write")
+        else:
+            require(journal_created is False and
+                    (journal_info.st_dev, journal_info.st_ino, journal_info.st_mode,
+                     journal_info.st_size, journal_info.st_mtime_ns,
+                     journal_info.st_ctime_ns) == expected,
+                    "Source5 V5 registration journal changed before its durable write")
+        require(time.monotonic_ns() < session.deadline_ns,
+                "Source5 V5 registration operation expired immediately before proof consumption")
+        entry["pre_append_file_key"] = (
+            journal_info.st_dev, journal_info.st_ino, journal_info.st_mode,
+            journal_info.st_size, journal_info.st_uid,
+        )
+        entry["append_bytes"] = append_bytes
+        entry["state"] = "consumed"
+        return
+    require(entry["state"] == "consumed" and
+            entry["record_sha256"] == record_sha256 and
+            journal_info is not None and
+            entry["append_bytes"] == append_bytes and
+            entry["pre_append_file_key"] is not None and
+            (journal_info.st_dev, journal_info.st_ino, journal_info.st_mode,
+             journal_info.st_uid) == (
+                entry["pre_append_file_key"][0], entry["pre_append_file_key"][1],
+                entry["pre_append_file_key"][2], entry["pre_append_file_key"][4],
+            ) and
+            journal_info.st_size ==
+                entry["pre_append_file_key"][3] + entry["append_bytes"] and
+            stat.S_IMODE(journal_info.st_mode) == 0o600 and
+            journal_info.st_uid == os.getuid(),
+            "Source5 V5 registration apply does not match its one consumed durable record")
 
 def _capacity_completion(
     prepared: dict[str, Any], capacity_output_root: Path, completion_pin: object,
@@ -24514,6 +25161,1407 @@ def main(argv: list[str] | None = None) -> int:
         print(f"application campaign chronology: {error}", file=sys.stderr)
         return 2
 
+
+_SOURCE5_PREPARED_EXPLORATION_REGISTRATION_SESSION_SECRET = object()
+
+
+def _source5_read_owned_replay_input_profile(
+    profile_pin_value: object, prepared: dict[str, Any], completion_pin: dict[str, Any],
+    provenance_v2: dict[str, Any], lineage_module: Any,
+) -> tuple[dict[str, Any], bytes, dict[str, str]]:
+    pin = _source5_construction_pin3(
+        profile_pin_value, "Source5 owned replay-input profile raw3 pin",
+    )
+    path = Path(pin["path"])
+    require(_within(prepared["input_root"], path) and
+            path.is_absolute() and path.as_posix() == pin["path"],
+            "Source5 owned replay-input profile escaped the validated input root")
+    checked = _safe_child(
+        prepared["input_root"], path.relative_to(prepared["input_root"]).as_posix(),
+        "Source5 owned replay-input profile",
+    )
+    raw, info = _read_stable(
+        checked, "Source5 owned replay-input profile", MAX_PLAN_BYTES,
+    )
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and
+            stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+            sha256_bytes(raw) == pin["raw_sha256"],
+            "Source5 owned replay-input profile is not an exact owned raw-pinned input")
+    value = _parse_object(raw, "Source5 owned replay-input profile", MAX_PLAN_BYTES)
+    require(raw == canonical_bytes(value),
+            "Source5 owned replay-input profile is not canonical JSON")
+    hosts = [row["host_id"] for row in prepared["spec"]["hosts"]]
+    expected = {
+        "campaign_id": prepared["campaign_id"],
+        "consumer_host_id": prepared["host_id"],
+        "cohort_hosts": hosts,
+        "completion_pin": completion_pin,
+        "provenance_v2": provenance_v2,
+    }
+    checked_profile = validate_source5_owned_replay_input_profile_v1(
+        value, expected,
+    )
+    require(checked_profile["profile_sha256"] == pin["semantic_sha256"] and
+            callable(getattr(lineage_module,
+                             "validate_prepared_input_provenance_v2", None)),
+            "Source5 owned replay profile raw/semantic or selected lineage API differs")
+    validate = lineage_module.validate_prepared_input_provenance_v2
+    try:
+        revalidated = validate(
+            checked_profile["provenance_v2"], expected_hosts=hosts,
+        )
+    except Exception as error:
+        raise ChronologyError(
+            f"Source-selected lineage module rejected the owned replay profile: {error}",
+        ) from error
+    require(canonical_bytes(revalidated) == canonical_bytes(provenance_v2),
+            "Source5 owned replay profile lost its current Source-selected V2 provenance")
+    return checked_profile, raw, pin
+
+
+def _source5_prepared_registration_recheck_inputs_callback_free(
+    session: Any, label: str,
+) -> None:
+    """Recheck bound inputs without invoking cancellation or user callbacks."""
+    prepared = session.prepared
+    _check_lock(
+        session.lock, prepared["output_root"], prepared["campaign_id"],
+        prepared["host_id"],
+    )
+    for snapshot in session.input_snapshots:
+        _source5_construction_recheck_file(snapshot, label)
+    for snapshot in session.source_file_snapshots:
+        _source5_construction_recheck_file(snapshot, label)
+    for snapshot in session.root_snapshots:
+        _source5_construction_recheck_directory(snapshot, label)
+    try:
+        descriptor = session.capture_reader._open_root_checked()
+    except Exception as error:
+        raise ChronologyError(
+            f"SourceA {label} lost its physical old capture root: {error}",
+        ) from error
+    else:
+        os.close(descriptor)
+    fresh = None
+    try:
+        args = session.prepare_args
+        fresh = _prepare_inputs(
+            args["plan_pin"], args["spec_pin"], args["source_root"],
+            args["input_root"], args["host_id"],
+            args["observed_host_pin"], args["output_root"],
+        )
+        require(fresh["original_pins"] == prepared["original_pins"] and
+                fresh["campaign_id"] == prepared["campaign_id"] and
+                fresh["host_id"] == prepared["host_id"] and
+                fresh["source_root"] == prepared["source_root"] and
+                fresh["input_root"] == prepared["input_root"] and
+                fresh["output_root"] == prepared["output_root"],
+                f"SourceA {label} changed the exact current Spec/Plan/Source/host pins")
+    finally:
+        _source5_construction_close_prepared(fresh)
+    require(time.monotonic_ns() < session.deadline_ns,
+            f"SourceA {label} expired during its callback-free input recheck")
+
+
+def _source5_prepared_registration_recheck_inputs(
+    session: Any, label: str,
+) -> None:
+    session.check_deadline(label)
+    _source5_prepared_registration_recheck_inputs_callback_free(session, label)
+    session.check_deadline(label)
+
+
+class _Source5PreparedExplorationRegistrationSession:
+    __slots__ = (
+        "lock", "prepared", "prepare_args", "frontier", "journal_file_key",
+        "input_snapshots", "source_file_snapshots", "root_snapshots",
+        "capture_reader", "capture_storage_usage", "artifact_reader", "modules",
+        "source_module_pins", "hosts", "lineage_proofs", "archived_authorities",
+        "numeric_context", "old_budgets", "basis", "basis_pin", "plan", "plan_pin",
+        "chunks", "plan_module", "h_client", "providers", "provider_cursors",
+        "global_cursor", "numeric_replay_count", "active", "active_window",
+        "failed", "closed", "deadline_ns", "cancel_event", "lease_lock",
+        "profile", "profile_pin", "width_pin", "completion_pin", "provenance",
+        "verified_completion",
+    )
+
+    def __init__(
+        self, secret: object, lock: CampaignHostLock,
+        prepared: dict[str, Any], prepare_args: dict[str, Any],
+        frontier: dict[str, Any], journal_file_key: object,
+        input_snapshots: list[dict[str, Any]],
+        source_file_snapshots: list[dict[str, Any]],
+        root_snapshots: list[dict[str, Any]], capture_reader: Any,
+        artifact_reader: _Source5PreparedInputConstructionArtifactReader,
+        modules: dict[str, types.ModuleType], hosts: list[str],
+        deadline_ns: int, cancel_event: Any, profile: dict[str, Any],
+        profile_pin: dict[str, str], width_pin: dict[str, str],
+        completion_pin: dict[str, str], provenance: dict[str, Any],
+    ) -> None:
+        require(secret is _SOURCE5_PREPARED_EXPLORATION_REGISTRATION_SESSION_SECRET and
+                _lock_token_is_live(lock) and type(prepared) is dict and
+                type(prepare_args) is dict and type(frontier) is dict and
+                type(input_snapshots) is list and type(source_file_snapshots) is list and
+                type(root_snapshots) is list and
+                callable(getattr(artifact_reader, "__call__", None)) and
+                type(modules) is dict and type(hosts) is list and
+                type(deadline_ns) is int and deadline_ns > 0 and
+                (cancel_event is None or callable(getattr(cancel_event, "is_set", None))),
+                "SourceA ordinary registration session construction inputs are malformed")
+        self.lock = lock
+        self.prepared = prepared
+        self.prepare_args = prepare_args
+        self.frontier = dict(frontier)
+        self.journal_file_key = journal_file_key
+        self.input_snapshots = input_snapshots
+        self.source_file_snapshots = source_file_snapshots
+        self.root_snapshots = root_snapshots
+        self.capture_reader = capture_reader
+        self.capture_storage_usage = None
+        self.artifact_reader = artifact_reader
+        self.modules = modules
+        self.source_module_pins = {}
+        self.hosts = list(hosts)
+        self.lineage_proofs = {}
+        self.archived_authorities = {}
+        self.numeric_context = None
+        self.old_budgets = {}
+        self.basis = None
+        self.basis_pin = None
+        self.plan = None
+        self.plan_pin = None
+        self.chunks = []
+        self.plan_module = modules["planner"]
+        self.h_client = None
+        self.providers = None
+        self.provider_cursors = {host: 0 for host in hosts}
+        self.global_cursor = 0
+        self.numeric_replay_count = 0
+        self.active = False
+        self.active_window = None
+        self.failed = False
+        self.closed = False
+        self.deadline_ns = deadline_ns
+        self.cancel_event = cancel_event
+        self.lease_lock = threading.Lock()
+        self.profile = profile
+        self.profile_pin = profile_pin
+        self.width_pin = width_pin
+        self.completion_pin = completion_pin
+        self.provenance = provenance
+        self.verified_completion = None
+
+    def check_deadline(self, label: str) -> None:
+        require(not self.closed and not self.failed and
+                time.monotonic_ns() < self.deadline_ns and
+                (self.cancel_event is None or not self.cancel_event.is_set()),
+                f"SourceA owned registration {label} was cancelled, expired, or closed")
+
+    def check_live(self, label: str) -> None:
+        _source5_construction_check_live(self, label)
+
+    def read_captured(self, pin_value: object, maximum: object) -> bytes:
+        self.check_deadline("raw2 read")
+        return self.artifact_reader(pin_value, maximum)
+
+    def begin_window(
+        self, provider: Any, job: object, purpose: object, use: object,
+    ) -> tuple[int, dict[str, Any], dict[str, Any], dict[str, Any]]:
+        if not self.lease_lock.acquire(blocking=False):
+            self.failed = True
+            raise ChronologyError(
+                "SourceA ordinary replay rejected an overlapping H3 lease",
+            )
+        try:
+            self.check_deadline("provider lease")
+            _check_lock(
+                self.lock, self.prepared["output_root"],
+                self.prepared["campaign_id"], self.prepared["host_id"],
+            )
+            require(not self.active and provider.session is self and
+                    provider.host_id in self.hosts and purpose == "exploration" and
+                    use == "capacity_pilot_export",
+                    "SourceA ordinary provider scope or lease state differs")
+            host_position = self.hosts.index(provider.host_id)
+            job_index = self.provider_cursors[provider.host_id]
+            ordinal = host_position * 360 + job_index
+            require(self.global_cursor == ordinal and ordinal < 720 and
+                    job_index < 360,
+                    "SourceA ordinary provider is not the exact next ordered H3 window")
+            (index_row, record, _authorization, _finished, gpg_row) = \
+                self.numeric_context["rows_by_host"][provider.host_id][job_index]
+            expected_job = index_row.get("job")
+            require(type(job) is dict and type(expected_job) is dict and
+                    canonical_bytes(job) == canonical_bytes(expected_job) and
+                    record.get("job") == expected_job,
+                    "SourceA ordinary provider job differs from its exact GPG row")
+            index = self.plan["window_index"][ordinal]
+            chunk = self.chunks[index["chunk_ordinal"]]
+            window = self.plan_module.validate_recorded_preparation_read_window_v2(
+                self.plan, self.plan_pin, chunk, ordinal,
+            )
+            require(index["owner_host_id"] == provider.host_id and
+                    index["job_index"] == job_index and
+                    window["owner_host_id"] == provider.host_id and
+                    window["job_index"] == job_index and
+                    window["read_ordinal"] == ordinal and
+                    window["job"] == expected_job,
+                    "SourceA ordinary H3 plan row differs from the exact lineage job")
+            self.active = True
+            self.active_window = (provider.host_id, job_index, ordinal)
+            return ordinal, window, chunk, gpg_row
+        except BaseException:
+            self.failed = True
+            self.active = False
+            self.active_window = None
+            self.lease_lock.release()
+            raise
+
+    def complete_window(
+        self, provider: Any, job_index: int, ordinal: int,
+    ) -> None:
+        require(self.active and not self.failed and not self.closed and
+                self.active_window == (provider.host_id, job_index, ordinal) and
+                self.global_cursor == ordinal and
+                self.provider_cursors[provider.host_id] == job_index,
+                "SourceA ordinary H3 window completion differs from its active lease")
+        self.check_deadline("provider completion")
+        _check_lock(
+            self.lock, self.prepared["output_root"],
+            self.prepared["campaign_id"], self.prepared["host_id"],
+        )
+        self.provider_cursors[provider.host_id] = job_index + 1
+        self.global_cursor = ordinal + 1
+        self.active = False
+        self.active_window = None
+        self.lease_lock.release()
+
+    def fail_window(self) -> None:
+        self.failed = True
+        self.active = False
+        self.active_window = None
+        if self.lease_lock.locked():
+            self.lease_lock.release()
+
+    def require_complete(self) -> None:
+        require(not self.failed and not self.closed and not self.active and
+                self.global_cursor == 720 and
+                all(self.provider_cursors[host] == 360 for host in self.hosts) and
+                self.numeric_replay_count == 720,
+                "SourceA ordinary replay did not close exactly 720 H3 and Fixed windows")
+
+
+class _Source5PreparedExplorationRegistrationPilotProvider:
+    __slots__ = ("session", "host_id")
+
+    def __init__(
+        self, session: _Source5PreparedExplorationRegistrationSession,
+        host_id: str,
+    ) -> None:
+        require(host_id in session.hosts,
+                "SourceA ordinary replay provider is outside the exact cohort")
+        self.session = session
+        self.host_id = host_id
+
+    @contextlib.contextmanager
+    def open_view(self, job: dict[str, Any], purpose: str, *, use: str):
+        session = self.session
+        ordinal, _window, chunk, gpg_row = session.begin_window(
+            self, job, purpose, use,
+        )
+        job_index = session.provider_cursors[self.host_id]
+        index_row, record = session.numeric_context["rows_by_host"][
+            self.host_id
+        ][job_index][:2]
+        completed = False
+        try:
+            with session.h_client.open_view(ordinal) as yielded:
+                session.check_deadline("H3 payload view")
+                numeric = _source5_verify_recorded_numeric_ancestor_held(
+                    session.numeric_context, self.host_id, job_index,
+                    artifact_reader=session.artifact_reader,
+                    read_basis_value=session.basis,
+                    read_basis_pin_value=session.basis_pin,
+                    read_plan_value=session.plan,
+                    read_plan_pin_value=session.plan_pin,
+                    read_window_chunk_value=chunk,
+                    h3_yield=yielded,
+                )
+                require(numeric.get("schema") ==
+                            _SOURCE5_RECORDED_NUMERIC_RESULT_SCHEMA and
+                        numeric.get("qualification_eligible") is False and
+                        numeric.get("host_id") == self.host_id and
+                        numeric.get("job_index") == job_index and
+                        numeric.get("run_id") == record["job"]["run_id"] and
+                        numeric.get("process_metrics") == record["process_metrics"] and
+                        numeric.get("process_metrics_sha256") ==
+                            record["chronology"]["process_metrics_sha256"],
+                        "SourceA ordinary numeric replay changed its exact recorded data row")
+                session.numeric_replay_count += 1
+                authority = gpg_row["authority"]
+                checkpoint_pin = _source5_construction_pin3(
+                    authority["checkpoint_pin"],
+                    "SourceA authenticated ordinary checkpoint pin",
+                )
+                budget = session.old_budgets[self.host_id]
+                transport_rows = budget.get("archive_transport", {}).get("per_job")
+                require(type(transport_rows) is list and len(transport_rows) == 360 and
+                        transport_rows[job_index].get("job_index") == job_index,
+                        "SourceA ordinary checkpoint cap differs from its Source Budget row")
+                checkpoint_maximum = transport_rows[job_index].get("checkpoint_bytes")
+                checkpoint_raw = session.read_captured(
+                    {"path": checkpoint_pin["path"],
+                     "raw_sha256": checkpoint_pin["raw_sha256"]},
+                    checkpoint_maximum,
+                )
+                checkpoint = _parse_object(
+                    checkpoint_raw, "SourceA authenticated ordinary checkpoint",
+                    checkpoint_maximum,
+                )
+                require(checkpoint_raw == canonical_bytes(checkpoint) and
+                        checkpoint.get("checkpoint_sha256") ==
+                            checkpoint_pin["semantic_sha256"] and
+                        sha256_bytes(checkpoint_raw) == checkpoint_pin["raw_sha256"],
+                        "SourceA ordinary checkpoint bytes differ from the GPG authority")
+                session.check_deadline("before InputPrep closed replay")
+                inputprep_view = {
+                    "objects": yielded["objects_by_origin"],
+                    "stage_root": yielded["stage_root"],
+                    "checkpoint_pin": checkpoint_pin,
+                    "checkpoint_raw": checkpoint_raw,
+                }
+                yield inputprep_view
+                session.check_deadline("after InputPrep closed replay")
+            session.complete_window(self, job_index, ordinal)
+            completed = True
+        except BaseException:
+            session.fail_window()
+            raise
+        finally:
+            if not completed and session.active:
+                session.fail_window()
+
+    def require_complete(self) -> None:
+        require(not self.session.failed and not self.session.closed and
+                not self.session.active and
+                self.session.provider_cursors[self.host_id] == 360,
+                f"{self.host_id} SourceA ordinary provider omitted an exact H3 window")
+
+
+def _source5_owned_registration_verify_h_ledger(
+    session: _Source5PreparedExplorationRegistrationSession,
+) -> None:
+    session.check_deadline("ordinary H ledger verification")
+    h_campaign = session.modules["source5_campaign"]
+    open_ledger = getattr(h_campaign, "_source5_recorded_read_ledger_fd", None)
+    read_ledger = getattr(h_campaign, "_source5_recorded_read_ledger_state", None)
+    require(callable(open_ledger) and callable(read_ledger) and
+            session.h_client is not None,
+            "Source-selected H lacks its ordinary exact closed-ledger verifier")
+    descriptor = open_ledger(session.plan, session.h_client.plan_module)
+    try:
+        cursor, pending, _head = read_ledger(
+            descriptor, session.basis, session.basis_pin,
+            session.plan, session.plan_pin, session.h_client.plan_module,
+            cancel_event=session.cancel_event,
+            deadline_ns=session.deadline_ns, construction=False,
+        )
+    finally:
+        os.close(descriptor)
+    require(cursor == 720 and pending is None and
+            session.h_client.plan_module.READ_WINDOW_COUNT == 720,
+            "SourceA ordinary H ledger did not release the full ordered 720-window cohort")
+
+
+def _source5_owned_registration_build_plan(
+    session: _Source5PreparedExplorationRegistrationSession,
+    current_roots: dict[str, str],
+    old_catalogues: dict[str, Any], old_caps: dict[str, Any],
+    window_metadata: dict[str, Any],
+    scratch_declaration: object, timeout_declaration: object,
+) -> None:
+    planner = session.plan_module
+    prepared = session.prepared
+    scratch = planner._validate_scratch(scratch_declaration)
+    timeouts = planner._validate_timeouts(timeout_declaration)
+    nonce = os.urandom(16).hex()
+    require(re.fullmatch(r"[0-9a-f]{32}", nonce) is not None,
+            "SourceA ordinary replay nonce is not fresh lowercase 32-hex text")
+    layout = planner._layout(
+        scratch["root"], prepared["campaign_id"], prepared["host_id"], nonce,
+    )
+    source_pins = {
+        row["host_id"]: {
+            key: row[key] for key in ("path", "raw_sha256", "semantic_sha256")
+        } for row in prepared["original_pins"]["source_manifests"]
+    }
+    require(list(source_pins) == session.hosts,
+            "SourceA ordinary replay Source pin order differs from the exact cohort")
+    basis = {
+        "schema": planner.REPLAY_BASIS_SCHEMA_V1,
+        "campaign_id": prepared["campaign_id"],
+        "consumer_host_id": prepared["host_id"],
+        "cohort_hosts": list(session.hosts),
+        "operation_kind": "registration_replay",
+        "spec_pin": _source5_construction_pin3(
+            prepared["original_pins"]["spec"], "SourceA ordinary final Spec pin",
+        ),
+        "plan_pin": _source5_construction_pin3(
+            prepared["original_pins"]["plan"], "SourceA ordinary final Plan pin",
+        ),
+        "source_manifest_pins": source_pins,
+        "source_module_pins": copy.deepcopy(session.source_module_pins),
+        "prepared_input_generation": {
+            "completion_pin": copy.deepcopy(session.completion_pin),
+            "provenance": copy.deepcopy(session.provenance),
+        },
+        "ancestor_pins": {
+            host: {
+                name: copy.deepcopy(session.lineage_proofs[host]["ancestor"][f"{name}_pin"])
+                for name in ("bridge_header", "record_index")
+            } for host in session.hosts
+        },
+        "metadata_capture_manifest_pin": {
+            "path": session.profile["metadata_capture_manifest_pin"]["path"],
+            "raw_sha256": session.profile["metadata_capture_manifest_pin"]["raw_sha256"],
+        },
+        "width_contract_pin": copy.deepcopy(session.width_pin),
+        "current_roots": copy.deepcopy(current_roots),
+        "current_journal_frontier": copy.deepcopy(session.frontier),
+    }
+    basis["basis_sha256"] = sha256_bytes(planner.canonical_bytes(basis))
+    basis_raw = planner.canonical_bytes(basis)
+    basis_pin = {
+        "path": layout["basis"], "raw_sha256": sha256_bytes(basis_raw),
+        "semantic_sha256": basis["basis_sha256"],
+    }
+    try:
+        checked_basis, checked_pin, checked_hosts = planner._validate_basis(
+            basis, basis_pin,
+        )
+    except Exception as error:
+        raise ChronologyError(
+            f"Source-selected ordinary H rejected its replay basis: {error}",
+        ) from error
+    require(checked_basis == basis and checked_pin == basis_pin and
+            checked_hosts == session.hosts and
+            basis["operation_kind"] == "registration_replay",
+            "SourceA ordinary replay basis changed its exact source-owned inputs")
+    plan, chunks = planner.build_recorded_preparation_read_plan_v2(
+        basis, basis_pin,
+        old_catalogues_by_host=old_catalogues,
+        old_readback_caps_by_host=old_caps,
+        window_metadata_by_host=window_metadata,
+        session_nonce=nonce, scratch_declaration=scratch,
+        timeout_declaration=timeouts,
+    )
+    checked_plan = planner.validate_recorded_preparation_read_plan_v2(
+        plan, chunks, basis, basis_pin,
+        old_catalogues_by_host=old_catalogues,
+        old_readback_caps_by_host=old_caps,
+        window_metadata_by_host=window_metadata,
+        session_nonce=nonce, scratch_declaration=scratch,
+        timeout_declaration=timeouts,
+    )
+    require(checked_plan == plan and
+            len(chunks) == len(plan["window_chunks"]) and
+            plan.get("operation_kind") == "registration_replay" and
+            planner.READ_WINDOW_COUNT == 720 and
+            type(plan.get("window_index")) is list and
+            len(plan["window_index"]) == planner.READ_WINDOW_COUNT and
+            plan["session_paths"]["basis"] == basis_pin["path"],
+            "SourceA ordinary H plan differs from its exact 720-row replay basis")
+    plan_pin = planner.recorded_preparation_read_plan_pin_v2(plan)
+    session.basis = basis
+    session.basis_pin = basis_pin
+    session.plan = plan
+    session.plan_pin = plan_pin
+    session.chunks = copy.deepcopy(chunks)
+
+
+
+def _source5_owned_registration_input_snapshots(
+    prepared: dict[str, Any], reader: _Source5PreparedInputConstructionArtifactReader,
+    profile: dict[str, Any], profile_pin: dict[str, str], profile_raw: bytes,
+    completion_pin: dict[str, str], width_pin: dict[str, str],
+    completion_raw: bytes, provenance: dict[str, Any], completion: dict[str, Any],
+    replay_arguments: dict[str, Any], preparation_intent: dict[str, Any],
+    inputprep: Any, archive: Any, campaign: Any,
+    initial_control_snapshots: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    input_root = prepared["input_root"]
+    candidates: dict[str, dict[str, Any]] = {}
+
+    def add(path_value: object, raw_sha_value: object, maximum: int,
+            label: str, *, required: bool = False, exact_cap: bool = False) -> None:
+        path_text = _source5_construction_normalized_root(path_value, label)
+        raw_sha = _digest(raw_sha_value, f"{label} raw SHA-256")
+        path = Path(path_text)
+        if not _within(input_root, path):
+            return
+        key = (path_text, raw_sha)
+        if not required and key in reader.capture_pin_keys:
+            return
+        previous = candidates.get(path_text)
+        require(previous is None or previous["raw_sha256"] == raw_sha,
+                f"SourceA current input path {path_text} has conflicting raw pins")
+        if previous is None:
+            candidates[path_text] = {
+                "path": path_text, "raw_sha256": raw_sha,
+                "maximum_bytes": maximum, "label": label,
+            }
+        elif exact_cap:
+            previous["maximum_bytes"] = maximum
+        else:
+            previous["maximum_bytes"] = max(previous["maximum_bytes"], maximum)
+
+    def collect(value: object, label: str) -> None:
+        if type(value) is dict:
+            path = value.get("path")
+            digest = value.get("raw_sha256")
+            if type(path) is str and type(digest) is str and \
+                    re.fullmatch(r"[0-9a-f]{64}", digest) is not None:
+                add(path, digest, MAX_PLAN_BYTES, label)
+            elif type(path) is str and type(value.get("sha256")) is str and \
+                    re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) is not None:
+                add(path, value["sha256"], MAX_PLAN_BYTES, label)
+            relative = value.get("relative_path")
+            relative_digest = value.get("raw_sha256")
+            if type(relative) is str and type(relative_digest) is str and \
+                    re.fullmatch(r"[0-9a-f]{64}", relative_digest) is not None:
+                rel = Path(relative)
+                require(not rel.is_absolute() and rel.as_posix() == relative and
+                        ".." not in rel.parts,
+                        "SourceA current preparation relative path is not normalized")
+                add(str(input_root / rel), relative_digest, MAX_PLAN_BYTES, label)
+            for child in value.values():
+                collect(child, label)
+        elif type(value) is list:
+            for child in value:
+                collect(child, label)
+
+    for value, label in (
+        (profile_raw, "SourceA replay profile"),
+        (completion, "SourceA completed input generation"),
+        (provenance, "SourceA V2 provenance"),
+        (replay_arguments, "SourceA replay argument"),
+        (preparation_intent, "SourceA preparation intent"),
+    ):
+        if type(value) is bytes:
+            continue
+        collect(value, label)
+    add(profile_pin["path"], profile_pin["raw_sha256"], MAX_PLAN_BYTES,
+        "SourceA owned replay profile", required=True, exact_cap=True)
+    add(completion_pin["path"], completion_pin["raw_sha256"],
+        inputprep.PREPARED_INPUT_COMPLETION_MAX_BYTES,
+        "SourceA current prepared-input completion", required=True, exact_cap=True)
+    add(provenance["preparation_pin"]["path"],
+        provenance["preparation_pin"]["raw_sha256"],
+        inputprep.MAX_REQUEST_BYTES, "SourceA original preparation", required=True,
+        exact_cap=True)
+    add(profile["metadata_capture_manifest_pin"]["path"],
+        profile["metadata_capture_manifest_pin"]["raw_sha256"],
+        archive.PREPARED_CAPTURE_MANIFEST_MAX_BYTES,
+        "SourceA current metadata-capture manifest", required=True, exact_cap=True)
+    add(profile["probe_capture_index_pin"]["path"],
+        profile["probe_capture_index_pin"]["raw_sha256"],
+        inputprep.MAX_REQUEST_BYTES, "SourceA current ProbeV2 capture index",
+        required=True, exact_cap=True)
+    add(width_pin["path"], width_pin["raw_sha256"],
+        MAX_SOURCE5_JOURNAL_WIDTH_CONTRACT_BYTES,
+        "SourceA current V2 journal-width contract", required=True, exact_cap=True)
+    for pin, maximum, label in (
+        (prepared["original_pins"]["spec"], MAX_SPEC_BYTES,
+         "SourceA current final Spec"),
+        (prepared["original_pins"]["plan"], MAX_PLAN_BYTES,
+         "SourceA current final Plan"),
+        (prepared["original_pins"]["observed_host"], MAX_MANIFEST_BYTES,
+         "SourceA current observed host"),
+    ):
+        add(pin["path"], pin["raw_sha256"], maximum, label,
+            required=True, exact_cap=True)
+    for source_pin in prepared["original_pins"]["source_manifests"]:
+        add(source_pin["path"], source_pin["raw_sha256"], MAX_MANIFEST_BYTES,
+            f"SourceA current {source_pin['host_id']} Source manifest",
+            required=True, exact_cap=True)
+    for snapshot in initial_control_snapshots:
+        add(snapshot["path"], snapshot["raw_sha256"],
+            inputprep.MAX_REQUEST_BYTES,
+            "SourceA original initial Spec control", required=True, exact_cap=True)
+    for row in completion.get("pilots", []):
+        if type(row) is dict and type(row.get("manifest")) is dict:
+            pin = row["manifest"]
+            add(pin.get("path"), pin.get("raw_sha256"),
+                inputprep.MAX_MANIFEST_BYTES,
+                f"SourceA {row.get('host_id')} pilot manifest",
+                required=True, exact_cap=True)
+    input_snapshots = []
+    for path_text, candidate in candidates.items():
+        checked_path = _safe_child(
+            input_root, Path(path_text).relative_to(input_root).as_posix(),
+            candidate["label"],
+        )
+        snapshot = _source5_construction_snapshot_file(
+            str(checked_path), candidate["raw_sha256"],
+            candidate["maximum_bytes"], candidate["label"],
+        )
+        input_snapshots.append(snapshot)
+        reader.resident_pins[(path_text, candidate["raw_sha256"])] = {
+            "maximum_bytes": candidate["maximum_bytes"],
+            "file_key": snapshot["file_key"],
+        }
+    oracle_root_snapshots = []
+    oracle_rows = completion.get("oracles")
+    require(type(oracle_rows) is list and len(oracle_rows) == len(prepared["spec"]["hosts"]),
+            "SourceA completion lacks the exact current two-host oracle map")
+    seen_oracles = set()
+    for index, row_value in enumerate(oracle_rows):
+        row = _exact(row_value, {
+            "host_id", "manifest", "artifact_root", "semantic_sha256",
+            "source_manifest_semantic_sha256", "preregistration_sha256",
+            "oracle_count", "oracles",
+        }, f"SourceA completion oracle[{index}]")
+        host = prepared["spec"]["hosts"][index]["host_id"]
+        require(row["host_id"] == host and host not in seen_oracles and
+                row["oracle_count"] == 120,
+                "SourceA completion oracle order/count differs from the selected host cohort")
+        seen_oracles.add(host)
+        manifest_pin = _source5_construction_pin2(
+            row["manifest"], f"{host} current oracle manifest pin",
+        )
+        manifest_path = Path(manifest_pin["path"])
+        require(_within(input_root, manifest_path),
+                f"{host} current oracle manifest escaped the validated input root")
+        manifest_raw, _info = _read_stable(
+            _safe_child(input_root, manifest_path.relative_to(input_root).as_posix(),
+                        f"{host} current oracle manifest"),
+            f"{host} current oracle manifest", inputprep.MAX_MANIFEST_BYTES,
+        )
+        manifest = _parse_object(
+            manifest_raw, f"{host} current oracle manifest",
+            inputprep.MAX_MANIFEST_BYTES,
+        )
+        require(manifest_raw == canonical_bytes(manifest) and
+                sha256_bytes(manifest_raw) == manifest_pin["raw_sha256"] and
+                campaign.digest_object(manifest) == row["semantic_sha256"] and
+                manifest.get("host_id") == host and
+                manifest.get("campaign_id") == prepared["campaign_id"] and
+                manifest.get("manifest_sha256") == row["semantic_sha256"] and
+                manifest.get("oracles") == row["oracles"] and
+                type(manifest.get("oracles")) is list and
+                len(manifest["oracles"]) == 120,
+                f"{host} current oracle manifest differs from its completed data row")
+        oracle_root = _safe_root(Path(row["artifact_root"]),
+                                 f"{host} current oracle artifact root")
+        require(str(oracle_root) == row["artifact_root"],
+                f"{host} oracle artifact root is not canonical")
+        oracle_root_snapshots.append(_source5_construction_snapshot_directory(
+            oracle_root, f"SourceA {host} current oracle artifact root",
+        ))
+        for oracle_index, oracle_value in enumerate(manifest["oracles"]):
+            item = _exact(oracle_value, {
+                "host_id", "allocator", "family", "profile", "load_percent",
+                "relative_path", "sha256",
+            }, f"{host} current oracle payload[{oracle_index}]")
+            require(item["host_id"] == host,
+                    f"{host} oracle payload[{oracle_index}] crossed host identity")
+            oracle_path = _safe_child(
+                oracle_root, item["relative_path"],
+                f"{host} oracle payload[{oracle_index}]",
+            )
+            oracle_snapshot = _source5_construction_snapshot_file(
+                str(oracle_path), item["sha256"],
+                campaign.MAX_TRACE_ARTIFACT_BYTES,
+                f"SourceA {host} oracle payload[{oracle_index}]",
+            )
+            input_snapshots.append(oracle_snapshot)
+    require(seen_oracles == set(prepared["spec"]["host_ids"]
+                                if "host_ids" in prepared["spec"] else
+                                [row["host_id"] for row in prepared["spec"]["hosts"]]),
+            "SourceA oracle snapshots do not cover the exact selected host cohort")
+    return input_snapshots, oracle_root_snapshots
+
+
+
+@_serialize_locked_api
+def register_source5_prepared_exploration_owned_locked(
+    current_lock: CampaignHostLock, plan_pin: object, spec_pin: object,
+    source_root: Path, input_root: Path, host_id: str,
+    observed_host_pin: object, output_root: Path,
+    completion_pin: object, provenance_v2: object, *,
+    replay_input_profile_pin: object,
+    journal_width_contract_pin: object,
+    cancel_event=None,
+) -> dict[str, Any]:
+    """Replay current V5 inputs through Source-owned H3/Fixed owners, then register data."""
+    require(isinstance(current_lock, CampaignHostLock) and
+            isinstance(source_root, Path) and isinstance(input_root, Path) and
+            isinstance(output_root, Path) and
+            (cancel_event is None or
+             callable(getattr(cancel_event, "is_set", None))),
+            "SourceA owned registration requires the live lock, exact roots and cancellation token")
+    checked_completion_pin = _source5_construction_pin3(
+        completion_pin, "SourceA owned registration completion pin",
+    )
+    checked_profile_pin = _source5_construction_pin3(
+        replay_input_profile_pin, "SourceA owned replay profile pin",
+    )
+    checked_width_pin = _source5_construction_pin3(
+        journal_width_contract_pin, "SourceA owned current journal-width pin",
+    )
+    host_id = _token(host_id, "SourceA owned registration host")
+    source_root = Path(source_root)
+    input_root = Path(input_root)
+    output_root = Path(output_root)
+    initial_spec, _spec_path, _spec_raw, _spec_raw_sha = _read_pin(
+        spec_pin, "SourceA owned registration final SpecV3", MAX_SPEC_BYTES,
+    )
+    campaign_id = _token(initial_spec.get("campaign_id"),
+                         "SourceA owned registration campaign")
+    current_lock = _check_lock(current_lock, output_root, campaign_id, host_id)
+    prepare_args = {
+        "plan_pin": copy.deepcopy(plan_pin),
+        "spec_pin": copy.deepcopy(spec_pin),
+        "source_root": source_root, "input_root": input_root,
+        "host_id": host_id,
+        "observed_host_pin": copy.deepcopy(observed_host_pin),
+        "output_root": output_root,
+    }
+    prepared = _prepare_inputs(
+        prepare_args["plan_pin"], prepare_args["spec_pin"], source_root,
+        input_root, host_id, observed_host_pin, output_root,
+    )
+    _require_no_legacy_confirmation(prepared)
+    current_lock = _check_lock(
+        current_lock, prepared["output_root"], prepared["campaign_id"], host_id,
+    )
+    hosts = [row["host_id"] for row in prepared["spec"]["hosts"]]
+    require(hosts == list(_SOURCE5_PREPARED_INPUT_CONSTRUCTION_ALLOWED_HOSTS) and
+            len(hosts) == 2 and host_id in hosts and
+            all(row.get("venue") == "kvm_guest"
+                for row in prepared["spec"]["hosts"]) and
+            type(prepared["spec"].get("rates")) is list and
+            len(prepared["spec"]["rates"]) == 60 and
+            type(prepared["spec"].get("oracles")) is list and
+            len(prepared["spec"]["oracles"]) == 240,
+            "SourceA owned registration requires the exact ordered final two-KVM source profile")
+    require(checked_completion_pin["path"] == str(
+                Path(prepared["prepared"]["plan_path"]).parent /
+                "prepared-inputs-completion.json") and
+            _within(input_root, Path(checked_completion_pin["path"])) and
+            _within(input_root, Path(checked_profile_pin["path"])) and
+            _within(input_root, Path(checked_width_pin["path"])),
+            "SourceA completion/profile/width pins escaped the exact current input root")
+    state = _read_journal(current_lock, prepared)
+    frontier = _source5_construction_empty_journal(state)
+    journal_file_key = state.get("file_stat")
+    input_modules: dict[str, types.ModuleType] = {}
+    bootstrap_reader = None
+    capture_reader = None
+    session = None
+    proof = None
+    try:
+        input_modules, module_pins, source_file_snapshots = \
+            _source5_construction_load_modules(prepared)
+        planner = input_modules["planner"]
+        inputprep = input_modules["input_preparation"]
+        archive = input_modules["archive"]
+        capture_module = input_modules["capture"]
+        campaign = input_modules["controller"]
+        lineage_module = input_modules["lineage"]
+        require(callable(getattr(inputprep,
+                                 "verify_prepared_inputs_completion_closed_recorded_v2",
+                                 None)) and
+                callable(getattr(inputprep, "_prepared_input_replay_arguments", None)) and
+                callable(getattr(input_modules["source5_campaign"],
+                                 "source5_recorded_preparation_read_client_v1", None)),
+                "Source-selected InputPrep or H lacks the named ordinary closed-replay API")
+        provenance_value = _exact(
+            provenance_v2, set(SOURCE5_PREPARED_INPUTS_PROVENANCE_V2_FIELDS),
+            "SourceA owned registration V2 provenance",
+        )
+        validate_provenance = getattr(
+            lineage_module, "validate_prepared_input_provenance_v2", None,
+        )
+        require(callable(validate_provenance),
+                "Source-selected lineage module lacks its V2 provenance validator")
+        try:
+            provenance = validate_provenance(
+                provenance_value, expected_hosts=hosts,
+            )
+        except Exception as error:
+            raise ChronologyError(
+                f"SourceA selected Source rejected V2 registration provenance: {error}",
+            ) from error
+        require(provenance["final_spec_pin"] == {
+                    "path": str(prepared["prepared"]["spec_path"]),
+                    "raw_sha256": prepared["prepared"]["spec_raw_sha256"],
+                } and provenance["final_plan_pin"] == {
+                    "path": str(prepared["prepared"]["plan_path"]),
+                    "raw_sha256": prepared["prepared"]["plan_raw_sha256"],
+                } and _within(
+                    prepared["input_root"],
+                    Path(provenance["preparation_pin"]["path"]),
+                ),
+                "SourceA V2 provenance differs from its exact final Spec/Plan or input root")
+        profile, profile_raw, checked_profile_pin = \
+            _source5_read_owned_replay_input_profile(
+                checked_profile_pin, prepared, checked_completion_pin,
+                provenance, lineage_module,
+            )
+        completion_path = _safe_child(
+            input_root,
+            Path(checked_completion_pin["path"]).relative_to(input_root).as_posix(),
+            "SourceA current prepared-input completion",
+        )
+        completion_raw, completion_info = _read_stable(
+            completion_path,
+            "SourceA current prepared-input completion",
+            inputprep.PREPARED_INPUT_COMPLETION_MAX_BYTES,
+        )
+        completion = _parse_object(
+            completion_raw, "SourceA current prepared-input completion",
+            inputprep.PREPARED_INPUT_COMPLETION_MAX_BYTES,
+        )
+        completion_body = {
+            key: value for key, value in completion.items()
+            if key != "completion_sha256"
+        }
+        require(stat.S_ISREG(completion_info.st_mode) and
+                completion_info.st_uid == os.getuid() and
+                stat.S_IMODE(completion_info.st_mode) == 0o600 and
+                completion_info.st_nlink == 1 and
+                completion_raw == canonical_bytes(completion) and
+                sha256_bytes(completion_raw) == checked_completion_pin["raw_sha256"] and
+                completion.get("schema") ==
+                    inputprep.PREPARED_BOUNDED_COMPLETION_SCHEMA and
+                completion.get("complete") is True and
+                completion.get("qualification_eligible") is False and
+                completion.get("completion_sha256") ==
+                    checked_completion_pin["semantic_sha256"] ==
+                    sha256_bytes(canonical_bytes(completion_body)) and
+                profile["completion_pin"] == checked_completion_pin and
+                profile["provenance_v2"] == provenance,
+                "SourceA current completion differs from its exact bounded raw/semantic profile")
+        replay_arguments = inputprep._prepared_input_replay_arguments(completion)
+        require(type(replay_arguments) is dict and
+                set(replay_arguments) == {
+                    "capacity_completion_pins", "pressure_calibration_pins",
+                    "pilot_pins", "oracle_pins", "resource_budget_pins",
+                }, "Source-selected InputPrep changed its exact completion argument projection")
+        preparation_pin2 = {
+            "path": provenance["preparation_pin"]["path"],
+            "raw_sha256": provenance["preparation_pin"]["raw_sha256"],
+        }
+        preparation_intent, _preparation_sources, _prep_campaign, _inputs_api = \
+            inputprep.read_preparation_intent_metadata_v1(
+                preparation_pin2, source_root, input_root,
+            )
+        preparation_hosts = [row["host_id"]
+                             for row in preparation_intent["core"]["hosts"]]
+        require(preparation_hosts == hosts,
+                "SourceA current preparation intent changed the exact final host order")
+        scratch = planner._validate_scratch(profile["scratch_declaration"])
+        timeouts = planner._validate_timeouts(profile["timeout_declaration"])
+        started_ns = time.monotonic_ns()
+        deadline_ns = started_ns + \
+            timeouts["maximum_operation_seconds"] * planner.NANOSECONDS_PER_SECOND
+        require(deadline_ns < (1 << 63) and
+                (cancel_event is None or not cancel_event.is_set()),
+                "SourceA ordinary replay deadline is invalid or already cancelled")
+        metadata_pin = _source5_construction_pin2(
+            profile["metadata_capture_manifest_pin"],
+            "SourceA ordinary replay metadata-capture manifest pin",
+        )
+        metadata_path = Path(metadata_pin["path"])
+        capture_root = _source5_construction_capture_root(
+            profile["metadata_capture_stage_root"],
+        )
+        require(_within(input_root, metadata_path) and
+                _within(input_root, capture_root),
+                "SourceA ordinary replay capture inputs escaped the exact current input root")
+        metadata_raw, metadata_info = _read_stable(
+            _safe_child(input_root, metadata_path.relative_to(input_root).as_posix(),
+                        "SourceA ordinary metadata-capture manifest"),
+            "SourceA ordinary metadata-capture manifest",
+            archive.PREPARED_CAPTURE_MANIFEST_MAX_BYTES,
+        )
+        metadata_value = _parse_object(
+            metadata_raw, "SourceA ordinary metadata-capture manifest",
+            archive.PREPARED_CAPTURE_MANIFEST_MAX_BYTES,
+        )
+        require(stat.S_ISREG(metadata_info.st_mode) and
+                metadata_info.st_uid == os.getuid() and
+                stat.S_IMODE(metadata_info.st_mode) == 0o600 and
+                metadata_raw == canonical_bytes(metadata_value) and
+                sha256_bytes(metadata_raw) == metadata_pin["raw_sha256"],
+                "SourceA ordinary metadata-capture manifest changed its owned raw pin")
+        finite_maximum = min(
+            archive.PREPARED_CAPTURE_BOOTSTRAP_MAX_BYTES,
+            max(archive.MAX_SOURCE_MANIFEST_BYTES, archive.MAX_PLAN_BYTES,
+                inputprep.MAX_PLAN_BYTES,
+                input_modules["preparatory_budget"].MAX_BUDGET_BYTES),
+        )
+        bootstrap_reader, capture_manifest = \
+            archive._prepared_bootstrap_capture_reader(
+                capture_module.__dict__, metadata_raw, str(capture_root),
+                hosts, finite_maximum, deadline_ns=deadline_ns,
+                cancel_event=cancel_event,
+            )
+        artifact_reader = _Source5PreparedInputConstructionArtifactReader(
+            bootstrap_reader, deadline_ns, cancel_event,
+            capture_pin_keys={
+                (row["origin_pin"]["path"], row["origin_pin"]["raw_sha256"])
+                for row in capture_manifest["objects"]
+            }, input_root=input_root,
+        )
+        for pin, maximum, label in (
+            (preparation_pin2, inputprep.MAX_REQUEST_BYTES,
+             "SourceA current preparation intent"),
+            (metadata_pin, archive.PREPARED_CAPTURE_MANIFEST_MAX_BYTES,
+             "SourceA current metadata-capture manifest"),
+            (profile["probe_capture_index_pin"], inputprep.MAX_REQUEST_BYTES,
+             "SourceA current ProbeV2 capture index"),
+            ({"path": checked_profile_pin["path"],
+              "raw_sha256": checked_profile_pin["raw_sha256"]}, MAX_PLAN_BYTES,
+             "SourceA current owned replay profile"),
+            ({"path": checked_completion_pin["path"],
+              "raw_sha256": checked_completion_pin["raw_sha256"]},
+             inputprep.PREPARED_INPUT_COMPLETION_MAX_BYTES,
+             "SourceA current prepared-input completion"),
+            ({"path": checked_width_pin["path"],
+              "raw_sha256": checked_width_pin["raw_sha256"]},
+             MAX_SOURCE5_JOURNAL_WIDTH_CONTRACT_BYTES,
+             "SourceA current V2 width contract"),
+        ):
+            _source5_construction_allow_resident_pin(
+                artifact_reader, input_root, pin, maximum, label,
+            )
+        for pin, maximum, label in (
+            (prepared["original_pins"]["spec"], MAX_SPEC_BYTES,
+             "SourceA current final Spec"),
+            (prepared["original_pins"]["plan"], MAX_PLAN_BYTES,
+             "SourceA current final Plan"),
+            (prepared["original_pins"]["observed_host"], MAX_MANIFEST_BYTES,
+             "SourceA current observed host"),
+        ):
+            _source5_construction_allow_resident_pin(
+                artifact_reader, input_root,
+                {"path": pin["path"], "raw_sha256": pin["raw_sha256"]},
+                maximum, label,
+            )
+        for pin in prepared["original_pins"]["source_manifests"]:
+            _source5_construction_allow_resident_pin(
+                artifact_reader, input_root,
+                {"path": pin["path"], "raw_sha256": pin["raw_sha256"]},
+                MAX_MANIFEST_BYTES,
+                f"SourceA current {pin['host_id']} Source manifest",
+            )
+        pilot_pins = {}
+        completion_pilots = completion.get("pilots")
+        require(type(completion_pilots) is list and len(completion_pilots) == 2,
+                "SourceA completion omitted its exact two-host pilot map")
+        for index, row_value in enumerate(completion_pilots):
+            row = _exact(row_value, {
+                "host_id", "campaign_artifacts_root", "manifest", "semantic_sha256",
+                "initial_spec", "initial_plan", "prepared_host_binding",
+                "spec_preregistration_sha256", "fixed_pair_count",
+                "fixed_pair_evidence", "fixed_pair_evidence_sha256",
+                "replay_raw_sha256",
+            }, f"SourceA completed pilot[{index}]")
+            host = hosts[index]
+            require(row["host_id"] == host,
+                    "SourceA completed pilot order changed the exact host cohort")
+            pilot_pins[host] = {
+                "path": row["manifest"]["path"],
+                "raw_sha256": row["manifest"]["raw_sha256"],
+                "semantic_sha256": row["semantic_sha256"],
+            }
+        bootstrap_inputs = {
+            "preparation_pin": preparation_pin2,
+            "pilot_pins": pilot_pins,
+        }
+        bootstrap_bindings, control_snapshots = \
+            _source5_construction_bootstrap_lineage_inputs(
+                artifact_reader, prepared, bootstrap_inputs,
+                provenance["exploration_lineage"], preparation_intent,
+                input_modules, hosts,
+            )
+        preliminary = _source5_verify_prepared_exploration_lineage_pins_cohort(
+            prepared, provenance["exploration_lineage"], lineage_module,
+            artifact_reader=artifact_reader,
+            campaign_module=campaign,
+            input_preparation_module=inputprep,
+            campaign_inputs_module=input_modules["campaign_inputs"],
+            source5_campaign_module=input_modules["source5_campaign"],
+            preparatory_budget_module=input_modules["preparatory_budget"],
+        )
+        expected_ancestors = {
+            host: preliminary[host]["ancestor"] for host in hosts
+        }
+        expected_jobs = {
+            host: [row["job"] for row in preliminary[host]["index_rows"]]
+            for host in hosts
+        }
+        declaration, storage_rows = \
+            input_modules["bridge"].build_prepared_exploration_capture_storage_v1(
+                hosts, preliminary, expected_ancestors=expected_ancestors,
+                expected_exploration_jobs=expected_jobs,
+                artifact_reader=artifact_reader,
+                evidence_budget_module=input_modules["evidence_budget"],
+            )
+        declared_keys = [
+            (row["origin_pin"]["path"], row["origin_pin"]["raw_sha256"])
+            for row in declaration["objects"]
+        ]
+        manifest_keys = [
+            (row["origin_pin"]["path"], row["origin_pin"]["raw_sha256"])
+            for row in capture_manifest["objects"]
+        ]
+        require(type(storage_rows) is list and
+                len(storage_rows) == len(declaration["objects"]) and
+                declared_keys == manifest_keys and
+                len(set(declared_keys)) == len(declared_keys),
+                "SourceA capture manifest differs from the exact Bridge lineage closure")
+        capture_reader = capture_module.PreparedExplorationLineageCaptureReaderV1(
+            declaration, capture_manifest, str(capture_root),
+        )
+        artifact_reader.capture_reader = capture_reader
+        artifact_reader.capture_pin_keys = set(declared_keys)
+        close_bootstrap = getattr(bootstrap_reader, "close", None)
+        if callable(close_bootstrap):
+            close_bootstrap()
+        bootstrap_reader = None
+        lineage_proofs = _source5_verify_prepared_exploration_lineage_pins_cohort(
+            prepared, provenance["exploration_lineage"], lineage_module,
+            artifact_reader=artifact_reader, campaign_module=campaign,
+            input_preparation_module=inputprep,
+            campaign_inputs_module=input_modules["campaign_inputs"],
+            source5_campaign_module=input_modules["source5_campaign"],
+            preparatory_budget_module=input_modules["preparatory_budget"],
+        )
+        require(canonical_bytes(lineage_proofs) == canonical_bytes(preliminary),
+                "SourceA final capture reader changed the exact raw-lineage cohort")
+        source_snapshots = list(source_file_snapshots)
+        for host in hosts:
+            pin = next(row for row in prepared["original_pins"]["source_manifests"]
+                       if row["host_id"] == host)
+            source_snapshots.append(_source5_construction_snapshot_file(
+                pin["path"], pin["raw_sha256"], MAX_MANIFEST_BYTES,
+                f"SourceA {host} current Source manifest",
+            ))
+        input_snapshots, oracle_root_snapshots = \
+            _source5_owned_registration_input_snapshots(
+                prepared, artifact_reader, profile, checked_profile_pin,
+                profile_raw, checked_completion_pin, checked_width_pin,
+                completion_raw, provenance, completion, replay_arguments, preparation_intent,
+                inputprep, archive, campaign, control_snapshots,
+            )
+        root_snapshots = [
+            _source5_construction_snapshot_directory(root, f"SourceA current {label} root")
+            for root, label in (
+                (prepared["source_root"], "Source"),
+                (prepared["input_root"], "input"),
+                (prepared["output_root"], "chronology output"),
+                (current_lock.directory, "campaign journal"),
+                (capture_root, "metadata capture"),
+            )
+        ] + oracle_root_snapshots
+        session = _Source5PreparedExplorationRegistrationSession(
+            _SOURCE5_PREPARED_EXPLORATION_REGISTRATION_SESSION_SECRET,
+            current_lock, prepared, prepare_args, frontier, journal_file_key,
+            input_snapshots, source_snapshots, root_snapshots, capture_reader,
+            artifact_reader, input_modules, hosts, deadline_ns, cancel_event,
+            profile, checked_profile_pin, checked_width_pin,
+            checked_completion_pin, provenance,
+        )
+        session.capture_storage_usage = capture_reader.storage_usage()
+        session.source_module_pins = module_pins
+        session.lineage_proofs = lineage_proofs
+        archived_authorities = _source5_verify_captured_prepared_ack_cohort_held(
+            prepared, lineage_proofs, artifact_reader=artifact_reader,
+        )
+        require(list(archived_authorities) == hosts and all(
+            row.get("job_count") == 360 and row.get("fresh_gpg_verified") is True and
+            row.get("component_replay_required") is True and
+            row.get("qualification_eligible") is False
+            for row in archived_authorities.values()
+        ), "SourceA fresh GPG replay did not close the exact two-host 720-row cohort")
+        session.archived_authorities = archived_authorities
+        numeric_context = _source5_recorded_numeric_ancestor_context_held(
+            current_lock, prepared, lineage_proofs, archived_authorities,
+            artifact_reader=artifact_reader,
+        )
+        session.numeric_context = numeric_context
+        session.old_budgets = {
+            host: lineage_proofs[host]["capture_context"]["budget"]
+            for host in hosts
+        }
+        _source5_construction_allow_resident_pin(
+            artifact_reader, input_root,
+            {"path": checked_width_pin["path"],
+             "raw_sha256": checked_width_pin["raw_sha256"]},
+            MAX_SOURCE5_JOURNAL_WIDTH_CONTRACT_BYTES,
+            "SourceA current V2 journal-width contract",
+        )
+        width_contract, width_projection, validated_width_pin, width_raw = \
+            _source5_prepared_exploration_width_projection(
+                prepared, checked_width_pin,
+                ancestor=lineage_proofs[host_id]["ancestor"],
+                artifact_reader=artifact_reader,
+            )
+        require(validated_width_pin == checked_width_pin and
+                width_contract.get("campaign_id") == prepared["campaign_id"] and
+                width_contract.get("host_id") == host_id,
+                "SourceA current width contract changed its selected campaign/host binding")
+        prepared["source5_execution_schema"] = SOURCE5_EXECUTION_SCHEMA_V5
+        prepared["source5_journal_width_projection"] = width_projection
+        prepared["source5_owned_replay_profile_pin"] = copy.deepcopy(
+            checked_profile_pin,
+        )
+        prepared["source5_owned_width_contract_pin"] = copy.deepcopy(
+            checked_width_pin,
+        )
+        prepared["source5_prepared_input_provenance_v2"] = copy.deepcopy(
+            provenance,
+        )
+        _source5_issue_owned_prepared_completion_role_context(
+            prepared, profile, checked_profile_pin, checked_completion_pin,
+            provenance, inputprep,
+        )
+        current_roots = _source5_construction_current_roots(
+            prepared, lineage_proofs, capture_root, current_lock,
+        )
+        readback_session = types.SimpleNamespace(
+            modules=input_modules,
+            plan_module=session.plan_module,
+            prepared=prepared,
+            hosts=hosts,
+            lineage_proofs=lineage_proofs,
+            numeric_context=numeric_context,
+            old_budgets={},
+            read_captured=artifact_reader,
+        )
+        old_catalogues, old_caps, window_metadata = \
+            _source5_construction_readback_inputs(readback_session)
+        session.old_budgets = readback_session.old_budgets
+        _source5_owned_registration_build_plan(
+            session, current_roots, old_catalogues, old_caps, window_metadata,
+            profile["scratch_declaration"], profile["timeout_declaration"],
+        )
+        source5_campaign = input_modules["source5_campaign"]
+        h_factory = getattr(
+            source5_campaign,
+            "source5_recorded_preparation_read_client_v1", None,
+        )
+        require(callable(h_factory),
+                "Source-selected H lacks its named ordinary preparation-read client")
+        source_row = next(
+            row for row in prepared["original_pins"]["source_manifests"]
+            if row["host_id"] == host_id
+        )
+        selected_source_raw, _source_info = _read_stable(
+            Path(source_row["path"]), "SourceA selected current Source manifest",
+            MAX_MANIFEST_BYTES,
+        )
+        require(sha256_bytes(selected_source_raw) == source_row["raw_sha256"] and
+                prepared["source"]["manifest_sha256"] ==
+                    source_row["semantic_sha256"] and
+                selected_source_raw == canonical_bytes(prepared["source"]),
+                "SourceA selected current Source manifest changed before ordinary H setup")
+        session.h_client = h_factory(
+            session.basis, session.basis_pin, session.plan, session.plan_pin,
+            selected_source_raw, window_chunk_values=session.chunks,
+            cancel_event=cancel_event,
+        )
+        require(type(getattr(session.h_client, "session", None)) is dict and
+                session.h_client.session == planner.build_recorded_preparation_read_session_descriptor_v2(
+                    session.plan, session.plan_pin,
+                )[0],
+                "Source-selected H client did not persist the exact ordinary 720-window session")
+        providers = {
+            host: _Source5PreparedExplorationRegistrationPilotProvider(session, host)
+            for host in hosts
+        }
+        session.providers = types.MappingProxyType(providers)
+        provenance_v1 = {
+            "schema": "allocatbelt.application-source5-prepared-inputs-provenance.v1",
+            "preparation_pin": copy.deepcopy(provenance["preparation_pin"]),
+            "final_spec_pin": copy.deepcopy(provenance["final_spec_pin"]),
+            "final_plan_pin": copy.deepcopy(provenance["final_plan_pin"]),
+        }
+        require(canonical_bytes(provenance_v1) == canonical_bytes({
+                    "schema": "allocatbelt.application-source5-prepared-inputs-provenance.v1",
+                    "preparation_pin": provenance["preparation_pin"],
+                    "final_spec_pin": provenance["final_spec_pin"],
+                    "final_plan_pin": provenance["final_plan_pin"],
+                }), "SourceA exact V1 InputPrep projection changed field names")
+        session.check_live("before closed-v2 InputPrep replay")
+        verifier = getattr(
+            inputprep,
+            "verify_prepared_inputs_completion_closed_recorded_v2", None,
+        )
+        try:
+            verified_completion = verifier(
+                checked_completion_pin, provenance_v1,
+                source_root, input_root,
+                captured_pilot_read_providers=dict(session.providers),
+                global_artifact_reader=artifact_reader,
+                probe_capture_index_pin=profile["probe_capture_index_pin"],
+            )
+        except Exception as error:
+            raise ChronologyError(
+                f"Source-selected closed-v2 InputPrep replay rejected the completion: {error}",
+            ) from error
+        require(type(verified_completion) is dict and
+                canonical_bytes(verified_completion) == canonical_bytes(completion) and
+                session.require_complete() is None and
+                session.global_cursor == 720 and
+                session.numeric_replay_count == 720 and
+                all(session.provider_cursors[host] == 360 for host in hosts) and
+                not session.active and
+                type(verified_completion.get("capacity_preparations")) is list and
+                len(verified_completion["capacity_preparations"]) == 2 and
+                type(verified_completion.get("pressure_calibrations")) is list and
+                len(verified_completion["pressure_calibrations"]) == 30 and
+                type(verified_completion.get("pilots")) is list and
+                sum(row.get("fixed_pair_count", 0)
+                    for row in verified_completion["pilots"]
+                    if type(row) is dict) == 720 and
+                type(verified_completion.get("oracles")) is list and
+                sum(row.get("oracle_count", 0)
+                    for row in verified_completion["oracles"]
+                    if type(row) is dict) == 240,
+                "SourceA closed-v2 replay changed its exact 720/30/60/240 owner counts")
+        session.verified_completion = verified_completion
+        _source5_owned_registration_verify_h_ledger(session)
+        session.check_live("after closed-v2 InputPrep replay")
+        usage_after = capture_reader.storage_usage()
+        require(usage_after == session.capture_storage_usage,
+                "SourceA closed-v2 replay changed its exact immutable old capture closure")
+        completion_after_raw, completion_after_info = _read_stable(
+            completion_path, "SourceA current prepared-input completion after replay",
+            inputprep.PREPARED_INPUT_COMPLETION_MAX_BYTES,
+        )
+        profile_after_raw, profile_after_info = _read_stable(
+            _safe_child(input_root,
+                        Path(checked_profile_pin["path"]).relative_to(input_root).as_posix(),
+                        "SourceA owned replay profile after replay"),
+            "SourceA owned replay profile after replay", MAX_PLAN_BYTES,
+        )
+        require(completion_after_raw == completion_raw and
+                sha256_bytes(completion_after_raw) == checked_completion_pin["raw_sha256"] and
+                profile_after_raw == profile_raw and
+                sha256_bytes(profile_after_raw) == checked_profile_pin["raw_sha256"] and
+                profile_after_info.st_uid == completion_after_info.st_uid == os.getuid() and
+                stat.S_IMODE(profile_after_info.st_mode) ==
+                    stat.S_IMODE(completion_after_info.st_mode) == 0o600,
+                "SourceA current completion or replay profile changed during closed replay")
+        host_index = hosts.index(host_id)
+        row = _exact(verified_completion["capacity_preparations"][host_index], {
+            "host_id", "completion", "host_verification", "evidence_path_map",
+            "completion_sha256", "ledger", "capacity_preparation_templates_sha256",
+            "entries", "resource_budget", "resource_monitor",
+        }, "SourceA selected current capacity completion row")
+        require(row["host_id"] == host_id and type(row["entries"]) is list and
+                len(row["entries"]) == 15,
+                "SourceA current completion selected host row is not the exact 15-entry data set")
+        details = {
+            "campaign_id": prepared["campaign_id"], "host_id": host_id,
+            "completion": copy.deepcopy(checked_completion_pin),
+            "provenance": copy.deepcopy(provenance),
+            "host_completion": {
+                **copy.deepcopy(row["completion"]),
+                "semantic_sha256": row["completion_sha256"],
+            },
+            "host_verification": copy.deepcopy(row["host_verification"]),
+            "capacity_ledger": copy.deepcopy(row["ledger"]),
+            "capacity_schedule_sha256":
+                row["capacity_preparation_templates_sha256"],
+            "entries": copy.deepcopy(row["entries"]),
+            "qualification_eligible": False,
+            "controller_chronology_proven": False,
+        }
+        prepared["source5_owned_registration_completion"] = {
+            "completion_pin": copy.deepcopy(checked_completion_pin),
+            "provenance": copy.deepcopy(provenance),
+            "verified_completion": verified_completion,
+        }
+        session.check_live("before prepared registration append")
+        session.require_complete()
+        proof = _source5_issue_prepared_registration_proof(session, details)
+        record = _append_event(
+            current_lock, prepared, "source5_prepared_capacity_registered",
+            details, source5_registration_proof=proof,
+        )
+        proof = None
+        after_state = _read_journal(current_lock, prepared)
+        require(after_state["record_count"] == 1 and
+                after_state["prepared_capacity_registration"] == details and
+                after_state["head"] == record["record_sha256"] and
+                after_state["registration_head"] == record["record_sha256"],
+                "SourceA durable registration did not replay to its exact data-only event")
+        session.frontier = {
+            "head_sha256": after_state["head"],
+            "record_count": after_state["record_count"],
+        }
+        session.journal_file_key = after_state["file_stat"]
+        session.check_live("after prepared registration append")
+        _source5_owned_registration_verify_h_ledger(session)
+        require(capture_reader.storage_usage() == session.capture_storage_usage,
+                "SourceA registration append changed the old captured lineage closure")
+        _source5_prepared_registration_recheck_inputs_callback_free(
+            session, "registration append postwrite",
+        )
+        return {
+            "schema": "allocatbelt.application-source5-owned-registration-replay-result.v1",
+            "campaign_id": prepared["campaign_id"], "host_id": host_id,
+            "completion": copy.deepcopy(checked_completion_pin),
+            "registration_record": {
+                "record_sha256": after_state["registration_head"],
+                "details": copy.deepcopy(
+                    after_state["prepared_capacity_registration"],
+                ),
+            },
+            "numeric_windows_replayed": 720,
+            "fixed_components_replayed": 720,
+            "qualification_eligible": False,
+            "controller_chronology_proven": False,
+        }
+    finally:
+        if proof is not None:
+            _source5_discard_prepared_registration_proof(proof)
+        if session is not None:
+            if session.active:
+                session.fail_window()
+            session.closed = True
+            if session.h_client is not None:
+                plan_module = getattr(session.h_client, "plan_module", None)
+                if isinstance(plan_module, types.ModuleType):
+                    _close_module(plan_module)
+        if bootstrap_reader is not None:
+            close = getattr(bootstrap_reader, "close", None)
+            if callable(close):
+                close()
+        if capture_reader is not None:
+            close = getattr(capture_reader, "close", None)
+            if callable(close):
+                close()
+        if prepared is not None:
+            for name in (
+                "source5_owned_registration_completion",
+                "source5_owned_replay_profile_pin",
+                "source5_owned_width_contract_pin",
+                "source5_prepared_input_provenance_v2",
+                "source5_owned_replay_profile",
+                "_source5_owned_prepared_completion_role_context",
+                "_source5_owned_prepared_completion_inputprep_module",
+            ):
+                prepared.pop(name, None)
+        for module in input_modules.values():
+            if isinstance(module, types.ModuleType):
+                _close_module(module)
+        _source5_construction_close_prepared(prepared)
 
 if __name__ == "__main__":
     raise SystemExit(main())

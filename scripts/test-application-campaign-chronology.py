@@ -2,6 +2,7 @@
 """Native CLI witnesses for the locked SourceV5 campaign chronology APIs."""
 from __future__ import annotations
 
+import ast
 import copy
 import inspect
 from contextlib import contextmanager
@@ -4539,6 +4540,18 @@ class Source5InputPrepConsumerPortTests(unittest.TestCase):
         }
         return prepared, manifest, completion, completion_pin
 
+    def _typed_inputprep_helper(self, prepared, name: str, **apis):
+        helper_path = (prepared["source_root"] / "scripts" /
+                       "application-source5-input-preparation.py")
+        helper_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        helper_path.write_bytes(b"typed selected Source helper fixture")
+        helper_path.chmod(0o600)
+        helper = types.ModuleType(name)
+        helper.__file__ = str(helper_path)
+        for api_name, api in apis.items():
+            setattr(helper, api_name, api)
+        return helper
+
     def test_recorded_and_ordinary_routes_forward_only_their_closed_arguments(self) -> None:
         """Call spies check routing only; they do not claim completion replay."""
         chronology = self.chronology
@@ -4556,15 +4569,16 @@ class Source5InputPrepConsumerPortTests(unittest.TestCase):
                 calls.append((args, kwargs))
                 raise RuntimeError("routing probe only")
 
-            helper = types.SimpleNamespace(
-                verify_prepared_inputs_completion=fail_after_capture,
-            )
-            if v5:
-                helper.verify_prepared_inputs_completion_recorded_host = fail_after_capture
             with tempfile.TemporaryDirectory(prefix="source5-consumer-routing-") as temporary:
                 prepared, manifest, _completion, completion_pin = self._routing_case(
                     Path(temporary), v5=v5, full_spec=True,
                 )
+                helper = self._typed_inputprep_helper(
+                    prepared, "source5_inputprep_routing_fixture",
+                    verify_prepared_inputs_completion=fail_after_capture,
+                )
+                if v5:
+                    helper.verify_prepared_inputs_completion_recorded_host = fail_after_capture
 
                 def captured(_prepared, _relative, label):
                     if label == "Source5 prepared-input provenance v2 validator":
@@ -4635,13 +4649,14 @@ class Source5InputPrepConsumerPortTests(unittest.TestCase):
             recorded_calls.append((args, kwargs))
             raise RuntimeError("recorded route should not run without providers")
 
-        helper = types.SimpleNamespace(
-            verify_prepared_inputs_completion=ordinary,
-            verify_prepared_inputs_completion_recorded_host=recorded,
-        )
         with tempfile.TemporaryDirectory(prefix="source5-consumer-restart-") as temporary:
             prepared, manifest, _completion, _pin = self._routing_case(
                 Path(temporary), v5=True, full_spec=False,
+            )
+            helper = self._typed_inputprep_helper(
+                prepared, "source5_inputprep_restart_fixture",
+                verify_prepared_inputs_completion=ordinary,
+                verify_prepared_inputs_completion_recorded_host=recorded,
             )
             def captured(_prepared, _relative, label):
                 return types.SimpleNamespace(
@@ -4695,7 +4710,8 @@ class Source5InputPrepConsumerPortTests(unittest.TestCase):
                 Path(temporary), v5=True, full_spec=True,
             )
             fallback_calls = []
-            helper_without_recorded_api = types.SimpleNamespace(
+            helper_without_recorded_api = self._typed_inputprep_helper(
+                prepared, "source5_inputprep_missing_recorded_fixture",
                 verify_prepared_inputs_completion=lambda *args, **kwargs:
                     fallback_calls.append((args, kwargs)),
             )
@@ -5899,6 +5915,448 @@ class Source5RecordedNumericScalarSeamTests(unittest.TestCase):
             api["payload"].__name__,
             "validate_recorded_preparation_payload_view_v2",
         )
+
+
+class SourceAOwnedRegistrationProfileTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.chronology = load_script(
+            SCRIPT_DIR / "application-campaign-chronology.py",
+            "sourcea_owned_registration_profile_tests",
+        )
+
+    def _profile_fixture(self):
+        c = self.chronology
+        hosts = ["agent-8845HS-dev", "agent-EPYC-4585PX-dev"]
+        pin2 = {"path": "/private/inputs/raw.json", "raw_sha256": "a" * 64}
+        pin3 = {**pin2, "semantic_sha256": "b" * 64}
+        provenance = {
+            "schema": c.SOURCE5_PREPARED_INPUTS_PROVENANCE_SCHEMA_V2,
+            "preparation_pin": pin2,
+            "final_spec_pin": pin2,
+            "final_plan_pin": pin2,
+            "exploration_lineage": {
+                host: {"bridge_header": pin2, "record_index": pin2}
+                for host in hosts
+            },
+        }
+        value = {
+            "schema": "allocatbelt.application-source5-owned-replay-inputs.v1",
+            "campaign_id": "sourcea-owned-profile",
+            "consumer_host_id": hosts[0],
+            "cohort_hosts": list(hosts),
+            "completion_pin": pin3,
+            "provenance_v2": copy.deepcopy(provenance),
+            "metadata_capture_manifest_pin": pin2,
+            "metadata_capture_stage_root": "/private/inputs/capture-stage",
+            "probe_capture_index_pin": pin2,
+            "scratch_declaration": {
+                "schema": "allocatbelt.application-source5-recorded-preparation-scratch.v3",
+                "root": "/private/scratch", "device_id": 1,
+                "allocation_block_bytes": 4096,
+                "directory_metadata_reserve_bytes": 4096,
+                "reserved_bytes": 1024 * 1024,
+                "reserved_inodes": 4096,
+            },
+            "timeout_declaration": {
+                "maximum_io_window_seconds": 30,
+                "maximum_operation_seconds": 3600,
+            },
+        }
+        value["profile_sha256"] = c.sha256_bytes(c.canonical_bytes(value))
+        expected = {
+            "campaign_id": value["campaign_id"],
+            "consumer_host_id": hosts[0], "cohort_hosts": hosts,
+            "completion_pin": pin3, "provenance_v2": provenance,
+        }
+        return value, expected
+
+    def test_profile_validator_returns_only_copied_data(self) -> None:
+        c = self.chronology
+        value, expected = self._profile_fixture()
+        checked = c.validate_source5_owned_replay_input_profile_v1(value, expected)
+        self.assertEqual(checked, value)
+        self.assertEqual(
+            c.source5_owned_prepared_completion_max_bytes_v1(value, expected),
+            64 * 1024 * 1024,
+        )
+        self.assertEqual(c._source5_journal_role_limit("prepared_completion"),
+                         16 * 1024 * 1024)
+        checked["provenance_v2"]["exploration_lineage"][
+            "agent-8845HS-dev"]["bridge_header"]["raw_sha256"] = "f" * 64
+        self.assertEqual(
+            value["provenance_v2"]["exploration_lineage"][
+                "agent-8845HS-dev"]["bridge_header"]["raw_sha256"],
+            "a" * 64,
+        )
+
+    def test_profile_validator_rejects_extra_fields_and_changed_digest(self) -> None:
+        c = self.chronology
+        value, expected = self._profile_fixture()
+        with self.assertRaisesRegex(c.ChronologyError, "unexpected field set"):
+            c.validate_source5_owned_replay_input_profile_v1(
+                {**value, "ready": True}, expected,
+            )
+        stale = copy.deepcopy(value)
+        stale["timeout_declaration"]["maximum_io_window_seconds"] = 31
+        with self.assertRaisesRegex(c.ChronologyError, "self-digest"):
+            c.validate_source5_owned_replay_input_profile_v1(stale, expected)
+
+    def test_profile_validator_rejects_wrong_order_consumer_and_path_grammar(self) -> None:
+        c = self.chronology
+        value, expected = self._profile_fixture()
+        reversed_expected = copy.deepcopy(expected)
+        reversed_expected["cohort_hosts"].reverse()
+        with self.assertRaisesRegex(c.ChronologyError, "two-host identity"):
+            c.validate_source5_owned_replay_input_profile_v1(value, reversed_expected)
+        external_consumer = copy.deepcopy(expected)
+        external_consumer["consumer_host_id"] = "other-host"
+        with self.assertRaisesRegex(c.ChronologyError, "two-host identity"):
+            c.validate_source5_owned_replay_input_profile_v1(value, external_consumer)
+        bad_path = copy.deepcopy(value)
+        bad_path["metadata_capture_manifest_pin"]["path"] = "/private/../ambient/capture.json"
+        bad_path["profile_sha256"] = c.sha256_bytes(c.canonical_bytes({
+            key: item for key, item in bad_path.items() if key != "profile_sha256"
+        }))
+        with self.assertRaisesRegex(c.ChronologyError, "normalized raw2 pin"):
+            c.validate_source5_owned_replay_input_profile_v1(
+                bad_path, copy.deepcopy(expected),
+            )
+
+    def test_owned_v5_profile_map_requires_exact_ordered_raw3_pins(self) -> None:
+        c = self.chronology
+        hosts = ["agent-8845HS-dev", "agent-EPYC-4585PX-dev"]
+        pin = {"path": "/private/profile.json", "raw_sha256": "a" * 64,
+               "semantic_sha256": "b" * 64}
+        manifest = {"hosts": hosts,
+                    "prepared_replay_inputs": {host: copy.deepcopy(pin) for host in hosts}}
+        self.assertEqual(list(c._source5_owned_replay_input_pin_map(manifest)), hosts)
+        bad = copy.deepcopy(manifest)
+        bad["prepared_replay_inputs"][hosts[0]] = {
+            "path": pin["path"], "raw_sha256": pin["raw_sha256"],
+        }
+        with self.assertRaisesRegex(c.ChronologyError, "unexpected field set"):
+            c._source5_owned_replay_input_pin_map(bad)
+        bad = copy.deepcopy(manifest)
+        bad["prepared_replay_inputs"] = {hosts[1]: pin, hosts[0]: pin}
+        with self.assertRaisesRegex(c.ChronologyError, "host order"):
+            c._source5_owned_replay_input_pin_map(bad)
+
+    def test_new_owned_entry_has_no_caller_reader_or_provider_inputs(self) -> None:
+        c = self.chronology
+        parameters = inspect.signature(
+            c.register_source5_prepared_exploration_owned_locked,
+        ).parameters
+        self.assertTrue({"replay_input_profile_pin", "journal_width_contract_pin",
+                         "completion_pin", "provenance_v2"}.issubset(parameters))
+        self.assertNotIn("artifact_reader", parameters)
+        self.assertNotIn("captured_pilot_read_providers", parameters)
+
+
+    def test_owned_plan_builder_reuses_the_source_v2_structural_fixture(self) -> None:
+        fixture_module = load_script(
+            SCRIPT_DIR / "test-application-source5-recorded-preparation-read.py",
+            "sourcea_owned_registration_real_v2_plan_fixture",
+        )
+        fixture_class = fixture_module.ActualH6RecordedReadPlanTests
+        fixture_class.setUpClass()
+        try:
+            f = fixture_class
+            basis = f.basis
+            hosts = list(f.hosts)
+            prepared = {
+                "campaign_id": basis["campaign_id"],
+                "host_id": f.consumer,
+                "original_pins": {
+                    "spec": copy.deepcopy(basis["spec_pin"]),
+                    "plan": copy.deepcopy(basis["plan_pin"]),
+                    "source_manifests": [
+                        {"host_id": host, **copy.deepcopy(
+                            basis["source_manifest_pins"][host],
+                        )}
+                        for host in hosts
+                    ],
+                },
+            }
+            session = types.SimpleNamespace(
+                plan_module=fixture_module.read_plan,
+                prepared=prepared,
+                hosts=hosts,
+                source_module_pins=copy.deepcopy(basis["source_module_pins"]),
+                completion_pin=copy.deepcopy(
+                    basis["prepared_input_generation"]["completion_pin"],
+                ),
+                provenance=copy.deepcopy(f.provenance),
+                lineage_proofs=f.proofs,
+                profile={
+                    "metadata_capture_manifest_pin": copy.deepcopy(
+                        basis["metadata_capture_manifest_pin"],
+                    ),
+                },
+                width_pin=copy.deepcopy(basis["width_contract_pin"]),
+                frontier=copy.deepcopy(basis["current_journal_frontier"]),
+            )
+            self.chronology._source5_owned_registration_build_plan(
+                session, copy.deepcopy(basis["current_roots"]),
+                f.catalogues, f.readback_caps, f.windows, f.scratch, f.timeouts,
+            )
+            planner = fixture_module.read_plan
+            self.assertEqual(planner.READ_WINDOW_COUNT, 720)
+            self.assertEqual(session.plan["operation_kind"], "registration_replay")
+            self.assertNotIn("read_window_count", session.plan)
+            self.assertEqual(
+                [row["read_ordinal"] for row in session.plan["window_index"]],
+                list(range(720)),
+            )
+            self.assertEqual(len(session.chunks),
+                             len(session.plan["window_chunks"]))
+            self.assertRegex(session.plan["session_nonce"], r"^[0-9a-f]{32}$")
+            expected_ancestors = {
+                host: {
+                    name: f.proofs[host]["ancestor"][f"{name}_pin"]
+                    for name in ("bridge_header", "record_index")
+                }
+                for host in hosts
+            }
+            self.assertEqual(session.basis["ancestor_pins"], expected_ancestors)
+            self.assertNotIn("execution_manifest_pin", session.basis)
+            self.assertNotIn("registration_head", session.basis)
+            checked = planner.validate_recorded_preparation_read_plan_v2(
+                session.plan, session.chunks, session.basis, session.basis_pin,
+                old_catalogues_by_host=f.catalogues,
+                old_readback_caps_by_host=f.readback_caps,
+                window_metadata_by_host=f.windows,
+                session_nonce=session.plan["session_nonce"],
+                scratch_declaration=f.scratch,
+                timeout_declaration=f.timeouts,
+            )
+            self.assertEqual(checked, session.plan)
+        finally:
+            fixture_class.tearDownClass()
+
+    def test_owned_source_is_top_level_code_and_uses_current_pins(self) -> None:
+        source = (SCRIPT_DIR / "application-campaign-chronology.py").read_text()
+        module = ast.parse(source)
+        top_level_functions = {
+            node.name: node for node in module.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        self.assertIn("_source5_owned_registration_input_snapshots", top_level_functions)
+        api_name = "register_source5_prepared_exploration_owned_locked"
+        self.assertIn(api_name, top_level_functions)
+        self.assertTrue(callable(getattr(self.chronology, api_name, None)))
+        api_source = ast.get_source_segment(source, top_level_functions[api_name])
+        self.assertIsNotNone(api_source)
+        self.assertIn("verify_prepared_inputs_completion_closed_recorded_v2", api_source)
+        self.assertIn("_source5_recorded_numeric_ancestor_context_held", api_source)
+        self.assertIn("checked_width_pin", api_source)
+        provider_class = next(
+            node for node in module.body
+            if isinstance(node, ast.ClassDef) and
+            node.name == "_Source5PreparedExplorationRegistrationPilotProvider"
+        )
+        open_view = next(
+            node for node in provider_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "open_view"
+        )
+        provider_source = ast.get_source_segment(source, open_view)
+        self.assertIsNotNone(provider_source)
+        h3_offset = provider_source.index("session.h_client.open_view(ordinal)")
+        numeric_offset = provider_source.index(
+            "_source5_verify_recorded_numeric_ancestor_held("
+        )
+        inputprep_yield_offset = provider_source.index("yield inputprep_view")
+        complete_offset = provider_source.index("session.complete_window(")
+        self.assertLess(h3_offset, numeric_offset)
+        self.assertLess(numeric_offset, inputprep_yield_offset)
+        self.assertLess(inputprep_yield_offset, complete_offset)
+        self.assertIn("capture_reader", api_source)
+        self.assertIn("session.h_client", api_source)
+        self.assertIn('getattr(session.h_client, "plan_module", None)', api_source)
+        self.assertIn('getattr(capture_reader, "close", None)', api_source)
+        self.assertIn('"registration_record"', api_source)
+        self.assertIn('after_state["registration_head"]', api_source)
+        self.assertIn('after_state["prepared_capacity_registration"]', api_source)
+        self.assertIn("owned-registration-replay-result.v1", api_source)
+        self.assertFalse(any(
+            isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+            for node in module.body
+        ), "module scope must not execute an editor write fragment")
+        self.assertFalse(any(
+            isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and
+            type(node.value.value) is str and
+            ("def register_source5_prepared_exploration_owned_locked" in node.value.value or
+             "p.write_text(p.read_text() + insert)" in node.value.value)
+            for node in module.body
+        ), "owned source must be code, not a triple-quoted editor fragment")
+        plan_builder = top_level_functions["_source5_owned_registration_build_plan"]
+        plan_source = ast.get_source_segment(source, plan_builder)
+        self.assertIsNotNone(plan_source)
+        self.assertIn("READ_WINDOW_COUNT", plan_source)
+        self.assertIn('"window_index"', plan_source)
+        self.assertNotIn('"read_window_count"', plan_source)
+        final_recheck = ast.get_source_segment(
+            source, top_level_functions["_source5_prepared_registration_recheck_inputs_callback_free"],
+        )
+        self.assertIn("time.monotonic_ns() < session.deadline_ns", final_recheck)
+        snapshot_parameters = inspect.signature(
+            self.chronology._source5_owned_registration_input_snapshots,
+        ).parameters
+        self.assertIn("width_pin", snapshot_parameters)
+        self.assertNotIn("source5_owned_width_contract_pin",
+                         ast.get_source_segment(
+                             source,
+                             top_level_functions["_source5_owned_registration_input_snapshots"],
+                         ))
+        proof_check = ast.get_source_segment(
+            source, top_level_functions["_source5_prepared_registration_proof_check"],
+        )
+        consume_offset = proof_check.index('session.check_deadline("registration append consume")')
+        consume_source = proof_check[consume_offset:]
+        ledger_offset = consume_source.index("_source5_owned_registration_verify_h_ledger(session)")
+        final_check_offset = consume_source.index(
+            "_source5_prepared_registration_recheck_inputs_callback_free(",
+        )
+        consume_offset = consume_source.index('entry["state"] = "consumed"')
+        self.assertLess(ledger_offset, final_check_offset)
+        clock_offset = consume_source.index("time.monotonic_ns() < session.deadline_ns")
+        self.assertLess(final_check_offset, clock_offset)
+        self.assertLess(clock_offset, consume_offset)
+        self.assertIn("registration append postwrite", api_source)
+
+    def test_last_cancel_callback_mutation_fails_the_final_prewrite_snapshot(self) -> None:
+        c = self.chronology
+        with tempfile.TemporaryDirectory(prefix="sourcea-prewrite-callback-") as temporary:
+            root = Path(temporary)
+            source_root = root / "source"
+            input_root = root / "inputs"
+            output_root = root / "output"
+            capture_root = root / "capture"
+            for path in (source_root, input_root, output_root, capture_root):
+                path.mkdir(mode=0o700)
+            controlled = input_root / "spec.json"
+            controlled.write_bytes(b"pinned before callback")
+            controlled.chmod(0o600)
+            raw_sha256 = c.sha256_bytes(controlled.read_bytes())
+            snapshot = c._source5_construction_snapshot_file(
+                str(controlled), raw_sha256, 128, "SourceA controlled current Spec",
+            )
+            original_pins = {"selected": "unchanged"}
+            prepared = {
+                "output_root": output_root, "campaign_id": "prewrite-callback",
+                "host_id": "host-a", "original_pins": original_pins,
+                "source_root": source_root, "input_root": input_root,
+            }
+            prepare_args = {
+                "plan_pin": {}, "spec_pin": {}, "source_root": source_root,
+                "input_root": input_root, "host_id": "host-a",
+                "observed_host_pin": {}, "output_root": output_root,
+            }
+            refreshed = {
+                **prepared, "original_pins": original_pins,
+            }
+            callback_calls = []
+
+            def last_cancel_callback(label):
+                callback_calls.append(label)
+                controlled.write_bytes(b"mutated after last cancel poll")
+
+            session = types.SimpleNamespace(
+                prepared=prepared, lock=object(), input_snapshots=[snapshot],
+                source_file_snapshots=[], root_snapshots=[],
+                capture_reader=types.SimpleNamespace(
+                    _open_root_checked=lambda: os.open(capture_root, os.O_RDONLY),
+                ),
+                prepare_args=prepare_args, check_deadline=last_cancel_callback,
+                deadline_ns=time.monotonic_ns() + 60_000_000_000,
+            )
+            session.check_deadline("last H/cancellation callback")
+            append_attempts = []
+            with patch.object(c, "_check_lock"), \
+                 patch.object(c, "_prepare_inputs", return_value=refreshed), \
+                 patch.object(c, "_source5_construction_close_prepared"):
+                try:
+                    c._source5_prepared_registration_recheck_inputs_callback_free(
+                        session, "registration append final prewrite",
+                    )
+                except c.ChronologyError as error:
+                    self.assertRegex(
+                        str(error), "identity changed during the held construction",
+                    )
+                else:
+                    append_attempts.append("durable write")
+            self.assertEqual(callback_calls, ["last H/cancellation callback"])
+            self.assertEqual(append_attempts, [])
+
+    def test_deadline_expiry_during_final_recheck_prevents_append(self) -> None:
+        c = self.chronology
+        with tempfile.TemporaryDirectory(prefix="sourcea-prewrite-deadline-") as temporary:
+            root = Path(temporary)
+            source_root = root / "source"
+            input_root = root / "inputs"
+            output_root = root / "output"
+            capture_root = root / "capture"
+            for path in (source_root, input_root, output_root, capture_root):
+                path.mkdir(mode=0o700)
+            controlled = input_root / "spec.json"
+            controlled.write_bytes(b"still pinned")
+            controlled.chmod(0o600)
+            snapshot = c._source5_construction_snapshot_file(
+                str(controlled), c.sha256_bytes(controlled.read_bytes()), 128,
+                "SourceA deadline current Spec",
+            )
+            original_pins = {"selected": "unchanged"}
+            prepared = {
+                "output_root": output_root, "campaign_id": "prewrite-deadline",
+                "host_id": "host-a", "original_pins": original_pins,
+                "source_root": source_root, "input_root": input_root,
+            }
+            prepare_args = {
+                "plan_pin": {}, "spec_pin": {}, "source_root": source_root,
+                "input_root": input_root, "host_id": "host-a",
+                "observed_host_pin": {}, "output_root": output_root,
+            }
+            refreshed = {**prepared, "original_pins": original_pins}
+            session = types.SimpleNamespace(
+                prepared=prepared, lock=object(), input_snapshots=[snapshot],
+                source_file_snapshots=[], root_snapshots=[],
+                capture_reader=types.SimpleNamespace(
+                    _open_root_checked=lambda: os.open(capture_root, os.O_RDONLY),
+                ),
+                prepare_args=prepare_args, deadline_ns=100,
+            )
+            append_attempts = []
+            with patch.object(c, "_check_lock"), \
+                 patch.object(c, "_prepare_inputs", return_value=refreshed), \
+                 patch.object(c, "_source5_construction_close_prepared"), \
+                 patch.object(c.time, "monotonic_ns", return_value=101):
+                try:
+                    c._source5_prepared_registration_recheck_inputs_callback_free(
+                        session, "registration append final prewrite",
+                    )
+                except c.ChronologyError as error:
+                    self.assertRegex(
+                        str(error), "expired during its callback-free input recheck",
+                    )
+                else:
+                    append_attempts.append("durable write")
+            self.assertEqual(append_attempts, [])
+
+    def test_forged_registration_proof_is_rejected_before_lock_or_file_access(self) -> None:
+        c = self.chronology
+        with self.assertRaisesRegex(c.ChronologyError, "exact private one-use owner proof"):
+            c._source5_prepared_registration_proof_check(
+                object(), None, {}, {}, {}, "a" * 64, mode="precheck",
+            )
+
+    def test_cli_main_guard_follows_all_owned_registration_definitions(self) -> None:
+        source = (SCRIPT_DIR / "application-campaign-chronology.py").read_text()
+        guard = source.rindex('if __name__ == "__main__":')
+        owned_api = source.index(
+            "def register_source5_prepared_exploration_owned_locked(",
+        )
+        self.assertLess(owned_api, guard)
+        self.assertEqual(source.count('if __name__ == "__main__":'), 1)
 
 
 if __name__ == "__main__":

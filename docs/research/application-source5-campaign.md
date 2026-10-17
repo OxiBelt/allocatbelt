@@ -26,6 +26,28 @@ supported. The byte declaration accounts serialized inputs; transport must
 bound reads before allocating them. Structural tests do not establish a
 genuine signed window, complete preparation replay or campaign qualification.
 
+## Owned prepared registration
+
+`register_source5_prepared_exploration_owned_locked` accepts the exact current
+completion, provenance, replay-input profile and journal-width pins. It owns
+the two-host recorded read cohort, signature checks, numeric replay and closed
+InputPrep verification while holding the live chronology lock. A private
+one-use append proof permits the single registration event after final input,
+frontier and deadline checks. The returned registration record is data; a
+later operation must obtain fresh replay authority.
+
+The profile validator and
+`source5_owned_prepared_completion_max_bytes_v1` are pure data APIs. The named
+owned route admits a completion of at most 64 MiB only after validating that
+profile and its bindings. Legacy completion limits remain unchanged. Merely
+loading an owned V5 manifest or copying its registration result cannot enable
+analysis, authorization, APP launch, capacity or context lookup.
+
+Native registration regressions cover these boundaries and CLI lifecycle
+behavior. A genuine signed window and complete 720-window replay remain
+separate operational gates. The v1/v2 sections below describe the legacy
+three-host routes.
+
 `scripts/application-source5-campaign.py` now has separate execution-manifest
 v1 and v2 paths. V1 retains the original capacity-stage registration
 contract. V2 accepts only the closed `final_prepared` scope: it replays the
