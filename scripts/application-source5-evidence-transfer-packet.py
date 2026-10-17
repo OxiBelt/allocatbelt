@@ -882,6 +882,78 @@ def _read_source_budget_module(
     return namespace
 
 
+def _prepared_execution_replay_profile_fields_v1(
+    execution: dict[str, Any],
+) -> set[str]:
+    """Recognize immutable owned-profile references without granting replay."""
+    if "prepared_replay_inputs" not in execution:
+        return set()
+    hosts = execution.get("hosts")
+    _require(execution.get("schema") == PREPARED_EXPLORATION_EXECUTION_SCHEMA and
+             type(hosts) is list and len(hosts) == 2 and
+             all(type(host) is str and bool(host) for host in hosts) and
+             len(set(hosts)) == 2,
+             "owned prepared replay references require the exact two-host V5 cohort")
+    refs = _exact(execution["prepared_replay_inputs"], set(hosts),
+                   "owned prepared replay profile map")
+    pins = [_pin(refs[host], f"owned prepared replay profile {host}")
+            for host in hosts]
+    _require(len({pin["path"] for pin in pins}) == len(hosts),
+             "owned prepared replay profiles alias another host's profile path")
+    return {"prepared_replay_inputs"}
+
+
+def _validate_prepared_execution_signer_binding_v1(
+    execution: dict[str, Any], execution_pin: dict[str, str],
+    signer_pin: dict[str, str], context: dict[str, Any],
+) -> None:
+    """Validate only V5 manifest/signer data, never a live SourceA scope."""
+    fields = {
+        "schema", "campaign_id", "hosts", "original_inputs", "execution_sources",
+        "modules", "observed_hosts", "artifact_root", "output_root", "phase_order",
+        "protocol_sha256", "qualification_eligible", "manifest_sha256", "scope",
+        "prepared_input_generation", "prepared_capacity_registration",
+        "archive_signer_contexts", "journal_width_contracts",
+    } | _prepared_execution_replay_profile_fields_v1(execution)
+    _exact(execution, fields, "prepared V5 execution manifest signer binding")
+    hosts = execution["hosts"]
+    _require(execution["schema"] == PREPARED_EXPLORATION_EXECUTION_SCHEMA and
+             execution["scope"] == PREPARED_EXPLORATION_SCOPE and
+             execution["campaign_id"] == context["campaign_id"] and
+             type(hosts) is list and len(hosts) == 2 and
+             all(type(host) is str and bool(host) for host in hosts) and
+             len(set(hosts)) == 2 and context["host_id"] in hosts and
+             execution["qualification_eligible"] is False and
+             execution["phase_order"] == [
+                 "exploration", "aa", "confirmation", "fixed_analysis",
+                 "pressure", "pressure_analysis", "soak", "final_analysis",
+             ] and
+             execution["manifest_sha256"] == execution_pin["semantic_sha256"] ==
+                 _sha(_canonical({key: value for key, value in execution.items()
+                                  if key != "manifest_sha256"},
+                                 maximum_bytes=MAX_PLAN_BYTES)),
+             "prepared V5 execution signer identity, cohort, scope or digest differs")
+    widths = _exact(execution["journal_width_contracts"], set(hosts),
+                     "prepared V5 execution journal-width map")
+    for host in hosts:
+        width = _exact(widths[host], {"artifact", "semantic_sha256"},
+                        f"prepared V5 execution journal-width wrapper {host}")
+        _pin({**_pin_raw(width["artifact"],
+                         f"prepared V5 execution journal-width artifact {host}"),
+              "semantic_sha256": width["semantic_sha256"]},
+             f"prepared V5 execution journal width {host}")
+    contexts = _exact(execution["archive_signer_contexts"], set(hosts),
+                       "prepared V5 archive signer-context map")
+    wrapper = _exact(contexts[context["host_id"]], {
+        "artifact", "semantic_sha256",
+    }, "prepared V5 signer-context wrapper")
+    artifact = _pin_raw(wrapper["artifact"], "prepared V5 signer-context artifact")
+    _require(artifact == {"path": signer_pin["path"],
+                          "raw_sha256": signer_pin["raw_sha256"]} and
+             wrapper["semantic_sha256"] == signer_pin["semantic_sha256"],
+             "prepared V5 signer-context pin differs from its exact manifest entry")
+
+
 def _read_source_archive_preparatory_validator(
     source_manifest_raw: bytes, execution_manifest_raw: bytes,
     context: dict[str, Any], *, prepared_exploration: bool = False,
@@ -943,7 +1015,8 @@ def _read_source_archive_preparatory_validator(
             "manifest_sha256", "scope", "prepared_input_generation",
             "prepared_capacity_registration", "archive_signer_contexts",
             "journal_width_contracts",
-        }, "selected prepared-exploration execution manifest")
+        } | _prepared_execution_replay_profile_fields_v1(execution),
+               "selected prepared-exploration execution manifest")
         _require(execution.get("schema") == PREPARED_EXPLORATION_EXECUTION_SCHEMA and
                  execution.get("scope") == PREPARED_EXPLORATION_SCOPE and
                  type(execution.get("hosts")) is list and
@@ -2157,6 +2230,20 @@ def _validate_archive_signer_context(
             "keyring_pin": keyring_pin, "gpgv_pin": gpgv_pin,
             "execution_manifest_pin": checked_execution_pin,
         }
+    if execution_probe.get("schema") == PREPARED_EXPLORATION_EXECUTION_SCHEMA:
+        _validate_prepared_execution_signer_binding_v1(
+            execution_probe, checked_execution_pin, pin, context,
+        )
+        return {
+            "schema": value["schema"], "campaign_id": context["campaign_id"],
+            "host_id": context["host_id"],
+            "authorized_primary_fingerprint": fingerprint,
+            "maximum_signature_bytes": maximum_signature_bytes,
+            "keyring_pin": keyring_pin, "gpgv_pin": gpgv_pin,
+            "signature_format": value["signature_format"],
+            "signer_context_sha256": value["signer_context_sha256"],
+            "execution_manifest_pin": checked_execution_pin,
+        }
     execution_fields = {
         "schema", "campaign_id", "hosts", "original_inputs",
         "execution_sources", "modules", "observed_hosts", "artifact_root",
@@ -2691,7 +2778,8 @@ def _read_root_prepared_exploration_dependencies(
             "protocol_sha256", "qualification_eligible", "manifest_sha256", "scope",
             "prepared_input_generation", "prepared_capacity_registration",
             "archive_signer_contexts", "journal_width_contracts",
-        }, "Root V5 execution manifest")
+        } | _prepared_execution_replay_profile_fields_v1(execution),
+               "Root V5 execution manifest")
         _require(execution["schema"] == PREPARED_EXPLORATION_EXECUTION_SCHEMA and
                  execution["scope"] == PREPARED_EXPLORATION_SCOPE and
                  execution["campaign_id"] == context["campaign_id"] and

@@ -224,6 +224,19 @@ RECORDED_READ_GPG_RESOURCE_FIELDS_V2 = {
     "maximum_stdout_bytes", "maximum_stderr_bytes",
     "maximum_window_seconds", "resource_sha256",
 }
+ROOT_INLINE_CURRENT_INPUT_RESOURCE_SCHEMA_V1 = (
+    "allocatbelt.application-source5-recorded-read-root-current-input-resource.v1"
+)
+ROOT_INLINE_OPERATION_CONSTRUCTION_SERVE = "construction_serve"
+ROOT_INLINE_OPERATION_ORDINARY_SERVE = "ordinary_serve"
+ROOT_INLINE_OPERATION_CONSTRUCTION_RELEASE = "construction_release"
+ROOT_INLINE_OPERATION_ORDINARY_RELEASE = "ordinary_release"
+# Resource-admission subset for these Root inline routes, not a maximum of
+# the Source plan grammar. Source may split its 720 rows into more chunks to
+# meet its per-chunk byte cap. Root accepts only plans with at most 45 chunks;
+# operators must preflight the complete plan and refuse larger sessions.
+# No truncation, automatic rechunking or legacy path fallback is permitted.
+ROOT_INLINE_MAX_WINDOW_CHUNKS = 45
 RECORDED_READ_ROOT_OUTPUT_SCHEMA_V2 = (
     "allocatbelt.application-source5-recorded-read-root-output-resource.v2"
 )
@@ -2021,6 +2034,78 @@ def _prepared_bootstrap_capture_reader(
     return reader, manifest
 
 
+def _prepared_execution_replay_profile_fields_v1(
+    execution: dict[str, Any],
+) -> set[str]:
+    """Recognize immutable owned-profile references without granting replay."""
+    if "prepared_replay_inputs" not in execution:
+        return set()
+    hosts = execution.get("hosts")
+    _require(execution.get("schema") == PREPARED_EXPLORATION_EXECUTION_SCHEMA and
+             type(hosts) is list and len(hosts) == 2 and
+             all(type(host) is str and bool(host) for host in hosts) and
+             len(set(hosts)) == 2,
+             "owned prepared replay references require the exact two-host V5 cohort")
+    refs = _exact(execution["prepared_replay_inputs"], set(hosts),
+                   "owned prepared replay profile map")
+    pins = [_pin(refs[host], f"owned prepared replay profile {host}")
+            for host in hosts]
+    _require(len({pin["path"] for pin in pins}) == len(hosts),
+             "owned prepared replay profiles alias another host's profile path")
+    return {"prepared_replay_inputs"}
+
+
+def _validate_prepared_execution_signer_binding_v1(
+    execution: dict[str, Any], execution_pin: dict[str, str],
+    signer_pin: dict[str, str], context: dict[str, Any],
+) -> None:
+    """Validate only V5 manifest/signer data, never a live SourceA scope."""
+    fields = {
+        "schema", "campaign_id", "hosts", "original_inputs", "execution_sources",
+        "modules", "observed_hosts", "artifact_root", "output_root", "phase_order",
+        "protocol_sha256", "qualification_eligible", "manifest_sha256", "scope",
+        "prepared_input_generation", "prepared_capacity_registration",
+        "archive_signer_contexts", "journal_width_contracts",
+    } | _prepared_execution_replay_profile_fields_v1(execution)
+    _exact(execution, fields, "prepared V5 execution manifest signer binding")
+    hosts = execution["hosts"]
+    _require(execution["schema"] == PREPARED_EXPLORATION_EXECUTION_SCHEMA and
+             execution["scope"] == PREPARED_EXPLORATION_SCOPE and
+             execution["campaign_id"] == context["campaign_id"] and
+             type(hosts) is list and len(hosts) == 2 and
+             all(type(host) is str and bool(host) for host in hosts) and
+             len(set(hosts)) == 2 and context["host_id"] in hosts and
+             execution["qualification_eligible"] is False and
+             execution["phase_order"] == [
+                 "exploration", "aa", "confirmation", "fixed_analysis",
+                 "pressure", "pressure_analysis", "soak", "final_analysis",
+             ] and
+             execution["manifest_sha256"] == execution_pin["semantic_sha256"] ==
+                 _sha(_canonical({key: value for key, value in execution.items()
+                                  if key != "manifest_sha256"},
+                                 maximum_bytes=MAX_PLAN_BYTES)),
+             "prepared V5 execution signer identity, cohort, scope or digest differs")
+    widths = _exact(execution["journal_width_contracts"], set(hosts),
+                     "prepared V5 execution journal-width map")
+    for host in hosts:
+        width = _exact(widths[host], {"artifact", "semantic_sha256"},
+                        f"prepared V5 execution journal-width wrapper {host}")
+        _pin({**_pin_raw(width["artifact"],
+                         f"prepared V5 execution journal-width artifact {host}"),
+              "semantic_sha256": width["semantic_sha256"]},
+             f"prepared V5 execution journal width {host}")
+    contexts = _exact(execution["archive_signer_contexts"], set(hosts),
+                       "prepared V5 archive signer-context map")
+    wrapper = _exact(contexts[context["host_id"]], {
+        "artifact", "semantic_sha256",
+    }, "prepared V5 signer-context wrapper")
+    artifact = _pin_raw(wrapper["artifact"], "prepared V5 signer-context artifact")
+    _require(artifact == {"path": signer_pin["path"],
+                          "raw_sha256": signer_pin["raw_sha256"]} and
+             wrapper["semantic_sha256"] == signer_pin["semantic_sha256"],
+             "prepared V5 signer-context pin differs from its exact manifest entry")
+
+
 def _prepared_execution_manifest(
     raw: bytes, pin_value: object, budget: dict[str, Any],
     context: dict[str, Any], source_docs: dict[str, dict[str, Any]],
@@ -2045,7 +2130,8 @@ def _prepared_execution_manifest(
     _exact(execution, (base - {"capacity_completions"}) | {
         "scope", "prepared_input_generation", "prepared_capacity_registration",
         "archive_signer_contexts", "journal_width_contracts",
-    }, "prepared Source5 execution manifest V5")
+    } | _prepared_execution_replay_profile_fields_v1(execution),
+           "prepared Source5 execution manifest V5")
     hosts = execution["hosts"]
     _require(type(hosts) is list and len(hosts) == 2 and
              all(type(host) is str and bool(host) for host in hosts) and
@@ -2684,6 +2770,7 @@ def _recorded_pre_manifest_source_graph(
     capture_manifest_raw: bytes, capture_stage_root: str,
     source_root_value: str, final_plan_module: object, *,
     deadline_ns: int | None = None, cancel_event=None,
+    inline_current_inputs: dict[str, bytes] | None = None,
 ) -> dict[str, Any]:
     """Rebuild the actual SourceV2/Bridge capture graph before one read.
 
@@ -2779,12 +2866,34 @@ def _recorded_pre_manifest_source_graph(
                         "recorded-read final Spec pin")
         plan_pin = _pin(basis["plan_pin"],
                         "recorded-read final Plan pin")
-        spec_raw = bootstrap.read({
-            "path": spec_pin["path"], "raw_sha256": spec_pin["raw_sha256"],
-        }, PREPARATORY_MAX_SPEC_BYTES)
-        plan_raw = bootstrap.read({
-            "path": plan_pin["path"], "raw_sha256": plan_pin["raw_sha256"],
-        }, MAX_PLAN_BYTES)
+        current_width_pin = (
+            _pin(basis["width_contract_pin"],
+                 "recorded-read current width pin")
+            if "width_contract_pin" in basis else None
+        )
+        if inline_current_inputs is None:
+            current_inputs = None
+            spec_raw = bootstrap.read({
+                "path": spec_pin["path"], "raw_sha256": spec_pin["raw_sha256"],
+            }, PREPARATORY_MAX_SPEC_BYTES)
+            plan_raw = bootstrap.read({
+                "path": plan_pin["path"], "raw_sha256": plan_pin["raw_sha256"],
+            }, MAX_PLAN_BYTES)
+        else:
+            expected_current_roles = {"final_spec", "final_plan"}
+            if "width_contract_pin" in basis:
+                expected_current_roles.add("current_width")
+            _require(type(inline_current_inputs) is dict and
+                     set(inline_current_inputs) == expected_current_roles and
+                     all(type(raw) is bytes and 0 < len(raw) <=
+                         (PREPARATORY_MAX_SPEC_BYTES if role == "final_spec" else
+                          MAX_PLAN_BYTES if role == "final_plan" else
+                          PREPARATORY_MAX_WIDTH_BYTES)
+                         for role, raw in inline_current_inputs.items()),
+                     "Root inline current Source controls differ from its fixed role set/caps")
+            current_inputs = inline_current_inputs
+            spec_raw = current_inputs["final_spec"]
+            plan_raw = current_inputs["final_plan"]
         spec = _parse_canonical(spec_raw, "recorded-read final Spec",
                                 maximum_bytes=PREPARATORY_MAX_SPEC_BYTES)
         source_plan = _parse_canonical(plan_raw, "recorded-read final Plan",
@@ -2824,6 +2933,11 @@ def _recorded_pre_manifest_source_graph(
             elif pin == {"path": plan_pin["path"],
                         "raw_sha256": plan_pin["raw_sha256"]}:
                 raw = plan_raw
+            elif (current_inputs is not None and
+                  current_width_pin is not None and
+                  pin == {"path": current_width_pin["path"],
+                          "raw_sha256": current_width_pin["raw_sha256"]}):
+                raw = current_inputs["current_width"]
             elif pin == {"path": selected_pin["path"],
                         "raw_sha256": selected_pin["raw_sha256"]}:
                 raw = selected_source_manifest_raw
@@ -3041,12 +3155,14 @@ def _recorded_pre_manifest_source_closure(
     capture_manifest_raw: bytes, capture_stage_root: str,
     source_root_value: str, final_plan_module: object, *,
     deadline_ns: int | None = None, cancel_event=None,
+    inline_current_inputs: dict[str, bytes] | None = None,
 ) -> dict[str, Any]:
     """Rebuild the common Source graph and retain ordinary current-width replay."""
     graph = _recorded_pre_manifest_source_graph(
         basis, basis_pin, selected_source_manifest_raw, capture_manifest_raw,
         capture_stage_root, source_root_value, final_plan_module,
         deadline_ns=deadline_ns, cancel_event=cancel_event,
+        inline_current_inputs=inline_current_inputs,
     )
     try:
         graph["width"] = _recorded_pre_manifest_source_current_width(
@@ -3064,6 +3180,7 @@ def _recorded_pre_manifest_source_construction_closure(
     capture_manifest_raw: bytes, capture_stage_root: str,
     source_root_value: str, final_plan_module: object, *,
     deadline_ns: int | None = None, cancel_event=None,
+    inline_current_inputs: dict[str, bytes] | None = None,
 ) -> dict[str, Any]:
     """Rebuild the same graph without a future completion or current-width pin."""
     _require("prepared_input_generation" not in basis and
@@ -3074,6 +3191,7 @@ def _recorded_pre_manifest_source_construction_closure(
         basis, basis_pin, selected_source_manifest_raw, capture_manifest_raw,
         capture_stage_root, source_root_value, final_plan_module,
         deadline_ns=deadline_ns, cancel_event=cancel_event,
+        inline_current_inputs=inline_current_inputs,
     )
 
 
@@ -3750,6 +3868,7 @@ def _recorded_root_control_state(
     plan_pin: dict[str, Any], plan_module: object, *,
     deadline_ns: int | None = None, cancel_event=None,
     construction: bool = False,
+    inline_window_chunk_raws: list[bytes] | None = None,
 ) -> tuple[int, dict[str, Any] | None, str]:
     info = os.fstat(descriptor)
     _require(info.st_size <= context["maximum_control_ledger_bytes"] and
@@ -3818,6 +3937,7 @@ def _recorded_root_control_state(
                 plan, plan_pin, plan_module, ordinal,
                 deadline_ns=deadline_ns, cancel_event=cancel_event,
                 construction=construction,
+                inline_window_chunk_raws=inline_window_chunk_raws,
             )
             cached_chunk_ordinal = current_chunk_ordinal
         window_chunk = cached_window_chunk
@@ -4252,6 +4372,8 @@ def _serve_source5_preparation_read_window_core(
     root_output_context: dict[str, Any],
     window_deadline_ns: int, cancel_event=None,
     construction: bool = False,
+    inline_current_inputs: dict[str, bytes] | None = None,
+    inline_window_chunk_raws: list[bytes] | None = None,
 ) -> dict[str, Any]:
     """Materialize one actual Source-verified recorded window into its exact slots.
 
@@ -4264,9 +4386,11 @@ def _serve_source5_preparation_read_window_core(
     _require(type(request_raw) is bytes and
              type(basis_raw) is bytes and type(read_plan_raw) is bytes and
              type(session_descriptor_raw) is bytes and
+             ((inline_current_inputs is None) ==
+              (inline_window_chunk_raws is None)) and
              (cancel_event is None or
               callable(getattr(cancel_event, "is_set", None))),
-             "recorded-read Root operation inputs or cancellation token are malformed")
+             "recorded-read Root inputs, inline resolver pair, or cancellation token are malformed")
     try:
         basis = _parse_canonical(basis_raw,
                                  "recorded-read replay basis",
@@ -4361,6 +4485,7 @@ def _serve_source5_preparation_read_window_core(
         plan, plan_pin, plan_module, ordinal,
         deadline_ns=window_deadline_ns, cancel_event=cancel_event,
         construction=construction,
+        inline_window_chunk_raws=inline_window_chunk_raws,
     )
     outer_request = _recorded_read_plan_member(
         plan_module, "validate_request", construction=construction,
@@ -4432,15 +4557,17 @@ def _serve_source5_preparation_read_window_core(
                  ordinal // plan_module.READ_JOB_COUNT_PER_HOST
              ],
              "recorded-read requested window is outside its ordered Source cohort row")
-    _require(request_raw == _canonical(outer_request) and
-             request_raw == _read_absolute_private_file(
-                 Path(row["session_paths"]["request"]),
-                 row["resource_bounds"]["outer_request_bytes"],
-                 "recorded-read current persisted request",
-                 deadline_ns=window_deadline_ns,
-                 cancel_event=cancel_event,
-             )[0],
-             "recorded-read request bytes differ from the exact persisted current slot")
+    _require(request_raw == _canonical(outer_request),
+             "recorded-read request bytes differ from their pure current plan projection")
+    if inline_current_inputs is None:
+        _require(request_raw == _read_absolute_private_file(
+                     Path(row["session_paths"]["request"]),
+                     row["resource_bounds"]["outer_request_bytes"],
+                     "recorded-read current persisted request",
+                     deadline_ns=window_deadline_ns,
+                     cancel_event=cancel_event,
+                 )[0],
+                 "recorded-read request bytes differ from the exact persisted current slot")
     source_graph_builder = (
         _recorded_pre_manifest_source_construction_closure if construction else
         _recorded_pre_manifest_source_closure
@@ -4450,25 +4577,27 @@ def _serve_source5_preparation_read_window_core(
         lineage_capture_manifest_raw, lineage_capture_stage_root,
         source_root, plan_module, deadline_ns=window_deadline_ns,
         cancel_event=cancel_event,
+        inline_current_inputs=inline_current_inputs,
     )
     reader = source_graph["reader"]
     try:
         check_window("Source metadata closure")
-        session_validator_name = (
-            "_source5_prepared_input_construction_read_session_documents"
-            if construction else "_source5_recorded_read_session_documents"
-        )
-        session_validator = getattr(
-            source_graph["source_modules"]["source5_campaign"],
-            session_validator_name, None,
-        )
-        _require(callable(session_validator),
-                 "selected typed H lacks the exact session-document validator")
-        session_validator(
-            basis, basis_pin_value, plan, plan_pin, plan_module,
-            create_missing=False, cancel_event=cancel_event,
-            deadline_ns=window_deadline_ns,
-        )
+        if inline_current_inputs is None:
+            session_validator_name = (
+                "_source5_prepared_input_construction_read_session_documents"
+                if construction else "_source5_recorded_read_session_documents"
+            )
+            session_validator = getattr(
+                source_graph["source_modules"]["source5_campaign"],
+                session_validator_name, None,
+            )
+            _require(callable(session_validator),
+                     "selected typed H lacks the exact session-document validator")
+            session_validator(
+                basis, basis_pin_value, plan, plan_pin, plan_module,
+                create_missing=False, cancel_event=cancel_event,
+                deadline_ns=window_deadline_ns,
+            )
         owner = row["owner_host_id"]
         job_index = row["job_index"]
         proof = source_graph["proofs"][owner]
@@ -4818,6 +4947,201 @@ def _serve_source5_preparation_read_window_core(
         reader.close()
 
 
+def _root_inline_current_input_role_caps(
+    operation_kind: str,
+) -> dict[str, int]:
+    """Return the fixed Source caps for one non-legacy Root inline route."""
+    common = {
+        "basis": MAX_ARCHIVE_READ_METADATA_BYTES,
+        "read_plan": MAX_ARCHIVE_READ_METADATA_BYTES,
+        "session_descriptor": MAX_ARCHIVE_READ_METADATA_BYTES,
+        "selected_source_manifest": MAX_SOURCE_MANIFEST_BYTES,
+    }
+    if operation_kind in {
+            ROOT_INLINE_OPERATION_CONSTRUCTION_SERVE,
+            ROOT_INLINE_OPERATION_ORDINARY_SERVE}:
+        common.update({
+            "final_spec": PREPARATORY_MAX_SPEC_BYTES,
+            "final_plan": MAX_PLAN_BYTES,
+            "request": MAX_ARCHIVE_READ_METADATA_BYTES,
+        })
+        if operation_kind == ROOT_INLINE_OPERATION_ORDINARY_SERVE:
+            common["current_width"] = PREPARATORY_MAX_WIDTH_BYTES
+        return common
+    if operation_kind in {
+            ROOT_INLINE_OPERATION_CONSTRUCTION_RELEASE,
+            ROOT_INLINE_OPERATION_ORDINARY_RELEASE}:
+        return common
+    raise EvidenceArchiveError(
+        "Root inline current-input operation is not one of its four named routes",
+    )
+
+
+def _validate_root_inline_current_input_resource_v1(
+    resource_value: object, operation_kind: str,
+    role_raws: dict[str, bytes], window_chunk_raws: list[bytes],
+) -> dict[str, Any]:
+    """Account exact inline serialized bytes before any document is parsed.
+
+    The declaration is a byte-count contract, not an authority token or an OS
+    memory reservation. It bounds roles and chunks with fixed Source maxima;
+    Root checks their semantic pins after loading the typed plan.
+    """
+    caps = _root_inline_current_input_role_caps(operation_kind)
+    resource_fields = {
+        "schema", "operation_kind", "maximum_buffered_bytes",
+        "document_count", "role_byte_counts", "window_chunk_byte_counts",
+        "resource_sha256",
+    }
+    _require(type(resource_value) is dict and
+             len(resource_value) == len(resource_fields) and
+             all(type(key) is str for key in resource_value),
+             "Root inline current-input declaration has an unbounded field map")
+    resource = _exact(resource_value, resource_fields,
+                      "Root inline current-input byte declaration")
+    _require(type(resource["schema"]) is str and
+             type(resource["operation_kind"]) is str and
+             resource["schema"] ==
+             ROOT_INLINE_CURRENT_INPUT_RESOURCE_SCHEMA_V1 and
+             resource["operation_kind"] == operation_kind,
+             "Root inline current-input declaration differs from its fixed API route")
+    role_counts_value = resource["role_byte_counts"]
+    _require(type(role_counts_value) is dict and
+             len(role_counts_value) == len(caps) and
+             all(type(key) is str for key in role_counts_value),
+             "Root inline current-input role-count map is not exactly bounded")
+    counts = _exact(role_counts_value, set(caps),
+                    "Root inline current-input role byte counts")
+    _require(type(role_raws) is dict and len(role_raws) == len(caps) and
+             set(role_raws) == set(caps),
+             "Root inline current-input bytes differ from the fixed route roles")
+    total = 0
+    for role, maximum in caps.items():
+        raw = role_raws[role]
+        count = _uint(counts[role],
+                      f"Root inline {role} serialized byte count",
+                      positive=True, maximum=maximum)
+        _require(type(raw) is bytes and len(raw) == count,
+                 f"Root inline {role} bytes differ from their declared exact length")
+        total += count
+    _require(type(window_chunk_raws) is list and
+             0 < len(window_chunk_raws) <= ROOT_INLINE_MAX_WINDOW_CHUNKS and
+             type(resource["window_chunk_byte_counts"]) is list and
+             len(resource["window_chunk_byte_counts"]) == len(window_chunk_raws),
+             "Root inline window-chunk counts exceed this route's 45-chunk admission or differ")
+    chunk_counts = []
+    for ordinal, raw in enumerate(window_chunk_raws):
+        count = _uint(resource["window_chunk_byte_counts"][ordinal],
+                      f"Root inline window chunk[{ordinal}] byte count",
+                      positive=True, maximum=MAX_ARCHIVE_READ_METADATA_BYTES)
+        _require(type(raw) is bytes and len(raw) == count,
+                 f"Root inline window chunk[{ordinal}] differs from its exact byte count")
+        chunk_counts.append(count)
+        total += count
+    maximum_total = sum(caps.values()) + (
+        ROOT_INLINE_MAX_WINDOW_CHUNKS * MAX_ARCHIVE_READ_METADATA_BYTES
+    )
+    _require(_uint(resource["document_count"],
+                   "Root inline current-input document count",
+                   positive=True, maximum=len(caps) +
+                   ROOT_INLINE_MAX_WINDOW_CHUNKS) == len(caps) +
+             len(window_chunk_raws) and
+             _uint(resource["maximum_buffered_bytes"],
+                   "Root inline current-input buffered byte count",
+                   positive=True, maximum=maximum_total) == total,
+             "Root inline current-input byte/document totals differ from the exact payload set")
+    resource_sha256 = resource["resource_sha256"]
+    _require(type(resource_sha256) is str and len(resource_sha256) == 64,
+             "Root inline current-input declaration digest is not bounded")
+    _digest(resource_sha256, "Root inline current-input declaration digest")
+    body = {key: value for key, value in resource.items()
+            if key != "resource_sha256"}
+    _require(resource_sha256 == _sha(_canonical(body)),
+             "Root inline current-input declaration self digest differs")
+    return {
+        "operation_kind": operation_kind,
+        "role_byte_counts": dict(counts),
+        "window_chunk_byte_counts": chunk_counts,
+        "document_count": resource["document_count"],
+        "maximum_buffered_bytes": resource["maximum_buffered_bytes"],
+    }
+
+
+def _validate_root_inline_window_chunk_sequence(
+    plan: dict[str, Any], window_chunk_raws: list[bytes],
+) -> None:
+    """Bind every supplied inline chunk to its ordered Source plan pin.
+
+    The external transport bounds each read before allocating these immutable
+    byte strings. Once the typed plan is validated, this inexpensive pass
+    checks the complete sequence before Root ledger replay uses any row.
+    """
+    refs = plan.get("window_chunks") if type(plan) is dict else None
+    _require(type(refs) is list and
+             0 < len(refs) <= ROOT_INLINE_MAX_WINDOW_CHUNKS and
+             type(window_chunk_raws) is list and
+             len(window_chunk_raws) == len(refs),
+             "Root inline chunks exceed this route's 45-chunk admission or differ from the typed plan")
+    for ordinal, (ref_value, raw) in enumerate(zip(refs, window_chunk_raws)):
+        ref = _exact(ref_value, {
+            "chunk_ordinal", "first_read_ordinal", "read_ordinals",
+            "window_count", "byte_count", "pin",
+        }, f"Root inline window chunk reference[{ordinal}]")
+        pin = _pin(ref["pin"],
+                   f"Root inline window chunk pin[{ordinal}]")
+        _require(ref["chunk_ordinal"] == ordinal and
+                 type(raw) is bytes and 0 < len(raw) <=
+                     MAX_ARCHIVE_READ_METADATA_BYTES and
+                 len(raw) == ref["byte_count"] and
+                 _sha(raw) == pin["raw_sha256"],
+                 f"Root inline window chunk[{ordinal}] differs from its ordered Source pin")
+
+
+def _validate_root_inline_plan_session(
+    plan_module: object, basis: dict[str, Any], plan: dict[str, Any],
+    session_descriptor_raw: bytes, *, construction: bool,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Rebuild the session solely from the selected pure Source plan API."""
+    session = _parse_canonical(
+        session_descriptor_raw, "Root inline read session descriptor",
+        maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES,
+    )
+    session = _exact(session, {
+        "schema", "basis_pin", "read_plan_pin", "session_nonce",
+        "consumer_host_id", "operation_kind", "current_journal_frontier",
+        "session_sha256",
+    }, "Root inline read session descriptor")
+    session_body = {key: value for key, value in session.items()
+                    if key != "session_sha256"}
+    session_schema = (
+        plan_module.PREPARED_INPUT_CONSTRUCTION_SESSION_DESCRIPTOR_SCHEMA_V1
+        if construction else plan_module.SESSION_DESCRIPTOR_SCHEMA_V2
+    )
+    _require(session["schema"] == session_schema and
+             session["session_sha256"] == _sha(_canonical(session_body)),
+             "Root inline session descriptor digest differs")
+    basis_pin = _pin(session["basis_pin"], "Root inline basis pin")
+    plan_pin = _pin(session["read_plan_pin"], "Root inline plan pin")
+    checked_basis, checked_basis_pin, _hosts = _recorded_read_plan_member(
+        plan_module, "validate_basis", construction=construction,
+    )(basis, basis_pin)
+    descriptor_raw = _recorded_read_plan_member(
+        plan_module, "build_session_descriptor", construction=construction,
+    )(plan, plan_pin)[1]
+    _require(checked_basis == basis and checked_basis_pin == basis_pin and
+             _recorded_read_plan_member(
+                 plan_module, "plan_pin", construction=construction,
+             )(plan) == plan_pin and plan["basis_pin"] == basis_pin and
+             session["session_nonce"] == plan["session_nonce"] and
+             session["consumer_host_id"] == basis["consumer_host_id"] and
+             session["operation_kind"] == basis["operation_kind"] and
+             session["current_journal_frontier"] ==
+                 basis["current_journal_frontier"] and
+             descriptor_raw == session_descriptor_raw,
+             "Root inline session, basis and plan do not close")
+    return session, basis_pin, plan_pin
+
+
 def _serve_source5_preparation_read_window(
     request_raw: bytes, *, basis_raw: bytes, read_plan_raw: bytes,
     session_descriptor_raw: bytes, source_root: str,
@@ -5095,12 +5419,354 @@ def serve_source5_prepared_input_construction_read_window_v1(
     )
 
 
+def _serve_source5_preparation_read_window_inline(
+    request_raw: bytes, *, basis_raw: bytes, read_plan_raw: bytes,
+    session_descriptor_raw: bytes, window_chunk_raws: list[bytes],
+    final_spec_raw: bytes, final_plan_raw: bytes,
+    current_width_raw: bytes | None,
+    source_root: str, selected_source_manifest_raw: bytes,
+    lineage_capture_manifest_raw: bytes, lineage_capture_stage_root: str,
+    archive_source5_root: str, response_output_path: str,
+    bundle_output_path: str,
+    root_current_input_resource_declaration: object,
+    root_resource_declaration: object,
+    root_output_resource_declaration: object,
+    cancel_event=None, route: str,
+) -> dict[str, Any]:
+    """Serve one Root window from inline current Source/H data only.
+
+    H paths in the pure plan remain identities. This route never opens or
+    stats a guest session, request or window-chunk path on the Root device.
+    The transport must enforce Source byte caps and the declaration before it
+    allocates each input; this DTO accounts serialized bytes but does not
+    reserve operating-system memory. The old capture manifest keeps its
+    independent fixed 32 MiB cap and capture-storage quota.
+    """
+    construction = route == ROOT_INLINE_OPERATION_CONSTRUCTION_SERVE
+    _require(route in {ROOT_INLINE_OPERATION_CONSTRUCTION_SERVE,
+                       ROOT_INLINE_OPERATION_ORDINARY_SERVE} and
+             (cancel_event is None or
+              callable(getattr(cancel_event, "is_set", None))),
+             "Root inline serve route or cancellation token is malformed")
+    role_raws = {
+        "basis": basis_raw,
+        "read_plan": read_plan_raw,
+        "session_descriptor": session_descriptor_raw,
+        "selected_source_manifest": selected_source_manifest_raw,
+        "final_spec": final_spec_raw,
+        "final_plan": final_plan_raw,
+        "request": request_raw,
+    }
+    if not construction:
+        _require(type(current_width_raw) is bytes,
+                 "ordinary Root inline serve requires the current width bytes")
+        role_raws["current_width"] = current_width_raw
+    else:
+        _require(current_width_raw is None,
+                 "construction Root inline serve rejects a future current-width input")
+    _require(type(lineage_capture_manifest_raw) is bytes and
+             0 < len(lineage_capture_manifest_raw) <=
+                 PREPARED_CAPTURE_MANIFEST_MAX_BYTES,
+             "Root inline old-capture manifest exceeds its separate fixed cap")
+    start_ns = time.monotonic_ns()
+    resource = _validate_root_inline_current_input_resource_v1(
+        root_current_input_resource_declaration, route, role_raws,
+        window_chunk_raws,
+    )
+    basis = _parse_canonical(
+        basis_raw, "Root inline recorded-read basis",
+        maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES,
+    )
+    plan = _parse_canonical(
+        read_plan_raw, "Root inline recorded-read plan",
+        maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES,
+    )
+    expected_basis_operation = (
+        "completion_construction" if construction else
+        {"registration_replay", "refresh_replay"}
+    )
+    basis_operation = basis.get("operation_kind")
+    _require(type(basis_operation) is str and
+             (basis_operation == expected_basis_operation
+              if construction else
+              basis_operation in expected_basis_operation) and
+             plan.get("operation_kind") == basis.get("operation_kind") and
+             resource["operation_kind"] == route,
+             "Root inline route differs from its exact Source basis operation")
+    consumer = basis.get("consumer_host_id")
+    source_pin = basis.get("source_manifest_pins", {}).get(consumer)
+    _require(type(source_pin) is dict and
+             type(selected_source_manifest_raw) is bytes and
+             _sha(selected_source_manifest_raw) == source_pin.get("raw_sha256"),
+             "Root inline selected Source bytes differ from the basis")
+    selected_module_pins = basis["source_module_pins"][consumer]
+    if construction:
+        plan_module = _prepared_input_construction_read_plan_module(
+            selected_source_manifest_raw, source_pin, selected_module_pins,
+            source_root, source_root,
+        )
+    else:
+        namespace = _recorded_pre_manifest_typed_module(
+            selected_source_manifest_raw, source_pin, selected_module_pins,
+            SOURCE5_RECORDED_READ_PLAN_PATH, source_root, source_root,
+            namespace_name="_allocatbelt_recorded_read_inline_plan_api",
+        )
+        plan_module = sys.modules[namespace["__name__"]]
+    _require(plan_module.READ_WINDOW_COUNT == 720 and
+             getattr(plan_module, "MAX_WINDOWS_PER_METADATA_CHUNK", None) == 16,
+             "Root inline route selected a different 720/16 chunk protocol")
+    session, basis_pin, plan_pin = _validate_root_inline_plan_session(
+        plan_module, basis, plan, session_descriptor_raw,
+        construction=construction,
+    )
+    spec_pin = _pin(basis["spec_pin"], "Root inline final Spec pin")
+    plan_source_pin = _pin(basis["plan_pin"], "Root inline final Plan pin")
+    _require(_sha(final_spec_raw) == spec_pin["raw_sha256"] and
+             _sha(final_plan_raw) == plan_source_pin["raw_sha256"],
+             "Root inline final Spec/Plan bytes differ from their basis raw pins")
+    current_inputs = {
+        "final_spec": final_spec_raw,
+        "final_plan": final_plan_raw,
+    }
+    if construction:
+        _require("width_contract_pin" not in basis,
+                 "construction Root inline basis carries a current-width pin")
+    else:
+        width_pin = _pin(basis["width_contract_pin"],
+                         "Root inline current width pin")
+        _require(type(current_width_raw) is bytes and
+                 _sha(current_width_raw) == width_pin["raw_sha256"],
+                 "Root inline current width bytes differ from their basis raw pin")
+        current_inputs["current_width"] = current_width_raw
+    capture_pin = _pin_raw(
+        basis["metadata_capture_manifest_pin"],
+        "Root inline old capture manifest pin",
+    )
+    _require(_sha(lineage_capture_manifest_raw) == capture_pin["raw_sha256"],
+             "Root inline old capture manifest differs from its basis raw pin")
+    _validate_root_inline_window_chunk_sequence(plan, window_chunk_raws)
+    _require(resource["window_chunk_byte_counts"] == [
+                 ref["byte_count"] for ref in plan["window_chunks"]
+             ],
+             "Root inline ordered chunk lengths differ from the pure plan refs")
+    start_deadline_ns = start_ns + plan["timeout_declaration"][
+        "maximum_io_window_seconds"] * 1_000_000_000
+    _require(start_deadline_ns < (1 << 63) and
+             time.monotonic_ns() < start_deadline_ns,
+             "Root inline read window expired during bounded document admission")
+    request_header = _parse_canonical(
+        request_raw, "Root inline outer request",
+        maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES,
+    )
+    ordinal = plan_module._uint(
+        request_header.get("read_ordinal"),
+        "Root inline request ordinal",
+        maximum=plan_module.READ_WINDOW_COUNT - 1,
+    )
+    window_chunk, row = _recorded_read_window_chunk(
+        plan, plan_pin, plan_module, ordinal,
+        deadline_ns=start_deadline_ns, cancel_event=cancel_event,
+        construction=construction,
+        inline_window_chunk_raws=window_chunk_raws,
+    )
+    outer_request = _recorded_read_plan_member(
+        plan_module, "validate_request", construction=construction,
+    )(request_raw, basis, basis_pin, plan, plan_pin, window_chunk)
+    _request, expected_request_raw, expected_request_pin = \
+        _recorded_read_plan_member(
+            plan_module, "build_request", construction=construction,
+        )(basis, basis_pin, plan, plan_pin, ordinal, window_chunk)
+    _require(request_raw == _canonical(outer_request) and
+             expected_request_raw == request_raw,
+             "Root inline request differs from its exact pure Source projection")
+    _require(_absolute_path(archive_source5_root,
+                            "Root inline old Source5 archive root") ==
+                 row["archive_source5_root"] and
+             _absolute_path(lineage_capture_stage_root,
+                            "Root inline old capture root") ==
+                 basis["current_roots"]["metadata_capture_root"] and
+             _absolute_path(source_root,
+                            "Root inline selected Source root") ==
+                 basis["current_roots"]["source_root"],
+             "Root inline caller roots differ from the exact Source basis/window")
+    root_output = _recorded_read_root_output_context(
+        root_output_resource_declaration, basis, basis_pin, plan, plan_pin,
+        ordinal, window_chunk, plan_module, construction=construction,
+    )
+    _require(_absolute_path(response_output_path,
+                            "Root inline response slot") ==
+                 root_output["paths"]["response"] and
+             _absolute_path(bundle_output_path,
+                            "Root inline bundle slot") ==
+                 root_output["paths"]["bundle"],
+             "Root inline output arguments differ from Root-owned slots")
+    _prepare_recorded_read_root_output_dirs(root_output)
+    failure_path = Path(root_output["paths"]["failure_receipt"])
+    _require(not failure_path.exists() and not failure_path.is_symlink(),
+             "Root inline nonce has a retained failure receipt")
+    root_ledger_fd = _open_recorded_read_root_ledger(root_output)
+    request_pin = {key: expected_request_pin[key] for key in (
+        "path", "raw_sha256", "semantic_sha256",
+    )}
+    try:
+        cursor, pending, previous = _recorded_root_control_state(
+            root_ledger_fd, root_output, basis, basis_pin, plan, plan_pin,
+            plan_module, deadline_ns=start_deadline_ns,
+            cancel_event=cancel_event, construction=construction,
+            inline_window_chunk_raws=window_chunk_raws,
+        )
+        _require(ordinal == cursor and
+                 (pending is None or pending == request_pin),
+                 "Root inline request is not the next ordered Root window")
+        if pending is None:
+            accepted = _recorded_root_control_event(
+                basis, basis_pin, plan, plan_pin, row, 2 * ordinal + 1,
+                "request_accepted", request_pin, root_output["paths"],
+                construction=construction,
+            )
+            previous = _append_recorded_root_control_event(
+                root_ledger_fd, accepted, previous, root_output,
+                deadline_ns=start_deadline_ns, cancel_event=cancel_event,
+            )
+        result = _serve_source5_preparation_read_window_core(
+            request_raw, basis_raw=basis_raw,
+            read_plan_raw=read_plan_raw,
+            session_descriptor_raw=session_descriptor_raw,
+            source_root=source_root,
+            selected_source_manifest_raw=selected_source_manifest_raw,
+            lineage_capture_manifest_raw=lineage_capture_manifest_raw,
+            lineage_capture_stage_root=lineage_capture_stage_root,
+            archive_source5_root=archive_source5_root,
+            response_output_path=root_output["paths"]["response"],
+            bundle_output_path=root_output["paths"]["bundle"],
+            root_resource_declaration=root_resource_declaration,
+            root_output_context=root_output,
+            window_deadline_ns=start_deadline_ns,
+            cancel_event=cancel_event, construction=construction,
+            inline_current_inputs=current_inputs,
+            inline_window_chunk_raws=window_chunk_raws,
+        )
+        completed = _recorded_root_control_event(
+            basis, basis_pin, plan, plan_pin, row, 2 * ordinal + 2,
+            "response_published", request_pin, root_output["paths"],
+            result["response_pin"], result["bundle_pin"],
+            construction=construction,
+        )
+        _append_recorded_root_control_event(
+            root_ledger_fd, completed, previous, root_output,
+            deadline_ns=start_deadline_ns, cancel_event=cancel_event,
+        )
+        return result
+    except BaseException as error:
+        retained = any(
+            Path(path).exists() or Path(path).is_symlink()
+            for path in (root_output["paths"]["response"],
+                         root_output["paths"]["bundle"])
+        )
+        try:
+            _write_recorded_root_failure_receipt(
+                root_output, basis, basis_pin, plan, plan_pin, ordinal, row,
+                retained_window=retained, deadline_ns=start_deadline_ns,
+                cancel_event=cancel_event, construction=construction,
+            )
+        except BaseException as receipt_error:
+            raise EvidenceArchiveError(
+                f"Root inline failure receipt could not be stored: {receipt_error}",
+            ) from error
+        raise
+    finally:
+        os.close(root_ledger_fd)
+
+
+def serve_recorded_preparation_read_window_inline_v2(
+    request_raw: bytes, *, basis_raw: bytes, read_plan_raw: bytes,
+    session_descriptor_raw: bytes, window_chunk_raws: list[bytes],
+    final_spec_raw: bytes, final_plan_raw: bytes, current_width_raw: bytes,
+    source_root: str, selected_source_manifest_raw: bytes,
+    lineage_capture_manifest_raw: bytes, lineage_capture_stage_root: str,
+    archive_source5_root: str, response_output_path: str,
+    bundle_output_path: str,
+    root_current_input_resource_declaration: object,
+    root_resource_declaration: object,
+    root_output_resource_declaration: object,
+    cancel_event=None,
+) -> dict[str, Any]:
+    """Serve one ordinary window without opening H logical paths on Root.
+
+    The caller supplies the exact final width bytes; transport reads must be
+    bounded before allocation by the Source role caps and byte declaration.
+    Preflight the entire Source plan: this inline route admits at most 45
+    chunks and refuses larger valid plans without truncation or rechunking.
+    """
+    return _serve_source5_preparation_read_window_inline(
+        request_raw, basis_raw=basis_raw, read_plan_raw=read_plan_raw,
+        session_descriptor_raw=session_descriptor_raw,
+        window_chunk_raws=window_chunk_raws,
+        final_spec_raw=final_spec_raw, final_plan_raw=final_plan_raw,
+        current_width_raw=current_width_raw, source_root=source_root,
+        selected_source_manifest_raw=selected_source_manifest_raw,
+        lineage_capture_manifest_raw=lineage_capture_manifest_raw,
+        lineage_capture_stage_root=lineage_capture_stage_root,
+        archive_source5_root=archive_source5_root,
+        response_output_path=response_output_path,
+        bundle_output_path=bundle_output_path,
+        root_current_input_resource_declaration=
+            root_current_input_resource_declaration,
+        root_resource_declaration=root_resource_declaration,
+        root_output_resource_declaration=root_output_resource_declaration,
+        cancel_event=cancel_event,
+        route=ROOT_INLINE_OPERATION_ORDINARY_SERVE,
+    )
+
+
+def serve_source5_prepared_input_construction_read_window_inline_v1(
+    request_raw: bytes, *, basis_raw: bytes, read_plan_raw: bytes,
+    session_descriptor_raw: bytes, window_chunk_raws: list[bytes],
+    final_spec_raw: bytes, final_plan_raw: bytes,
+    source_root: str, selected_source_manifest_raw: bytes,
+    lineage_capture_manifest_raw: bytes, lineage_capture_stage_root: str,
+    archive_source5_root: str, response_output_path: str,
+    bundle_output_path: str,
+    root_current_input_resource_declaration: object,
+    root_resource_declaration: object,
+    root_output_resource_declaration: object,
+    cancel_event=None,
+) -> dict[str, Any]:
+    """Serve one construction window without any current-width input.
+
+    Transport reads must be bounded before allocation by the Source role caps
+    and byte declaration; this route does not receive a future completion.
+    Preflight the entire Source plan: this inline route admits at most 45
+    chunks and refuses larger valid plans without truncation or rechunking.
+    """
+    return _serve_source5_preparation_read_window_inline(
+        request_raw, basis_raw=basis_raw, read_plan_raw=read_plan_raw,
+        session_descriptor_raw=session_descriptor_raw,
+        window_chunk_raws=window_chunk_raws,
+        final_spec_raw=final_spec_raw, final_plan_raw=final_plan_raw,
+        current_width_raw=None, source_root=source_root,
+        selected_source_manifest_raw=selected_source_manifest_raw,
+        lineage_capture_manifest_raw=lineage_capture_manifest_raw,
+        lineage_capture_stage_root=lineage_capture_stage_root,
+        archive_source5_root=archive_source5_root,
+        response_output_path=response_output_path,
+        bundle_output_path=bundle_output_path,
+        root_current_input_resource_declaration=
+            root_current_input_resource_declaration,
+        root_resource_declaration=root_resource_declaration,
+        root_output_resource_declaration=root_output_resource_declaration,
+        cancel_event=cancel_event,
+        route=ROOT_INLINE_OPERATION_CONSTRUCTION_SERVE,
+    )
+
+
 def _release_source5_preparation_read_root_output(
     basis_raw: bytes, read_plan_raw: bytes, session_descriptor_raw: bytes,
     source_root: str, selected_source_manifest_raw: bytes,
     root_output_resource_declaration: object, read_ordinal: object,
     response_pin_value: object, bundle_pin_value: object, *,
     construction: bool = False,
+    inline_window_chunk_raws: list[bytes] | None = None,
 ) -> dict[str, Any]:
     """Free one exact Root spool only after the caller transferred its pins."""
     basis = _parse_canonical(basis_raw, "recorded-read release basis",
@@ -5150,7 +5816,7 @@ def _release_source5_preparation_read_root_output(
         "maximum_io_window_seconds"] * 1_000_000_000
     _require(deadline_ns < (1 << 63),
              "Root output release deadline exceeds monotonic arithmetic")
-    if construction:
+    if construction and inline_window_chunk_raws is None:
         h_namespace = _recorded_pre_manifest_typed_module(
             selected_source_manifest_raw, source_pin,
             basis["source_module_pins"][consumer],
@@ -5172,6 +5838,7 @@ def _release_source5_preparation_read_root_output(
     window_chunk, row = _recorded_read_window_chunk(
         plan, plan_pin, module, ordinal, deadline_ns=deadline_ns,
         construction=construction,
+        inline_window_chunk_raws=inline_window_chunk_raws,
     )
     context = _recorded_read_root_output_context(
         root_output_resource_declaration, basis, basis_pin, plan, plan_pin,
@@ -5192,18 +5859,21 @@ def _release_source5_preparation_read_root_output(
     request_pin3 = {key: request_pin[key] for key in (
         "path", "raw_sha256", "semantic_sha256",
     )}
-    request_saved, request_sha, _info = _read_absolute_private_file(
-        Path(request_pin["path"]), row["resource_bounds"]["outer_request_bytes"],
-        "Root output release current Source request",
-        deadline_ns=deadline_ns,
-    )
-    _require(request_saved == request_raw and request_sha == request_pin["raw_sha256"],
-             "Root output release Source request differs from its exact plan")
+    if inline_window_chunk_raws is None:
+        request_saved, request_sha, _info = _read_absolute_private_file(
+            Path(request_pin["path"]), row["resource_bounds"]["outer_request_bytes"],
+            "Root output release current Source request",
+            deadline_ns=deadline_ns,
+        )
+        _require(request_saved == request_raw and
+                 request_sha == request_pin["raw_sha256"],
+                 "Root output release Source request differs from its exact plan")
     ledger_fd = _open_recorded_read_root_ledger(context)
     try:
         cursor, pending, _previous = _recorded_root_control_state(
             ledger_fd, context, basis, basis_pin, plan, plan_pin, module,
             deadline_ns=deadline_ns, construction=construction,
+            inline_window_chunk_raws=inline_window_chunk_raws,
         )
         _require(cursor > ordinal and pending is None,
                  "Root output release row is not a completed Root control pair")
@@ -5344,6 +6014,132 @@ def release_source5_prepared_input_construction_read_root_output_v1(
         basis_raw, read_plan_raw, session_descriptor_raw, source_root,
         selected_source_manifest_raw, root_output_resource_declaration,
         read_ordinal, response_pin_value, bundle_pin_value, construction=True,
+    )
+
+
+def _release_source5_preparation_read_root_output_inline(
+    basis_raw: bytes, read_plan_raw: bytes, session_descriptor_raw: bytes,
+    window_chunk_raws: list[bytes], source_root: str,
+    selected_source_manifest_raw: bytes,
+    root_current_input_resource_declaration: object,
+    root_output_resource_declaration: object, read_ordinal: object,
+    response_pin_value: object, bundle_pin_value: object, *, route: str,
+) -> dict[str, Any]:
+    construction = route == ROOT_INLINE_OPERATION_CONSTRUCTION_RELEASE
+    _require(route in {ROOT_INLINE_OPERATION_CONSTRUCTION_RELEASE,
+                       ROOT_INLINE_OPERATION_ORDINARY_RELEASE},
+             "Root inline release route is not one of its fixed named APIs")
+    role_raws = {
+        "basis": basis_raw,
+        "read_plan": read_plan_raw,
+        "session_descriptor": session_descriptor_raw,
+        "selected_source_manifest": selected_source_manifest_raw,
+    }
+    resource = _validate_root_inline_current_input_resource_v1(
+        root_current_input_resource_declaration, route, role_raws,
+        window_chunk_raws,
+    )
+    basis = _parse_canonical(
+        basis_raw, "Root inline release basis",
+        maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES,
+    )
+    plan = _parse_canonical(
+        read_plan_raw, "Root inline release plan",
+        maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES,
+    )
+    consumer = basis.get("consumer_host_id")
+    expected_operation = (
+        "completion_construction" if construction else
+        {"registration_replay", "refresh_replay"}
+    )
+    basis_operation = basis.get("operation_kind")
+    _require(type(basis_operation) is str and
+             (basis_operation == expected_operation
+              if construction else
+              basis_operation in expected_operation) and
+             plan.get("operation_kind") == basis.get("operation_kind") and
+             resource["operation_kind"] == route,
+             "Root inline release route differs from its exact Source basis operation")
+    source_pin = basis.get("source_manifest_pins", {}).get(consumer)
+    _require(type(source_pin) is dict and
+             type(selected_source_manifest_raw) is bytes and
+             _sha(selected_source_manifest_raw) == source_pin.get("raw_sha256"),
+             "Root inline release selected Source bytes differ from the basis")
+    selected_module_pins = basis["source_module_pins"][consumer]
+    if construction:
+        module = _prepared_input_construction_read_plan_module(
+            selected_source_manifest_raw, source_pin, selected_module_pins,
+            source_root, source_root,
+        )
+    else:
+        namespace = _recorded_pre_manifest_typed_module(
+            selected_source_manifest_raw, source_pin, selected_module_pins,
+            SOURCE5_RECORDED_READ_PLAN_PATH, source_root, source_root,
+            namespace_name="_allocatbelt_recorded_read_inline_release_plan",
+        )
+        module = sys.modules[namespace["__name__"]]
+    _require(module.READ_WINDOW_COUNT == 720 and
+             getattr(module, "MAX_WINDOWS_PER_METADATA_CHUNK", None) == 16,
+             "Root inline release selected a different 720/16 chunk protocol")
+    _session, basis_pin, plan_pin = _validate_root_inline_plan_session(
+        module, basis, plan, session_descriptor_raw,
+        construction=construction,
+    )
+    _validate_root_inline_window_chunk_sequence(plan, window_chunk_raws)
+    _require(resource["window_chunk_byte_counts"] == [
+                 ref["byte_count"] for ref in plan["window_chunks"]
+             ],
+             "Root inline release chunk lengths differ from the exact plan refs")
+    return _release_source5_preparation_read_root_output(
+        basis_raw, read_plan_raw, session_descriptor_raw, source_root,
+        selected_source_manifest_raw, root_output_resource_declaration,
+        read_ordinal, response_pin_value, bundle_pin_value,
+        construction=construction,
+        inline_window_chunk_raws=window_chunk_raws,
+    )
+
+
+def release_recorded_preparation_read_root_output_inline_v2(
+    basis_raw: bytes, read_plan_raw: bytes, session_descriptor_raw: bytes,
+    window_chunk_raws: list[bytes], source_root: str,
+    selected_source_manifest_raw: bytes,
+    root_current_input_resource_declaration: object,
+    root_output_resource_declaration: object, read_ordinal: object,
+    response_pin_value: object, bundle_pin_value: object,
+) -> dict[str, Any]:
+    """Release one ordinary Root spool from caller-supplied immutable plan bytes.
+
+    The transport bounds reads before allocation; the declaration is exact
+    byte accounting, not an operating-system memory reservation.
+    """
+    return _release_source5_preparation_read_root_output_inline(
+        basis_raw, read_plan_raw, session_descriptor_raw, window_chunk_raws,
+        source_root, selected_source_manifest_raw,
+        root_current_input_resource_declaration,
+        root_output_resource_declaration, read_ordinal, response_pin_value,
+        bundle_pin_value, route=ROOT_INLINE_OPERATION_ORDINARY_RELEASE,
+    )
+
+
+def release_source5_prepared_input_construction_read_root_output_inline_v1(
+    basis_raw: bytes, read_plan_raw: bytes, session_descriptor_raw: bytes,
+    window_chunk_raws: list[bytes], source_root: str,
+    selected_source_manifest_raw: bytes,
+    root_current_input_resource_declaration: object,
+    root_output_resource_declaration: object, read_ordinal: object,
+    response_pin_value: object, bundle_pin_value: object,
+) -> dict[str, Any]:
+    """Release one construction Root spool without reopening H session paths.
+
+    The transport bounds reads before allocation; the declaration is exact
+    byte accounting, not an operating-system memory reservation.
+    """
+    return _release_source5_preparation_read_root_output_inline(
+        basis_raw, read_plan_raw, session_descriptor_raw, window_chunk_raws,
+        source_root, selected_source_manifest_raw,
+        root_current_input_resource_declaration,
+        root_output_resource_declaration, read_ordinal, response_pin_value,
+        bundle_pin_value, route=ROOT_INLINE_OPERATION_CONSTRUCTION_RELEASE,
     )
 
 
@@ -6894,6 +7690,11 @@ def _validate_execution_manifest_signer_context(
                               "raw_sha256": expected["raw_sha256"]} and
                  wrapper["semantic_sha256"] == expected["semantic_sha256"],
                  "preparatory signer-context pin differs from its manifest entry")
+        return pin
+    if parsed_probe.get("schema") == PREPARED_EXPLORATION_EXECUTION_SCHEMA:
+        _validate_prepared_execution_signer_binding_v1(
+            parsed_probe, pin, signer_context_pin, context,
+        )
         return pin
     fields = {
         "schema", "campaign_id", "hosts", "original_inputs",
@@ -10086,6 +10887,7 @@ def _recorded_read_window_chunk(
     plan: dict[str, Any], plan_pin: dict[str, Any], plan_module: object,
     read_ordinal: int, *, deadline_ns: int | None = None,
     cancel_event=None, construction: bool = False,
+    inline_window_chunk_raws: list[bytes] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     ordinal = plan_module._uint(
         read_ordinal, "Root recorded-read chunk ordinal",
@@ -10098,20 +10900,31 @@ def _recorded_read_window_chunk(
                 f"chunk-{ref['chunk_ordinal']:06d}.json")
     _require(path == expected and path.is_absolute(),
              "Root recorded-read chunk path differs from its nonce-bound plan")
-    raw, digest, info = _read_absolute_private_file(
-        path, MAX_ARCHIVE_READ_METADATA_BYTES,
-        "Root recorded-read current window metadata chunk",
-        deadline_ns=deadline_ns, cancel_event=cancel_event,
-    )
-    _require(digest == ref["pin"]["raw_sha256"] and
-             len(raw) == ref["byte_count"] and
-             info.st_dev == plan["scratch_declaration"]["device_id"],
-             "Root recorded-read chunk raw pin or byte count differs")
-    chunk_space = os.statvfs(path.parent)
-    chunk_block = chunk_space.f_frsize or chunk_space.f_bsize
-    _require(chunk_block ==
-             plan["scratch_declaration"]["allocation_block_bytes"],
-             "Root recorded-read chunk filesystem block differs from the plan")
+    if inline_window_chunk_raws is None:
+        raw, digest, info = _read_absolute_private_file(
+            path, MAX_ARCHIVE_READ_METADATA_BYTES,
+            "Root recorded-read current window metadata chunk",
+            deadline_ns=deadline_ns, cancel_event=cancel_event,
+        )
+        _require(digest == ref["pin"]["raw_sha256"] and
+                 len(raw) == ref["byte_count"] and
+                 info.st_dev == plan["scratch_declaration"]["device_id"],
+                 "Root recorded-read chunk raw pin or byte count differs")
+        chunk_space = os.statvfs(path.parent)
+        chunk_block = chunk_space.f_frsize or chunk_space.f_bsize
+        _require(chunk_block ==
+                 plan["scratch_declaration"]["allocation_block_bytes"],
+                 "Root recorded-read chunk filesystem block differs from the plan")
+    else:
+        _require(type(inline_window_chunk_raws) is list and
+                 len(inline_window_chunk_raws) == len(plan["window_chunks"]) and
+                 0 <= ref["chunk_ordinal"] < len(inline_window_chunk_raws),
+                 "Root inline window-chunk sequence differs from its typed plan")
+        raw = inline_window_chunk_raws[ref["chunk_ordinal"]]
+        _require(type(raw) is bytes and len(raw) == ref["byte_count"] and
+                 0 < len(raw) <= MAX_ARCHIVE_READ_METADATA_BYTES and
+                 _sha(raw) == ref["pin"]["raw_sha256"],
+                 "Root inline window chunk differs from its exact Source pin or cap")
     chunk = _parse_canonical(
         raw, "Root recorded-read current window metadata chunk",
         maximum_bytes=MAX_ARCHIVE_READ_METADATA_BYTES,
@@ -10441,7 +11254,8 @@ def _read_root_prepared_exploration_dependencies(
             "protocol_sha256", "qualification_eligible", "manifest_sha256", "scope",
             "prepared_input_generation", "prepared_capacity_registration",
             "archive_signer_contexts", "journal_width_contracts",
-        }, "Root V5 execution manifest")
+        } | _prepared_execution_replay_profile_fields_v1(execution),
+               "Root V5 execution manifest")
         _require(execution["schema"] == PREPARED_EXPLORATION_EXECUTION_SCHEMA and
                  execution["scope"] == PREPARED_EXPLORATION_SCOPE and
                  execution["campaign_id"] == context["campaign_id"] and

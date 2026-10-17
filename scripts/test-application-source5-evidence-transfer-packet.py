@@ -3109,8 +3109,6 @@ class PreparatoryTypedConsumerSelectionTests(unittest.TestCase):
                     "raw_sha256": ("7" if selected == host else
                                    "8" if selected == "host-b" else "9") * 64,
                 },
-                "semantic_sha256": ("a" if selected == host else
-                                    "b" if selected == "host-b" else "c") * 64,
             }
             for selected in hosts
         }
@@ -3187,6 +3185,21 @@ class PreparatoryTypedConsumerSelectionTests(unittest.TestCase):
             "authorized_signer_fingerprint": "A" * 40,
         }
         return prep, source_raw, source_pin, execution_raw, context, module_pins
+
+    def test_preparatory_observed_host_wrappers_use_only_raw_artifacts(self):
+        with tempfile.TemporaryDirectory(prefix="prep-observed-wrapper-") as tmp:
+            _prep, _source_raw, _source_pin, execution_raw, _context, _pins = \
+                self._fixture(Path(tmp))
+            execution = json.loads(execution_raw)
+            original = archive._preparatory_original_pins(execution)
+            for host in execution["hosts"]:
+                self.assertEqual(set(execution["observed_hosts"][host]), {"artifact"})
+                self.assertEqual(original["observed_hosts"][host],
+                                 execution["observed_hosts"][host]["artifact"])
+            execution["observed_hosts"][execution["hosts"][0]]["semantic_sha256"] = "a" * 64
+            with self.assertRaisesRegex(archive.EvidenceArchiveError,
+                                        "observed-host wrapper"):
+                archive._preparatory_original_pins(execution)
 
     def test_preparatory_source_and_archive_validators_load_only_typed_modules(self):
         with tempfile.TemporaryDirectory(prefix="prep-typed-module-consumer-") as tmp:

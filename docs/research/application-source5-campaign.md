@@ -8,6 +8,24 @@ host. Results cover those KVM venues. Specs without the selector retain the
 legacy three-host contract discussed below. Existing source, spec, plan and
 journal generations cannot be retagged when changing profiles.
 
+## Bounded inline preparation reads
+
+The additive Root APIs
+`serve_source5_prepared_input_construction_read_window_inline_v1` and
+`serve_recorded_preparation_read_window_inline_v2`, with their inline release
+siblings, consume bounded immutable current control bytes. H session, request
+and chunk paths remain logical identities on Root. Old evidence still comes
+from the exact closed capture and its real Source and signature checks.
+
+These inline routes admit only complete plans with at most 45 chunks. This
+is a Root resource limit: Source permits at most 16 rows per chunk and may
+produce more than 45 chunks to meet its byte bound. Operators must preflight
+the actual full plan before transport and refuse larger sessions. Dropping
+chunks, automatic rechunking and falling back to guest path reads are not
+supported. The byte declaration accounts serialized inputs; transport must
+bound reads before allocating them. Structural tests do not establish a
+genuine signed window, complete preparation replay or campaign qualification.
+
 `scripts/application-source5-campaign.py` now has separate execution-manifest
 v1 and v2 paths. V1 retains the original capacity-stage registration
 contract. V2 accepts only the closed `final_prepared` scope: it replays the
