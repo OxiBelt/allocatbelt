@@ -48,6 +48,27 @@ behavior. A genuine signed window and complete 720-window replay remain
 separate operational gates. The v1/v2 sections below describe the legacy
 three-host routes.
 
+## Premanifest width and profile controls
+
+The named `build_source5_prepared_exploration_width_pre_manifest_v1`,
+`build_source5_owned_replay_input_profile_v1` and
+`build_source5_prepared_exploration_soak_material_index_pre_manifest_v1`
+APIs consume closed data inputs before an execution manifest is sealed.
+They join the actual Spec, Plan, Source, observed-host and preparation pins.
+The Soak material producer and width consumer share receipt and stable budget
+checks, including canonical raw bytes.
+
+Owned V5 profile and width controls belong in the current input root.
+Legacy width locations remain supported by their existing routes. A planned
+manifest path is only a sizing slot; these builders do not invent a manifest,
+registration head or replay grant. V5 loading keeps structural completion
+data separate from live replay state. The named owned completion cap is
+checked against the selected InputPrep writer without widening legacy caps.
+
+The native 150-test component gate covers these data boundaries, existing H
+and Soak behavior, and registration regressions. Genuine width/profile
+handoff, complete recorded replay and campaign qualification remain separate.
+
 `scripts/application-source5-campaign.py` now has separate execution-manifest
 v1 and v2 paths. V1 retains the original capacity-stage registration
 contract. V2 accepts only the closed `final_prepared` scope: it replays the
