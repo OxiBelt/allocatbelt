@@ -4052,5 +4052,322 @@ class ClosedRecordedOwnerSelectorTests(unittest.TestCase):
         old_api.assert_not_called()
 
 
+class ClosedCompletionPublicationTests(unittest.TestCase):
+    """Real writer and reservation checks; no fabricated 720-row producer pass."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_script(
+            SCRIPT_DIR / "application-source5-input-preparation.py",
+            "closed_completion_publication_target",
+        )
+
+    def _reservation(self, parent: Path, output: Path, **changes):
+        block = 4096
+        values = {
+            "schema": self.module.PREPARED_INPUT_COMPLETION_OUTPUT_RESERVATION_SCHEMA,
+            "path": str(output),
+            "device_id": parent.stat().st_dev,
+            "allocation_block_bytes": block,
+            "maximum_file_bytes": self.module.PREPARED_INPUT_COMPLETION_MAX_BYTES,
+            "directory_growth_reserve_bytes": block,
+            "reserved_bytes": (
+                self.module.PREPARED_INPUT_COMPLETION_MAX_BYTES + 2 * block
+            ),
+            "reserved_inodes": 1,
+        }
+        values.update(changes)
+        return values
+
+    def _capacity(self):
+        return types.SimpleNamespace(
+            f_frsize=4096, f_bsize=4096,
+            f_bavail=100_000, f_favail=1000,
+        )
+
+    def _open_reservation(self, parent, output, reservation):
+        return self.module._open_prepared_input_completion_output_reservation(
+            reservation, output,
+        )
+
+    def test_invalid_quotas_and_boolean_integers_are_rejected(self):
+        module = self.module
+        with tempfile.TemporaryDirectory(prefix="inputprep-completion-quota-") as temp:
+            parent = Path(temp)
+            parent.chmod(0o700)
+            output = parent / module.PREPARED_INPUT_COMPLETION_OUTPUT_NAME
+            valid = self._reservation(parent, output)
+            invalid = (
+                {"device_id": True},
+                {"allocation_block_bytes": True},
+                {"allocation_block_bytes": module.MAX_MANIFEST_BYTES + 1},
+                {"maximum_file_bytes": True},
+                {"directory_growth_reserve_bytes": True},
+                {"reserved_bytes": True},
+                {"reserved_inodes": True},
+                {"maximum_file_bytes": module.PREPARED_INPUT_COMPLETION_MAX_BYTES - 1},
+                {"directory_growth_reserve_bytes": -1},
+                {"directory_growth_reserve_bytes": 0},
+                {"extra": 1},
+                {"reserved_bytes": (
+                    self.module.PREPARED_INPUT_COMPLETION_MAX_BYTES
+                    + valid["allocation_block_bytes"]
+                    - 1
+                )},
+                {"reserved_inodes": 0},
+            )
+            with mock.patch.object(
+                    module.os, "fstatvfs", return_value=self._capacity()):
+                for change in invalid:
+                    with self.subTest(change=change):
+                        reservation = dict(valid)
+                        reservation.update(change)
+                        with self.assertRaises(module.PreparationError):
+                            self._open_reservation(parent, output, reservation)
+
+                for capacity in (
+                    types.SimpleNamespace(
+                        f_frsize=4096, f_bsize=4096,
+                        f_bavail=(valid["reserved_bytes"] // 4096) - 1,
+                        f_favail=1000,
+                    ),
+                    types.SimpleNamespace(
+                        f_frsize=4096, f_bsize=4096,
+                        f_bavail=100_000, f_favail=0,
+                    ),
+                ):
+                    with self.subTest(capacity=capacity):
+                        with mock.patch.object(
+                                module.os, "fstatvfs", return_value=capacity):
+                            with self.assertRaisesRegex(
+                                    module.PreparationError,
+                                    "lacks its reserved free bytes or inodes"):
+                                self._open_reservation(parent, output, valid)
+
+    def test_device_block_and_fixed_path_mismatches_are_rejected(self):
+        module = self.module
+        with tempfile.TemporaryDirectory(prefix="inputprep-completion-device-") as temp:
+            parent = Path(temp)
+            parent.chmod(0o700)
+            output = parent / module.PREPARED_INPUT_COMPLETION_OUTPUT_NAME
+            valid = self._reservation(parent, output)
+            with mock.patch.object(
+                    module.os, "fstatvfs", return_value=self._capacity()):
+                for change in (
+                    {"device_id": valid["device_id"] + 1},
+                    {"allocation_block_bytes": 2048},
+                ):
+                    with self.subTest(change=change):
+                        reservation = dict(valid)
+                        reservation.update(change)
+                        with self.assertRaises(module.PreparationError):
+                            self._open_reservation(parent, output, reservation)
+                wrong_path = dict(valid, path=str(parent / "other.json"))
+                with self.assertRaisesRegex(
+                        module.PreparationError, "exact fixed output path"):
+                    self._open_reservation(parent, output, wrong_path)
+
+    def test_completion_output_size_is_distinct_from_plan_read_bound(self):
+        module = self.module
+        self.assertEqual(
+            module.PREPARED_INPUT_COMPLETION_MAX_BYTES, 64 * 1024 * 1024,
+        )
+        self.assertGreater(module.MAX_PLAN_BYTES,
+                           module.PREPARED_INPUT_COMPLETION_MAX_BYTES)
+        with self.assertRaisesRegex(module.PreparationError, "64 MiB"):
+            module._validate_prepared_input_completion_length(
+                module.PREPARED_INPUT_COMPLETION_MAX_BYTES + 1,
+            )
+        with self.assertRaises(module.PreparationError):
+            module._validate_prepared_input_completion_length(
+                module.MAX_PLAN_BYTES,
+            )
+        with self.assertRaises(module.PreparationError):
+            module._validate_prepared_input_completion_length(True)
+
+    def test_actual_write_and_identical_retry_keep_the_same_inode(self):
+        module = self.module
+        with tempfile.TemporaryDirectory(prefix="inputprep-completion-write-") as temp:
+            parent = Path(temp)
+            parent.chmod(0o700)
+            source_root = parent / "source"
+            source_root.mkdir(mode=0o700)
+            output = parent / module.PREPARED_INPUT_COMPLETION_OUTPUT_NAME
+            raw = module._canonical({"schema": "private-completion-writer-test"})
+            guarded = []
+
+            def physical_guard(info, parent_fd):
+                guarded.append((info.st_dev, info.st_ino))
+                self.assertTrue(stat.S_ISREG(info.st_mode))
+                self.assertTrue(stat.S_ISDIR(os.fstat(parent_fd).st_mode))
+
+            digest = module._write_private_json_new_bytes(
+                output, raw, source_root,
+                size_class="prepared_input_completion",
+                publication_guard=physical_guard,
+            )
+            first = output.stat()
+            retry_digest = module._write_private_json_new_bytes(
+                output, raw, source_root,
+                size_class="prepared_input_completion",
+                allow_existing_identical=True,
+                publication_guard=physical_guard,
+            )
+            second = output.stat()
+            self.assertEqual(digest, hashlib.sha256(raw).hexdigest())
+            self.assertEqual(retry_digest, digest)
+            self.assertEqual(output.read_bytes(), raw)
+            self.assertEqual((first.st_dev, first.st_ino),
+                             (second.st_dev, second.st_ino))
+            self.assertEqual(len(guarded), 2)
+
+    def test_physical_guard_rejection_cleans_new_and_preserves_existing_inode(self):
+        module = self.module
+        with tempfile.TemporaryDirectory(prefix="inputprep-completion-guard-") as temp:
+            parent = Path(temp)
+            parent.chmod(0o700)
+            source_root = parent / "source"
+            source_root.mkdir(mode=0o700)
+            output = parent / module.PREPARED_INPUT_COMPLETION_OUTPUT_NAME
+            raw = module._canonical({"schema": "physical-guard-rejection"})
+            reservation = self._reservation(parent, output)
+            with mock.patch.object(
+                    module.os, "fstatvfs", return_value=self._capacity()):
+                held = self._open_reservation(parent, output, reservation)
+            try:
+                def reject_overallocated_inode(info, parent_fd, baseline_blocks):
+                    physical_guard = held.publication_guard(
+                        baseline_blocks, len(raw),
+                    )
+                    overallocated_info = types.SimpleNamespace(
+                        st_dev=info.st_dev, st_ino=info.st_ino,
+                        st_mode=info.st_mode, st_size=info.st_size,
+                        st_uid=info.st_uid, st_nlink=info.st_nlink,
+                        st_blocks=(
+                            module._round_up_allocation_bytes(
+                                module.PREPARED_INPUT_COMPLETION_MAX_BYTES,
+                                reservation["allocation_block_bytes"],
+                            ) // 512
+                        ) + 1,
+                    )
+                    physical_guard(overallocated_info, parent_fd)
+
+                baseline_blocks = os.fstat(held.parent_fd).st_blocks
+                with self.assertRaisesRegex(
+                        module.PreparationError, "physical byte or parent-growth"):
+                    module._write_private_json_new_bytes(
+                        output, raw, source_root,
+                        size_class="prepared_input_completion",
+                        publication_guard=lambda info, fd: reject_overallocated_inode(
+                            info, fd, baseline_blocks,
+                        ),
+                    )
+                self.assertFalse(output.exists())
+
+                module._write_private_json_new_bytes(
+                    output, raw, source_root,
+                    size_class="prepared_input_completion",
+                )
+                before = output.stat()
+                baseline_blocks = os.fstat(held.parent_fd).st_blocks
+                with self.assertRaisesRegex(
+                        module.PreparationError, "physical byte or parent-growth"):
+                    module._write_private_json_new_bytes(
+                        output, raw, source_root,
+                        size_class="prepared_input_completion",
+                        allow_existing_identical=True,
+                        publication_guard=lambda info, fd: reject_overallocated_inode(
+                            info, fd, baseline_blocks,
+                        ),
+                    )
+                after = output.stat()
+                self.assertEqual(output.read_bytes(), raw)
+                self.assertEqual((before.st_dev, before.st_ino),
+                                 (after.st_dev, after.st_ino))
+            finally:
+                held.close()
+
+    def test_parent_replacement_after_preflight_is_rejected(self):
+        module = self.module
+        with tempfile.TemporaryDirectory(prefix="inputprep-completion-parent-") as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            parent = root / "output"
+            parent.mkdir(mode=0o700)
+            parent.chmod(0o700)
+            output = parent / module.PREPARED_INPUT_COMPLETION_OUTPUT_NAME
+            reservation = self._reservation(parent, output)
+            with mock.patch.object(
+                    module.os, "fstatvfs", return_value=self._capacity()):
+                held = self._open_reservation(parent, output, reservation)
+            try:
+                displaced = root / "displaced"
+                parent.rename(displaced)
+                parent.mkdir(mode=0o700)
+                parent.chmod(0o700)
+                with mock.patch.object(
+                        module.os, "fstatvfs", return_value=self._capacity()):
+                    with self.assertRaisesRegex(
+                            module.PreparationError, "identity or private mode changed"):
+                        held.check_free_capacity()
+            finally:
+                held.close()
+
+    def test_mandatory_source_a_hook_is_checked_before_any_replay_or_io(self):
+        module = self.module
+        constructor = module._complete_prepared_inputs_closed_recorded_source_a_v1
+        parameters = inspect.signature(constructor).parameters
+        self.assertTrue(constructor.__name__.startswith("_"))
+        self.assertIs(parameters["source_a_prepublication_check"].default,
+                      inspect.Parameter.empty)
+        self.assertIs(parameters["captured_pilot_read_providers"].default,
+                      inspect.Parameter.empty)
+        ordinary_parameters = inspect.signature(
+            module.complete_prepared_inputs,
+        ).parameters
+        self.assertNotIn("closed_recorded", ordinary_parameters)
+        self.assertNotIn("source_a_prepublication_check", ordinary_parameters)
+        with self.assertRaises(TypeError):
+            module.complete_prepared_inputs(
+                {}, [], [], [], [], {}, {}, closed_recorded=True,
+            )
+        with patch.object(module, "_open_prepared_input_completion_output_reservation") as open_output:
+            with patch.object(module, "_complete_prepared_inputs_impl") as replay:
+                with self.assertRaisesRegex(
+                        module.PreparationError, "prepublication check"):
+                    constructor(
+                        {}, [], [], [], [], {}, {},
+                        captured_pilot_read_providers={"host-a": object(),
+                                                       "host-b": object()},
+                        global_artifact_reader=lambda _pin, _maximum: b"",
+                        input_root=Path("/inputs"),
+                        probe_capture_index_pin={},
+                        completion_output_reservation={},
+                        source_a_prepublication_check=None,
+                    )
+            replay.assert_not_called()
+            open_output.assert_not_called()
+
+    def test_prepublication_hook_receives_detached_result_pins(self):
+        module = self.module
+        original = {
+            "path": "/inputs/prepared-inputs-completion.json",
+            "nested": {"value": 1},
+        }
+        seen = []
+
+        def check(raw, pins):
+            seen.append((raw, pins))
+            pins["nested"]["value"] = 2
+
+        module._invoke_source_a_prepublication_check(
+            check, b"canonical full completion bytes", original,
+        )
+        self.assertEqual(seen[0][0], b"canonical full completion bytes")
+        self.assertIsNot(seen[0][1], original)
+        self.assertIsNot(seen[0][1]["nested"], original["nested"])
+        self.assertEqual(original["nested"]["value"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

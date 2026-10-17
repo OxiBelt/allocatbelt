@@ -52,6 +52,11 @@ MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_PLAN_BYTES = 256 * 1024 * 1024
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
 MAX_U64 = (1 << 64) - 1
+PREPARED_INPUT_COMPLETION_MAX_BYTES = 64 * 1024 * 1024
+PREPARED_INPUT_COMPLETION_OUTPUT_RESERVATION_SCHEMA = (
+    "allocatbelt.application-source5-prepared-input-completion-reservation.v1"
+)
+PREPARED_INPUT_COMPLETION_OUTPUT_NAME = "prepared-inputs-completion.json"
 
 
 class PreparationError(ValueError):
@@ -807,13 +812,20 @@ def _write_private_json_new(
 def _write_private_json_new_bytes(
     path: Path, raw: bytes, source_root: Path, *, size_class: str,
     allow_existing_identical: bool = False,
+    publication_guard: Callable[[os.stat_result, int], None] | None = None,
 ) -> str:
-    size_bounds = {"request": MAX_REQUEST_BYTES, "campaign_plan": MAX_PLAN_BYTES}
+    size_bounds = {
+        "request": MAX_REQUEST_BYTES,
+        "campaign_plan": MAX_PLAN_BYTES,
+        "prepared_input_completion": PREPARED_INPUT_COMPLETION_MAX_BYTES,
+    }
     _require(type(size_class) is str and size_class in size_bounds,
              "new artifact writer requires a named finite Source artifact bound")
     maximum_bytes = size_bounds[size_class]
     _require(type(raw) is bytes and len(raw) <= maximum_bytes,
              "new preparation artifact exceeds its finite size bound")
+    _require(publication_guard is None or callable(publication_guard),
+             "private artifact publication guard must be callable")
     _require(path.is_absolute(), "new artifact path must be absolute")
     parent = path.parent
     name = path.name
@@ -910,6 +922,16 @@ def _write_private_json_new_bytes(
             _require(stat.S_IMODE(info.st_mode) == 0o600 and info.st_uid == os.getuid() and
                      info.st_nlink == 1 and existing_raw == raw and same_named_parent(),
                      "existing immutable artifact differs from the exact replayed bytes or private mode")
+            if publication_guard is not None:
+                publication_guard(info, directory_fd)
+                guarded_raw, guarded_info = read_named_file(len(raw))
+                _require(guarded_raw == raw and
+                         (guarded_info.st_dev, guarded_info.st_ino) ==
+                             (info.st_dev, info.st_ino) and
+                         stat.S_IMODE(guarded_info.st_mode) == 0o600 and
+                         guarded_info.st_uid == os.getuid() and guarded_info.st_nlink == 1 and
+                         same_named_parent(),
+                         "existing immutable artifact changed during its publication guard")
             return checksum
         try:
             created_fd = os.open(
@@ -937,6 +959,12 @@ def _write_private_json_new_bytes(
                  stat.S_IMODE(written_info.st_mode) == 0o600 and written_info.st_nlink == 1 and
                  written_info.st_size == len(raw) and same_named_parent(),
                  "new artifact or its parent changed before durable publication")
+        if publication_guard is not None:
+            publication_guard(written_info, directory_fd)
+            _require(same_named_parent() and
+                     (os.fstat(created_fd).st_dev, os.fstat(created_fd).st_ino) ==
+                         created_identity,
+                     "new artifact or its parent changed during its publication guard")
         os.fsync(directory_fd)
         written, readback_info = read_named_file(len(raw))
         _require(written == raw and
@@ -970,6 +998,252 @@ def _write_private_json_new_bytes(
             os.close(directory_fd)
         except OSError:
             pass
+
+
+def _validate_prepared_input_completion_length(length: object) -> None:
+    """Keep the full canonical completion bound distinct from plan read limits."""
+    _require(type(length) is int and
+             0 <= length <= PREPARED_INPUT_COMPLETION_MAX_BYTES,
+             "prepared-input completion exceeds its explicit 64 MiB output bound")
+
+
+def _round_up_allocation_bytes(byte_count: int, block_bytes: int) -> int:
+    _require(type(byte_count) is int and byte_count >= 0 and
+             type(block_bytes) is int and block_bytes > 0,
+             "prepared-input completion allocation dimensions are invalid")
+    return ((byte_count + block_bytes - 1) // block_bytes) * block_bytes
+
+
+def _completion_parent_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode),
+        stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid,
+    )
+
+
+class _HeldPreparedInputCompletionParent:
+    """Keep the reserved private output directory pinned through publication."""
+
+    def __init__(
+        self, parent: Path, output: Path, reservation: dict[str, Any],
+        parent_fd: int, parent_identity: tuple[int, int, int, int, int, int],
+    ) -> None:
+        self.parent = parent
+        self.output = output
+        self.reservation = reservation
+        self.parent_fd = parent_fd
+        self.parent_identity = parent_identity
+
+    def close(self) -> None:
+        if self.parent_fd >= 0:
+            fd = self.parent_fd
+            self.parent_fd = -1
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _assert_parent_fd(
+        self, descriptor: int,
+    ) -> os.stat_result:
+        try:
+            opened = os.fstat(descriptor)
+            named = self.parent.lstat()
+            resolved = self.parent.resolve(strict=True)
+        except OSError as error:
+            raise PreparationError(
+                f"prepared-input completion parent changed or disappeared: {error}"
+            ) from error
+        identity = self.parent_identity
+        _require(stat.S_ISDIR(opened.st_mode) and stat.S_ISDIR(named.st_mode) and
+                 resolved == self.parent and
+                 _completion_parent_identity(opened) == identity and
+                 _completion_parent_identity(named) == identity,
+                 "prepared-input completion parent identity or private mode changed")
+        return opened
+
+    def check_free_capacity(self) -> os.stat_result:
+        parent_info = self._assert_parent_fd(self.parent_fd)
+        _require(parent_info.st_dev == self.reservation["device_id"],
+                 "prepared-input completion parent moved to a different device")
+        try:
+            capacity = os.fstatvfs(self.parent_fd)
+        except OSError as error:
+            raise PreparationError(
+                f"cannot inspect prepared-input completion filesystem capacity: {error}"
+            ) from error
+        block_bytes = getattr(capacity, "f_frsize", 0)
+        if block_bytes == 0:
+            block_bytes = getattr(capacity, "f_bsize", 0)
+        _require(type(block_bytes) is int and block_bytes > 0 and
+                 block_bytes == self.reservation["allocation_block_bytes"],
+                 "prepared-input completion allocation block differs from its reservation")
+        rounded_file_cap = _round_up_allocation_bytes(
+            self.reservation["maximum_file_bytes"], block_bytes,
+        )
+        required_bytes = (
+            self.reservation["directory_growth_reserve_bytes"] + rounded_file_cap
+        )
+        _require(required_bytes <= MAX_U64 and
+                 self.reservation["reserved_bytes"] >= required_bytes and
+                 self.reservation["reserved_inodes"] >= 1,
+                 "prepared-input completion reservation is below its exact finite output bound")
+        free_blocks = getattr(capacity, "f_bavail", None)
+        free_inodes = getattr(capacity, "f_favail", None)
+        _require(type(free_blocks) is int and free_blocks >= 0 and
+                 type(free_inodes) is int and free_inodes >= 0 and
+                 free_blocks * block_bytes >= self.reservation["reserved_bytes"] and
+                 free_inodes >= self.reservation["reserved_inodes"],
+                 "prepared-input completion filesystem lacks its reserved free bytes or inodes")
+        return parent_info
+
+    def publication_guard(
+        self, baseline_parent_blocks: int, raw_size: int,
+    ) -> Callable[[os.stat_result, int], None]:
+        """Check actual file allocation while the exclusive writer owns the inode."""
+        _require(type(baseline_parent_blocks) is int and baseline_parent_blocks >= 0,
+                 "prepared-input completion parent allocation baseline is invalid")
+        _validate_prepared_input_completion_length(raw_size)
+
+        def guard(info: os.stat_result, parent_fd: int) -> None:
+            held_parent = self._assert_parent_fd(self.parent_fd)
+            writer_parent = self._assert_parent_fd(parent_fd)
+            _require((writer_parent.st_dev, writer_parent.st_ino) ==
+                     (held_parent.st_dev, held_parent.st_ino),
+                     "completion writer opened a different parent than the held reservation")
+            try:
+                named_file = os.stat(
+                    self.output.name, dir_fd=parent_fd, follow_symlinks=False,
+                )
+                parent_after = os.fstat(parent_fd)
+            except OSError as error:
+                raise PreparationError(
+                    f"prepared-input completion output changed during physical guard: {error}"
+                ) from error
+            _require(stat.S_ISREG(info.st_mode) and stat.S_ISREG(named_file.st_mode) and
+                     (named_file.st_dev, named_file.st_ino) == (info.st_dev, info.st_ino) and
+                     info.st_dev == self.reservation["device_id"] and
+                     info.st_size == raw_size and
+                     stat.S_IMODE(info.st_mode) == 0o600 and
+                     info.st_uid == os.getuid() and info.st_nlink == 1 and
+                     type(info.st_blocks) is int and info.st_blocks >= 0,
+                     "prepared-input completion output is not the exact private reserved inode")
+            file_allocation = info.st_blocks * 512
+            rounded_file_cap = _round_up_allocation_bytes(
+                self.reservation["maximum_file_bytes"],
+                self.reservation["allocation_block_bytes"],
+            )
+            parent_growth = max(
+                0, parent_after.st_blocks * 512 - baseline_parent_blocks * 512,
+            )
+            _require(file_allocation <= rounded_file_cap and
+                     parent_growth <= self.reservation["directory_growth_reserve_bytes"] and
+                     file_allocation + parent_growth <= self.reservation["reserved_bytes"],
+                     "prepared-input completion exceeded its physical byte or parent-growth reservation")
+
+        return guard
+
+
+def _open_prepared_input_completion_output_reservation(
+    reservation_value: object, expected_output: Path,
+) -> _HeldPreparedInputCompletionParent:
+    """Validate and pin the exact fixed completion destination before replay."""
+    fields = {
+        "schema", "path", "device_id", "allocation_block_bytes",
+        "maximum_file_bytes", "directory_growth_reserve_bytes",
+        "reserved_bytes", "reserved_inodes",
+    }
+    reservation = _exact(
+        reservation_value, fields, "prepared-input completion-output reservation",
+    )
+    _require(reservation["schema"] ==
+             PREPARED_INPUT_COMPLETION_OUTPUT_RESERVATION_SCHEMA,
+             "prepared-input completion-output reservation schema differs")
+    output_path_value = reservation["path"]
+    _require(type(output_path_value) is str,
+             "prepared-input completion reservation path must be a string")
+    try:
+        output_path_bytes = output_path_value.encode("utf-8", "strict")
+    except UnicodeError as error:
+        raise PreparationError(
+            f"prepared-input completion reservation path is not UTF-8: {error}"
+        ) from error
+    normalized_output_path = Path(output_path_value)
+    _require(expected_output.is_absolute() and
+             expected_output.name == PREPARED_INPUT_COMPLETION_OUTPUT_NAME and
+             output_path_value == str(expected_output) and
+             output_path_value.startswith("/") and len(output_path_bytes) <= 4096 and
+             normalized_output_path.as_posix() == output_path_value and
+             ".." not in normalized_output_path.parts and
+             "\\" not in output_path_value and "\x00" not in output_path_value and
+             all(ord(character) >= 32 and ord(character) != 127
+                 for character in output_path_value),
+             "prepared-input completion reservation differs from the exact fixed output path")
+    for field in (
+        "device_id", "allocation_block_bytes", "maximum_file_bytes",
+        "directory_growth_reserve_bytes", "reserved_bytes", "reserved_inodes",
+    ):
+        value = reservation[field]
+        _require(type(value) is int and 0 <= value <= MAX_U64,
+                 f"prepared-input completion reservation {field} must be a bounded integer")
+    _require(0 < reservation["allocation_block_bytes"] <= MAX_MANIFEST_BYTES and
+             reservation["maximum_file_bytes"] ==
+                 PREPARED_INPUT_COMPLETION_MAX_BYTES and
+             reservation["directory_growth_reserve_bytes"] > 0 and
+             reservation["reserved_bytes"] > 0 and
+             reservation["reserved_inodes"] > 0,
+             "prepared-input completion reservation has an invalid size or quota")
+    parent = expected_output.parent
+    try:
+        named_parent = parent.lstat()
+        resolved_parent = parent.resolve(strict=True)
+    except OSError as error:
+        raise PreparationError(
+            f"prepared-input completion parent is unavailable: {error}"
+        ) from error
+    _require(stat.S_ISDIR(named_parent.st_mode) and resolved_parent == parent and
+             stat.S_IMODE(named_parent.st_mode) == 0o700 and
+             named_parent.st_uid == os.getuid(),
+             "prepared-input completion parent must be a canonical owned mode-0700 directory")
+    try:
+        parent_fd = os.open(
+            parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+            getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as error:
+        raise PreparationError(
+            f"cannot safely open prepared-input completion parent: {error}"
+        ) from error
+    held: _HeldPreparedInputCompletionParent | None = None
+    try:
+        opened_parent = os.fstat(parent_fd)
+        identity = _completion_parent_identity(named_parent)
+        _require(_completion_parent_identity(opened_parent) == identity,
+                 "prepared-input completion parent changed while opening its descriptor")
+        held = _HeldPreparedInputCompletionParent(
+            parent, expected_output, dict(reservation), parent_fd, identity,
+        )
+        held.check_free_capacity()
+        return held
+    except BaseException:
+        if held is None:
+            os.close(parent_fd)
+        else:
+            held.close()
+        raise
+
+
+def _invoke_source_a_prepublication_check(
+    check: Callable[[bytes, dict[str, Any]], None],
+    raw_completion: bytes,
+    result_pins: dict[str, Any],
+) -> None:
+    """Give SourceA immutable completion bytes and detached result pins to recheck."""
+    _require(callable(check),
+             "closed completion publication requires its SourceA prepublication check")
+    returned = check(raw_completion, copy.deepcopy(result_pins))
+    _require(returned is None,
+             "SourceA prepublication check must return None after its held-state checks")
 
 
 def _initial_spec_plan_payload_bytes(
@@ -4219,6 +4493,184 @@ def _complete_prepared_inputs_impl(
     if not write_completion:
         result["replayed_completion"] = completion
     return result
+
+
+def _complete_prepared_inputs_closed_recorded_source_a_v1(
+    preparation_pin: dict[str, Any],
+    capacity_completion_pins: list[dict[str, Any]],
+    pressure_calibration_pins: list[dict[str, Any]],
+    pilot_pins: list[dict[str, Any]],
+    oracle_pins: list[dict[str, Any]],
+    final_spec_pin: dict[str, Any],
+    final_plan_pin: dict[str, Any],
+    *,
+    captured_pilot_read_providers: dict[str, Any],
+    global_artifact_reader: Callable[[dict[str, str], int], bytes],
+    input_root: Path,
+    probe_capture_index_pin: object,
+    completion_output_reservation: object,
+    source_a_prepublication_check: Callable[[bytes, dict[str, Any]], None],
+    resource_budget_pins: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Replay closed SourceA evidence, then publish its bounded data receipt.
+
+    SourceA must call this while its campaign lock and captured provider
+    cohort remain held. Its required prepublication check receives the full
+    canonical bytes and detached result pins, and must recheck the held
+    journal frontier, immutable inputs, and closed provider cohort. This
+    constructor creates no authority: callers still need a later SourceA
+    consumer that independently verifies the published completion.
+    """
+    _require(callable(source_a_prepublication_check),
+             "closed completion publication requires its SourceA prepublication check")
+    _require(type(captured_pilot_read_providers) is dict and
+             len(captured_pilot_read_providers) == 2 and
+             all(type(host_id) is str and bool(host_id)
+                 for host_id in captured_pilot_read_providers),
+             "closed completion requires the exact captured two-host provider map")
+    _require(callable(global_artifact_reader),
+             "closed completion requires the SourceA raw artifact reader")
+    _require(isinstance(input_root, Path),
+             "closed completion requires the exact private input-root path")
+    _require(probe_capture_index_pin is not None,
+             "closed completion requires the pinned pressure-capture index")
+    plan_ref = _exact(
+        final_plan_pin, {"path", "sha256"}, "final PlanV3 raw pin",
+    )
+    _require(type(plan_ref["path"]) is str,
+             "final PlanV3 path must be an absolute canonical string")
+    final_plan_path = Path(plan_ref["path"])
+    _require(final_plan_path.is_absolute(),
+             "final PlanV3 path must be absolute")
+    try:
+        canonical_plan_path = final_plan_path.resolve(strict=True)
+    except (OSError, ValueError) as error:
+        raise PreparationError(f"final PlanV3 path is unavailable: {error}") from error
+    _require(canonical_plan_path == final_plan_path,
+             "final PlanV3 path must be canonical before output reservation")
+    output = final_plan_path.parent / PREPARED_INPUT_COMPLETION_OUTPUT_NAME
+    source_root = _safe_root(SOURCE_ROOT, "SourceV5 root")
+    input_root = _safe_root(input_root, "private SourceV5 input root")
+    _require(_within(input_root, output) and not _within(source_root, output),
+             "prepared-input completion output must stay inside private inputs and outside SourceV5")
+    provider_snapshot = dict(captured_pilot_read_providers)
+    capture_index_snapshot = copy.deepcopy(probe_capture_index_pin)
+    held_parent = _open_prepared_input_completion_output_reservation(
+        completion_output_reservation, output,
+    )
+    try:
+        replay_result = _complete_prepared_inputs_impl(
+            preparation_pin, capacity_completion_pins, pressure_calibration_pins,
+            pilot_pins, oracle_pins, final_spec_pin, final_plan_pin,
+            write_completion=False, resource_budget_pins=resource_budget_pins,
+            captured_pilot_read_providers=provider_snapshot,
+            recorded_host=True, global_artifact_reader=global_artifact_reader,
+            input_root=input_root, closed_recorded=True,
+            probe_capture_index_pin=capture_index_snapshot,
+        )
+        _require(type(replay_result) is dict and
+                 "replayed_completion" in replay_result,
+                 "closed replay did not return its complete in-memory completion body")
+        completion = replay_result.pop("replayed_completion")
+        _require(type(completion) is dict and completion.get("complete") is True and
+                 completion.get("qualification_eligible") is False,
+                 "closed replay result is not a data-only prepared-input completion")
+        completion_digest = completion.get("completion_sha256")
+        completion_body = {
+            key: value for key, value in completion.items()
+            if key != "completion_sha256"
+        }
+        _require(_is_sha(completion_digest) and
+                 completion_digest == _sha256(_canonical(completion_body)),
+                 "closed replay completion self-hash differs from its canonical body")
+        raw_completion = _canonical(completion)
+        _validate_prepared_input_completion_length(len(raw_completion))
+        _require(replay_result.get("path") == str(output) and
+                 replay_result.get("raw_sha256") == _sha256(raw_completion) and
+                 replay_result.get("semantic_sha256") == completion_digest and
+                 replay_result.get("schema") == completion.get("schema") and
+                 replay_result.get("campaign_id") == completion.get("campaign_id") and
+                 replay_result.get("complete") is True and
+                 replay_result.get("qualification_eligible") is False,
+                 "closed replay result pins differ from the full canonical completion")
+        result_pins = {
+            key: replay_result[key] for key in (
+                "path", "raw_sha256", "semantic_sha256", "schema",
+                "campaign_id", "complete", "qualification_eligible",
+            )
+        }
+        _require(set(replay_result) == set(result_pins),
+                 "closed replay returned unexpected non-pin result data")
+
+        source_manifests = completion.get("source_manifests")
+        _require(type(source_manifests) is dict and len(source_manifests) == 2,
+                 "closed completion lost its exact two-host source cohort")
+        host_ids = set(source_manifests)
+        _require(set(provider_snapshot) == host_ids,
+                 "closed completion provider cohort differs from its actual source hosts")
+        for host_id in sorted(host_ids):
+            complete_provider = getattr(
+                provider_snapshot[host_id], "require_complete", None,
+            )
+            _require(callable(complete_provider) and complete_provider() is None,
+                     f"{host_id} closed SourceA provider is incomplete")
+        pilot_outputs = completion.get("pilots")
+        _require(type(pilot_outputs) is list and len(pilot_outputs) == 2 and
+                 all(type(item) is dict and type(item.get("host_id")) is str and
+                     item["host_id"] in host_ids and
+                     item.get("fixed_pair_count") == 360 and
+                     type(item.get("fixed_pair_evidence")) is list and
+                     len(item["fixed_pair_evidence"]) == 360
+                     for item in pilot_outputs) and
+                 {item["host_id"] for item in pilot_outputs} == host_ids and
+                 sum(item["fixed_pair_count"] for item in pilot_outputs) == 720,
+                 "closed completion did not replay all 720 actual fixed-pair owners")
+        capacity_preparations = completion.get("capacity_preparations")
+        pressure_calibrations = completion.get("pressure_calibrations")
+        oracle_outputs = completion.get("oracles")
+        filled_slots = completion.get("filled_slots")
+        _require(type(capacity_preparations) is list and
+                 len(capacity_preparations) == 2 and
+                 all(type(item) is dict and type(item.get("host_id")) is str and
+                     item["host_id"] in host_ids and
+                     type(item.get("entries")) is list and len(item["entries"]) == 15
+                     for item in capacity_preparations) and
+                 {item["host_id"] for item in capacity_preparations} == host_ids and
+                 type(pressure_calibrations) is list and
+                 len(pressure_calibrations) == 30 and
+                 type(oracle_outputs) is list and len(oracle_outputs) == 2 and
+                 all(type(item) is dict and type(item.get("host_id")) is str and
+                     item["host_id"] in host_ids and
+                     type(item.get("oracles")) is list and len(item["oracles"]) == 120
+                     for item in oracle_outputs) and
+                 {item["host_id"] for item in oracle_outputs} == host_ids and
+                 type(filled_slots) is dict and
+                 type(filled_slots.get("capacity_evidence")) is list and
+                 len(filled_slots["capacity_evidence"]) == 30 and
+                 type(filled_slots.get("pressure_calibrations")) is list and
+                 len(filled_slots["pressure_calibrations"]) == 30 and
+                 type(filled_slots.get("rates")) is list and
+                 len(filled_slots["rates"]) == 60 and
+                 type(filled_slots.get("oracles")) is list and
+                 len(filled_slots["oracles"]) == 240,
+                 "closed completion omitted its 30 pressure/capacity, 60 rate, or 240 oracle replay rows")
+
+        _invoke_source_a_prepublication_check(
+            source_a_prepublication_check, raw_completion, result_pins,
+        )
+        parent_before_publish = held_parent.check_free_capacity()
+        baseline_parent_blocks = parent_before_publish.st_blocks
+        guard = held_parent.publication_guard(
+            baseline_parent_blocks, len(raw_completion),
+        )
+        _write_private_json_new_bytes(
+            output, raw_completion, source_root,
+            size_class="prepared_input_completion",
+            allow_existing_identical=True, publication_guard=guard,
+        )
+        return result_pins
+    finally:
+        held_parent.close()
 
 
 def complete_prepared_inputs(
