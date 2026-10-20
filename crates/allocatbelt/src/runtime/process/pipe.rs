@@ -492,7 +492,7 @@ mod tests {
          for ((i=0; i<128; i++)); do printf '%s' \"$block\" >&2; done"
       }
       "vectors" => "printf '%s' 'vector-read'",
-      "hold" => "sleep 20",
+      "hold" => "exec sleep 20",
       _ => "exit 2",
     };
     let mut command = Command::new("/bin/bash");

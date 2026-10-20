@@ -896,7 +896,7 @@ mod tests {
   #[test]
   fn repeated_pending_polls_keep_only_bounded_waker_state() {
     let (mut driver, _reactor, _scope, mut future) =
-      setup(shell("sleep 20"), 8, 8, OutputLimitPolicy::ReturnPartial);
+      setup(shell("exec sleep 20"), 8, 8, OutputLimitPolicy::ReturnPartial);
     let wake = Arc::new(ThreadWake(thread::current()));
     let waker = Waker::from(Arc::clone(&wake));
     let mut context = Context::from_waker(&waker);
