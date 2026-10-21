@@ -698,9 +698,17 @@ fn invalid_stream_counts_become_errors_and_preserve_writer_suffix() {
 
 #[test]
 fn panicking_stream_job_becomes_terminal_and_releases_managed_buffer() {
-  struct PanicWriter;
+  struct PanicWriter {
+    gate: Arc<Gate>,
+    started: Option<Sender<()>>,
+  }
+
   impl Write for PanicWriter {
     fn write(&mut self, _input: &[u8]) -> io::Result<usize> {
+      if let Some(started) = self.started.take() {
+        started.send(()).unwrap();
+        self.gate.wait();
+      }
       panic!("scripted writer panic");
     }
 
@@ -711,10 +719,16 @@ fn panicking_stream_job_becomes_terminal_and_releases_managed_buffer() {
 
   let mut runtime = runtime(1, 3);
   let scope = resource_scope(2);
+  let gate = Arc::new(Gate::default());
+  let (started_tx, started_rx) = mpsc::channel();
+  let _release = ReleaseGate(Arc::clone(&gate));
   let mut writer = writer(
     runtime.handle(),
     Resources::ZERO,
-    PanicWriter,
+    PanicWriter {
+      gate: Arc::clone(&gate),
+      started: Some(started_tx),
+    },
     managed(&scope, 2),
   )
   .unwrap();
@@ -722,7 +736,9 @@ fn panicking_stream_job_becomes_terminal_and_releases_managed_buffer() {
     block_on(AsyncWriteExt::write(&mut writer, b"xy")).unwrap(),
     2
   );
+  started(&started_rx);
   assert_eq!(scope.snapshot().managed_memory, 2);
+  gate.release();
   assert_eq!(
     block_on(AsyncWriteExt::flush(&mut writer))
       .unwrap_err()
