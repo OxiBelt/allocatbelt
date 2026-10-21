@@ -1203,10 +1203,20 @@ def _load_module(raw: bytes, path: Path, name: str) -> types.ModuleType:
     module = types.ModuleType(f"pressure_pair_{name}_{sha256_bytes(raw)}")
     module.__file__ = str(path)
     module.__package__ = ""
+    module_name = module.__name__
+    had_previous_module = module_name in sys.modules
+    previous_module = sys.modules.get(module_name)
+    sys.modules[module_name] = module
     try:
         exec(compile(raw, str(path), "exec", dont_inherit=True), module.__dict__)
-    except (SyntaxError, TypeError, ValueError) as error:
-        raise PressurePairError(f"pinned {name} cannot be loaded: {error}") from error
+    except BaseException as error:
+        if had_previous_module:
+            sys.modules[module_name] = previous_module
+        else:
+            sys.modules.pop(module_name, None)
+        if isinstance(error, (SyntaxError, TypeError, ValueError)):
+            raise PressurePairError(f"pinned {name} cannot be loaded: {error}") from error
+        raise
     return module
 
 

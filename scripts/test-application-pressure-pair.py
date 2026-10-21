@@ -37,7 +37,18 @@ def load_module(name: str, path: Path):
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module_name = module.__name__
+    had_previous_module = module_name in sys.modules
+    previous_module = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if had_previous_module:
+            sys.modules[module_name] = previous_module
+        else:
+            sys.modules.pop(module_name, None)
+        raise
     return module
 
 
@@ -56,6 +67,120 @@ def sha_file(path: Path) -> str:
 
 def artifact_pin(path: Path) -> dict[str, str]:
     return {"path": str(path), "raw_sha256": "a" * 64}
+
+
+class PressurePairModuleLoaderTests(unittest.TestCase):
+    @staticmethod
+    def _future_dataclass_source() -> bytes:
+        return (
+            b"from __future__ import annotations\n"
+            b"from dataclasses import dataclass\n"
+            b"@dataclass(frozen=True)\n"
+            b"class Record:\n"
+            b"    value: int\n"
+            b"    parent: Record | None = None\n"
+        )
+
+    def test_pressure_pair_loader_registers_future_annotated_dataclass(self) -> None:
+        path = Path("pressure-pair-dataclass-fixture.py")
+        raw = self._future_dataclass_source()
+        label = "future_dataclass_fixture"
+        name = f"pressure_pair_{label}_{pair.sha256_bytes(raw)}"
+        had_previous = name in sys.modules
+        previous = sys.modules.get(name)
+        sys.modules.pop(name, None)
+        try:
+            module = pair._load_module(raw, path, label)
+            self.assertIs(sys.modules[name], module)
+            self.assertEqual(module.Record.__module__, name)
+            self.assertIsNone(module.Record(7).parent)
+        finally:
+            sys.modules.pop(name, None)
+            if had_previous:
+                sys.modules[name] = previous
+
+    def test_pressure_pair_loader_failure_removes_new_registry_entry(self) -> None:
+        path = Path("pressure-pair-loader-failure.py")
+        raw = b"raise ValueError('loader fixture failed')\n"
+        label = "failure_fixture"
+        name = f"pressure_pair_{label}_{pair.sha256_bytes(raw)}"
+        had_previous = name in sys.modules
+        previous = sys.modules.get(name)
+        sys.modules.pop(name, None)
+        try:
+            with self.assertRaisesRegex(
+                pair.PressurePairError,
+                "pinned failure_fixture cannot be loaded: loader fixture failed",
+            ):
+                pair._load_module(raw, path, label)
+            self.assertNotIn(name, sys.modules)
+        finally:
+            sys.modules.pop(name, None)
+            if had_previous:
+                sys.modules[name] = previous
+
+    def test_pressure_pair_loader_failure_restores_prior_registry_entry(self) -> None:
+        path = Path("pressure-pair-loader-restore.py")
+        raw = b"raise ValueError('loader fixture failed')\n"
+        label = "restore_fixture"
+        name = f"pressure_pair_{label}_{pair.sha256_bytes(raw)}"
+        had_previous = name in sys.modules
+        original = sys.modules.get(name)
+        previous = types.ModuleType(name)
+        previous.marker = "preserved"
+        sys.modules[name] = previous
+        try:
+            with self.assertRaisesRegex(
+                pair.PressurePairError,
+                "pinned restore_fixture cannot be loaded: loader fixture failed",
+            ):
+                pair._load_module(raw, path, label)
+            self.assertIs(sys.modules[name], previous)
+            self.assertEqual(sys.modules[name].marker, "preserved")
+        finally:
+            if had_previous:
+                sys.modules[name] = original
+            else:
+                sys.modules.pop(name, None)
+
+    def test_test_module_loader_registers_dataclass_and_restores_failed_load(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-test-module-loader-") as temporary:
+            root = Path(temporary)
+            name = "pressure_pair_test_loader_dataclass_fixture"
+            path = root / "dataclass-fixture.py"
+            path.write_bytes(self._future_dataclass_source())
+            had_previous = name in sys.modules
+            original = sys.modules.get(name)
+            sys.modules.pop(name, None)
+            try:
+                module = load_module(name, path)
+                self.assertIs(sys.modules[name], module)
+                self.assertEqual(module.Record.__module__, name)
+            finally:
+                sys.modules.pop(name, None)
+                if had_previous:
+                    sys.modules[name] = original
+
+            failing_name = "pressure_pair_test_loader_failure_fixture"
+            failing_path = root / "failure-fixture.py"
+            failing_path.write_text("raise RuntimeError('test loader fixture failed')\n", encoding="utf-8")
+            had_previous = failing_name in sys.modules
+            original = sys.modules.get(failing_name)
+            sys.modules.pop(failing_name, None)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "test loader fixture failed"):
+                    load_module(failing_name, failing_path)
+                self.assertNotIn(failing_name, sys.modules)
+                previous = types.ModuleType(failing_name)
+                sys.modules[failing_name] = previous
+                with self.assertRaisesRegex(RuntimeError, "test loader fixture failed"):
+                    load_module(failing_name, failing_path)
+                self.assertIs(sys.modules[failing_name], previous)
+            finally:
+                if had_previous:
+                    sys.modules[failing_name] = original
+                else:
+                    sys.modules.pop(failing_name, None)
 
 
 def valid_member(index: int, root: Path) -> dict:
