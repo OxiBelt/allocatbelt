@@ -460,6 +460,21 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
   {
     feedback_trace = run_bindings.start_feedback_trace(options.mode)?;
   }
+  #[cfg(feature = "resource-feedback")]
+  let capacity_collection = if options.mode == Mode::Capacity {
+    feedback_trace
+      .as_ref()
+      .map(|trace| trace.capacity_collection())
+      .transpose()?
+      .map_or(
+        super::CapacityCollection::Fixed,
+        super::CapacityCollection::Traced,
+      )
+  } else {
+    super::CapacityCollection::Fixed
+  };
+  #[cfg(not(feature = "resource-feedback"))]
+  let capacity_collection = super::CapacityCollection::Fixed;
   let mut runtime_readback = RuntimeBindingWriter::begin(options, plan, &run_bindings)?;
   let resources = run_bindings.resources();
   let io_bindings = run_bindings.io();
@@ -547,6 +562,7 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
   let observer_resources = resources.clone();
   let observer_expected_oracle = expected_oracle.clone();
   let observer_application = Observer::Bounded(async_handle.clone());
+  let observer_capacity_collection = capacity_collection.clone();
   let (observer_tx, observer_rx) = mpsc::sync_channel(1);
   let observer_thread = thread::Builder::new()
     .name("http-application-observer".into())
@@ -562,6 +578,7 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
         observer_expected_oracle,
         plan,
         Some(observer_application),
+        observer_capacity_collection,
       );
       let _ = observer_tx.send(report);
     })
@@ -616,6 +633,7 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
         settings,
         plan,
         app_submitter,
+        capacity_collection,
       );
       let _ = producer_tx.send(report);
     })
@@ -862,6 +880,21 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
   let mut run_bindings = domain.for_tokio()?;
   #[cfg(feature = "resource-feedback")]
   let mut feedback_trace = run_bindings.start_feedback_trace(options.mode)?;
+  #[cfg(feature = "resource-feedback")]
+  let capacity_collection = if options.mode == Mode::Capacity {
+    feedback_trace
+      .as_ref()
+      .map(|trace| trace.capacity_collection())
+      .transpose()?
+      .map_or(
+        super::CapacityCollection::Fixed,
+        super::CapacityCollection::Traced,
+      )
+  } else {
+    super::CapacityCollection::Fixed
+  };
+  #[cfg(not(feature = "resource-feedback"))]
+  let capacity_collection = super::CapacityCollection::Fixed;
   let mut runtime_readback = RuntimeBindingWriter::begin(options, plan, &run_bindings)?;
   let resources = run_bindings.resources();
   let io_bindings = run_bindings.io();
@@ -968,6 +1001,7 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
   let observer_resources = resources.clone();
   let observer_expected_oracle = expected_oracle.clone();
   let observer_application = Observer::Tokio;
+  let observer_capacity_collection = capacity_collection.clone();
   let (observer_tx, observer_rx) = mpsc::sync_channel(1);
   let observer_thread = thread::Builder::new()
     .name("http-application-observer".into())
@@ -983,6 +1017,7 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
         observer_expected_oracle,
         plan,
         Some(observer_application),
+        observer_capacity_collection,
       );
       let _ = observer_tx.send(report);
     })
@@ -1039,6 +1074,7 @@ fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<
         settings,
         plan,
         app_submitter,
+        capacity_collection,
       );
       let _ = producer_tx.send(report);
     })
@@ -1424,6 +1460,7 @@ fn produce_native(
   settings: Settings,
   plan: ArrivalPlan,
   app_submitter: Option<super::Submitter>,
+  capacity_collection: super::CapacityCollection,
 ) -> Result<ProducerReport, String> {
   let role_sender = roles.clone();
   let ready_events = events.clone();
@@ -1433,6 +1470,7 @@ fn produce_native(
     plan,
     events,
     credits,
+    capacity_collection,
     move |id, workload, lease| {
       if workload != Workload::Http {
         drop(lease);
@@ -1512,6 +1550,7 @@ fn produce_tokio(
   settings: Settings,
   plan: ArrivalPlan,
   app_submitter: Option<super::Submitter>,
+  capacity_collection: super::CapacityCollection,
 ) -> Result<ProducerReport, String> {
   let role_sender = roles.clone();
   let ready_events = events.clone();
@@ -1521,6 +1560,7 @@ fn produce_tokio(
     plan,
     events,
     credits,
+    capacity_collection,
     move |id, workload, lease| {
       if workload != Workload::Http {
         drop(lease);
@@ -1613,11 +1653,12 @@ fn produce_with_plan(
   plan: ArrivalPlan,
   events: ObserverEventSender<Event>,
   credits: mpsc::Receiver<()>,
+  capacity_collection: super::CapacityCollection,
   mut submit: impl FnMut(u64, Workload, RoleLease) -> Result<Submission, SubmitResult>,
 ) -> Result<ProducerReport, String> {
   let started_at = Instant::now();
   let horizon_end = match options.mode {
-    Mode::Capacity => started_at + settings.horizon,
+    Mode::Capacity => capacity_collection.production_horizon_end(started_at, settings.horizon)?,
     Mode::OpenLoop => started_at
       .checked_add(Duration::from_nanos(plan.trace_duration_ns()?))
       .ok_or_else(|| "HTTP arrival trace end instant overflow".to_owned())?,
@@ -1630,18 +1671,34 @@ fn produce_with_plan(
   let mut lateness_max_ns = 0u64;
   let mut outstanding = 0usize;
   let mut next_capacity_id = 0u64;
+  let mut collection_stop = None;
 
   let production_cpu_started_ns = super::process_cpu_time_ns();
   loop {
+    if options.mode == Mode::Capacity
+      && let Some(stopped_at) = capacity_collection.try_stop()?
+    {
+      collection_stop = Some(stopped_at);
+      break;
+    }
     while let Ok(()) = credits.try_recv() {
       outstanding = outstanding.saturating_sub(1);
     }
-    if options.mode == Mode::Capacity {
-      super::wait_until_capacity_pulse(plan, started_at, horizon_end);
+    if options.mode == Mode::Capacity
+      && let Some(stopped_at) =
+        super::wait_until_capacity_pulse(plan, started_at, horizon_end, &capacity_collection)?
+    {
+      collection_stop = Some(stopped_at);
+      break;
     }
     let (id, scheduled) = match options.mode {
       Mode::Capacity => {
         if Instant::now() >= horizon_end {
+          if let Some(stopped_at) = capacity_collection.try_stop()? {
+            collection_stop = Some(stopped_at);
+          } else if capacity_collection.is_traced() {
+            return Err("HTTP capacity trace collection reached its production deadline".into());
+          }
           break;
         }
         if attempted >= MAX_CAPACITY_JOBS {
@@ -1649,18 +1706,54 @@ fn produce_with_plan(
         }
         let pulse_end = super::capacity_pulse_end(plan, started_at, horizon_end);
         while outstanding >= WINDOW {
-          if Instant::now() >= horizon_end {
+          if capacity_collection.is_traced()
+            && let Some(stopped_at) = capacity_collection.try_stop()?
+          {
+            collection_stop = Some(stopped_at);
             break;
           }
-          match credits.recv_timeout(pulse_end.saturating_duration_since(Instant::now())) {
+          if Instant::now() >= horizon_end {
+            if let Some(stopped_at) = capacity_collection.try_stop()? {
+              collection_stop = Some(stopped_at);
+            } else if capacity_collection.is_traced() {
+              return Err("HTTP capacity trace collection reached its production deadline".into());
+            }
+            break;
+          }
+          let remaining = pulse_end.saturating_duration_since(Instant::now());
+          let wait = if capacity_collection.is_traced() {
+            remaining.min(super::CAPACITY_COLLECTION_POLL)
+          } else {
+            remaining
+          };
+          match credits.recv_timeout(wait) {
             Ok(()) => outstanding -= 1,
-            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+              if capacity_collection.is_traced() {
+                if let Some(stopped_at) = capacity_collection.try_stop()? {
+                  collection_stop = Some(stopped_at);
+                  break;
+                }
+                if Instant::now() < pulse_end {
+                  continue;
+                }
+              }
+              break;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
               return Err("HTTP observer closed before returning window credit".into());
             }
           }
         }
+        if collection_stop.is_some() {
+          break;
+        }
         if Instant::now() >= horizon_end {
+          if let Some(stopped_at) = capacity_collection.try_stop()? {
+            collection_stop = Some(stopped_at);
+          } else if capacity_collection.is_traced() {
+            return Err("HTTP capacity trace collection reached its production deadline".into());
+          }
           break;
         }
         if Instant::now() >= pulse_end {
@@ -1750,7 +1843,19 @@ fn produce_with_plan(
   {
     thread::sleep(remaining);
   }
-  let production_end = Instant::now();
+  let production_end = if options.mode == Mode::Capacity {
+    match collection_stop {
+      Some(stopped_at) => stopped_at,
+      None if capacity_collection.is_traced() => {
+        capacity_collection.try_stop()?.ok_or_else(|| {
+          "HTTP capacity trace collection stopped before an eligible sample ACK".to_owned()
+        })?
+      }
+      None => Instant::now(),
+    }
+  } else {
+    Instant::now()
+  };
   let trace_overrun =
     super::trace_exceeded_for_plan(options.mode, started_at, production_end, plan)?;
   let report = ProducerReport {
@@ -1857,6 +1962,7 @@ fn observe_events(
     expected_oracle,
     plan,
     None,
+    super::CapacityCollection::Fixed,
   )
 }
 
@@ -1871,6 +1977,7 @@ fn observe_events_with_plan(
   expected_oracle: Option<Arc<Vec<u64>>>,
   plan: ArrivalPlan,
   application_observer: Option<Observer>,
+  capacity_collection: super::CapacityCollection,
 ) -> Result<ObserverReport, String> {
   let mut pending = HashMap::<u64, PendingPair>::new();
   pending
@@ -2103,7 +2210,7 @@ fn observe_events_with_plan(
         {
           let value = output.value();
           checksum = value;
-          if observed <= horizon_end {
+          if capacity_collection.on_time(observed, horizon_end) {
             on_time += 1;
             if let Some(index) = workload.family_index() {
               family_published_on_time[index] = family_published_on_time[index].saturating_add(1);
@@ -2211,7 +2318,7 @@ fn observe_events_with_plan(
         Ok(value) => {
           checksum = value;
           succeeded = true;
-          if observed <= horizon_end {
+          if capacity_collection.on_time(observed, horizon_end) {
             on_time += 1;
             if let Some(index) = plan.workload_for(id).family_index() {
               family_published_on_time[index] = family_published_on_time[index].saturating_add(1);
@@ -2689,8 +2796,14 @@ fn print_row(allocator: &str, options: Options, report: &Report) {
   debug_assert!(domain_non_control_resources_empty(
     report.final_tenant_domain
   ));
+  let production_ns = report
+    .producer
+    .production_end
+    .saturating_duration_since(report.producer.started_at)
+    .as_nanos()
+    .max(1);
   let capacity_rate = if options.mode == Mode::Capacity {
-    (report.on_time as f64 / CAPACITY_HORIZON.as_secs_f64()).to_string()
+    (report.on_time as f64 / production_ns as f64 * 1_000_000_000.0).to_string()
   } else {
     String::new()
   };

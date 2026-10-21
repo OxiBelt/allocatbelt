@@ -392,6 +392,22 @@ def full_pressure_recipe_api_fixture(root: Path) -> tuple[dict[str, object], dic
 
 
 class PressurePairContractTests(unittest.TestCase):
+    def test_actual_production_duration_rejects_underflow_and_uses_wall_minus_drain(self) -> None:
+        self.assertEqual(
+            pair._actual_production_duration_ns(
+                {"wall_through_drain_ns": "31000000000", "drain_tail_ns": "750000000"},
+                "capacity fixture",
+            ),
+            30_250_000_000,
+        )
+        for row in (
+            {"wall_through_drain_ns": "0", "drain_tail_ns": "0"},
+            {"wall_through_drain_ns": "100", "drain_tail_ns": "100"},
+            {"wall_through_drain_ns": "100", "drain_tail_ns": "101"},
+        ):
+            with self.assertRaises(pair.PressurePairError):
+                pair._actual_production_duration_ns(row, "capacity fixture")
+
     def _floor_policy_fixture(self, root: Path, selected: bool):
         policy_id = feedback_reader.CAPACITY_FLOOR_POLICY_ID
         descriptor = {
@@ -1624,6 +1640,7 @@ class CompleteMappedFilePreflightTests(unittest.TestCase):
         add_file(output_root / "journal.jsonl", "journal", "host-a", b"event\n")
 
         execution_body: dict[str, object] = {
+            "hosts": ["host-a", "host-b", "host-c"],
             "modules": {"host-a": {
                 "scripts/fixture-module.py": {
                     "path": "scripts/fixture-module.py", "sha256": source_sha,

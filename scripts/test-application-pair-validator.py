@@ -604,7 +604,18 @@ class ApplicationPairValidatorTests(unittest.TestCase):
         )
         self.assertNotEqual(rejected.returncode, 0)
 
-    def test_capacity_report_uses_the_actual_30_second_horizon(self) -> None:
+    def test_capacity_report_reconciles_actual_production_duration(self) -> None:
+        header = runner_header()
+        row = {column: "0" for column in header}
+        row.update(
+            schema="2", allocator="system", executor="allocatbelt", workload="cpu", mode="capacity",
+            attempted="2", admitted="2", completed_on_time="2", result_digest="3", expected_digest="3",
+            wall_through_drain_ns="31000000000", drain_tail_ns="750000000",
+        )
+        self.output.write_text(
+            "\t".join(header) + "\n" + "\t".join(row[column] for column in header) + "\n",
+            encoding="utf-8",
+        )
         report = self.directory / "capacity.shutdown.tsv"
         report.write_text(
             "schema\tallocatbelt-app-phase-v1\t\n"
@@ -616,7 +627,7 @@ class ApplicationPairValidatorTests(unittest.TestCase):
             "identity\tprofile\tsteady\n"
             f"identity\tsource_sha256\t{self.source_hash}\n"
             f"identity\tbinary_sha256\t{self.binary_hash}\n"
-            "phase\tproduction_trace\t30000000001\n"
+            "phase\tproduction_trace\t30250000000\n"
             "phase\tproduction_cpu_started_ns\t100\n"
             "phase\tproduction_cpu_ended_ns\t300\n"
             "phase\tproduction_through_drain_cpu_ns\t200\n"
@@ -625,6 +636,26 @@ class ApplicationPairValidatorTests(unittest.TestCase):
             "driver\tallocatbelt application driver\t500000000\n",
             encoding="utf-8",
         )
+        original_report = report.read_text(encoding="utf-8")
+        original_output_row = dict(row)
+
+        def set_production_duration(duration_ns: int) -> None:
+            wall_ns = duration_ns + 750_000_000
+            output_row = dict(original_output_row)
+            output_row.update(
+                wall_through_drain_ns=str(wall_ns), drain_tail_ns="750000000",
+                capacity_publications_per_second=f"{2_000_000_000 / duration_ns:.17g}",
+                successful_throughput_through_drain_per_second=f"{2_000_000_000 / wall_ns:.17g}",
+            )
+            self.output.write_text(
+                "\t".join(header) + "\n" + "\t".join(output_row[column] for column in header) + "\n",
+                encoding="utf-8",
+            )
+            report.write_text(
+                original_report.replace("30250000000", str(duration_ns)),
+                encoding="utf-8",
+            )
+
         program = embedded_validator("validate_shutdown_report")
         accepted = subprocess.run(
             [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "capacity", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
@@ -639,7 +670,19 @@ class ApplicationPairValidatorTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        set_production_duration(30_000_000_000)
+        report.write_text(report.read_text(encoding="utf-8").replace(
+            "phase\tproduction_trace\t30000000000", "phase\tproduction_trace\t30250000000",
+        ), encoding="utf-8")
+        phase_mismatch = subprocess.run(
+            [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "capacity", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(phase_mismatch.returncode, 0)
         self.assertNotEqual(rejected_override.returncode, 0)
+        set_production_duration(30_250_000_000)
         report.write_text(report.read_text(encoding="utf-8").replace("identity\trun_id\tvalidator-1", "identity\trun_id\tvalidator-replay"), encoding="utf-8")
         replayed = subprocess.run(
             [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "capacity", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
@@ -648,11 +691,7 @@ class ApplicationPairValidatorTests(unittest.TestCase):
             text=True,
         )
         self.assertNotEqual(replayed.returncode, 0)
-        report.write_text(report.read_text(encoding="utf-8").replace("validator-replay", "validator-1"), encoding="utf-8")
-        report.write_text(
-            report.read_text(encoding="utf-8").replace("30000000001", "31000000001"),
-            encoding="utf-8",
-        )
+        set_production_duration(31_000_000_001)
         beyond_allowance = subprocess.run(
             [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "capacity", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
             check=False,
@@ -660,6 +699,7 @@ class ApplicationPairValidatorTests(unittest.TestCase):
             text=True,
         )
         self.assertNotEqual(beyond_allowance.returncode, 0)
+        set_production_duration(30_250_000_000)
         report.write_text(report.read_text(encoding="utf-8").replace("production_cpu_ended_ns\t300", "production_cpu_ended_ns\t299"), encoding="utf-8")
         invalid_cpu_boundary = subprocess.run(
             [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "capacity", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
@@ -668,11 +708,7 @@ class ApplicationPairValidatorTests(unittest.TestCase):
             text=True,
         )
         self.assertNotEqual(invalid_cpu_boundary.returncode, 0)
-        report.write_text(
-            report.read_text(encoding="utf-8").replace("31000000001", "29999999999")
-            .replace("production_cpu_ended_ns\t299", "production_cpu_ended_ns\t300"),
-            encoding="utf-8",
-        )
+        set_production_duration(29_999_999_999)
         short_capacity = subprocess.run(
             [sys.executable, "-c", program, str(report), "allocatbelt", "cpu", "capacity", "31", "60", "1200", str(self.output), self.nonce, self.run_id, "system", "steady", self.source_hash, self.binary_hash],
             check=False,
@@ -680,6 +716,47 @@ class ApplicationPairValidatorTests(unittest.TestCase):
             text=True,
         )
         self.assertNotEqual(short_capacity.returncode, 0)
+
+    def test_capacity_stdout_rate_uses_reconciled_actual_production_duration(self) -> None:
+        header = runner_header()
+        row = {column: "0" for column in header}
+        row.update(
+            schema="2", allocator="system", executor="allocatbelt", workload="cpu", mode="capacity",
+            async_workers="4", blocking_workers="0", topology="4 async workers", logical_window="8",
+            global_task_limit="8", retained_window="0", arrival_rate_per_second="", requested_arrivals="",
+            attempted="1", admitted="1", completed_on_time="1",
+            result_digest="77", expected_digest="77", capacity_publications_per_second="0.03305785123966942149",
+            successful_throughput_through_drain_per_second="0.03225806451612903226",
+            wall_through_drain_ns="31000000000", drain_tail_ns="750000000",
+        )
+        self.output.write_text(
+            "\t".join(header) + "\n" + "\t".join(row[column] for column in header) + "\n",
+            encoding="utf-8",
+        )
+        program = embedded_validator("validate_output")
+        args = [
+            str(self.output), "\t".join(header), "system", "allocatbelt", "cpu", "capacity", "-",
+            "0", "4 async workers", "8", "0", "0", "0", "0", "2", "5000", "1200", "300", "4",
+        ]
+        accepted = subprocess.run([sys.executable, "-c", program, *args], check=False, capture_output=True, text=True)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        nominal_rate = "0.03333333333333333333"
+        self.output.write_text(
+            self.output.read_text(encoding="utf-8").replace(row["capacity_publications_per_second"], nominal_rate),
+            encoding="utf-8",
+        )
+        nominal = subprocess.run([sys.executable, "-c", program, *args], check=False, capture_output=True, text=True)
+        self.assertNotEqual(nominal.returncode, 0)
+        self.output.write_text(
+            self.output.read_text(encoding="utf-8").replace(nominal_rate, row["capacity_publications_per_second"]),
+            encoding="utf-8",
+        )
+        self.output.write_text(
+            self.output.read_text(encoding="utf-8").replace("31000000000\t750000000", "31000000000\t31000000000"),
+            encoding="utf-8",
+        )
+        underflow = subprocess.run([sys.executable, "-c", program, *args], check=False, capture_output=True, text=True)
+        self.assertNotEqual(underflow.returncode, 0)
 
     def test_mixed_capacity_family_counts_are_identity_bound_and_complete(self) -> None:
         report = self.directory / "capacity-families.tsv"
@@ -703,7 +780,7 @@ class ApplicationPairValidatorTests(unittest.TestCase):
         )
         header = runner_header()
         row = {column: "0" for column in header}
-        row.update(schema="2", allocator="system", executor="allocatbelt", workload="mixed", mode="capacity", attempted="8", admitted="8", completed_on_time="8")
+        row.update(schema="2", allocator="system", executor="allocatbelt", workload="mixed", mode="capacity", attempted="8", admitted="8", completed_on_time="8", wall_through_drain_ns="31000000000", drain_tail_ns="750000000")
         self.output.write_text("\t".join(header) + "\n" + "\t".join(row[column] for column in header) + "\n", encoding="utf-8")
         program = embedded_validator("validate_capacity_family_report")
         args = [str(report), str(self.output), "allocatbelt", self.nonce, self.run_id, "system", "mixed", "mixed", self.source_hash, self.binary_hash]

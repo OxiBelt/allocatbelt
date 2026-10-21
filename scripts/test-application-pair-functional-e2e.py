@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 import types
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -1824,6 +1825,8 @@ def validate_v4_shutdown_report(
             "functional shutdown phase ledger differs")
     require(all(re.fullmatch(r"(?:0|[1-9][0-9]*)", row[2]) for row in phases), "functional shutdown phase value is malformed")
     actual_trace_ns = int(phases[0][2])
+    require(actual_trace_ns == capacity_actual_duration_ns(output),
+            "functional production phase differs from stdout wall time less drain tail")
     if output["mode"] == "capacity":
         validate_v4_capacity_liveness(workload, actual_trace_ns, int(output["completed_on_time"]), trace_deadline)
     else:
@@ -1859,6 +1862,18 @@ def validate_v4_capacity_liveness(
         require(set(family_successes) == {"cpu", "memory", "http", "disk"}
                 and all(value > 0 for value in family_successes.values()),
                 "mixed capacity trace did not complete work in every family")
+
+
+def capacity_actual_duration_ns(output: dict[str, str]) -> int:
+    wall_text = output.get("wall_through_drain_ns", "")
+    drain_text = output.get("drain_tail_ns", "")
+    require(re.fullmatch(r"(?:0|[1-9][0-9]*)", wall_text) is not None
+            and re.fullmatch(r"(?:0|[1-9][0-9]*)", drain_text) is not None,
+            "capacity wall/drain duration fields are malformed")
+    wall_ns, drain_ns = int(wall_text), int(drain_text)
+    require(wall_ns > 0 and drain_ns < wall_ns,
+            "capacity production duration is not a positive checked wall/drain subtraction")
+    return wall_ns - drain_ns
 
 
 def validate_v4_open_loop_ids(
@@ -2140,14 +2155,16 @@ def validate_v4_output_row(
                 "capacity result unexpectedly carries open-loop response quantiles")
         require(numeric["completed_on_time"] > 0,
                 "capacity functional result contains no completed work")
-        expected_capacity = Decimal(numeric["completed_on_time"]) / Decimal(SOURCE_V4_FUNCTIONAL_LIMITS["capacity_horizon_seconds"])
+        actual_duration_ns = capacity_actual_duration_ns(output)
+        expected_capacity = (Decimal(numeric["completed_on_time"]) * Decimal(1_000_000_000)
+                             / Decimal(actual_duration_ns))
         try:
             actual_capacity = Decimal(output["capacity_publications_per_second"])
         except InvalidOperation as error:
             raise RuntimeError("functional capacity throughput is malformed") from error
         require(actual_capacity.is_finite() and abs(actual_capacity - expected_capacity)
                 <= max(Decimal("0.00000001"), expected_capacity * Decimal("0.00000001")),
-                "capacity throughput does not use the preserved 30-second horizon")
+                "capacity throughput does not use the reconciled actual production duration")
     else:
         require(output["arrival_rate_per_second"] == str(context["rate_per_second"])
                 and output["requested_arrivals"] == str(context["arrivals"])

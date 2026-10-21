@@ -3274,6 +3274,18 @@ def _tabular_bytes(raw: bytes, label: str, expected_rows: int) -> tuple[list[str
     return header, rows
 
 
+def _actual_production_duration_ns(output_row: dict[str, str], label: str) -> int:
+    wall_text = output_row.get("wall_through_drain_ns", "")
+    drain_text = output_row.get("drain_tail_ns", "")
+    require(re.fullmatch(r"(?:0|[1-9][0-9]*)", wall_text) is not None
+            and re.fullmatch(r"(?:0|[1-9][0-9]*)", drain_text) is not None,
+            f"{label} wall/drain duration fields are malformed")
+    wall_ns, drain_ns = int(wall_text), int(drain_text)
+    require(wall_ns > 0 and drain_ns < wall_ns,
+            f"{label} production duration is not a positive checked wall/drain subtraction")
+    return wall_ns - drain_ns
+
+
 def _validate_shutdown_report(
     raw: bytes, member: dict[str, Any], inputs: dict[str, Any], deadlines: dict[str, Any], output_row: dict[str, str],
 ) -> dict[str, int | str]:
@@ -3311,6 +3323,9 @@ def _validate_shutdown_report(
         uint(int(row[2]) if row[2].isdigit() else None, f"shutdown {row[1]}")
     trace_ns, cpu_started, cpu_ended, cpu_total, successes, cpu_per_completion = (int(row[2]) for row in phases)
     require(trace_ns <= deadlines["trace_seconds"] * 1_000_000_000, "normal APP trace exceeded the frozen trace deadline")
+    actual_duration_ns = _actual_production_duration_ns(output_row, "normal APP")
+    require(trace_ns == actual_duration_ns,
+            "normal APP production phase differs from stdout wall time less drain tail")
     if job["mode"] == "capacity":
         require(30_000_000_000 <= trace_ns <= min(deadlines["trace_seconds"] * 1_000_000_000, 31_000_000_000), "capacity APP trace duration differs from the fixed 30-second capacity phase")
     require(cpu_started > 0 and cpu_ended >= cpu_started and cpu_ended - cpu_started == cpu_total and 0 < cpu_total <= deadlines["process_seconds"] * 128 * 1_000_000_000, "normal APP CPU phase bounds do not reconcile")
@@ -3323,6 +3338,7 @@ def _validate_shutdown_report(
         require(duration <= deadlines["shutdown_seconds"] * 1_000_000_000, "normal APP shutdown driver exceeded its frozen bound")
     return {
         "raw_sha256": sha256_bytes(raw),
+        "production_trace_ns": trace_ns,
         "production_cpu_started_ns": cpu_started,
         "production_cpu_ended_ns": cpu_ended,
         "production_cpu_ns": cpu_total,
@@ -3369,6 +3385,9 @@ def _validate_capacity_family_report(
     attempted = uint(int(output_row["attempted"]) if output_row["attempted"].isdigit() else None, "capacity-family attempted count", positive=True)
     completed = uint(int(output_row["completed_on_time"]) if output_row["completed_on_time"].isdigit() else None, "capacity-family completion count", positive=True)
     require(sum(int(values[0]) for values in families.values() if values[0].isdigit()) == attempted and sum(int(values[1]) for values in families.values() if values[1].isdigit()) == completed, "capacity-family totals differ from stdout")
+    production_ns = _actual_production_duration_ns(output_row, "capacity-family")
+    require(30_000_000_000 <= production_ns <= 31_000_000_000,
+            "capacity-family production duration is outside its checked 30-to-31-second window")
     throughput_by_family: dict[str, float] = {}
     for index, family in enumerate(("cpu", "memory", "http", "disk")):
         scheduled_text, success_text = families[family]
@@ -3376,7 +3395,7 @@ def _validate_capacity_family_report(
         scheduled, successes = int(scheduled_text), int(success_text)
         expected_count = attempted // 4 + int(index < attempted % 4)
         require(scheduled == expected_count and 0 < successes <= scheduled, f"capacity-family {family} count differs from the fixed interleave")
-        throughput_by_family[family] = successes / 30.0
+        throughput_by_family[family] = successes * 1_000_000_000 / production_ns
     require(len(raw) <= budget, "capacity-family report exceeds its frozen budget")
     return {"raw_sha256": sha256_bytes(raw), "capacity_throughput_by_family": throughput_by_family}
 
@@ -3547,8 +3566,11 @@ hwm_after_shutdown_kib shutdown_ns""".split()
         require(row["arrival_rate_per_second"] == "" and row["requested_arrivals"] == "", "capacity APP stdout contains open-loop rate/arrival values")
         require(numbers["rejected_full"] == numbers["rejected_resource"] == numbers["lost"] == 0 and numbers["completed_on_time"] > 0, "capacity APP stdout contains missing work or no successful publication")
         require(numbers["response_p50_ns"] == numbers["response_p95_ns"] == numbers["response_p99_ns"] == 0, "capacity APP stdout unexpectedly reports open-loop latencies")
-        expected_capacity = Decimal(numbers["completed_on_time"]) / Decimal(30)
-        require(abs(decimals["capacity_publications_per_second"] - expected_capacity) <= max(Decimal("0.00000001"), expected_capacity * Decimal("0.00000001")), "capacity APP throughput differs from its completed publications")
+        production_ns = _actual_production_duration_ns(row, "capacity APP")
+        require(30_000_000_000 <= production_ns <= 31_000_000_000,
+                "capacity APP production duration is outside its checked 30-to-31-second window")
+        expected_capacity = Decimal(numbers["completed_on_time"]) * Decimal(1_000_000_000) / Decimal(production_ns)
+        require(abs(decimals["capacity_publications_per_second"] - expected_capacity) <= max(Decimal("0.00000001"), expected_capacity * Decimal("0.00000001")), "capacity APP throughput differs from its on-time completions and actual production duration")
         ids_sha, arrival_metrics = "not_applicable", {"family_successes": {}, "latency_p99_by_family_ns": {}}
     wall_ns = numbers["wall_through_drain_ns"]
     require(wall_ns > 0 and wall_ns <= recipe["deadlines"]["process_seconds"] * 1_000_000_000 and numbers["drain_tail_ns"] <= recipe["deadlines"]["drain_seconds"] * 1_000_000_000, "normal APP production/drain timing exceeds its frozen deadline")

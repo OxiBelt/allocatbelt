@@ -32,6 +32,7 @@ import tempfile
 import threading
 import time
 import types
+from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -3822,6 +3823,31 @@ def qualification_pair_metadata(
     return metadata, digest
 
 
+def actual_production_duration_ns(row: dict[str, str]) -> int:
+    wall_ns = parse_uint(row.get("wall_through_drain_ns", ""), "wall through drain")
+    drain_tail_ns = parse_uint(row.get("drain_tail_ns", ""), "drain tail")
+    require(wall_ns > 0 and drain_tail_ns < wall_ns,
+            "production duration is not a positive checked wall/drain subtraction")
+    return wall_ns - drain_tail_ns
+
+
+def reconcile_production_duration_ns(row: dict[str, str], production_trace_ns: int | None) -> int:
+    actual_ns = actual_production_duration_ns(row)
+    require(production_trace_ns is not None and production_trace_ns == actual_ns,
+            "production phase duration differs from stdout wall time less drain tail")
+    return actual_ns
+
+
+def validate_capacity_throughput(completed_on_time: int, actual_text: str, duration_ns: int) -> None:
+    require(completed_on_time > 0 and duration_ns > 0,
+            "capacity throughput lacks on-time completions or a positive production duration")
+    expected = Decimal(completed_on_time) * Decimal(1_000_000_000) / Decimal(duration_ns)
+    parse_decimal(actual_text, "capacity publications")
+    actual = Decimal(actual_text)
+    require(abs(actual - expected) <= max(Decimal("0.00000001"), expected * Decimal("0.00000001")),
+            "capacity throughput differs from on-time completions and actual production duration")
+
+
 def extract_process_metrics(
     pair_dir: Path,
     process_row: dict[str, str],
@@ -3893,6 +3919,14 @@ def extract_process_metrics(
         "binary_sha256": source["artifacts"][process_allocator]["sha256"],
     }
     require(identity == expected_identity, "phase sidecar identity differs from this frozen process")
+    production_trace_ns = phases.get("production_trace")
+    actual_production_ns = reconcile_production_duration_ns(row, production_trace_ns)
+    if job["mode"] == "capacity":
+        require(29_000_000_000 <= actual_production_ns <= 31_000_000_000,
+                "capacity production duration is outside its existing 29-to-31-second bound")
+        validate_capacity_throughput(
+            numeric_counts["completed_on_time"], row["capacity_publications_per_second"], actual_production_ns,
+        )
     cpu_per_completion = phases.get("cpu_ns_per_successful_completion")
     cpu_started, cpu_ended = phases.get("production_cpu_started_ns"), phases.get("production_cpu_ended_ns")
     cpu_total = phases.get("production_through_drain_cpu_ns")
@@ -3964,7 +3998,10 @@ def extract_process_metrics(
         require(set(family_counts) == set(STANDALONE) and sum(item[0] for item in family_counts.values()) == numeric_counts["attempted"] and sum(item[1] for item in family_counts.values()) == numeric_counts["completed_on_time"], "capacity family counts do not reconcile with on-time row totals")
         expected_family_counts = {family: numeric_counts["attempted"] // 4 + int(index < numeric_counts["attempted"] % 4) for index, family in enumerate(STANDALONE)}
         require(all(family_counts[family][0] == expected_family_counts[family] and family_counts[family][1] <= expected_family_counts[family] for family in STANDALONE), "capacity family scheduled IDs or on-time count is invalid")
-        metrics["capacity_throughput_by_family"] = {family: count[1] / parse_uint(family_phases["trace_seconds"], "trace seconds") for family, count in family_counts.items()}
+        metrics["capacity_throughput_by_family"] = {
+            family: count[1] * 1_000_000_000 / actual_production_ns
+            for family, count in family_counts.items()
+        }
         metrics["capacity_family_sha256"] = family_sha
     else:
         require(process_row["capacity_family_sha256"] == "not_applicable", "unexpected capacity family sidecar for this process")

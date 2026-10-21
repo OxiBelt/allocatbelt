@@ -292,6 +292,19 @@ def add_frozen_rates(spec: dict, include_oracles: bool) -> None:
 
 
 class ApplicationCampaignTests(unittest.TestCase):
+    def test_actual_capacity_duration_controls_rate_and_phase_reconciliation(self) -> None:
+        row = {"wall_through_drain_ns": "30250000000", "drain_tail_ns": "0"}
+        actual_ns = campaign.reconcile_production_duration_ns(row, 30_250_000_000)
+        self.assertEqual(actual_ns, 30_250_000_000)
+        actual_rate = campaign.Decimal(1_000_000_000) / campaign.Decimal(actual_ns)
+        campaign.validate_capacity_throughput(1, str(actual_rate), actual_ns)
+        with self.assertRaisesRegex(campaign.CampaignError, "capacity throughput"):
+            campaign.validate_capacity_throughput(1, str(campaign.Decimal(1) / campaign.Decimal(30)), actual_ns)
+        with self.assertRaisesRegex(campaign.CampaignError, "production phase duration"):
+            campaign.reconcile_production_duration_ns(row, 30_000_000_000)
+        with self.assertRaisesRegex(campaign.CampaignError, "positive checked"):
+            campaign.actual_production_duration_ns({"wall_through_drain_ns": "0", "drain_tail_ns": "0"})
+
     def test_analyzer_scratch_projection_covers_full_source_group_and_window(self) -> None:
         spec, _sources = spec_fixture()
         trace_cap = 512 * 1024 * 1024
@@ -883,8 +896,9 @@ class ApplicationCampaignTests(unittest.TestCase):
             row.update(
                 schema="2", allocator="allocatbelt", executor="allocatbelt", workload="cpu", mode="capacity",
                 attempted="1", admitted="1", completed_on_time="1", result_digest="77", expected_digest="77",
-                capacity_publications_per_second="0.03333333333333333",
-                successful_throughput_through_drain_per_second="1",
+                capacity_publications_per_second="0.03305785123966942149",
+                successful_throughput_through_drain_per_second="0.03305785123966942149",
+                wall_through_drain_ns="30250000000", drain_tail_ns="0",
                 rss_after_drain_kib="100", rss_after_shutdown_kib="100",
             )
             stdout_path = pair_dir / "bounded-a-bounded.stdout.tsv"
@@ -906,7 +920,7 @@ class ApplicationCampaignTests(unittest.TestCase):
             )
             binary_sha = source["artifacts"]["allocatbelt"]["sha256"]
             phases = {
-                "production_trace": 30_000_000_000,
+                "production_trace": 30_250_000_000,
                 "production_cpu_started_ns": 100,
                 "production_cpu_ended_ns": 300,
                 "production_through_drain_cpu_ns": 200,
@@ -984,7 +998,7 @@ class ApplicationCampaignTests(unittest.TestCase):
                 metrics = campaign.extract_process_metrics(pair_dir, process_row, job, source, spec, Path(temporary))
             self.assertEqual(metrics["completed"], 1)
             self.assertEqual(metrics["cpu_ns_per_completion"], 200)
-            self.assertAlmostEqual(metrics["capacity_per_second"], 1 / 30)
+            self.assertAlmostEqual(metrics["capacity_per_second"], 1 / 30.25)
             self.assertNotEqual(campaign.sha256_file(stdout_path), process_row["stdout_sha256"])
             self.assertEqual(metrics["runtime_readback"]["numeric_snapshot"]["after_release"]["global_live_tenants"], 0)
 

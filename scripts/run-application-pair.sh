@@ -1721,7 +1721,12 @@ if mode == "capacity":
         raise SystemExit(1)
     if int(row["response_p50_ns"]) or int(row["response_p95_ns"]) or int(row["response_p99_ns"]):
         raise SystemExit(1)
-    expected_capacity = Decimal(completed_on_time) / Decimal(30)
+    wall_ns = int(row["wall_through_drain_ns"])
+    drain_tail_ns = int(row["drain_tail_ns"])
+    production_ns = wall_ns - drain_tail_ns
+    if wall_ns <= 0 or drain_tail_ns >= wall_ns or production_ns <= 0:
+        raise SystemExit(1)
+    expected_capacity = Decimal(completed_on_time) * Decimal(1_000_000_000) / Decimal(production_ns)
     actual_capacity = decimals["capacity_publications_per_second"]
     if abs(actual_capacity - expected_capacity) > max(Decimal("0.00000001"), expected_capacity * Decimal("0.00000001")):
         raise SystemExit(1)
@@ -1813,6 +1818,10 @@ except (OSError, IndexError):
     raise SystemExit(1)
 expected_successes = int(output_row[output_header.index("completed_on_time")]) + int(output_row[output_header.index("completed_late")])
 if successes != expected_successes:
+    raise SystemExit(1)
+wall_ns = int(output_row[output_header.index("wall_through_drain_ns")])
+drain_tail_ns = int(output_row[output_header.index("drain_tail_ns")])
+if wall_ns <= 0 or drain_tail_ns >= wall_ns or trace_ns != wall_ns - drain_tail_ns:
     raise SystemExit(1)
 if mode == "capacity" and (successes <= 0 or int(output_row[output_header.index("completed_on_time")]) <= 0):
     raise SystemExit(1)

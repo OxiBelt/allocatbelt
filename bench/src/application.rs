@@ -51,6 +51,9 @@ pub(super) use runtime_bindings::{
 const WORKERS: usize = 4;
 const WINDOW: usize = 8;
 const CAPACITY_HORIZON: Duration = Duration::from_secs(30);
+#[cfg(feature = "resource-feedback")]
+const CAPACITY_COLLECTION_MAX_EXTRA: Duration = Duration::from_secs(1);
+const CAPACITY_COLLECTION_POLL: Duration = Duration::from_millis(20);
 const OPEN_LOOP_ARRIVALS: usize = 5000;
 const MAX_OPEN_LOOP_ARRIVALS: usize = 1_000_000;
 const MAX_TRACE: Duration = Duration::from_secs(300);
@@ -62,6 +65,60 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(1200);
 pub(super) const SETUP_DEADLINE: Duration = Duration::from_secs(120);
 const MAX_RETAINED_MEMORY_OUTPUTS: usize = WINDOW;
 static EXECUTION_DEADLINES: OnceLock<ExecutionDeadlines> = OnceLock::new();
+
+#[derive(Clone, Default)]
+enum CapacityCollection {
+  #[default]
+  Fixed,
+  #[cfg(feature = "resource-feedback")]
+  Traced(feedback_trace::CapacityCollectionHandle),
+}
+
+impl CapacityCollection {
+  fn is_traced(&self) -> bool {
+    #[cfg(feature = "resource-feedback")]
+    if matches!(self, Self::Traced(_)) {
+      return true;
+    }
+    false
+  }
+
+  fn production_horizon_end(
+    &self,
+    started_at: Instant,
+    nominal: Duration,
+  ) -> Result<Instant, String> {
+    let duration = match self {
+      Self::Fixed => nominal,
+      #[cfg(feature = "resource-feedback")]
+      Self::Traced(handle) => {
+        handle.begin(started_at, nominal)?;
+        nominal
+          .checked_add(CAPACITY_COLLECTION_MAX_EXTRA)
+          .ok_or_else(|| "capacity collection hard deadline overflow".to_owned())?
+      }
+    };
+    started_at
+      .checked_add(duration)
+      .ok_or_else(|| "capacity production horizon overflow".to_owned())
+  }
+
+  fn try_stop(&self) -> Result<Option<Instant>, String> {
+    match self {
+      Self::Fixed => Ok(None),
+      #[cfg(feature = "resource-feedback")]
+      Self::Traced(handle) => handle.try_stop(),
+    }
+  }
+
+  fn on_time(&self, observed_at: Instant, fixed_horizon_end: Instant) -> bool {
+    match self {
+      Self::Fixed => observed_at <= fixed_horizon_end,
+      #[cfg(feature = "resource-feedback")]
+      Self::Traced(handle) => handle.on_time(observed_at),
+    }
+  }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ExecutionDeadlines {
@@ -110,21 +167,54 @@ pub(super) fn capacity_pulse_end(
     .map_or(horizon_end, |pulse_end| pulse_end.min(horizon_end))
 }
 
-pub(super) fn wait_until_capacity_pulse(plan: ArrivalPlan, started: Instant, horizon_end: Instant) {
+fn wait_until_capacity_pulse(
+  plan: ArrivalPlan,
+  started: Instant,
+  horizon_end: Instant,
+  collection: &CapacityCollection,
+) -> Result<Option<Instant>, String> {
+  if !collection.is_traced() {
+    if plan.profile != Profile::Burst {
+      return Ok(None);
+    }
+    let now = Instant::now();
+    let elapsed_ns = now.saturating_duration_since(started).as_nanos();
+    let phase_ns = elapsed_ns % 1_000_000_000;
+    if capacity_pulse_active(elapsed_ns) {
+      return Ok(None);
+    }
+    let wait_ns = 1_000_000_000 - phase_ns;
+    let pulse_start = now
+      .checked_add(Duration::from_nanos(wait_ns as u64))
+      .unwrap_or(horizon_end);
+    thread::sleep(pulse_start.min(horizon_end).saturating_duration_since(now));
+    return Ok(None);
+  }
+  if let Some(stopped_at) = collection.try_stop()? {
+    return Ok(Some(stopped_at));
+  }
   if plan.profile != Profile::Burst {
-    return;
+    return Ok(None);
   }
   let now = Instant::now();
   let elapsed_ns = now.saturating_duration_since(started).as_nanos();
   let phase_ns = elapsed_ns % 1_000_000_000;
   if capacity_pulse_active(elapsed_ns) {
-    return;
+    return Ok(None);
   }
   let wait_ns = 1_000_000_000 - phase_ns;
   let pulse_start = now
     .checked_add(Duration::from_nanos(wait_ns as u64))
     .unwrap_or(horizon_end);
-  thread::sleep(pulse_start.min(horizon_end).saturating_duration_since(now));
+  let wake_at = pulse_start.min(horizon_end);
+  while Instant::now() < wake_at {
+    if let Some(stopped_at) = collection.try_stop()? {
+      return Ok(Some(stopped_at));
+    }
+    let remaining = wake_at.saturating_duration_since(Instant::now());
+    thread::sleep(remaining.min(CAPACITY_COLLECTION_POLL));
+  }
+  collection.try_stop()
 }
 
 fn capacity_pulse_active(elapsed_ns: u128) -> bool {
@@ -1243,6 +1333,18 @@ fn run_with_plan(
       )
     }
   };
+  #[cfg(feature = "resource-feedback")]
+  let capacity_collection = if options.mode == Mode::Capacity {
+    feedback_trace
+      .as_ref()
+      .map(|trace| trace.capacity_collection())
+      .transpose()?
+      .map_or(CapacityCollection::Fixed, CapacityCollection::Traced)
+  } else {
+    CapacityCollection::Fixed
+  };
+  #[cfg(not(feature = "resource-feedback"))]
+  let capacity_collection = CapacityCollection::Fixed;
   // CPU/memory intentionally create no filesystem blocking-service workers.
   let mut scope_keepalive = scope;
   let observer_task_lease = run_bindings.reserve_task()?;
@@ -1271,6 +1373,7 @@ fn run_with_plan(
   let observer_open_loop_oracle = open_loop_oracle.clone();
   let observer_resources = resources.clone();
   let observer_arrivals = open_loop_arrivals;
+  let observer_capacity_collection = capacity_collection.clone();
   let observer_pending_limit = if options.mode == Mode::OpenLoop {
     observer_arrivals
   } else {
@@ -1294,6 +1397,7 @@ fn run_with_plan(
         Duration::from_millis(100),
         observer_open_loop_oracle,
         plan,
+        observer_capacity_collection,
       );
       let _ = observer_tx.send(report);
     })
@@ -1344,6 +1448,7 @@ fn run_with_plan(
         events_tx,
         credits_rx,
         producer_states,
+        capacity_collection,
         capacity_horizon.unwrap_or(CAPACITY_HORIZON),
         plan,
       );
@@ -2363,12 +2468,13 @@ fn produce_with_plan(
   events: ObserverEventSender<ObserverEvent>,
   credits: mpsc::Receiver<()>,
   states: Option<Arc<Mutex<Vec<IdState>>>>,
+  capacity_collection: CapacityCollection,
   capacity_horizon: Duration,
   plan: ArrivalPlan,
 ) -> Result<ProducerReport, String> {
   let start = Instant::now();
   let horizon_end = match options.mode {
-    Mode::Capacity => start + capacity_horizon,
+    Mode::Capacity => capacity_collection.production_horizon_end(start, capacity_horizon)?,
     Mode::OpenLoop => start
       .checked_add(Duration::from_nanos(plan.trace_duration_ns()?))
       .ok_or_else(|| "arrival trace end instant overflow".to_owned())?,
@@ -2381,20 +2487,36 @@ fn produce_with_plan(
   let mut lateness_max_ns = 0u64;
   let mut outstanding = 0usize;
   let mut next_capacity_id = 0u64;
+  let mut collection_stop = None;
 
   // Start the production CPU interval after warmup/setup and immediately
   // before the producer can observe or schedule its first operation.
   let production_cpu_started_ns = process_cpu_time_ns();
   loop {
+    if options.mode == Mode::Capacity
+      && let Some(stopped_at) = capacity_collection.try_stop()?
+    {
+      collection_stop = Some(stopped_at);
+      break;
+    }
     while let Ok(()) = credits.try_recv() {
       outstanding = outstanding.saturating_sub(1);
     }
-    if options.mode == Mode::Capacity {
-      wait_until_capacity_pulse(plan, start, horizon_end);
+    if options.mode == Mode::Capacity
+      && let Some(stopped_at) =
+        wait_until_capacity_pulse(plan, start, horizon_end, &capacity_collection)?
+    {
+      collection_stop = Some(stopped_at);
+      break;
     }
     let (id, scheduled) = match options.mode {
       Mode::Capacity => {
         if Instant::now() >= horizon_end {
+          if let Some(stopped_at) = capacity_collection.try_stop()? {
+            collection_stop = Some(stopped_at);
+          } else if capacity_collection.is_traced() {
+            return Err("capacity trace collection reached its production deadline".into());
+          }
           break;
         }
         if attempted >= MAX_CAPACITY_JOBS {
@@ -2404,18 +2526,54 @@ fn produce_with_plan(
         }
         let pulse_end = capacity_pulse_end(plan, start, horizon_end);
         while outstanding >= WINDOW {
-          if Instant::now() >= horizon_end {
+          if capacity_collection.is_traced()
+            && let Some(stopped_at) = capacity_collection.try_stop()?
+          {
+            collection_stop = Some(stopped_at);
             break;
           }
-          match credits.recv_timeout(pulse_end.saturating_duration_since(Instant::now())) {
+          if Instant::now() >= horizon_end {
+            if let Some(stopped_at) = capacity_collection.try_stop()? {
+              collection_stop = Some(stopped_at);
+            } else if capacity_collection.is_traced() {
+              return Err("capacity trace collection reached its production deadline".into());
+            }
+            break;
+          }
+          let remaining = pulse_end.saturating_duration_since(Instant::now());
+          let wait = if capacity_collection.is_traced() {
+            remaining.min(CAPACITY_COLLECTION_POLL)
+          } else {
+            remaining
+          };
+          match credits.recv_timeout(wait) {
             Ok(()) => outstanding -= 1,
-            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+              if capacity_collection.is_traced() {
+                if let Some(stopped_at) = capacity_collection.try_stop()? {
+                  collection_stop = Some(stopped_at);
+                  break;
+                }
+                if Instant::now() < pulse_end {
+                  continue;
+                }
+              }
+              break;
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
               return Err("capacity observer closed before returning window credit".into());
             }
           }
         }
+        if collection_stop.is_some() {
+          break;
+        }
         if Instant::now() >= horizon_end {
+          if let Some(stopped_at) = capacity_collection.try_stop()? {
+            collection_stop = Some(stopped_at);
+          } else if capacity_collection.is_traced() {
+            return Err("capacity trace collection reached its production deadline".into());
+          }
           break;
         }
         if Instant::now() >= pulse_end {
@@ -2498,7 +2656,19 @@ fn produce_with_plan(
   {
     thread::sleep(remaining);
   }
-  let production_end = Instant::now();
+  let production_end = if options.mode == Mode::Capacity {
+    match collection_stop {
+      Some(stopped_at) => stopped_at,
+      None if capacity_collection.is_traced() => {
+        capacity_collection.try_stop()?.ok_or_else(|| {
+          "capacity trace collection stopped before an eligible sample ACK".to_owned()
+        })?
+      }
+      None => Instant::now(),
+    }
+  } else {
+    Instant::now()
+  };
   let trace_overrun = trace_exceeded_for_plan(options.mode, start, production_end, plan)?;
   events
     .send(ObserverEvent::Done {
@@ -2555,6 +2725,7 @@ fn observe(
     watchdog_timeout,
     open_loop_oracle,
     plan,
+    CapacityCollection::Fixed,
   )
 }
 
@@ -2572,6 +2743,7 @@ fn observe_with_plan(
   watchdog_timeout: Duration,
   open_loop_oracle: Option<Arc<Vec<u64>>>,
   plan: ArrivalPlan,
+  capacity_collection: CapacityCollection,
 ) -> Result<ObserverReport, String> {
   let mut completed_on_time = 0;
   let mut completed_late = 0;
@@ -2687,7 +2859,7 @@ fn observe_with_plan(
           } else {
             completed = true;
             digest = digest.wrapping_add(output_value ^ id);
-            if observed <= horizon_end {
+            if capacity_collection.on_time(observed, horizon_end) {
               completed_on_time += 1;
               if let Some(index) = workload.family_index() {
                 family_published_on_time[index] = family_published_on_time[index].saturating_add(1);
@@ -3447,8 +3619,15 @@ fn print_row(allocator: &str, options: Options, counts: &Counts) {
     counts.producer.production_end,
     counts.observer.last_observed,
   );
+  let production_ns = counts
+    .producer
+    .production_end
+    .saturating_duration_since(counts.producer.started_at)
+    .as_nanos()
+    .max(1);
   let capacity_rate = if options.mode == Mode::Capacity {
-    ((counts.observer.completed_on_time as f64) / CAPACITY_HORIZON.as_secs_f64()).to_string()
+    ((counts.observer.completed_on_time as f64) / production_ns as f64 * 1_000_000_000.0)
+      .to_string()
   } else {
     String::new()
   };

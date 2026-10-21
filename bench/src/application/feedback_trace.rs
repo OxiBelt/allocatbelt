@@ -279,12 +279,54 @@ struct TraceState {
   stop_requested: AtomicBool,
   abort_requested: AtomicBool,
   phases: Mutex<[Option<PhaseMarker>; PHASE_COUNT]>,
+  capacity_collection: Mutex<CapacityCollectionState>,
 }
 
 struct TraceOwner {
   state: TraceState,
   task: Mutex<Option<ApplicationTaskLease>>,
   _control: DomainReservation,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SampleWindow {
+  capture_lower_ns: u128,
+  capture_upper_ns: u128,
+  disk_meter_lower_ns: u128,
+  download_meter_lower_ns: u128,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CapacityCollectionStart {
+  lower_ns: u128,
+  upper_ns: u128,
+  minimum_span_ns: u128,
+  maximum_span_ns: u128,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CapacityCollectionAck {
+  capture_upper_ns: u128,
+  disk_meter_lower_ns: u128,
+  download_meter_lower_ns: u128,
+}
+
+#[derive(Default)]
+struct CapacityCollectionState {
+  start: Option<CapacityCollectionStart>,
+  first_disk_meter_lower_ns: Option<u128>,
+  first_download_meter_lower_ns: Option<u128>,
+  last_ack: Option<CapacityCollectionAck>,
+  stopped_at: Option<Instant>,
+  failed: bool,
+}
+
+/// Shared production/trace handshake. Clones retain the existing trace owner
+/// and clock; they do not allocate a second owner or add sampler state.
+#[derive(Clone)]
+pub(super) struct CapacityCollectionHandle {
+  owner: Arc<TraceOwner>,
+  clock: TraceClock,
 }
 
 struct TraceBuffers {
@@ -309,6 +351,174 @@ impl TraceBuffers {
   }
 }
 
+impl CapacityCollectionHandle {
+  pub(super) fn begin(&self, started_at: Instant, nominal: Duration) -> Result<(), String> {
+    let bounds = self
+      .clock
+      .bounds(started_at)
+      .map_err(|_| TraceFailure::CapacityCollectionStart.description())?;
+    let maximum_span_ns = nominal
+      .as_nanos()
+      .checked_add(1_000_000_000)
+      .ok_or_else(|| TraceFailure::CapacityCollectionStart.description())?;
+    if nominal.is_zero() {
+      return Err(TraceFailure::CapacityCollectionStart.description());
+    }
+    let mut state = self
+      .owner
+      .state
+      .capacity_collection
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner);
+    if state.start.is_some() || state.failed {
+      return Err(TraceFailure::CapacityCollectionStart.description());
+    }
+    state.start = Some(CapacityCollectionStart {
+      lower_ns: bounds.0,
+      upper_ns: bounds.1,
+      minimum_span_ns: nominal.as_nanos(),
+      maximum_span_ns,
+    });
+    Ok(())
+  }
+
+  /// Captures the stop Instant while holding the same mutex used by observer
+  /// classification. The returned Instant is stable across repeated calls.
+  pub(super) fn try_stop(&self) -> Result<Option<Instant>, String> {
+    let mut state = self
+      .owner
+      .state
+      .capacity_collection
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner);
+    if let Some(stopped_at) = state.stopped_at {
+      return Ok(Some(stopped_at));
+    }
+    if state.failed {
+      return Err(TraceFailure::CapacityCollectionFailed.description());
+    }
+    let now = Instant::now();
+    let bounds = match self.clock.bounds(now) {
+      Ok(bounds) => bounds,
+      Err(_) => {
+        state.failed = true;
+        return Err(TraceFailure::CapacityCollectionSpan.description());
+      }
+    };
+    consider_capacity_stop(&mut state, now, bounds).map_err(TraceFailure::description)
+  }
+
+  pub(super) fn on_time(&self, observed_at: Instant) -> bool {
+    let state = self
+      .owner
+      .state
+      .capacity_collection
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner);
+    capacity_collection_on_time(&state, observed_at)
+  }
+
+  fn publish_sample(&self, sample: SampleWindow) {
+    let mut state = self
+      .owner
+      .state
+      .capacity_collection
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner);
+    record_capacity_sample(&mut state, sample);
+  }
+
+  fn fail(&self) {
+    let mut state = self
+      .owner
+      .state
+      .capacity_collection
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner);
+    state.failed = true;
+  }
+}
+
+fn record_capacity_sample(state: &mut CapacityCollectionState, sample: SampleWindow) {
+  let Some(start) = state.start else {
+    return;
+  };
+  if state.failed || state.stopped_at.is_some() {
+    return;
+  }
+  if sample.capture_upper_ns < start.lower_ns {
+    return;
+  }
+  if sample.capture_lower_ns >= start.upper_ns {
+    if sample.disk_meter_lower_ns >= start.upper_ns {
+      state
+        .first_disk_meter_lower_ns
+        .get_or_insert(sample.disk_meter_lower_ns);
+    }
+    if sample.download_meter_lower_ns >= start.upper_ns {
+      state
+        .first_download_meter_lower_ns
+        .get_or_insert(sample.download_meter_lower_ns);
+    }
+  }
+  state.last_ack = Some(CapacityCollectionAck {
+    capture_upper_ns: sample.capture_upper_ns,
+    disk_meter_lower_ns: sample.disk_meter_lower_ns,
+    download_meter_lower_ns: sample.download_meter_lower_ns,
+  });
+}
+
+fn capacity_collection_on_time(state: &CapacityCollectionState, observed_at: Instant) -> bool {
+  match state.stopped_at {
+    Some(stopped_at) => observed_at <= stopped_at,
+    None => !state.failed,
+  }
+}
+
+fn consider_capacity_stop(
+  state: &mut CapacityCollectionState,
+  now: Instant,
+  now_bounds: (u128, u128),
+) -> Result<Option<Instant>, TraceFailure> {
+  if let Some(stopped_at) = state.stopped_at {
+    return Ok(Some(stopped_at));
+  }
+  if state.failed {
+    return Err(TraceFailure::CapacityCollectionFailed);
+  }
+  let Some(start) = state.start else {
+    return Ok(None);
+  };
+  let Some(elapsed_upper_ns) = now_bounds.1.checked_sub(start.lower_ns) else {
+    state.failed = true;
+    return Err(TraceFailure::CapacityCollectionSpan);
+  };
+  if elapsed_upper_ns > start.maximum_span_ns {
+    state.failed = true;
+    return Err(TraceFailure::CapacityCollectionDeadline);
+  }
+  let acknowledged = state.last_ack.is_some_and(|ack| {
+    now_bounds.0 >= ack.capture_upper_ns
+      && state
+        .first_disk_meter_lower_ns
+        .and_then(|first| ack.disk_meter_lower_ns.checked_sub(first))
+        .is_some_and(|span| span >= start.minimum_span_ns)
+      && state
+        .first_download_meter_lower_ns
+        .and_then(|first| ack.download_meter_lower_ns.checked_sub(first))
+        .is_some_and(|span| span >= start.minimum_span_ns)
+  });
+  if acknowledged {
+    state.stopped_at = Some(now);
+    return Ok(Some(now));
+  }
+  if elapsed_upper_ns >= start.maximum_span_ns {
+    state.failed = true;
+    return Err(TraceFailure::CapacityCollectionDeadline);
+  }
+  Ok(None)
+}
+
 pub(super) fn control_charge_bytes() -> usize {
   std::mem::size_of::<TraceOwner>()
     .saturating_add(std::mem::size_of::<FeedbackTraceCollector>())
@@ -318,6 +528,8 @@ pub(super) fn control_charge_bytes() -> usize {
     .saturating_add(std::mem::size_of::<TraceWorkerOutput>())
     .saturating_add(std::mem::size_of::<TraceWorkerResult>())
     .saturating_add(std::mem::size_of::<TraceBuffers>())
+    .saturating_add(2 * std::mem::size_of::<super::CapacityCollection>())
+    .saturating_add(std::mem::size_of::<CapacityCollectionHandle>())
     .saturating_add(4 * MAX_TRACE_PATH_BYTES)
     .saturating_add(3 * MAX_TRACE_FILE_SUFFIX_BYTES)
     .saturating_add(2 * std::mem::size_of::<usize>())
@@ -372,6 +584,10 @@ enum TraceFailure {
   WorkerTimeout,
   WorkerChannel,
   HorizonExceeded,
+  CapacityCollectionStart,
+  CapacityCollectionFailed,
+  CapacityCollectionDeadline,
+  CapacityCollectionSpan,
   Phase,
 }
 
@@ -405,6 +621,16 @@ impl TraceFailure {
       Self::WorkerTimeout => "feedback trace worker exceeded its finite stop deadline".into(),
       Self::WorkerChannel => "feedback trace worker did not publish a completion result".into(),
       Self::HorizonExceeded => "feedback trace exceeded its finite 11,400-second horizon".into(),
+      Self::CapacityCollectionStart => {
+        "feedback capacity collection was started more than once or its clock could not be mapped".into()
+      }
+      Self::CapacityCollectionFailed => "feedback capacity collection worker failed".into(),
+      Self::CapacityCollectionDeadline => {
+        "feedback capacity collection did not reach its acknowledged sample span within the 31-second production bound".into()
+      }
+      Self::CapacityCollectionSpan => {
+        "feedback capacity collection sample span overflowed its monotonic clock bounds".into()
+      }
       Self::Phase => "feedback trace phase marker was missing or duplicated".into(),
     }
   }
@@ -500,6 +726,7 @@ impl FeedbackTraceCollector {
         stop_requested: AtomicBool::new(false),
         abort_requested: AtomicBool::new(false),
         phases: Mutex::new([None; PHASE_COUNT]),
+        capacity_collection: Mutex::new(CapacityCollectionState::default()),
       },
       task: Mutex::new(Some(admission.task)),
       _control: admission.control,
@@ -513,7 +740,7 @@ impl FeedbackTraceCollector {
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
           run_trace_worker(
             inputs,
-            worker_owner,
+            Arc::clone(&worker_owner),
             TraceWorkerStartup {
               event_file,
               sample_file,
@@ -527,6 +754,13 @@ impl FeedbackTraceCollector {
           )
         }))
         .unwrap_or(Err(TraceFailure::WorkerPanicked));
+        if outcome.is_err() {
+          CapacityCollectionHandle {
+            owner: worker_owner,
+            clock,
+          }
+          .fail();
+        }
         let _ = sender.send(outcome);
       })
       .map_err(|error| format!("feedback trace worker start failed: {error}"))?;
@@ -549,6 +783,17 @@ impl FeedbackTraceCollector {
       .as_ref()
       .ok_or_else(|| "feedback trace owner has already been released".to_owned())?;
     mark_phase_owner(owner, phase, Some(at), rss, true).map_err(TraceFailure::description)
+  }
+
+  pub(super) fn capacity_collection(&self) -> Result<CapacityCollectionHandle, String> {
+    let owner = self
+      .owner
+      .as_ref()
+      .ok_or_else(|| "feedback trace owner has already been released".to_owned())?;
+    Ok(CapacityCollectionHandle {
+      owner: Arc::clone(owner),
+      clock: self.clock,
+    })
   }
 
   /// Maps the same captured event Instant used by `mark_phase` through the
@@ -807,6 +1052,10 @@ fn run_trace_worker(
   let mut sample_count = 0u64;
   let mut first_sample_sequence = None;
   let mut last_sample_sequence = None;
+  let collection = CapacityCollectionHandle {
+    owner: Arc::clone(&owner),
+    clock,
+  };
   let mut next_sample = started_at;
   let horizon_end = started_at
     .checked_add(TRACE_HORIZON)
@@ -870,11 +1119,13 @@ fn run_trace_worker(
       let sequence = sample_count
         .checked_add(1)
         .ok_or(TraceFailure::SampleSequenceOverflow)?;
-      let length = encode_resource_sample(&inputs, &clock, &mut buffers, sequence)?;
+      let (length, sample_window) =
+        encode_resource_sample(&inputs, &clock, &mut buffers, sequence)?;
       sample_file
         .write_all(&buffers.sample_record[..length])
         .map_err(|error| TraceFailure::SampleWrite(error.kind()))?;
       sample_hash.update(&buffers.sample_record[..length]);
+      collection.publish_sample(sample_window);
       sample_count = sequence;
       first_sample_sequence.get_or_insert(sequence);
       last_sample_sequence = Some(sequence);
@@ -936,7 +1187,7 @@ fn encode_resource_sample(
   clock: &TraceClock,
   buffers: &mut TraceBuffers,
   sequence: u64,
-) -> Result<usize, TraceFailure> {
+) -> Result<(usize, SampleWindow), TraceFailure> {
   let started_at = Instant::now();
   let global = inputs.domain.snapshot();
   let tenant = inputs
@@ -968,16 +1219,26 @@ fn encode_resource_sample(
   write_rate_snapshot(&mut output, disk_rate).map_err(|_| TraceFailure::SampleEncoding)?;
   write_rate_snapshot(&mut output, upload_rate).map_err(|_| TraceFailure::SampleEncoding)?;
   write_rate_snapshot(&mut output, download_rate).map_err(|_| TraceFailure::SampleEncoding)?;
-  write_meter_snapshot(&mut output, clock, disk_meter).map_err(|_| TraceFailure::SampleEncoding)?;
+  let disk_meter_bounds = write_meter_snapshot(&mut output, clock, disk_meter)
+    .map_err(|_| TraceFailure::SampleEncoding)?;
   write_meter_snapshot(&mut output, clock, upload_meter)
     .map_err(|_| TraceFailure::SampleEncoding)?;
-  write_meter_snapshot(&mut output, clock, download_meter)
+  let download_meter_bounds = write_meter_snapshot(&mut output, clock, download_meter)
     .map_err(|_| TraceFailure::SampleEncoding)?;
   write_feedback_snapshot(&mut output, feedback).map_err(|_| TraceFailure::SampleEncoding)?;
   output
     .write_all(b"\n")
     .map_err(|_| TraceFailure::SampleEncoding)?;
-  usize::try_from(output.position()).map_err(|_| TraceFailure::SampleEncoding)
+  let length = usize::try_from(output.position()).map_err(|_| TraceFailure::SampleEncoding)?;
+  Ok((
+    length,
+    SampleWindow {
+      capture_lower_ns: window_lower,
+      capture_upper_ns: window_upper,
+      disk_meter_lower_ns: disk_meter_bounds.0,
+      download_meter_lower_ns: download_meter_bounds.0,
+    },
+  ))
 }
 
 fn write_domain_snapshot(out: &mut impl Write, snapshot: DomainSnapshot) -> io::Result<()> {
@@ -1034,7 +1295,7 @@ fn write_meter_snapshot(
   out: &mut impl Write,
   clock: &TraceClock,
   snapshot: IoFeedbackMeterSnapshot,
-) -> io::Result<()> {
+) -> io::Result<(u128, u128)> {
   let (lower, upper) = clock
     .bounds(snapshot.measured_at)
     .map_err(io::Error::other)?;
@@ -1049,7 +1310,8 @@ fn write_meter_snapshot(
     snapshot.diagnostics.invalid_io,
     snapshot.diagnostics.source_count_overflow,
     snapshot.diagnostics.generation_overflow
-  )
+  )?;
+  Ok((lower, upper))
 }
 
 fn write_feedback_snapshot(
@@ -1614,6 +1876,226 @@ mod tests {
     hash.finish_hex()
   }
 
+  fn collection_state(nominal: Duration) -> CapacityCollectionState {
+    CapacityCollectionState {
+      start: Some(CapacityCollectionStart {
+        lower_ns: 100,
+        upper_ns: 110,
+        minimum_span_ns: nominal.as_nanos(),
+        maximum_span_ns: nominal.as_nanos() + 1_000_000_000,
+      }),
+      ..CapacityCollectionState::default()
+    }
+  }
+
+  const SYNTHETIC_CLOCK_WIDTH_NS: u128 = 10;
+
+  fn sample_window(
+    capture_lower_ns: u128,
+    capture_upper_ns: u128,
+    disk_meter_lower_ns: u128,
+    download_meter_lower_ns: u128,
+  ) -> SampleWindow {
+    assert!(disk_meter_lower_ns >= capture_lower_ns);
+    assert!(download_meter_lower_ns >= capture_lower_ns);
+    assert!(disk_meter_lower_ns + SYNTHETIC_CLOCK_WIDTH_NS <= capture_upper_ns);
+    assert!(download_meter_lower_ns + SYNTHETIC_CLOCK_WIDTH_NS <= capture_upper_ns);
+    SampleWindow {
+      capture_lower_ns,
+      capture_upper_ns,
+      disk_meter_lower_ns,
+      download_meter_lower_ns,
+    }
+  }
+
+  #[test]
+  fn capacity_collection_ignores_samples_overlapping_production_start() {
+    let mut state = collection_state(Duration::from_nanos(10));
+    record_capacity_sample(&mut state, sample_window(105, 140, 110, 112));
+    assert_eq!(state.first_disk_meter_lower_ns, None);
+    assert_eq!(state.first_download_meter_lower_ns, None);
+
+    record_capacity_sample(&mut state, sample_window(130, 160, 135, 140));
+    assert_eq!(state.first_disk_meter_lower_ns, Some(135));
+    assert_eq!(state.first_download_meter_lower_ns, Some(140));
+  }
+
+  #[test]
+  fn capacity_collection_requires_both_meter_spans_and_written_capture_ack() {
+    let mut state = collection_state(Duration::from_nanos(1_000));
+    record_capacity_sample(&mut state, sample_window(110, 150, 120, 130));
+    record_capacity_sample(&mut state, sample_window(1_100, 1_150, 1_120, 1_129));
+    let now = Instant::now();
+    assert_eq!(
+      consider_capacity_stop(&mut state, now, (1_150, 1_160)).unwrap(),
+      None,
+      "the download meter span remains one nanosecond short after the row is fully captured"
+    );
+
+    record_capacity_sample(&mut state, sample_window(1_140, 1_170, 1_140, 1_141));
+    assert_eq!(
+      consider_capacity_stop(&mut state, now, (1_169, 1_179)).unwrap(),
+      None,
+      "both meter spans are long enough but the ACKed row capture is not yet contained"
+    );
+    assert_eq!(
+      consider_capacity_stop(&mut state, now, (1_170, 1_180)).unwrap(),
+      Some(now)
+    );
+  }
+
+  #[test]
+  fn capacity_collection_accepts_the_inclusive_upper_clock_bound() {
+    let mut state = collection_state(Duration::from_nanos(1));
+    record_capacity_sample(&mut state, sample_window(110, 150, 120, 130));
+    record_capacity_sample(&mut state, sample_window(1_100, 1_200, 1_121, 1_131));
+    let now = Instant::now();
+    let maximum = state.start.expect("test start").maximum_span_ns;
+    assert_eq!(
+      consider_capacity_stop(&mut state, now, (90 + maximum, 100 + maximum)).unwrap(),
+      Some(now),
+      "the conservative upper bound may equal the 31-second ceiling"
+    );
+  }
+
+  #[test]
+  fn capacity_collection_fails_closed_on_worker_failure_or_deadline() {
+    let now = Instant::now();
+    let mut failed = collection_state(Duration::from_nanos(1));
+    failed.failed = true;
+    assert!(matches!(
+      consider_capacity_stop(&mut failed, now, (120, 130)),
+      Err(TraceFailure::CapacityCollectionFailed)
+    ));
+
+    let mut expired = collection_state(Duration::from_secs(30));
+    let maximum = expired.start.expect("test start").maximum_span_ns;
+    assert!(matches!(
+      consider_capacity_stop(&mut expired, now, (90 + maximum, 100 + maximum)),
+      Err(TraceFailure::CapacityCollectionDeadline)
+    ));
+    assert!(expired.failed);
+  }
+
+  #[test]
+  fn capacity_collection_stop_is_idempotent_and_classifies_by_observed_instant() {
+    let start_at = Instant::now();
+    let stopped_at = start_at + Duration::from_secs(30);
+    let observed_before = stopped_at - Duration::from_nanos(1);
+    let observed_after = stopped_at + Duration::from_nanos(1);
+    let mut state = collection_state(Duration::from_nanos(1));
+    record_capacity_sample(&mut state, sample_window(110, 150, 120, 130));
+    record_capacity_sample(&mut state, sample_window(1_100, 1_200, 1_121, 1_131));
+    assert_eq!(
+      consider_capacity_stop(&mut state, stopped_at, (1_200, 1_210)).unwrap(),
+      Some(stopped_at)
+    );
+    assert_eq!(
+      consider_capacity_stop(&mut state, observed_after, (1_300, 1_310)).unwrap(),
+      Some(stopped_at)
+    );
+    assert!(capacity_collection_on_time(&state, observed_before));
+    assert!(!capacity_collection_on_time(&state, observed_after));
+  }
+
+  #[test]
+  fn capacity_collection_acknowledges_an_ordinary_row_before_worker_joined() {
+    let mut runtime = TestRuntime::new(TRACE_HISTORY_CAPACITY);
+    let fixture = TraceFixture::new();
+    let collector = trace_collector(&fixture, &runtime);
+    let handle = collector.capacity_collection().unwrap();
+    let started_at = Instant::now();
+    handle.begin(started_at, Duration::from_millis(20)).unwrap();
+    let deadline = started_at + Duration::from_secs(2);
+    let mut work_iterations = 0usize;
+    let stopped_at = loop {
+      work_iterations = work_iterations.wrapping_add(1);
+      match handle.try_stop() {
+        Ok(Some(stopped_at)) => break stopped_at,
+        Ok(None) => {}
+        Err(error) => panic!("ordinary trace writer failed before its sample ACK: {error}"),
+      }
+      assert!(
+        Instant::now() < deadline,
+        "ordinary sample ACK missed its bound"
+      );
+      thread::yield_now();
+    };
+
+    assert!(work_iterations > 0);
+    assert!(stopped_at.saturating_duration_since(started_at) >= Duration::from_millis(20));
+    assert!(
+      fs::metadata(fixture.0.join("resource-samples.tsv"))
+        .expect("live sample file")
+        .len()
+        > SAMPLE_HEADER.len() as u64,
+      "the ACK follows an ordinary row write"
+    );
+    assert!(
+      !collector
+        .owner
+        .as_ref()
+        .expect("collector owner")
+        .state
+        .stop_requested
+        .load(Ordering::Acquire),
+      "production ACK does not wait for trace finalization"
+    );
+    assert!(!runtime.service.metrics().shutdown_complete);
+
+    drop(handle);
+    drop(collector);
+    runtime.stop();
+  }
+
+  #[test]
+  fn capacity_collection_observes_trace_worker_failure_before_worker_joined() {
+    let mut runtime = TestRuntime::new(TRACE_HISTORY_CAPACITY);
+    let fixture = TraceFixture::new();
+    let collector = trace_collector(&fixture, &runtime);
+    let handle = collector.capacity_collection().unwrap();
+    handle
+      .begin(Instant::now(), Duration::from_secs(1))
+      .unwrap();
+    collector
+      .owner
+      .as_ref()
+      .expect("collector owner")
+      .state
+      .abort_requested
+      .store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let failure = loop {
+      match handle.try_stop() {
+        Err(error) => break error,
+        Ok(Some(_)) => panic!("aborted trace worker cannot acknowledge production"),
+        Ok(None) => {}
+      }
+      assert!(
+        Instant::now() < deadline,
+        "trace worker failure was not published"
+      );
+      thread::yield_now();
+    };
+
+    assert!(failure.contains("capacity collection worker failed"));
+    assert!(!runtime.service.metrics().shutdown_complete);
+    assert!(
+      !collector
+        .owner
+        .as_ref()
+        .expect("collector owner")
+        .state
+        .stop_requested
+        .load(Ordering::Acquire),
+      "the collector worker failure is independent of WorkerJoined finalization"
+    );
+
+    drop(handle);
+    drop(collector);
+    runtime.stop();
+  }
+
   #[test]
   fn bounded_trace_constants_fit_the_declared_control_charge() {
     assert!(control_charge_bytes() >= std::mem::size_of::<TraceBuffers>());
@@ -1643,6 +2125,7 @@ mod tests {
       .get(DomainResource::Tasks);
     let fixture = TraceFixture::new();
     let collector = trace_collector(&fixture, &runtime);
+    let collection_handle = collector.capacity_collection().unwrap();
     assert!(runtime.domain.snapshot().used.get(DomainResource::Control) > before_trace);
     assert_eq!(
       runtime
@@ -1727,6 +2210,12 @@ mod tests {
       finalizer.finish_at(owner_release).unwrap(),
       owner_release_bounds
     );
+    assert_eq!(
+      runtime.domain.snapshot().used.get(DomainResource::Control),
+      control_with_finalizer,
+      "a live capacity collection handle keeps the charged trace owner alive"
+    );
+    drop(collection_handle);
     assert_eq!(
       runtime.domain.snapshot().used.get(DomainResource::Control),
       control_with_finalizer - control_charge_bytes()
