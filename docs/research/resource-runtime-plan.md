@@ -255,7 +255,7 @@ configured ceiling per second. Floors, ceilings and hysteresis are explicit;
 missing, sparse or stale required telemetry freezes that control.
 
 Qualification must rebuild and record the new amd64-v3 package/library baseline
-on bare metal and both KVM guests. Analyze venues independently. All realistic
+on each of the two KVM guests. Analyze the guests independently. All realistic
 profiles (steady, mixed, burst and oversubscribed) bear the original numeric
 gates; deliberate overload is safety-only. Fixed-policy allocator/executor
 comparisons precede pressure comparisons with the same external feedback policy

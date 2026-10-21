@@ -1058,7 +1058,9 @@ bounded polling. Registered child-pipe `AsyncRead` and `AsyncWrite` trait
 polls also use the shared budget: ready fast paths and each readiness-plus-
 syscall attempt are gated, `Interrupted` spends a unit, and stale
 `WouldBlock` refunds it. Each such poll keeps a local 64-attempt retry cap.
-Raw readiness waits remain outside this automatic accounting. The concrete
+Public `Readiness`, `OwnedReadiness`, `ChildWait` and `SignalRecv` futures
+share this automatic budget during runtime-owned polls. Readiness-plus-syscall
+adapters suppress nested charges. The concrete
 `runtime::buffered_io` `BufferedReader` and `BufferedWriter` poll methods are
 covered below, including cached and empty/completed paths. This does not make
 arbitrary `AsyncBufRead` or `AsyncWrite` implementations, synchronous consume
@@ -1669,9 +1671,11 @@ processes, signals, concurrency helpers and explicit cgroup feedback are
 implemented with the contracts above. The stable Linux Tokio 1.53.1 capability
 baseline still requires these implementation and qualification steps:
 
-1. Extend automatic cooperative progress beyond the currently listed
-   operations. Verify application ports across the explicit-address nonblocking
-   connect, listen and Linux socket-option capabilities.
+1. Qualify the implemented cooperative progress paths, including public
+   readiness, child waits and signal receives, and preserve the documented
+   manual-poll and arbitrary-future limits. Verify application ports across the
+   explicit-address nonblocking connect, listen and Linux socket-option
+   capabilities.
 2. Qualify application migrations through the implemented bounded I/O ports:
    owned blocking and standard streams, anonymous pipes and named FIFOs,
    managed simplex/duplex pipes, caller-buffered bidirectional copy,
