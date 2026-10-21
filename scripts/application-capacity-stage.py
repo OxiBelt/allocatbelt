@@ -459,9 +459,16 @@ def _load_module(raw: bytes, path: Path, label: str) -> types.ModuleType:
     module = types.ModuleType(f"capacity_stage_{path.stem.replace('-', '_')}_{sha256_bytes(raw)}")
     module.__file__ = str(path)
     module.__package__ = ""
+    previous_module = sys.modules.get(module.__name__)
+    had_previous_module = module.__name__ in sys.modules
+    sys.modules[module.__name__] = module
     try:
         exec(compile(raw, str(path), "exec", dont_inherit=True), module.__dict__)
     except Exception as error:
+        if had_previous_module:
+            sys.modules[module.__name__] = previous_module
+        else:
+            sys.modules.pop(module.__name__, None)
         raise CapacityStageError(f"captured {label} cannot be compiled: {error}") from error
     return module
 

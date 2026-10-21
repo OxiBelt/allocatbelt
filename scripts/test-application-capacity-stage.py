@@ -131,6 +131,78 @@ class SourceInventorySymlinkTests(unittest.TestCase):
                     )
 
 
+class CapturedModuleLoaderCompatibilityTests(unittest.TestCase):
+    @staticmethod
+    def _module_name(raw: bytes, path: Path) -> str:
+        return f"capacity_stage_{path.stem.replace('-', '_')}_{stage.sha256_bytes(raw)}"
+
+    def test_annotated_dataclass_loads_with_registered_module(self) -> None:
+        path = Path("captured-dataclass-fixture.py")
+        raw = (
+            b"from __future__ import annotations\n"
+            b"from dataclasses import dataclass\n"
+            b"@dataclass(frozen=True)\n"
+            b"class Record:\n"
+            b"    value: int\n"
+            b"    parent: Record | None = None\n"
+        )
+        name = self._module_name(raw, path)
+        had_previous_registry_entry = name in sys.modules
+        previous_registry_entry = sys.modules.get(name)
+        sys.modules.pop(name, None)
+        try:
+            module = stage._load_module(raw, path, "dataclass fixture")
+            self.assertEqual(module.__file__, str(path))
+            self.assertEqual(module.Record.__module__, name)
+            self.assertIs(sys.modules[name], module)
+            self.assertIsNone(module.Record(7).parent)
+        finally:
+            sys.modules.pop(name, None)
+            if had_previous_registry_entry:
+                sys.modules[name] = previous_registry_entry
+
+    def test_failed_exec_restores_previous_registry_entry(self) -> None:
+        path = Path("captured-failed-fixture.py")
+        raw = b"raise RuntimeError('fixture execution failed')\n"
+        name = self._module_name(raw, path)
+        previous_registry_entry = sys.modules.get(name)
+        had_previous_registry_entry = name in sys.modules
+        previous = types.ModuleType(name)
+        previous.marker = "preserved"
+        sys.modules[name] = previous
+        try:
+            with self.assertRaisesRegex(
+                stage.CapacityStageError,
+                "captured failing fixture cannot be compiled: fixture execution failed",
+            ):
+                stage._load_module(raw, path, "failing fixture")
+            self.assertIs(sys.modules[name], previous)
+            self.assertEqual(sys.modules[name].marker, "preserved")
+        finally:
+            if had_previous_registry_entry:
+                sys.modules[name] = previous_registry_entry
+            else:
+                sys.modules.pop(name, None)
+
+    def test_failed_exec_removes_new_registry_entry(self) -> None:
+        path = Path("captured-unregistered-failure.py")
+        raw = b"raise RuntimeError('fixture execution failed')\n"
+        name = self._module_name(raw, path)
+        had_previous_registry_entry = name in sys.modules
+        previous_registry_entry = sys.modules.pop(name, None)
+        try:
+            with self.assertRaisesRegex(
+                stage.CapacityStageError,
+                "captured failing fixture cannot be compiled: fixture execution failed",
+            ):
+                stage._load_module(raw, path, "failing fixture")
+            self.assertNotIn(name, sys.modules)
+        finally:
+            sys.modules.pop(name, None)
+            if had_previous_registry_entry:
+                sys.modules[name] = previous_registry_entry
+
+
 FAKE_CHILD_C = r"""
 #define _GNU_SOURCE
 #include <errno.h>
