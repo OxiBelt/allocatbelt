@@ -63,6 +63,15 @@ fn assert_ready_loop_yields(
   progress: Arc<AtomicUsize>,
   max_batch: Arc<AtomicUsize>,
 ) {
+  assert_ready_loop_yields_with_activity(future, progress, max_batch, None);
+}
+
+fn assert_ready_loop_yields_with_activity(
+  future: impl Future<Output = ()> + Send + 'static,
+  progress: Arc<AtomicUsize>,
+  max_batch: Arc<AtomicUsize>,
+  startup_activity: Option<Arc<AtomicUsize>>,
+) {
   let runtime = AsyncRuntime::new(AsyncConfig {
     workers: 1,
     max_outstanding: 4,
@@ -73,9 +82,25 @@ fn assert_ready_loop_yields(
     .handle()
     .spawn(future)
     .unwrap_or_else(|error| panic!("hot task spawn failed: {error}"));
-  let deadline = Instant::now() + WATCHDOG;
+  let mut deadline = Instant::now() + WATCHDOG;
+  let mut observed_activity = startup_activity
+    .as_ref()
+    .map(|activity| activity.load(Ordering::SeqCst))
+    .unwrap_or(0);
   while progress.load(Ordering::SeqCst) == 0 {
-    assert!(Instant::now() < deadline, "ready loop did not start");
+    if let Some(activity) = startup_activity.as_ref() {
+      let current_activity = activity.load(Ordering::SeqCst);
+      if current_activity != observed_activity {
+        observed_activity = current_activity;
+        deadline = Instant::now() + WATCHDOG;
+      }
+      assert!(
+        Instant::now() < deadline,
+        "ready loop made no forward progress"
+      );
+    } else {
+      assert!(Instant::now() < deadline, "ready loop did not start");
+    }
     thread::yield_now();
   }
 
@@ -910,9 +935,11 @@ fn child_pipe_data_and_eof_ready_loop_yields_to_a_sibling_task() {
   let mut child = child("head -c 16777216 /dev/zero", false);
   let mut reader = AsyncChildStdout::from_std(child.0.stdout.take().unwrap(), &handle).unwrap();
   let progress = Arc::new(AtomicUsize::new(0));
+  let startup_bytes = Arc::new(AtomicUsize::new(0));
   let ready_reads = Arc::new(AtomicUsize::new(0));
   let max_batch = Arc::new(AtomicUsize::new(0));
   let loop_progress = Arc::clone(&progress);
+  let loop_startup_bytes = Arc::clone(&startup_bytes);
   let loop_ready_reads = Arc::clone(&ready_reads);
   let loop_max_batch = Arc::clone(&max_batch);
   let future = async move {
@@ -937,9 +964,20 @@ fn child_pipe_data_and_eof_ready_loop_yields_to_a_sibling_task() {
         loop_progress.fetch_add(1, Ordering::SeqCst);
         continue;
       }
+      loop_startup_bytes.fetch_add(count, Ordering::SeqCst);
     }
   };
-  assert_ready_loop_yields(future, progress, max_batch);
+  assert_ready_loop_yields_with_activity(
+    future,
+    progress,
+    max_batch,
+    Some(Arc::clone(&startup_bytes)),
+  );
+  assert_eq!(
+    startup_bytes.load(Ordering::SeqCst),
+    16 * 1024 * 1024,
+    "child pipe should deliver the complete finite payload before EOF"
+  );
   let _ = child.0.kill();
   let _ = child.0.wait();
   reactor.shutdown().unwrap();
