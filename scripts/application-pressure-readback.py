@@ -253,7 +253,7 @@ def _preflight_capacity_request_paths_v2(request: dict[str, Any]) -> None:
         probe_path = absolute_path(probe["path"], "capacity expectation construction-probe path")
         _require_evidence_path_mapped(probe_path)
         probe_pin = {"path": str(probe_path), "raw_sha256": sha256(probe["raw_sha256"], "capacity construction-probe raw SHA-256")}
-        construction_probe, _probe_raw, _probe_sha = _read_raw_pin(
+        _, construction_probe, _probe_raw, _probe_sha = _read_raw_pin(
             probe_pin, "preflighted capacity construction probe", 512 * 1024,
         )
         _require_absolute_evidence_paths_mapped(construction_probe)
@@ -296,7 +296,7 @@ def _preflight_context_policy_bundle_paths_v2(context_policy_pin_value: object) 
             "path": str(absolute_path(member_probe["path"], f"preflighted member construction probe[{index}] path")),
             "raw_sha256": sha256(member_probe["raw_sha256"], f"preflighted member construction probe[{index}] SHA-256"),
         }
-        construction_probe, _probe_raw, _probe_sha = _read_raw_pin(
+        _, construction_probe, _probe_raw, _probe_sha = _read_raw_pin(
             probe_pin, f"preflighted composer construction probe[{index}]", 512 * 1024,
         )
         _require_absolute_evidence_paths_mapped(construction_probe)
@@ -2248,7 +2248,7 @@ def _verify_context_policy_bundle_v2(
         request_probe = exact(request.get("construction_probe"), {"path", "raw_sha256", "allocator", "binary_sha256"}, f"context-policy member[{index}] composer probe pin")
         _require_evidence_path_mapped(request_probe["path"])
         require(request_probe == probe_pin, f"context-policy member[{index}] composer request differs from its genuine construction-probe pin")
-        construction_probe, _probe_raw, _probe_sha = _read_raw_pin(
+        _, construction_probe, _probe_raw, _probe_sha = _read_raw_pin(
             {"path": probe_pin["path"], "raw_sha256": probe_pin["raw_sha256"]},
             f"context-policy member[{index}] preflighted construction probe", 512 * 1024,
         )

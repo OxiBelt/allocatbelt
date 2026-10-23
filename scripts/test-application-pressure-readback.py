@@ -750,6 +750,200 @@ def run_genuine_closed_recorded_scope_fixture(
 
 
 class PressureReadbackV2Tests(unittest.TestCase):
+    def test_preflights_traverse_nested_construction_probe_evidence_paths(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-probe-preflight-") as temporary:
+            root = Path(temporary).resolve()
+            allowed_paths: set[str] = set()
+
+            def write_document(name: str, value: object) -> dict[str, str]:
+                path = root / name
+                raw = readback.canonical_bytes(value)
+                path.write_bytes(raw)
+                allowed_paths.add(str(path))
+                return {"path": str(path), "raw_sha256": readback.sha256_bytes(raw)}
+
+            nested_path = root / "nested-evidence.json"
+            nested_path.write_bytes(readback.canonical_bytes({"kind": "nested evidence"}))
+            allowed_paths.add(str(nested_path))
+            probes = []
+            for index in range(2):
+                probe_pin = write_document(
+                    f"probe-{index}.json",
+                    {"evidence": {"nested": {"path": str(nested_path)}}},
+                )
+                probe_pin.update({"allocator": "allocatbelt", "binary_sha256": "a" * 64})
+                probes.append(probe_pin)
+
+            source_pin = write_document("source-manifest.json", {})
+            context_pin = write_document("context.json", {})
+            validation_pin = write_document("validation.json", {})
+            expectation = {"construction_probe": probes[0]}
+            expectation_pin = write_document("expectation.json", expectation)
+            capacity_request = {
+                "source_manifest": {
+                    "path": source_pin["path"], "sha256": source_pin["raw_sha256"],
+                },
+                "context": {
+                    "path": context_pin["path"], "sha256": context_pin["raw_sha256"],
+                },
+                "validation": {
+                    "path": validation_pin["path"], "sha256": validation_pin["raw_sha256"],
+                },
+                "expectation": {
+                    "path": expectation_pin["path"], "sha256": expectation_pin["raw_sha256"],
+                },
+                "expectation_sha256": expectation_pin["raw_sha256"],
+            }
+
+            shared_policy_pin = write_document("shared-policy.json", {})
+            members = []
+            for index, probe_pin in enumerate(probes):
+                request_pin = write_document(
+                    f"composer-request-{index}.json",
+                    {"construction_probe": probe_pin},
+                )
+                resolved_pin = write_document(f"resolved-policy-{index}.json", {})
+                receipt_pin = write_document(f"composition-receipt-{index}.json", {})
+                members.append({
+                    "descriptor": {},
+                    "request": request_pin,
+                    "construction_probe": probe_pin,
+                    "resolved_policy": resolved_pin,
+                    "composition_receipt": receipt_pin,
+                })
+            context_bundle_pin = write_document("context-policy-bundle.json", {
+                "schema": readback.CONTEXT_POLICY_BUNDLE_SCHEMA_V2,
+                "artifact": shared_policy_pin,
+                "members": members,
+            })
+            mapped = {path: path for path in allowed_paths}
+
+            def run_with_mapping(mapping: dict[str, str], callback) -> None:
+                token = readback._EVIDENCE_PATH_MAP_CONTEXT.set((mapping, set()))
+                try:
+                    callback()
+                finally:
+                    readback._EVIDENCE_PATH_MAP_CONTEXT.reset(token)
+
+            def capacity_preflight() -> None:
+                readback._preflight_capacity_request_paths_v2(capacity_request)
+
+            def context_policy_preflight() -> None:
+                readback._preflight_context_policy_bundle_paths_v2(context_bundle_pin)
+
+            with self.subTest(preflight="capacity"):
+                run_with_mapping(mapped, capacity_preflight)
+                with self.assertRaisesRegex(
+                        readback.ReadbackError,
+                        "absent from the explicit identity path map"):
+                    run_with_mapping(
+                        {path: path for path in allowed_paths if path != str(nested_path)},
+                        capacity_preflight,
+                    )
+
+            with self.subTest(preflight="context-policy"):
+                run_with_mapping(mapped, context_policy_preflight)
+                with self.assertRaisesRegex(
+                        readback.ReadbackError,
+                        "absent from the explicit identity path map"):
+                    run_with_mapping(
+                        {path: path for path in allowed_paths if path != str(nested_path)},
+                        context_policy_preflight,
+                    )
+
+    def test_context_policy_verification_reads_probe_before_composer_replay(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-context-probe-replay-") as temporary:
+            root = Path(temporary).resolve()
+
+            def write_document(name: str, value: object) -> dict[str, str]:
+                path = root / name
+                raw = readback.canonical_bytes(value)
+                path.write_bytes(raw)
+                return {"path": str(path), "raw_sha256": readback.sha256_bytes(raw)}
+
+            source_pin = write_document("source-manifest.json", {})
+            capacity_key = {
+                "host_id": "host", "workload": "workload",
+                "profile": "profile", "calibration_id": "calibration",
+            }
+            capacity_pins = {
+                "request": {"path": str(root / "capacity-request.json"), "raw_sha256": "b" * 64},
+                "artifact": {"path": str(root / "capacity.tsv"), "raw_sha256": "c" * 64},
+                "receipt": {"path": str(root / "capacity-receipt.json"), "raw_sha256": "d" * 64},
+            }
+            expected_capacity = {
+                name: capacity_pins[name] for name in ("request", "artifact", "receipt")
+            }
+            members = []
+            for index, pair in enumerate(("bounded", "tokio")):
+                probe_pin = write_document(f"probe-{index}.json", {"probe": "read"})
+                probe_pin.update({"allocator": "allocatbelt", "binary_sha256": "a" * 64})
+                request = {
+                    "schema": "test-composer-request-v1",
+                    "source_root": str(root),
+                    "source_manifest": source_pin,
+                    "context": capacity_key,
+                    "construction_probe": probe_pin,
+                    "capacity_bundle": expected_capacity,
+                }
+                request_pin = write_document(f"request-{index}.json", request)
+                resolved_pin = write_document(f"resolved-{index}.json", {})
+                receipt_pin = write_document(f"receipt-{index}.json", {})
+                members.append({
+                    "descriptor": {
+                        "pair": pair, "executor": pair, "allocator": "allocatbelt",
+                    },
+                    "request": request_pin,
+                    "construction_probe": probe_pin,
+                    "resolved_policy": resolved_pin,
+                    "composition_receipt": receipt_pin,
+                })
+
+            policy = {
+                "schema": readback.SOURCE5_PRESSURE_POLICY_SCHEMA,
+                "source_manifest": source_pin,
+                "context": capacity_key,
+                "capacity_bundle": expected_capacity,
+                "base_policy_artifact_sha256": "1" * 64,
+                "base_policy_sha256": "2" * 64,
+                "base_context_sha256": "3" * 64,
+                "resolution_rule_version": "test-rule-v1",
+                "numeric_policy": {},
+                "baseline": {},
+                "hard_ceilings": {},
+                "normalization_denominators": {},
+                "member_resolutions": [],
+            }
+            policy["policy_sha256"] = readback.digest_object(policy)
+            policy_pin = write_document("shared-policy.json", policy)
+            context_bundle = {
+                "schema": readback.CONTEXT_POLICY_BUNDLE_SCHEMA_V2,
+                "artifact": policy_pin,
+                "members": members,
+            }
+            context_bundle_pin = write_document("context-policy-bundle.json", context_bundle)
+
+            class Composer:
+                REQUEST_SCHEMA = "test-composer-request-v1"
+
+                @staticmethod
+                def compose_calibrated_policy_v5(request: object, request_sha: str) -> object:
+                    raise RuntimeError("reached mocked composer")
+
+            source_stack = {
+                "source_pin": source_pin,
+                "source_root": root,
+                "composer": Composer(),
+            }
+            capacity = {"capacity_key": capacity_key, "pins": capacity_pins}
+            with patch.object(readback, "_source5_capacity_floor_policy_id", return_value=None):
+                with self.assertRaisesRegex(
+                        readback.ReadbackError,
+                        r"pinned SourceV5 composer replay failed for member\[0\]: RuntimeError: reached mocked composer"):
+                    readback._verify_context_policy_bundle_v2(
+                        source_stack, context_bundle_pin, capacity, source_pin,
+                    )
+
     def test_closed_recorded_pressure_api_requires_two_capture_members(self) -> None:
         parameters = inspect.signature(
             readback.verify_calibration_scope_v2_closed_recorded_v1,
