@@ -369,6 +369,22 @@ def _record(source: dict[str, Any], relative: str, label: str) -> dict[str, Any]
     return record
 
 
+def _exec_registered_module(module: types.ModuleType, raw: bytes, path: Path) -> None:
+    """Execute exact pinned bytes with normal import-time module semantics."""
+    module_name = module.__name__
+    previous_module = sys.modules.get(module_name)
+    had_previous_module = module_name in sys.modules
+    sys.modules[module_name] = module
+    try:
+        exec(compile(raw, str(path), "exec", dont_inherit=True), module.__dict__)
+    except BaseException:
+        if had_previous_module:
+            sys.modules[module_name] = previous_module
+        else:
+            sys.modules.pop(module_name, None)
+        raise
+
+
 def _pinned_source_module(source: dict[str, Any], key: str, relative: str, label: str, maximum: int) -> types.ModuleType:
     harness = source.get("qualification_harness")
     require(type(harness) is dict and key in harness, f"SourceV5 harness omits {label}")
@@ -384,7 +400,7 @@ def _pinned_source_module(source: dict[str, Any], key: str, relative: str, label
     module.__file__ = str(path)
     module.__package__ = ""
     try:
-        exec(compile(raw, str(path), "exec", dont_inherit=True), module.__dict__)
+        _exec_registered_module(module, raw, path)
     except (SyntaxError, ValueError, TypeError) as error:
         raise CompositionError(f"pinned {label} cannot be compiled: {error}") from error
     return module
@@ -1602,7 +1618,7 @@ def _captured_source_module(reader: Any, source: dict[str, Any], relative: str, 
     module.__file__ = str(path)
     module.__package__ = ""
     try:
-        exec(compile(raw, str(path), "exec", dont_inherit=True), module.__dict__)
+        _exec_registered_module(module, raw, path)
     except (SyntaxError, ValueError, TypeError) as error:
         raise CompositionError(f"pinned {label} cannot be compiled from captured bytes: {error}") from error
     return module, record["sha256"]
@@ -3945,7 +3961,7 @@ def _finish_expectation(request: dict[str, Any], raw_sha: str) -> tuple[bytes, d
     reader = types.ModuleType(f"finalize_feedback_reader_{reader_sha}")
     reader.__file__ = str(reader_path)
     reader.__package__ = ""
-    exec(compile(reader_raw, str(reader_path), "exec", dont_inherit=True), reader.__dict__)
+    _exec_registered_module(reader, reader_raw, reader_path)
     final_bytes, final_sha = reader.build_pressure_expectation_recipe(body)
     receipt = {
         "schema": FINALIZE_RECEIPT_SCHEMA,

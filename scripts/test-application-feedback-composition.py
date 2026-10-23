@@ -177,6 +177,47 @@ class CompositionContractTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
+    def test_captured_source_module_registers_postponed_dataclass_during_exec(self) -> None:
+        raw = (
+            b"from __future__ import annotations\n"
+            b"from dataclasses import dataclass\n"
+            b"@dataclass(frozen=True, slots=True)\n"
+            b"class CapturedRecord:\n"
+            b"    count: int\n"
+        )
+        source_reader = mock.Mock()
+        source_reader._source_v5_regular_record.return_value = {"sha256": _sha(raw)}
+        source_reader._capture_source_v5_sibling.return_value = raw
+
+        module, module_sha = composition._captured_source_module(
+            source_reader, {"source": {}}, "scripts/postponed-dataclass.py", "test helper",
+        )
+        try:
+            self.assertEqual(module_sha, _sha(raw))
+            self.assertIs(sys.modules.get(module.__name__), module)
+            self.assertEqual(module.CapturedRecord(7).count, 7)
+        finally:
+            sys.modules.pop(module.__name__, None)
+
+    def test_captured_source_module_removes_failed_execution_registration(self) -> None:
+        raw = b"raise TypeError('captured execution failed')\n"
+        module_name = f"source5_capture_captured-loader-failure.py_{_sha(raw)}"
+        sys.modules.pop(module_name, None)
+        source_reader = mock.Mock()
+        source_reader._source_v5_regular_record.return_value = {"sha256": _sha(raw)}
+        source_reader._capture_source_v5_sibling.return_value = raw
+
+        with self.assertRaisesRegex(
+            composition.CompositionError,
+            "pinned test helper cannot be compiled from captured bytes",
+        ):
+            composition._captured_source_module(
+                source_reader, {"source": {}},
+                "scripts/captured-loader-failure.py", "test helper",
+            )
+
+        self.assertNotIn(module_name, sys.modules)
+
     def test_composition_and_reader_close_the_same_capture_paths(self) -> None:
         capture = {
             "output_mount": {"mount_point": "/", "mount_root": "/metadata-only"},
