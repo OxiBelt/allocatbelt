@@ -4022,6 +4022,8 @@ def _validate_event_timeline(
     live_seen = False
     terminal_inactive_seen = False
     startup_ready: list[bool] = []
+    ready_count = recipe["schedule"]["startup_ready_windows"]
+    startup_ready_anchor_seen = False
     active_readiness_windows = 0
     active_readiness_ok = True
     app_start_ns: int | None = None
@@ -4056,8 +4058,18 @@ def _validate_event_timeline(
                 complete_overlap_window=app_start_ns is not None and start >= app_start_ns,
             )
             if app_start_ns is None:
+                require(result["readiness"]["all_ready"], "pressure window before application start is unready")
                 startup_ready.append(result["readiness"]["all_ready"])
-                del startup_ready[:-recipe["schedule"]["startup_ready_windows"]]
+                del startup_ready[:-ready_count]
+                if sequence + 1 == ready_count:
+                    # The one-time marker remains anchored here while pressure
+                    # sampling continues until the launch binding is observed.
+                    require(
+                        end == binding["pressure_ready_monotonic_ns"]
+                        and result["readiness"] == binding["readiness_snapshot"],
+                        "ready marker does not match the first complete startup windows",
+                    )
+                    startup_ready_anchor_seen = True
             else:
                 ready_barrier_ns = binding["pressure_ready_monotonic_ns"]
                 require(start >= ready_barrier_ns, "pressure sample precedes the authenticated readiness barrier")
@@ -4103,9 +4115,8 @@ def _validate_event_timeline(
             app_start_ns = uint(start_exact["monotonic_ns"], "application start observation", positive=True)
             require(app_start_ns == binding["observed_monotonic_ns"] and last_sample["end"] <= app_start_ns, "application start does not follow its measured readiness window")
             require(app_start_ns >= start_ns, "application start precedes pressure worker startup")
-            ready_count = recipe["schedule"]["startup_ready_windows"]
             require(len(startup_ready) >= ready_count and all(startup_ready[-ready_count:]), "measured startup readiness windows are missing or failed")
-            require(last_sample["end"] == binding["pressure_ready_monotonic_ns"] and last_sample["readiness"] == binding["readiness_snapshot"], "ready marker does not match the last complete startup sample")
+            require(startup_ready_anchor_seen, "application start precedes its original startup readiness marker")
         elif kind == "application_exit":
             app_exit_count += 1
             require(app_exit_count == 1 and app_start_ns is not None and cleanup_count == 0, "pressure event stream repeats or reorders application exit")

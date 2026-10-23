@@ -10,6 +10,7 @@ performance, or qualification run.
 from __future__ import annotations
 
 import hashlib
+import io
 import importlib.util
 import json
 import os
@@ -18,6 +19,8 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import types
 import time
 import unittest
 import uuid
@@ -55,6 +58,162 @@ class PressureDriverTests(unittest.TestCase):
             driver.parse_object(b'{"x":NaN}\n', "nonfinite", 128)
         with self.assertRaises(driver.PressureError):
             driver.uint(True, "boolean-as-integer")
+
+    def test_window_grants_hold_future_worker_writes_until_counter_snapshot(self) -> None:
+        read_fd, write_fd = os.pipe()
+        writer = os.fdopen(write_fd, "wb", buffering=0)
+        worker_start = driver._proc_stat(os.getpid())["start_ticks"]
+        nonce = uuid.uuid4().hex
+        ownership_sha = "a" * 64
+        recipe_sha = "b" * 64
+        child = {
+            "role": "disk", "cpu": None, "pid": os.getpid(),
+            "start_ticks": worker_start, "pgid_observed": os.getpgrp(),
+            "sid_observed": os.getsid(0),
+            "process": types.SimpleNamespace(stdin=writer),
+        }
+        controller = object.__new__(driver.WorkerSet)
+        controller.recipe = {
+            "recipe_sha256": recipe_sha, "identity": {"nonce": nonce},
+            "schedule": {"sample_interval_ms": 100},
+        }
+        controller.driver_pid = os.getpid()
+        controller.driver_start_ticks = worker_start
+        controller.children = [child]
+        controller._ownership_sha256 = ownership_sha
+        controller._next_window_sequence = 0
+        controller._last_window_end_ns = None
+        controller._final_capture_sent = False
+        ownership = {"nonce": nonce, "ownership_sha256": ownership_sha,
+                     "start_ticks": worker_start}
+        args = types.SimpleNamespace(
+            recipe_sha256=recipe_sha, owner_nonce=nonce, driver_pid=os.getpid(),
+            driver_start_ticks=worker_start, kind="disk", cpu=None, interval_ms=100,
+        )
+        writes: list[int] = []
+        first_written = threading.Event()
+        waiting_for_next = threading.Event()
+        waiting_for_final = threading.Event()
+        worker_exited = threading.Event()
+        errors: list[BaseException] = []
+
+        def fake_disk_worker() -> None:
+            try:
+                with os.fdopen(read_fd, "rb", buffering=0) as reader:
+                    with patch.object(driver.sys, "stdin", reader):
+                        driver._WORKER_STOP_REQUESTED = False
+                        driver._WORKER_CONTROL_BUFFER.clear()
+                        grant0 = driver._worker_read_window_grant(
+                            args, ownership, 0, time.monotonic_ns() + 2_000_000_000, None,
+                        )
+                        self.assertIsNotNone(grant0)
+                        writes.append(0)
+                        first_written.set()
+                        waiting_for_next.set()
+                        grant1 = driver._worker_read_window_grant(
+                            args, ownership, 1, time.monotonic_ns() + 2_000_000_000,
+                            grant0[1],
+                        )
+                        self.assertIsNotNone(grant1)
+                        writes.append(1)
+                        waiting_for_final.set()
+                        driver._worker_wait_for_final_capture(
+                            args, ownership, 1, time.monotonic_ns() + 2_000_000_000,
+                        )
+                        worker_exited.set()
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=fake_disk_worker)
+        worker.start()
+        first_start = time.monotonic_ns()
+        first_end = controller.grant_sample_window(0, first_start)
+        self.assertTrue(first_written.wait(1.0))
+        self.assertTrue(waiting_for_next.wait(1.0))
+        # This is the collector's post-window diskstats + /proc/PID/io snapshot.
+        snapshot = tuple(writes)
+        self.assertEqual(snapshot, (0,))
+        next_start = max(first_end, time.monotonic_ns())
+        second_end = controller.grant_sample_window(1, next_start)
+        self.assertEqual(second_end - next_start, 100_000_000)
+        self.assertTrue(waiting_for_final.wait(1.0))
+        # Keep the child identity live through the final proc-I/O snapshot.
+        final_snapshot = tuple(writes)
+        self.assertEqual(final_snapshot, (0, 1))
+        self.assertFalse(worker_exited.is_set())
+        controller.finish_sample_capture(1)
+        worker.join(1.0)
+        writer.close()
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(worker_exited.is_set())
+        self.assertEqual(errors, [])
+        self.assertEqual(writes, [0, 1])
+        self.assertEqual(controller._next_window_sequence, 2)
+        with self.assertRaises(driver.PressureError):
+            controller.grant_sample_window(3, time.monotonic_ns())
+        with self.assertRaises(driver.PressureError):
+            controller.finish_sample_capture(1)
+
+    def test_worker_control_reader_keeps_coalesced_start_and_window_grant(self) -> None:
+        read_fd, write_fd = os.pipe()
+        read_stream = os.fdopen(read_fd, "rb", buffering=0)
+        write_stream = os.fdopen(write_fd, "wb", buffering=0)
+        driver._WORKER_STOP_REQUESTED = False
+        driver._WORKER_CONTROL_BUFFER.clear()
+        start = driver.canonical_bytes({"kind": "start"})
+        grant = driver.canonical_bytes({"kind": "window-grant"})
+        write_stream.write(start + grant)
+        write_stream.close()
+        try:
+            with patch.object(driver.sys, "stdin", read_stream):
+                self.assertEqual(driver._worker_read_control_line("start"), start[:-1])
+                self.assertEqual(driver._worker_read_control_line("grant"), grant[:-1])
+        finally:
+            read_stream.close()
+            driver._WORKER_CONTROL_BUFFER.clear()
+
+    def test_worker_control_wait_observes_deadline_and_term(self) -> None:
+        class EmptyInput:
+            def fileno(self) -> int:
+                return 123
+
+        driver._WORKER_CONTROL_BUFFER.clear()
+        driver._WORKER_STOP_REQUESTED = False
+        with patch.object(driver.sys, "stdin", EmptyInput()), \
+             patch.object(driver.select, "select", side_effect=[([], [], [])]), \
+             patch.object(driver.time, "monotonic_ns", side_effect=[100, 201]):
+            with self.assertRaisesRegex(driver.PressureError, "deadline expired"):
+                driver._worker_read_control_line("grant", deadline_ns=200)
+        driver._WORKER_CONTROL_BUFFER.clear()
+        driver._WORKER_STOP_REQUESTED = True
+        with patch.object(driver.sys, "stdin", EmptyInput()), \
+             patch.object(driver.select, "select") as select_mock:
+            self.assertIsNone(driver._worker_read_control_line("grant", deadline_ns=200))
+            select_mock.assert_not_called()
+        driver._WORKER_STOP_REQUESTED = False
+
+    def test_launch_poll_retries_without_blocking_and_rejects_late_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "launch-record.json"
+            path.write_bytes(b"partial")
+            valid = ({"process": {}}, b"{}\n", "a" * 64, 150)
+            with patch.object(driver, "_launch_binding", side_effect=[
+                driver.PressureError("partial publication"),
+                (valid[0], valid[1], valid[2]),
+            ]), patch.object(driver.time, "monotonic_ns", return_value=150):
+                self.assertIsNone(driver._try_launch_binding(path, {}))
+                observation = driver._try_launch_binding(path, {})
+                self.assertEqual(observation[:3], valid[:3])
+                self.assertEqual(observation[3], 150)
+            with patch.object(driver.time, "monotonic_ns", return_value=99), \
+                 patch.object(driver, "_try_launch_binding", return_value=valid):
+                with self.assertRaisesRegex(driver.PressureError, "observed after"):
+                    driver._try_launch_before_deadline(path, {}, 100)
+            with patch.object(driver.time, "monotonic_ns", return_value=100), \
+                 patch.object(driver, "_try_launch_binding") as poll:
+                with self.assertRaisesRegex(driver.PressureError, "before the startup deadline"):
+                    driver._try_launch_before_deadline(path, {}, 100)
+                poll.assert_not_called()
 
     def test_schedule_rejects_excessive_cumulative_io_and_unknown_fields(self) -> None:
         schedule = {

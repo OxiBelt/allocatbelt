@@ -1655,6 +1655,123 @@ class PressureReadbackV2Tests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), replacement)
 
 
+class PressureStartupReadyTimelineTests(unittest.TestCase):
+    """Timeline fixtures only; sample counters and process reaping are separate checks."""
+
+    def _timeline_fixture(self, pending_windows: int = 2) -> dict[str, Any]:
+        interval = 1_000_000_000
+        start_ns = interval
+        ready_count = 2
+        before_application = ready_count + pending_windows
+        application_start = start_ns + before_application * interval
+        application_exit = application_start + interval
+        readiness = {"all_ready": True, "cpu_busy_basis_points": 7000}
+        process = {"pid": 12345, "start_ticks": 6789}
+        binding = {
+            "observed_monotonic_ns": application_start,
+            "pressure_ready_monotonic_ns": start_ns + ready_count * interval,
+            "readiness_snapshot": dict(readiness),
+            "launch_record_sha256": "a" * 64,
+        }
+        cleanup = [{"role": "disk", "pid": 23456}]
+        events = []
+        for sequence in range(before_application + 1):
+            if sequence == before_application:
+                events.append({
+                    "schema": readback.EVENT_SCHEMA, "kind": "application_start",
+                    "sequence": sequence - 1, "monotonic_ns": application_start,
+                    **process, "launch_record_sha256": binding["launch_record_sha256"],
+                })
+            events.append({
+                "schema": readback.EVENT_SCHEMA, "kind": "sample", "sequence": sequence,
+                "start": start_ns + sequence * interval,
+                "end": start_ns + (sequence + 1) * interval,
+                "app_active": sequence == before_application,
+                "readiness": dict(readiness),
+            })
+        events.extend([
+            {
+                "schema": readback.EVENT_SCHEMA, "kind": "application_exit",
+                "sequence": before_application, "monotonic_ns": application_exit,
+                **process, "exit_observed": True,
+            },
+            {
+                "schema": readback.EVENT_SCHEMA, "kind": "pressure_cleanup",
+                "monotonic_ns": application_exit + 1, "workers": cleanup,
+                "scratch_file_removed": True, "cleanup_ok": True,
+            },
+        ])
+        return {
+            "events": events,
+            "start_event": {"monotonic_ns": start_ns},
+            "recipe": {"schedule": {
+                "sample_interval_ms": 1000, "startup_ready_windows": ready_count,
+                "minimum_overlap_seconds": 1,
+            }},
+            "process": process, "binding": binding,
+            "run": {
+                "sample_count": before_application + 1,
+                "finish_monotonic_ns": application_exit + 2,
+                "worker_cleanup": cleanup, "application_overlap_nanoseconds": interval,
+            },
+            "workers": {("disk", None): cleanup[0]},
+        }
+
+    def _validate_timeline(self, fixture: dict[str, Any]) -> dict[str, Any]:
+        def validated_sample(event, recipe, sequence):
+            self.assertEqual(event["sequence"], sequence)
+            return {key: event[key] for key in ("start", "end", "app_active", "readiness")}
+
+        with patch.object(readback, "_validate_sample", side_effect=validated_sample), patch.object(
+            readback, "_require_pid_reaped",
+        ):
+            return readback._validate_event_timeline(
+                iter(fixture["events"]), fixture["start_event"], fixture["recipe"],
+                fixture["process"], fixture["binding"], fixture["run"], fixture["workers"],
+            )
+
+    def test_original_ready_anchor_accepts_immediate_or_delayed_launch(self) -> None:
+        for pending_windows in (0, 1, 3):
+            with self.subTest(pending_windows=pending_windows):
+                fixture = self._timeline_fixture(pending_windows)
+                result = self._validate_timeline(fixture)
+                self.assertEqual(result["application_window"], {
+                    "observed_start_monotonic_ns": fixture["binding"]["observed_monotonic_ns"],
+                    "observed_exit_monotonic_ns": fixture["binding"]["observed_monotonic_ns"]
+                    + fixture["run"]["application_overlap_nanoseconds"],
+                })
+                self.assertEqual(result["continuous_ready_window"]["start_monotonic_ns"],
+                                 fixture["binding"]["observed_monotonic_ns"])
+
+    def test_ready_anchor_cannot_move_to_a_later_pending_sample(self) -> None:
+        fixture = self._timeline_fixture()
+        fixture["binding"]["pressure_ready_monotonic_ns"] = \
+            fixture["binding"]["observed_monotonic_ns"]
+        with self.assertRaisesRegex(readback.ReadbackError, "first complete startup windows"):
+            self._validate_timeline(fixture)
+
+    def test_ready_anchor_preserves_the_original_numeric_snapshot(self) -> None:
+        fixture = self._timeline_fixture()
+        fixture["binding"]["readiness_snapshot"]["cpu_busy_basis_points"] = 6999
+        with self.assertRaisesRegex(readback.ReadbackError, "first complete startup windows"):
+            self._validate_timeline(fixture)
+
+    def test_unready_pending_sample_is_rejected_after_later_recovery(self) -> None:
+        fixture = self._timeline_fixture(pending_windows=3)
+        fixture["events"][2]["readiness"]["all_ready"] = False
+        with self.assertRaisesRegex(readback.ReadbackError, "before application start is unready"):
+            self._validate_timeline(fixture)
+
+    def test_latest_pending_sample_must_precede_observed_application_start(self) -> None:
+        fixture = self._timeline_fixture()
+        fixture["binding"]["observed_monotonic_ns"] -= 1
+        for event in fixture["events"]:
+            if event["kind"] == "application_start":
+                event["monotonic_ns"] -= 1
+        with self.assertRaisesRegex(readback.ReadbackError, "does not follow its measured readiness window"):
+            self._validate_timeline(fixture)
+
+
 class PressurePairHostReceiptSchemaTests(unittest.TestCase):
     """Synthetic schema fixture only; this is not a host-cleanup witness."""
 

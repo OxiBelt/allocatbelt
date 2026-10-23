@@ -19,6 +19,7 @@ import mmap
 import os
 import re
 import selectors
+import select
 import shutil
 import signal
 import socket
@@ -65,6 +66,8 @@ EVENT_TERMINAL_RESERVE_BYTES = 2 * 1024 * 1024
 OWNERSHIP_PROTOCOL = "allocatbelt.pressure-worker-ownership.v1"
 OWNERSHIP_GRANT_SCHEMA = "allocatbelt.application-pressure-worker-ownership-grant.v1"
 WORKER_START_SCHEMA = "allocatbelt.application-pressure-worker-start.v2"
+WORKER_WINDOW_GRANT_SCHEMA = "allocatbelt.application-pressure-worker-window-grant.v1"
+WORKER_FINAL_CAPTURE_SCHEMA = "allocatbelt.application-pressure-worker-final-capture.v1"
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_FAILURE_BYTES = 4 * 1024 * 1024
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
@@ -81,10 +84,15 @@ BLOCK_BYTES = 4096
 U64_MAX = (1 << 64) - 1
 PRESSURE_IO_SCHEMA = "allocatbelt.application-pressure-io-window.v1"
 _WORKER_STOP_REQUESTED = False
+_WORKER_CONTROL_BUFFER = bytearray()
 
 
 class PressureError(ValueError):
     """A malformed request, unsupported host, or failed bounded pressure run."""
+
+
+class WorkerStop(Exception):
+    """A bounded worker control wait was interrupted by its parent or TERM."""
 
 
 def require(condition: bool, message: str) -> None:
@@ -1824,6 +1832,10 @@ class WorkerSet:
         self.scratch_removed = False
         self.scratch_identity: tuple[int, int] | None = None
         self._spawned = False
+        self._ownership_sha256: str | None = None
+        self._next_window_sequence = 0
+        self._last_window_end_ns: int | None = None
+        self._final_capture_sent = False
 
     def spawn(self) -> None:
         require(os.getsid(0) == os.getpid(), "driver must start in a fresh dedicated session")
@@ -1953,6 +1965,7 @@ class WorkerSet:
 
     def grant_ownership(self, ownership_sha256: str) -> None:
         sha256(ownership_sha256, "durable worker ownership journal SHA-256")
+        self._ownership_sha256 = ownership_sha256
         rows = {(item["role"], item["cpu"]): item for item in self.ownership_rows()}
         for child in self.children:
             row = rows[(child["role"], child["cpu"])]
@@ -2002,7 +2015,72 @@ class WorkerSet:
             }
             stream.write(canonical_bytes(message))
             stream.flush()
+
+    def grant_sample_window(self, sequence: int, window_start_ns: int) -> int:
+        require(sequence == self._next_window_sequence,
+                "sample window grant is duplicated or out of order")
+        require(self._ownership_sha256 is not None,
+                "sample window cannot start before durable worker ownership")
+        uint(window_start_ns, "worker sample window start", positive=True)
+        require(self._last_window_end_ns is None or window_start_ns >= self._last_window_end_ns,
+                "worker sample-window start regressed or overlapped its previous grant")
+        interval_ns = self.recipe["schedule"]["sample_interval_ms"] * 1_000_000
+        window_end_ns = window_start_ns + interval_ns
+        for child in self.children:
+            stream = child["process"].stdin
+            require(stream is not None and not stream.closed,
+                    "worker sample window control pipe is unavailable")
+            worker_identity = {
+                "role": child["role"], "cpu": child["cpu"],
+                "pid": child["pid"], "start_ticks": child["start_ticks"],
+                "pgid": child["pgid_observed"], "session_id": child["sid_observed"],
+            }
+            grant = {
+                "schema": WORKER_WINDOW_GRANT_SCHEMA,
+                "recipe_sha256": self.recipe["recipe_sha256"],
+                "nonce": self.recipe["identity"]["nonce"],
+                "ownership_sha256": self._ownership_sha256,
+                "sequence": sequence,
+                "window_start_monotonic_ns": window_start_ns,
+                "window_end_monotonic_ns": window_end_ns,
+                "driver_pid": self.driver_pid,
+                "driver_start_ticks": self.driver_start_ticks,
+                "worker": worker_identity,
+            }
+            stream.write(canonical_bytes(grant))
+            stream.flush()
+        self._next_window_sequence += 1
+        self._last_window_end_ns = window_end_ns
+        return window_end_ns
+
+    def finish_sample_capture(self, sequence: int) -> None:
+        require(not self._final_capture_sent, "final worker capture release is duplicated")
+        require(sequence == self._next_window_sequence - 1,
+                "final worker capture release does not name the last granted window")
+        require(self._ownership_sha256 is not None,
+                "final worker capture release precedes durable ownership")
+        for child in self.children:
+            stream = child["process"].stdin
+            require(stream is not None and not stream.closed,
+                    "worker final-capture control pipe is unavailable")
+            message = {
+                "schema": WORKER_FINAL_CAPTURE_SCHEMA,
+                "recipe_sha256": self.recipe["recipe_sha256"],
+                "nonce": self.recipe["identity"]["nonce"],
+                "ownership_sha256": self._ownership_sha256,
+                "sequence": sequence,
+                "driver_pid": self.driver_pid,
+                "driver_start_ticks": self.driver_start_ticks,
+                "worker": {
+                    "role": child["role"], "cpu": child["cpu"],
+                    "pid": child["pid"], "start_ticks": child["start_ticks"],
+                    "pgid": child["pgid_observed"], "session_id": child["sid_observed"],
+                },
+            }
+            stream.write(canonical_bytes(message))
+            stream.flush()
             stream.close()
+        self._final_capture_sent = True
 
     def wait_sample(self, seq: int, deadline_ns: int) -> dict[str, Any]:
         target = {child["pid"] for child in self.children}
@@ -2243,11 +2321,48 @@ def _worker_emit(value: dict[str, Any]) -> None:
     require(written == len(raw), "short worker telemetry write")
 
 
+def _worker_read_control_line(label: str, deadline_ns: int | None = None) -> bytes | None:
+    descriptor = sys.stdin.fileno()
+    while True:
+        newline = _WORKER_CONTROL_BUFFER.find(b"\n")
+        if newline >= 0:
+            line = bytes(_WORKER_CONTROL_BUFFER[:newline])
+            del _WORKER_CONTROL_BUFFER[:newline + 1]
+            require(len(line) <= 65536, f"{label} exceeds its finite line bound")
+            return line
+        require(len(_WORKER_CONTROL_BUFFER) <= 65536,
+                f"{label} exceeds its finite line bound")
+        if _WORKER_STOP_REQUESTED:
+            return None
+        timeout = 0.05
+        if deadline_ns is not None:
+            remaining_ns = deadline_ns - time.monotonic_ns()
+            require(remaining_ns > 0, f"{label} deadline expired")
+            timeout = min(timeout, remaining_ns / 1_000_000_000)
+        try:
+            readable, _, _ = select.select([descriptor], [], [], timeout)
+        except InterruptedError:
+            if _WORKER_STOP_REQUESTED:
+                return None
+            continue
+        if not readable:
+            continue
+        try:
+            chunk = os.read(descriptor, 65536)
+        except InterruptedError:
+            if _WORKER_STOP_REQUESTED:
+                return None
+            continue
+        require(bool(chunk), f"parent closed the {label} control pipe")
+        _WORKER_CONTROL_BUFFER.extend(chunk)
+
+
 def _worker_read_ownership(args: argparse.Namespace) -> dict[str, Any]:
-    raw = sys.stdin.buffer.readline(65537)
-    require(raw and len(raw) <= 65536 and raw.endswith(b"\n"), "worker did not receive its bounded ownership grant")
-    value = parse_object(raw[:-1], "worker ownership grant", 65536)
-    require(raw == canonical_bytes(value), "worker ownership grant is not canonical")
+    raw = _worker_read_control_line("worker ownership grant")
+    if raw is None:
+        raise WorkerStop("worker stopped before ownership grant")
+    value = parse_object(raw, "worker ownership grant", 65536)
+    require(raw + b"\n" == canonical_bytes(value), "worker ownership grant is not canonical")
     grant = exact_object(value, {
         "schema", "recipe_sha256", "nonce", "ownership_sha256", "worker",
     }, "worker ownership grant")
@@ -2282,10 +2397,11 @@ def _worker_read_ownership(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _worker_read_start(args: argparse.Namespace, ownership: dict[str, Any]) -> int:
-    raw = sys.stdin.buffer.readline(65537)
-    require(raw and len(raw) <= 65536 and raw.endswith(b"\n"), "worker did not receive its bounded work-start barrier")
-    value = parse_object(raw[:-1], "worker work-start barrier", 65536)
-    require(raw == canonical_bytes(value), "worker work-start barrier is not canonical")
+    raw = _worker_read_control_line("worker work-start barrier")
+    if raw is None:
+        raise WorkerStop("worker stopped before work-start grant")
+    value = parse_object(raw, "worker work-start barrier", 65536)
+    require(raw + b"\n" == canonical_bytes(value), "worker work-start barrier is not canonical")
     start = exact_object(value, {
         "schema", "recipe_sha256", "nonce", "ownership_sha256", "authorization_sha256",
         "pid", "start_ticks", "start_monotonic_ns",
@@ -2295,6 +2411,83 @@ def _worker_read_start(args: argparse.Namespace, ownership: dict[str, Any]) -> i
     sha256(start["authorization_sha256"], "worker authorization event SHA-256")
     require(start["pid"] == os.getpid() and start["start_ticks"] == ownership["start_ticks"], "worker work-start barrier PID/start differs")
     return uint(start["start_monotonic_ns"], "worker start time", positive=True)
+
+
+def _worker_read_window_grant(
+    args: argparse.Namespace, ownership: dict[str, Any], sequence: int,
+    grant_deadline_ns: int, previous_window_end_ns: int | None,
+) -> tuple[int, int] | None:
+    interval_ns = args.interval_ms * 1_000_000
+    raw = _worker_read_control_line("worker sample-window grant", grant_deadline_ns)
+    if raw is None:
+        return None
+    value = parse_object(raw, "worker sample-window grant", 65536)
+    require(raw + b"\n" == canonical_bytes(value), "worker sample-window grant is not canonical")
+    grant = exact_object(value, {
+        "schema", "recipe_sha256", "nonce", "ownership_sha256", "sequence",
+        "window_start_monotonic_ns", "window_end_monotonic_ns", "driver_pid",
+        "driver_start_ticks", "worker",
+    }, "worker sample-window grant")
+    observed_sequence = uint(grant["sequence"], "worker sample-window sequence", maximum=MAX_SAMPLES - 1)
+    require(grant["schema"] == WORKER_WINDOW_GRANT_SCHEMA and
+            grant["recipe_sha256"] == args.recipe_sha256 and
+            grant["nonce"] == args.owner_nonce and
+            grant["ownership_sha256"] == ownership["ownership_sha256"] and
+            observed_sequence == sequence,
+            "worker sample-window grant recipe, owner, or sequence differs")
+    worker = exact_object(grant["worker"], {
+        "role", "cpu", "pid", "start_ticks", "pgid", "session_id",
+    }, "sample-window worker identity")
+    require(worker == {
+        "role": args.kind, "cpu": args.cpu if args.kind == "cpu" else None,
+        "pid": os.getpid(), "start_ticks": ownership["start_ticks"],
+        "pgid": os.getpgrp(), "session_id": os.getsid(0),
+    }, "worker sample-window grant identity differs")
+    require(grant["driver_pid"] == args.driver_pid and
+            grant["driver_start_ticks"] == args.driver_start_ticks and
+            _proc_stat(args.driver_pid)["start_ticks"] == args.driver_start_ticks,
+            "sample-window grant came from another driver PID/start")
+    window_start = uint(grant["window_start_monotonic_ns"], "sample-window start", positive=True)
+    window_end = uint(grant["window_end_monotonic_ns"], "sample-window end", positive=True)
+    require(window_end - window_start == interval_ns and
+            (previous_window_end_ns is None or window_start >= previous_window_end_ns),
+            "sample-window grant changed cadence or regressed its window")
+    require(time.monotonic_ns() <= grant_deadline_ns,
+            "worker sample-window grant arrived after its finite deadline")
+    return window_start, window_end
+
+def _worker_wait_for_final_capture(
+    args: argparse.Namespace, ownership: dict[str, Any], sequence: int,
+    deadline_ns: int,
+) -> None:
+    raw = _worker_read_control_line("worker final-capture release", deadline_ns)
+    if raw is None:
+        raise WorkerStop("worker stopped before final counter capture")
+    value = parse_object(raw, "worker final-capture release", 65536)
+    require(raw + b"\n" == canonical_bytes(value),
+            "worker final-capture release is not canonical")
+    message = exact_object(value, {
+        "schema", "recipe_sha256", "nonce", "ownership_sha256", "sequence",
+        "driver_pid", "driver_start_ticks", "worker",
+    }, "worker final-capture release")
+    worker = exact_object(message["worker"], {
+        "role", "cpu", "pid", "start_ticks", "pgid", "session_id",
+    }, "final-capture worker identity")
+    observed_sequence = uint(message["sequence"], "final-capture sequence", maximum=MAX_SAMPLES - 1)
+    require(message["schema"] == WORKER_FINAL_CAPTURE_SCHEMA and
+            message["recipe_sha256"] == args.recipe_sha256 and
+            message["nonce"] == args.owner_nonce and
+            message["ownership_sha256"] == ownership["ownership_sha256"] and
+            observed_sequence == sequence and
+            message["driver_pid"] == args.driver_pid and
+            message["driver_start_ticks"] == args.driver_start_ticks and
+            _proc_stat(args.driver_pid)["start_ticks"] == args.driver_start_ticks and
+            worker == {
+                "role": args.kind, "cpu": args.cpu if args.kind == "cpu" else None,
+                "pid": os.getpid(), "start_ticks": ownership["start_ticks"],
+                "pgid": os.getpgrp(), "session_id": os.getsid(0),
+            },
+            "final-capture release recipe, owner, sequence, or worker identity differs")
 
 
 def _sleep_until(
@@ -2336,10 +2529,21 @@ def _worker_cpu(args: argparse.Namespace) -> None:
     _worker_wait_until(start_ns)
     interval_ns = args.interval_ms * 1_000_000
     duty_ns = interval_ns * args.duty_basis_points // 10000
-    end_ns = start_ns + args.duration_seconds * 1_000_000_000
-    sequence = 0
-    while sequence * interval_ns < end_ns - start_ns and not _WORKER_STOP_REQUESTED:
-        target_end = start_ns + (sequence + 1) * interval_ns
+    sample_count = args.duration_seconds * 1000 // args.interval_ms
+    grant_deadline_ns = start_ns + max(500_000_000, interval_ns // 2)
+    previous_window_end_ns: int | None = None
+    for sequence in range(sample_count):
+        if _WORKER_STOP_REQUESTED:
+            break
+        grant = _worker_read_window_grant(
+            args, ownership, sequence, grant_deadline_ns, previous_window_end_ns,
+        )
+        if grant is None:
+            break
+        target_start, target_end = grant
+        _worker_wait_until(target_start)
+        require(time.monotonic_ns() < target_end,
+                "CPU worker received an expired sample-window grant")
         interval_start = time.monotonic_ns()
         busy_end = min(target_end, interval_start + duty_ns)
         spins = 0
@@ -2355,7 +2559,10 @@ def _worker_cpu(args: argparse.Namespace) -> None:
             "start_monotonic_ns": interval_start, "end_monotonic_ns": actual_end,
             "thread_cpu_time_ns": time.thread_time_ns(), "spin_witness": spins,
         })
-        sequence += 1
+        previous_window_end_ns = target_end
+        grant_deadline_ns = target_end + max(500_000_000, interval_ns // 2)
+    if not _WORKER_STOP_REQUESTED:
+        _worker_wait_for_final_capture(args, ownership, sample_count - 1, grant_deadline_ns)
 
 
 def _worker_disk(args: argparse.Namespace) -> None:
@@ -2375,16 +2582,27 @@ def _worker_disk(args: argparse.Namespace) -> None:
         start_ns = _worker_read_start(args, ownership)
         _worker_wait_until(start_ns)
         interval_ns = args.interval_ms * 1_000_000
-        end_ns = start_ns + args.duration_seconds * 1_000_000_000
-        sequence = 0
+        sample_count = args.duration_seconds * 1000 // args.interval_ms
+        grant_deadline_ns = start_ns + max(500_000_000, interval_ns // 2)
+        previous_window_end_ns: int | None = None
         offset = 0
         seed_bytes = hashlib.sha256(str(args.seed).encode("ascii")).digest()
         payload = (seed_bytes * ((BLOCK_BYTES + len(seed_bytes) - 1) // len(seed_bytes)))[:BLOCK_BYTES]
         payload_map = mmap.mmap(-1, BLOCK_BYTES)
         payload_map[:] = payload
         payload_view = memoryview(payload_map)
-        while sequence * interval_ns < end_ns - start_ns and not _WORKER_STOP_REQUESTED:
-            target_end = start_ns + (sequence + 1) * interval_ns
+        for sequence in range(sample_count):
+            if _WORKER_STOP_REQUESTED:
+                break
+            grant = _worker_read_window_grant(
+                args, ownership, sequence, grant_deadline_ns, previous_window_end_ns,
+            )
+            if grant is None:
+                break
+            target_start, target_end = grant
+            _worker_wait_until(target_start)
+            require(time.monotonic_ns() < target_end,
+                    "disk worker received an expired sample-window grant")
             interval_start = time.monotonic_ns()
             target_bytes = max(BLOCK_BYTES, args.disk_rate * args.interval_ms // 1000)
             writes = 0
@@ -2409,7 +2627,10 @@ def _worker_disk(args: argparse.Namespace) -> None:
                 "end_monotonic_ns": actual_end, "write_bytes": writes,
                 "write_mode": "o_direct", "fdatasync_count": 1, "fdatasync_time_nanoseconds": sync_ns,
             })
-            sequence += 1
+            previous_window_end_ns = target_end
+            grant_deadline_ns = target_end + max(500_000_000, interval_ns // 2)
+        if not _WORKER_STOP_REQUESTED:
+            _worker_wait_for_final_capture(args, ownership, sample_count - 1, grant_deadline_ns)
     finally:
         if payload_view is not None:
             payload_view.release()
@@ -2500,16 +2721,27 @@ def _worker_loopback(args: argparse.Namespace) -> None:
     start_ns = _worker_read_start(args, ownership)
     _worker_wait_until(start_ns)
     interval_ns = args.interval_ms * 1_000_000
-    end_ns = start_ns + args.duration_seconds * 1_000_000_000
+    sample_count = args.duration_seconds * 1000 // args.interval_ms
+    grant_deadline_ns = start_ns + max(500_000_000, interval_ns // 2)
+    previous_window_end_ns: int | None = None
     payload_size = args.payload_bytes
     payload = hashlib.sha256(str(args.seed).encode("ascii")).digest()
     body = (payload * ((payload_size - 8 + len(payload) - 1) // len(payload)))[:payload_size - 8]
-    sequence = 0
     next_request = 0
     request_id = 0
     try:
-        while sequence * interval_ns < end_ns - start_ns and not _WORKER_STOP_REQUESTED:
-            target_end = start_ns + (sequence + 1) * interval_ns
+        for sequence in range(sample_count):
+            if _WORKER_STOP_REQUESTED:
+                break
+            grant = _worker_read_window_grant(
+                args, ownership, sequence, grant_deadline_ns, previous_window_end_ns,
+            )
+            if grant is None:
+                break
+            target_start, target_end = grant
+            _worker_wait_until(target_start)
+            require(time.monotonic_ns() < target_end,
+                    "loopback worker received an expired sample-window grant")
             interval_start = time.monotonic_ns()
             histogram = [0] * 64
             requests = 0
@@ -2551,7 +2783,10 @@ def _worker_loopback(args: argparse.Namespace) -> None:
                 "bytes_on_wire": bytes_on_wire, "latency_histogram": histogram,
                 "p99_upper_latency_nanoseconds": _histogram_p99_upper(histogram),
             })
-            sequence += 1
+            previous_window_end_ns = target_end
+            grant_deadline_ns = target_end + max(500_000_000, interval_ns // 2)
+        if not _WORKER_STOP_REQUESTED:
+            _worker_wait_for_final_capture(args, ownership, sample_count - 1, grant_deadline_ns)
     finally:
         _WORKER_STOP_REQUESTED = True
         client.close()
@@ -2567,15 +2802,19 @@ def worker_main(args: argparse.Namespace) -> int:
         global _WORKER_STOP_REQUESTED
         _WORKER_STOP_REQUESTED = True
     signal.signal(signal.SIGTERM, stop_worker)
+    _WORKER_CONTROL_BUFFER.clear()
     _install_worker_parent_death_signal(args.driver_pid, args.driver_start_ticks)
-    if args.kind == "cpu":
-        _worker_cpu(args)
-    elif args.kind == "disk":
-        _worker_disk(args)
-    elif args.kind == "loopback":
-        _worker_loopback(args)
-    else:
-        raise PressureError("unknown private worker kind")
+    try:
+        if args.kind == "cpu":
+            _worker_cpu(args)
+        elif args.kind == "disk":
+            _worker_disk(args)
+        elif args.kind == "loopback":
+            _worker_loopback(args)
+        else:
+            raise PressureError("unknown private worker kind")
+    except WorkerStop:
+        return 0
     return 0
 
 
@@ -2817,6 +3056,35 @@ def _write_ready_marker(
     return safe_write_new(path, canonical_bytes(value), "pressure readiness marker", maximum=64 * 1024)
 
 
+def _try_launch_binding(
+    path: Path, recipe: dict[str, Any],
+) -> tuple[dict[str, Any], bytes, str, int] | None:
+    if not path.exists():
+        return None
+    try:
+        binding, raw, sha = _launch_binding(path, recipe)
+        return binding, raw, sha, time.monotonic_ns()
+    except PressureError:
+        # Atomic publication can expose a newly created path before its final
+        # canonical bytes. The caller retries on each measured sample until
+        # the unchanged startup deadline.
+        if path.is_symlink() or path.is_dir():
+            raise
+        return None
+
+
+def _try_launch_before_deadline(
+    path: Path, recipe: dict[str, Any], deadline_ns: int,
+) -> tuple[dict[str, Any], bytes, str, int] | None:
+    require(time.monotonic_ns() < deadline_ns,
+            "authenticated application launch binding did not arrive before the startup deadline")
+    observation = _try_launch_binding(path, recipe)
+    if observation is not None:
+        require(observation[3] <= deadline_ns,
+                "authenticated application launch binding was observed after the startup deadline")
+    return observation
+
+
 def _wait_for_launch(path: Path, recipe: dict[str, Any], deadline_ns: int) -> tuple[dict[str, Any], bytes, str, int]:
     while time.monotonic_ns() < deadline_ns:
         if path.exists():
@@ -2883,6 +3151,7 @@ def run_pressure(recipe_path: Path, expected_sha: str, launch_path: Path, output
     failure: str | None = None
     cleanup_records: list[dict[str, Any]] = []
     readiness_marker_sha: str | None = None
+    readiness_sample: dict[str, Any] | None = None
     app_started_ns: int | None = None
     app_exit_ns: int | None = None
     app_last_alive_ns: int | None = None
@@ -2945,31 +3214,36 @@ def run_pressure(recipe_path: Path, expected_sha: str, launch_path: Path, output
         events_hash.update(raw_start)
         event_count += 1
         children.begin(start_ns, ownership_sha256, authorization_sha256)
-        # Wait for the first exact sample before opening the application gate.
-        selector_start = start_ns
         interval_ns = schedule["sample_interval_ms"] * 1_000_000
-        counters_before: dict[str, Any] | None = None
-        worker_io_before: dict[str, dict[str, int]] | None = None
-        for seq in range(schedule["duration_seconds"] * 1000 // schedule["sample_interval_ms"]):
+        total_samples = schedule["duration_seconds"] * 1000 // schedule["sample_interval_ms"]
+        _sleep_until(start_ns - 1_000_000, deadline_ns=hard_deadline_ns,
+                     maximum_sleep_ns=10_000_000, label="initial counter baseline")
+        counters_before = _counter_snapshot(recipe["storage"]["backing_chain"])
+        worker_io_before = children.process_io()
+        window_start_ns = max(start_ns, time.monotonic_ns())
+        window_end_ns = children.grant_sample_window(0, window_start_ns)
+        for seq in range(total_samples):
             require(time.monotonic_ns() < hard_deadline_ns, "pressure run total deadline expired")
-            target_start = start_ns + seq * interval_ns
-            target_end = target_start + interval_ns
+            target_start = window_start_ns
+            target_end = window_end_ns
             _sleep_until(target_start, deadline_ns=hard_deadline_ns, maximum_sleep_ns=10_000_000, label="pressure sample start")
-            before = _counter_snapshot(recipe["storage"]["backing_chain"])
-            before_mono = time.monotonic_ns()
-            if counters_before is not None:
-                before = counters_before
-                before_mono = selector_start
-            worker_before = children.process_io()
-            if worker_io_before is not None:
-                worker_before = worker_io_before
+            before = counters_before
+            before_mono = window_start_ns
+            worker_before = worker_io_before
             ready_deadline = target_end + max(500_000_000, interval_ns // 2)
             raw_worker_records = children.wait_sample(seq, ready_deadline)
             worker_records = _normalize_worker_records(raw_worker_records, children.children, seq, schedule, actual_recipe_sha)
             _sleep_until(target_end, deadline_ns=hard_deadline_ns, maximum_sleep_ns=5_000_000, label="pressure sample end")
             after = _counter_snapshot(recipe["storage"]["backing_chain"])
-            observed_end = time.monotonic_ns()
             worker_after = children.process_io()
+            observed_end = time.monotonic_ns()
+            if seq + 1 == total_samples:
+                children.finish_sample_capture(seq)
+            counters_before = after
+            worker_io_before = worker_after
+            window_start_ns = observed_end
+            if seq + 1 < total_samples:
+                window_end_ns = children.grant_sample_window(seq + 1, window_start_ns)
             app_active = False
             if process_binding is not None:
                 app_active = _proc_identity_still_same(process_binding)
@@ -2978,8 +3252,6 @@ def run_pressure(recipe_path: Path, expected_sha: str, launch_path: Path, output
                     app_last_alive_sequence = seq
                 else:
                     app_exit_ns = app_last_alive_ns
-            # First pressure sample is a complete independent window. Publish
-            # readiness before accepting a launch binding from the controller.
             sample = _build_sample(
                 recipe, seq, before_mono, observed_end, before, after,
                 worker_records, worker_before, worker_after, app_active,
@@ -2987,7 +3259,11 @@ def run_pressure(recipe_path: Path, expected_sha: str, launch_path: Path, output
             require(observed_end - before_mono <= interval_ns + max(500_000_000, interval_ns), "pressure telemetry sample is sparse")
             sample_count += 1
             if process_binding is None:
-                startup_readiness.append(sample["readiness"]["all_ready"])
+                if readiness_marker_sha is None:
+                    startup_readiness.append(sample["readiness"]["all_ready"])
+                else:
+                    require(sample["readiness"]["all_ready"],
+                            "pressure readiness failed while awaiting the authenticated application launch")
             elif app_active and app_started_ns is not None and sample["interval_start_monotonic_ns"] >= app_started_ns:
                 active_readiness_windows += 1
                 active_readiness_ok = active_readiness_ok and sample["readiness"]["all_ready"]
@@ -2999,52 +3275,57 @@ def run_pressure(recipe_path: Path, expected_sha: str, launch_path: Path, output
             sample_event_bytes += len(raw_sample)
             events_hash.update(raw_sample)
             event_count += 1
-            if process_binding is None and seq + 1 >= schedule["startup_ready_windows"]:
-                require(len(startup_readiness) == schedule["startup_ready_windows"] and all(startup_readiness), "measured pressure readiness did not pass the frozen startup windows")
+            if process_binding is None and readiness_marker_sha is None and len(startup_readiness) == schedule["startup_ready_windows"]:
+                require(all(startup_readiness), "measured pressure readiness did not pass the frozen startup windows")
+                readiness_sample = sample
                 readiness_marker_sha = _write_ready_marker(
-                    ready_path, recipe, sample, ownership_sha256, authorization_sha256,
+                    ready_path, recipe, readiness_sample, ownership_sha256, authorization_sha256,
                 )
-                binding, launch_raw, launch_raw_sha, observed_launch_ns = _wait_for_launch(
-                    launch_path, recipe, startup_deadline_ns,
-                )
-                process_binding = {
-                    "schema": PROCESS_BINDING_SCHEMA,
-                    "recipe_sha256": actual_recipe_sha,
-                    "launch_record_sha256": launch_raw_sha,
-                    "identity": {
-                        "pid": binding["process"]["pid"],
-                        "start_ticks": binding["process"]["start_ticks"],
-                        "nonce": recipe["identity"]["nonce"],
-                        "executable_sha256": binding["process"]["executable_sha256"],
-                        "tmpdir_path": binding["process"]["tmpdir_path"],
-                        "cpu_affinity": binding["process"]["cpu_affinity"],
-                        "network_namespace_inode": binding["process"]["network_namespace_inode"],
-                    },
-                    "observed_monotonic_ns": observed_launch_ns,
-                    "pressure_ready_monotonic_ns": sample["interval_end_monotonic_ns"],
-                    "readiness_snapshot": sample["readiness"],
-                    "application_capacity_calibration_sha256": recipe["files"]["application_capacity_calibration"]["raw_sha256"],
-                    "pressure_contention_calibration_sha256": recipe["pressure_calibration"]["raw_sha256"],
-                }
-                process_binding["process_binding_sha256"] = digest_object(process_binding)
-                process_binding_raw_sha = safe_write_new(process_binding_path, canonical_bytes(process_binding), "bound application process identity", maximum=256 * 1024)
-                app_started_ns = observed_launch_ns
-                event = {
-                    "schema": EVENT_SCHEMA, "kind": "application_start", "sequence": seq,
-                    "monotonic_ns": observed_launch_ns,
-                    "pid": binding["process"]["pid"], "start_ticks": binding["process"]["start_ticks"],
-                    "launch_record_sha256": launch_raw_sha,
-                }
-                raw_app = _write_event(events_stream, event, maximum_bytes=event_max_bytes)
-                events_hash.update(raw_app)
-                event_count += 1
-                copied_launch = output_dir / "launch-record.json"
-                require(launch_path == copied_launch and copied_launch.exists(), "launch record was not published at its canonical artifact path")
-                reread_binding, reread_raw, reread_sha = verify_canonical_json(copied_launch, "copied application launch binding", 256 * 1024)
-                require(reread_raw == launch_raw and reread_sha == launch_raw_sha and reread_binding == binding, "application launch record changed after process binding")
-                # The launch binding file is reread after creation; no mutable
-                # caller buffer is treated as the authenticated process proof.
-                del launch_raw
+            if process_binding is None and readiness_marker_sha is not None:
+                launch_observation = _try_launch_before_deadline(launch_path, recipe, startup_deadline_ns)
+                if launch_observation is None:
+                    require(time.monotonic_ns() < startup_deadline_ns,
+                            "authenticated application launch binding did not arrive before the startup deadline")
+                else:
+                    binding, launch_raw, launch_raw_sha, observed_launch_ns = launch_observation
+                    require(readiness_sample is not None,
+                            "authenticated launch has no original ready-sample anchor")
+                    process_binding = {
+                        "schema": PROCESS_BINDING_SCHEMA,
+                        "recipe_sha256": actual_recipe_sha,
+                        "launch_record_sha256": launch_raw_sha,
+                        "identity": {
+                            "pid": binding["process"]["pid"],
+                            "start_ticks": binding["process"]["start_ticks"],
+                            "nonce": recipe["identity"]["nonce"],
+                            "executable_sha256": binding["process"]["executable_sha256"],
+                            "tmpdir_path": binding["process"]["tmpdir_path"],
+                            "cpu_affinity": binding["process"]["cpu_affinity"],
+                            "network_namespace_inode": binding["process"]["network_namespace_inode"],
+                        },
+                        "observed_monotonic_ns": observed_launch_ns,
+                        "pressure_ready_monotonic_ns": readiness_sample["interval_end_monotonic_ns"],
+                        "readiness_snapshot": readiness_sample["readiness"],
+                        "application_capacity_calibration_sha256": recipe["files"]["application_capacity_calibration"]["raw_sha256"],
+                        "pressure_contention_calibration_sha256": recipe["pressure_calibration"]["raw_sha256"],
+                    }
+                    process_binding["process_binding_sha256"] = digest_object(process_binding)
+                    process_binding_raw_sha = safe_write_new(process_binding_path, canonical_bytes(process_binding), "bound application process identity", maximum=256 * 1024)
+                    app_started_ns = observed_launch_ns
+                    event = {
+                        "schema": EVENT_SCHEMA, "kind": "application_start", "sequence": seq,
+                        "monotonic_ns": observed_launch_ns,
+                        "pid": binding["process"]["pid"], "start_ticks": binding["process"]["start_ticks"],
+                        "launch_record_sha256": launch_raw_sha,
+                    }
+                    raw_app = _write_event(events_stream, event, maximum_bytes=event_max_bytes)
+                    events_hash.update(raw_app)
+                    event_count += 1
+                    copied_launch = output_dir / "launch-record.json"
+                    require(launch_path == copied_launch and copied_launch.exists(), "launch record was not published at its canonical artifact path")
+                    reread_binding, reread_raw, reread_sha = verify_canonical_json(copied_launch, "copied application launch binding", 256 * 1024)
+                    require(reread_raw == launch_raw and reread_sha == launch_raw_sha and reread_binding == binding, "application launch record changed after process binding")
+                    del launch_raw
             if process_binding is not None and not _proc_identity_still_same(process_binding):
                 # The exact PID/start pair is also checked in the launch record
                 # below; if the process ended, the final interval closes here.
@@ -3373,21 +3654,29 @@ def _calibrate_request(request_path: Path, output_path: Path, *, context_v2: boo
         safe_write_new(work_start_path, canonical_bytes(work_start_body), "calibration worker work-start journal", maximum=MAX_EVENT_LINE_BYTES)
         workers.begin(start_ns, ownership_sha256, authorization_sha256)
         interval_ns = schedule["sample_interval_ms"] * 1_000_000
-        counters_before: dict[str, Any] | None = None
-        io_before: dict[str, dict[str, int]] | None = None
-        previous_end = start_ns
-        for seq in range(schedule["duration_seconds"] * 1000 // schedule["sample_interval_ms"]):
-            target_start = start_ns + seq * interval_ns
-            target_end = target_start + interval_ns
+        sample_count = schedule["duration_seconds"] * 1000 // schedule["sample_interval_ms"]
+        _sleep_until(start_ns - 1_000_000, deadline_ns=calibration_deadline_ns,
+                     maximum_sleep_ns=10_000_000, label="calibration initial baseline")
+        counters_before = _counter_snapshot(app_storage["backing_chain"])
+        io_before = workers.process_io()
+        previous_end = max(start_ns, time.monotonic_ns())
+        window_start_ns = previous_end
+        window_end_ns = workers.grant_sample_window(0, window_start_ns)
+        for seq in range(sample_count):
+            target_start = window_start_ns
+            target_end = window_end_ns
             _sleep_until(target_start, deadline_ns=calibration_deadline_ns, maximum_sleep_ns=10_000_000, label="calibration sample start")
-            before = counters_before if counters_before is not None else _counter_snapshot(app_storage["backing_chain"])
-            worker_before = io_before if io_before is not None else workers.process_io()
+            before = counters_before
+            worker_before = io_before
             worker_records_raw = workers.wait_sample(seq, target_end + max(500_000_000, interval_ns // 2))
             worker_records = _normalize_worker_records(worker_records_raw, workers.children, seq, schedule, fake_recipe["recipe_sha256"])
             _sleep_until(target_end, deadline_ns=calibration_deadline_ns, maximum_sleep_ns=5_000_000, label="calibration sample end")
             after = _counter_snapshot(app_storage["backing_chain"])
             worker_after = workers.process_io()
-            sample = _build_sample(fake_recipe, seq, previous_end, time.monotonic_ns(), before, after, worker_records, worker_before, worker_after, False)
+            sample_end_ns = time.monotonic_ns()
+            if seq + 1 == sample_count:
+                workers.finish_sample_capture(seq)
+            sample = _build_sample(fake_recipe, seq, previous_end, sample_end_ns, before, after, worker_records, worker_before, worker_after, False)
             samples.append(sample)
             if context_v2:
                 prospective = normalized["scope"]["pressure_thresholds"]
@@ -3397,7 +3686,10 @@ def _calibrate_request(request_path: Path, output_path: Path, *, context_v2: boo
                 _storage_reserve(fake_recipe, run_dir, scratch_reserved=True)
             counters_before = after
             io_before = worker_after
-            previous_end = sample["interval_end_monotonic_ns"]
+            previous_end = sample_end_ns
+            if seq + 1 < sample_count:
+                window_start_ns = sample_end_ns
+                window_end_ns = workers.grant_sample_window(seq + 1, window_start_ns)
         require(all(item["block"]["writes_completed"] > 0 and item["block"]["write_bytes"] > 0 for item in samples), "pressure calibration did not observe writes on the application block device")
         require(any(item["block"]["in_flight"] > 0 or item["block"]["weighted_io_milliseconds"] > 0 or item["io_psi_delta_microseconds"] > 0 for item in samples), "pressure calibration has no independent block queue/stall evidence")
         require(all(
