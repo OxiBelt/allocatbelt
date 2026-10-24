@@ -215,10 +215,12 @@ def _require_absolute_evidence_paths_mapped(value: object) -> None:
         _require_evidence_path_mapped(value)
 
 
-def _preflight_capacity_request_paths_v2(request: dict[str, Any]) -> None:
+def _preflight_capacity_request_paths_v2(
+    request: dict[str, Any],
+) -> dict[str, Any] | None:
     """Close the capacity producer's nested canonical references before replay."""
     if _EVIDENCE_PATH_MAP_CONTEXT.get() is None:
-        return
+        return None
     _require_absolute_evidence_paths_mapped(request)
     source_pin = exact(request.get("source_manifest"), {"path", "sha256"}, "capacity request SourceV5 manifest pin")
     _require_evidence_path_mapped(absolute_path(source_pin["path"], "capacity request SourceV5 manifest path"))
@@ -247,6 +249,13 @@ def _preflight_capacity_request_paths_v2(request: dict[str, Any]) -> None:
     expected_sha = sha256(expectation_pin["sha256"], "capacity expectation raw SHA-256")
     require(expectation_sha == expected_sha == sha256(request.get("expectation_sha256"), "capacity expectation request SHA-256"), "preflighted capacity expectation pin differs")
     _require_absolute_evidence_paths_mapped(expectation)
+    validated_documents = {
+        "context": context,
+        "context_raw": _context_raw,
+        "context_raw_sha256": context_sha,
+        "validation": validation,
+        "expectation": expectation,
+    }
     probe_value = expectation.get("construction_probe")
     if probe_value is not None:
         probe = exact(probe_value, {"path", "raw_sha256", "allocator", "binary_sha256"}, "capacity expectation construction-probe pin")
@@ -257,6 +266,8 @@ def _preflight_capacity_request_paths_v2(request: dict[str, Any]) -> None:
             probe_pin, "preflighted capacity construction probe", 512 * 1024,
         )
         _require_absolute_evidence_paths_mapped(construction_probe)
+        validated_documents["construction_probe"] = construction_probe
+    return validated_documents
 
 
 def _preflight_context_policy_bundle_paths_v2(context_policy_pin_value: object) -> None:
@@ -310,10 +321,10 @@ def _preflight_context_policy_bundle_paths_v2(context_policy_pin_value: object) 
 def _preflight_scope_replay_paths_v2(
     calibration_scope: dict[str, Any], context_policy_pin: object,
     capacity_bundle_pins: object, observed_host_pin: object,
-) -> None:
+) -> dict[str, Any] | None:
     """Authorize all canonical replay inputs before loading SourceV5 helpers."""
     if _EVIDENCE_PATH_MAP_CONTEXT.get() is None:
-        return
+        return None
     _require_evidence_path_mapped(absolute_path(calibration_scope["source_root"], "preflighted SourceV5 source root"))
     for value, label, maximum in (
         (calibration_scope["condition"], "Source5 pressure condition", 1 * 1024 * 1024),
@@ -327,12 +338,20 @@ def _preflight_scope_replay_paths_v2(
     }, "preflighted capacity bundle")
     _require_absolute_evidence_paths_mapped(capacity)
     request_pin = _raw_pin(capacity["request"], "preflighted capacity producer request")
-    _, request, _request_raw, _request_sha = _read_raw_pin(
+    _, request, _request_raw, request_sha = _read_raw_pin(
         request_pin, "preflighted capacity producer request", 2 * 1024 * 1024,
     )
-    _preflight_capacity_request_paths_v2(request)
+    preflight_documents = _preflight_capacity_request_paths_v2(request)
+    require(preflight_documents is not None,
+            "preflighted closed capacity documents are unavailable")
     _preflight_context_policy_bundle_paths_v2(calibration_scope["context_policy_bundle"])
     _preflight_context_policy_bundle_paths_v2(context_policy_pin)
+    return {
+        "request": request,
+        "request_pin": request_pin,
+        "request_raw_sha256": request_sha,
+        "documents": preflight_documents,
+    }
 
 
 def _checked_evidence_path(path: Path | str) -> Path:
@@ -1859,6 +1878,7 @@ def _capacity_key_v2(value: object, label: str = "pressure capacity key") -> dic
 def _verify_capacity_bundle_v2(
     source_stack: dict[str, Any], capacity_bundle_pins_value: object,
     expected_source_pin: dict[str, Any], observed_host: dict[str, Any],
+    *, preflight_record: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     bundle = exact(capacity_bundle_pins_value, {
         "schema", "capacity_key", "source_manifest", "request", "artifact", "receipt",
@@ -1867,11 +1887,26 @@ def _verify_capacity_bundle_v2(
     key = _capacity_key_v2(bundle["capacity_key"])
     pins = {name: _raw_pin(bundle[name], f"capacity bundle {name}") for name in ("source_manifest", "request", "artifact", "receipt")}
     require(pins["source_manifest"] == expected_source_pin == source_stack["source_pin"], "capacity bundle does not bind the exact SourceV5 manifest file")
-    request, request_raw, request_sha = read_canonical(Path(pins["request"]["path"]), "capacity producer request", 2 * 1024 * 1024)
+    if preflight_record is None:
+        request, _request_raw, request_sha = read_canonical(
+            Path(pins["request"]["path"]), "capacity producer request",
+            2 * 1024 * 1024,
+        )
+        require(request_sha == pins["request"]["raw_sha256"],
+                "capacity producer request raw digest differs")
+        preflight_documents = _preflight_capacity_request_paths_v2(request)
+    else:
+        preflight_value = exact(preflight_record, {
+            "request", "request_pin", "request_raw_sha256", "documents",
+        }, "preflighted capacity request closure")
+        require(preflight_value["request_pin"] == pins["request"],
+                "preflighted capacity request path/raw pin differs from the bundle")
+        request = preflight_value["request"]
+        request_sha = preflight_value["request_raw_sha256"]
+        preflight_documents = preflight_value["documents"]
     require(request_sha == pins["request"]["raw_sha256"], "capacity producer request raw digest differs")
     for pin in pins.values():
         _require_evidence_path_mapped(pin["path"])
-    _preflight_capacity_request_paths_v2(request)
     identity = exact(request.get("identity"), {
         "host_id", "run_id", "report_nonce", "process_id", "allocator", "executor", "workload", "profile",
         "mode", "source_sha256", "binary_sha256", "pressure_qualification",
@@ -1882,7 +1917,15 @@ def _verify_capacity_bundle_v2(
     request_source = exact(request.get("source_manifest"), {"path", "sha256"}, "capacity producer source manifest pin")
     require(request_source == {"path": pins["source_manifest"]["path"], "sha256": pins["source_manifest"]["raw_sha256"]}, "capacity producer request uses a different SourceV5 raw manifest")
     context_pin = exact(request.get("context"), {"path", "sha256"}, "capacity producer context pin")
-    context, context_raw, context_sha = read_canonical(Path(context_pin["path"]), "capacity producer context", MAX_CAPACITY_CONTEXT_BYTES)
+    if preflight_documents is None:
+        context, context_raw, context_sha = read_canonical(
+            Path(context_pin["path"]), "capacity producer context",
+            MAX_CAPACITY_CONTEXT_BYTES,
+        )
+    else:
+        context = preflight_documents["context"]
+        context_raw = preflight_documents["context_raw"]
+        context_sha = preflight_documents["context_raw_sha256"]
     _require_evidence_path_mapped(context_pin["path"])
     _require_absolute_evidence_paths_mapped(context)
     require(context_sha == context_pin["sha256"], "capacity producer context raw digest differs")
@@ -1928,6 +1971,11 @@ def _verify_capacity_bundle_v2(
         "context_raw_sha256": context_sha, "context_raw": context_raw,
         "capacity_fields": capacity_fields, "capacity_tsv_raw_sha256": capacity_sha,
         "capacity_receipt": capacity_receipt, "capacity_receipt_raw_sha256": capacity_receipt_sha,
+        "closed_replay_documents": (None if preflight_documents is None else {
+            name: preflight_documents[name]
+            for name in ("validation", "expectation", "construction_probe")
+            if name in preflight_documents
+        }),
     }
 
 
@@ -2345,10 +2393,22 @@ def _verify_context_policy_bundle_v2(
                 require(capacity_pins["schema"] == CAPACITY_BUNDLE_PIN_SCHEMA_V2 and
                         _capacity_key_v2(capacity_pins["capacity_key"]) == capacity["capacity_key"],
                         "closed-recorded capacity bundle metadata differs")
+                capacity_path_documents = capacity.get("closed_replay_documents")
+                require(type(capacity_path_documents) is dict and
+                        set(capacity_path_documents) == {
+                            "validation", "expectation", "construction_probe",
+                        } and
+                        all(type(document) in (dict, list)
+                            for document in capacity_path_documents.values()),
+                        "closed-recorded capacity validation/expectation/probe documents were not preflighted")
                 replay_context = _closed_recorded_feedback_context_v1(
                     source_stack, evidence_path_map, source_stack["source_root"],
                     [source_stack["source"], capacity["request"], capacity["context"],
-                     capacity["capacity_receipt"], context_bundle, policy, request,
+                     capacity["capacity_receipt"],
+                     capacity_path_documents["validation"],
+                     capacity_path_documents["expectation"],
+                     capacity_path_documents["construction_probe"],
+                     context_bundle, policy, request,
                      construction_probe, resolved_policy, composition_receipt,
                      capture, owner_result, inventory_value],
                     {
@@ -3063,7 +3123,9 @@ def _replay_calibration_scope_v2(
         "schema", "capacity_key", "source_manifest", "request", "artifact", "receipt",
     }, "context calibration capacity bundle input")
     require(capacity_pins == scope["capacity_bundle_pins"], "context calibration capacity bundle differs from its independently supplied pin")
-    _preflight_scope_replay_paths_v2(scope, context_policy_pin, capacity_pins, observed_host_pin)
+    capacity_preflight = _preflight_scope_replay_paths_v2(
+        scope, context_policy_pin, capacity_pins, observed_host_pin,
+    )
     if preloaded_source_stack is None:
         source_stack = _source5_stack(
             scope["source_manifest"], scope["source_root"],
@@ -3084,7 +3146,10 @@ def _replay_calibration_scope_v2(
     host_verification = _host_verification_v2(
         calibration, observed_pin, observed, require_live=require_local_host,
     )
-    capacity = _verify_capacity_bundle_v2(source_stack, capacity_pins, scope["source_manifest"], observed)
+    capacity = _verify_capacity_bundle_v2(
+        source_stack, capacity_pins, scope["source_manifest"], observed,
+        preflight_record=capacity_preflight,
+    )
     require(capacity["capacity_key"] == scope["capacity_key"], "prepared capacity key differs from calibration scope")
     require(capacity["capacity_tsv_raw_sha256"] == calibration["raw_inputs"]["application_capacity_calibration_sha256"], "prepared capacity TSV differs from the exact calibration input bytes")
     calibration_policy = _verify_context_policy_bundle_v2(

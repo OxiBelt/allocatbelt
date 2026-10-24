@@ -1111,6 +1111,11 @@ class PressureReadbackV2Tests(unittest.TestCase):
             capacity = {
                 "capacity_key": capacity_key, "pins": capacity_pins,
                 "request": {}, "context": {}, "capacity_receipt": {},
+                "closed_replay_documents": {
+                    "validation": {"closure_role": "validation"},
+                    "expectation": {"closure_role": "expectation"},
+                    "construction_probe": {"closure_role": "probe"},
+                },
             }
             captured: dict[str, Any] = {}
 
@@ -1119,6 +1124,7 @@ class PressureReadbackV2Tests(unittest.TestCase):
                 _documents: object, evidence_files: set[str], *_rest: object,
             ) -> dict[str, Any]:
                 captured["evidence_files"] = set(evidence_files)
+                captured["documents"] = list(_documents)
                 return {"test": "intercepted after closed replay file closure"}
 
             with patch.object(readback, "_closed_probe_capture_mountpoints_v1", return_value=set()), \
@@ -1140,10 +1146,288 @@ class PressureReadbackV2Tests(unittest.TestCase):
             mapped_inputs = captured["evidence_files"]
             for role in ("source_manifest", "request", "artifact", "receipt"):
                 self.assertIn(capacity_pins[role]["path"], mapped_inputs)
+            for document in capacity["closed_replay_documents"].values():
+                self.assertIn(document, captured["documents"])
             self.assertEqual(
                 mapped_inputs.intersection({capacity_pins["schema"], str(capacity_key)}),
                 set(),
             )
+
+    def test_closed_capacity_expectation_probe_closure_reaches_real_cfb_map(self) -> None:
+        composer = _load_module(
+            "pressure_feedback_composition_capacity_closure_test_target",
+            SCRIPT_DIR / "application-feedback-composition.py",
+        )
+        with tempfile.TemporaryDirectory(prefix="pressure-capacity-closure-") as temporary:
+            root = Path(temporary).resolve()
+            input_root, source_root = root / "input", root / "source"
+            input_root.mkdir()
+            source_root.mkdir()
+
+            def write_document(name: str, value: object, *, under_input: bool = True) -> dict[str, str]:
+                path = (input_root if under_input else source_root) / name
+                raw = readback.canonical_bytes(value)
+                path.write_bytes(raw)
+                return {"path": str(path), "sha256": readback.sha256_bytes(raw)}
+
+            binary_sha = "a" * 64
+            source_tree_sha = "b" * 64
+            capacity_key = {
+                "host_id": "host-fixture", "workload": "cpu",
+                "profile": "steady", "calibration_id": "capacity-fixture-01",
+            }
+            identity = {
+                "host_id": capacity_key["host_id"], "run_id": "run-fixture-01",
+                "report_nonce": "nonce-fixture-01", "process_id": 123,
+                "allocator": "allocatbelt", "executor": "allocatbelt",
+                "workload": capacity_key["workload"], "profile": capacity_key["profile"],
+                "mode": "capacity", "source_sha256": source_tree_sha,
+                "binary_sha256": binary_sha, "pressure_qualification": False,
+            }
+            source_document = {
+                "source": {"git_commit": "1" * 40, "source_tree_sha256": source_tree_sha,
+                           "cargo_lock_sha256": "2" * 64, "files": []},
+                "artifacts": {"allocatbelt": {"path": "bin/allocatbelt",
+                                                "sha256": binary_sha}},
+                "feedback_policy": {
+                    "schema": "allocatbelt.application-feedback-policy-artifact.v1",
+                    "policy": {"schema": "allocatbelt.application-feedback-policy-artifact.v1",
+                               "version": "fixture-v1", "reader_contract": {},
+                               "algorithm": {}, "contexts": [], "source_pins": {}},
+                },
+            }
+            source_document["feedback_policy"]["policy_sha256"] = readback.digest_object(
+                source_document["feedback_policy"]["policy"],
+            )
+            source_pin_value = write_document("source-manifest.json", source_document)
+            source_pin = {"path": source_pin_value["path"],
+                          "raw_sha256": source_pin_value["sha256"]}
+            request_source_pin = {"path": source_pin["path"],
+                                  "sha256": source_pin["raw_sha256"]}
+            context_pin_value = write_document("capacity-context.json", {
+                "schema": "allocatbelt.application-capacity-context.v1",
+                "identity": identity, "stage": "pre_confirmation",
+                "storage": None, "network": None,
+            })
+            context_pin = {"path": context_pin_value["path"],
+                           "sha256": context_pin_value["sha256"]}
+            validation_pin_value = write_document("capacity-validation.json", {})
+            validation_pin = {"path": validation_pin_value["path"],
+                              "sha256": validation_pin_value["sha256"]}
+            probe_pin = write_document("policy-probe.json", {"probe": "pinned"})
+            expectation_value = {
+                "host_binding": source_pin,
+                "construction_probe": {
+                    "path": probe_pin["path"], "raw_sha256": probe_pin["sha256"],
+                    "allocator": "allocatbelt", "binary_sha256": binary_sha,
+                },
+            }
+            expectation_pin = write_document("feedback-expectation.json", expectation_value)
+            for trace_name in feedback_reader.CAPACITY_TRACE_FILES:
+                (input_root / trace_name).write_bytes(b"")
+            request = {
+                "schema": readback.SOURCE5_CAPACITY_BUNDLE_SCHEMA,
+                "trace_directory": str(input_root),
+                "calibration_id": capacity_key["calibration_id"],
+                "identity": identity,
+                "source_manifest": request_source_pin, "context": context_pin,
+                "validation": validation_pin, "expectation": expectation_pin,
+                "expectation_sha256": expectation_pin["sha256"],
+            }
+            request_pin = write_document("capacity-request.json", request)
+            mapping = {str(path): str(path) for path in (input_root, source_root)}
+            directories = set(mapping)
+
+            def preflight(value: dict[str, Any]) -> dict[str, Any] | None:
+                token = readback._EVIDENCE_PATH_MAP_CONTEXT.set((mapping, directories))
+                try:
+                    return readback._preflight_capacity_request_paths_v2(value)
+                finally:
+                    readback._EVIDENCE_PATH_MAP_CONTEXT.reset(token)
+
+            validated = preflight(request)
+            if validated is not None:
+                self.assertEqual(validated["expectation"], expectation_value)
+                self.assertEqual(validated["construction_probe"], {"probe": "pinned"})
+
+            missing_expectation = dict(request)
+            missing_expectation["expectation"] = {
+                "path": str(input_root / "missing-expectation.json"), "sha256": "0" * 64,
+            }
+            missing_expectation["expectation_sha256"] = "0" * 64
+            with self.assertRaises(readback.ReadbackError):
+                preflight(missing_expectation)
+            no_map_token = readback._EVIDENCE_PATH_MAP_CONTEXT.set(None)
+            try:
+                self.assertIsNone(
+                    readback._preflight_capacity_request_paths_v2(missing_expectation),
+                )
+            finally:
+                readback._EVIDENCE_PATH_MAP_CONTEXT.reset(no_map_token)
+            expectation_path = Path(expectation_pin["path"])
+            expectation_raw = readback.canonical_bytes(expectation_value)
+            expectation_path.write_bytes(readback.canonical_bytes({"tampered": True}))
+            with self.assertRaisesRegex(readback.ReadbackError, "expectation"):
+                preflight(request)
+            expectation_path.write_bytes(expectation_raw)
+
+            missing_probe = dict(expectation_value)
+            missing_probe["construction_probe"] = dict(expectation_value["construction_probe"])
+            missing_probe["construction_probe"]["path"] = str(input_root / "missing-policy-probe.json")
+            missing_probe_pin = write_document("missing-probe-expectation.json", missing_probe)
+            bad_probe_request = dict(request, expectation=missing_probe_pin,
+                                     expectation_sha256=missing_probe_pin["sha256"])
+            with self.assertRaises(readback.ReadbackError):
+                preflight(bad_probe_request)
+            outside_path = root / "outside" / "policy-probe.json"
+            outside_path.parent.mkdir()
+            outside_raw = readback.canonical_bytes({"probe": "outside-root"})
+            outside_path.write_bytes(outside_raw)
+            outside_expectation = dict(expectation_value)
+            outside_expectation["construction_probe"] = dict(expectation_value["construction_probe"])
+            outside_expectation["construction_probe"].update({
+                "path": str(outside_path),
+                "raw_sha256": readback.sha256_bytes(outside_raw),
+            })
+            outside_expectation_pin = write_document("outside-expectation.json", outside_expectation)
+            outside_request = dict(request, expectation=outside_expectation_pin,
+                                   expectation_sha256=outside_expectation_pin["sha256"])
+            with self.assertRaisesRegex(
+                    readback.ReadbackError,
+                    "absent from the explicit identity path map",
+            ):
+                preflight(outside_request)
+            probe_path = Path(probe_pin["path"])
+            probe_raw = readback.canonical_bytes({"probe": "pinned"})
+            probe_path.write_bytes(readback.canonical_bytes({"tampered": True}))
+            with self.assertRaises(readback.ReadbackError):
+                preflight(request)
+            probe_path.write_bytes(probe_raw)
+
+            artifact_path = input_root / "capacity.tsv"
+            artifact_raw = b"capacity\n"
+            artifact_path.write_bytes(artifact_raw)
+            artifact_sha = readback.sha256_bytes(artifact_raw)
+            capacity_receipt_value = {
+                "schema": "allocatbelt.application-byte-capacity-receipt.v1",
+                "qualification_eligible": False,
+                "identity": identity,
+                "calibration_id": capacity_key["calibration_id"],
+                "source_manifest_raw_sha256": source_pin["raw_sha256"],
+                "capacity_artifact_raw_sha256": artifact_sha,
+            }
+            receipt_pin = write_document("capacity-receipt.json", capacity_receipt_value)
+            capture_pin = write_document("capture-receipt.json", {"capture": "pinned"})
+            arbitrary = input_root / "unreferenced.json"
+            arbitrary.write_bytes(b"{}\n")
+            probe_path = Path(probe_pin["path"])
+            unlisted_link = input_root / "unlisted-link"
+            unlisted_link.symlink_to(probe_path)
+            capacity_pins = {
+                "schema": readback.CAPACITY_BUNDLE_PIN_SCHEMA_V2,
+                "capacity_key": capacity_key,
+                "source_manifest": source_pin,
+                "request": {"path": request_pin["path"], "raw_sha256": request_pin["sha256"]},
+                "artifact": {"path": str(artifact_path), "raw_sha256": artifact_sha},
+                "receipt": {"path": receipt_pin["path"], "raw_sha256": receipt_pin["sha256"]},
+            }
+            class Producer:
+                @staticmethod
+                def verify_capacity_bundle(*_args: object) -> bool:
+                    return True
+
+            class CapacityReader:
+                def __init__(self, fields: dict[str, Any]) -> None:
+                    self.fields = fields
+
+                def _read_capacity_artifact_v5(
+                    self, pin: dict[str, str],
+                ) -> tuple[dict[str, Any], str]:
+                    return self.fields, pin["raw_sha256"]
+
+            capacity_source_stack = {
+                "source_pin": source_pin, "source_tree_sha256": source_tree_sha,
+                "producer": Producer(),
+                "feedback_reader": CapacityReader({
+                    "host_id": capacity_key["host_id"],
+                    "workload": capacity_key["workload"],
+                    "profile": capacity_key["profile"],
+                    "calibration_id": capacity_key["calibration_id"],
+                    "source_sha256": source_tree_sha,
+                }),
+            }
+            bad_request = dict(request)
+            bad_request["expectation"] = {
+                "path": str(input_root / "missing-expectation-before-hash-check.json"),
+                "sha256": "0" * 64,
+            }
+            bad_request["expectation_sha256"] = "0" * 64
+            bad_request_pin = write_document("bad-capacity-request.json", bad_request)
+            bad_capacity_pins = dict(capacity_pins)
+            bad_capacity_pins["request"] = {
+                "path": bad_request_pin["path"], "raw_sha256": "0" * 64,
+            }
+            map_token = readback._EVIDENCE_PATH_MAP_CONTEXT.set((mapping, directories))
+            try:
+                with self.assertRaisesRegex(
+                        readback.ReadbackError,
+                        "capacity producer request raw digest differs",
+                ):
+                    readback._verify_capacity_bundle_v2(
+                        {"source_pin": source_pin}, bad_capacity_pins, source_pin, {},
+                    )
+                capacity = readback._verify_capacity_bundle_v2(
+                    capacity_source_stack, capacity_pins, source_pin, {},
+                )
+            finally:
+                readback._EVIDENCE_PATH_MAP_CONTEXT.reset(map_token)
+            capacity_bundle = {name: capacity["pins"][name]
+                               for name in ("request", "artifact", "receipt")}
+            evidence_files = {
+                source_pin["path"], request_pin["path"], context_pin["path"],
+                validation_pin["path"], expectation_pin["path"],
+                capacity_bundle["artifact"]["path"], capacity_bundle["receipt"]["path"],
+                capture_pin["path"],
+            }
+            self.assertNotIn(str(probe_path), evidence_files)
+            closed_documents = capacity.get("closed_replay_documents") or {}
+            documents = [source_document, capacity["request"], capacity["context"],
+                         capacity["capacity_receipt"]]
+            documents.extend(
+                closed_documents[name]
+                for name in ("validation", "expectation", "construction_probe")
+                if name in closed_documents
+            )
+            evidence_map = {
+                "schema": readback.EVIDENCE_PATH_MAP_SCHEMA_V1,
+                "entries": [{"origin": path, "local": path} for path in sorted(mapping)],
+            }
+            token = readback._EVIDENCE_PATH_MAP_CONTEXT.set((mapping, directories))
+            try:
+                replay_context = readback._closed_recorded_feedback_context_v1(
+                    {"source": source_document, "composer": composer,
+                     "feedback_reader": feedback_reader}, evidence_map, source_root,
+                    documents, evidence_files,
+                    {"path": capture_pin["path"], "raw_sha256": capture_pin["sha256"],
+                     "receipt_sha256": "f" * 64},
+                    capacity_bundle, str(source_root / "bin" / "allocatbelt"), set(),
+                )
+            finally:
+                readback._EVIDENCE_PATH_MAP_CONTEXT.reset(token)
+            inner = composer._offline_context(replay_context)
+            nested_paths = {expectation_pin["path"], probe_pin["path"]}
+            composer._require_mapped_files(inner, nested_paths,
+                                           "nested capacity expectation/probe closure")
+            self.assertTrue(nested_paths <= inner["mapped_files"])
+
+            elf = str(source_root / "bin" / "allocatbelt")
+            self.assertNotIn(str(arbitrary), inner["mapped_paths"])
+            self.assertNotIn(str(unlisted_link), inner["mapped_paths"])
+            self.assertNotIn(elf, inner["mapped_paths"])
+            with self.assertRaises(composer.CompositionError):
+                composer._require_mapped_files(inner, {str(arbitrary)}, "unreferenced input")
+            with self.assertRaises(composer.CompositionError):
+                composer._require_mapped_files(inner, {elf}, "SourceV5 executable")
 
     def test_closed_recorded_source_inventory_checks_literal_symlink_bytes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pressure-closed-symlink-") as temporary:
