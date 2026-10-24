@@ -2339,6 +2339,12 @@ def _verify_context_policy_bundle_v2(
                 )
                 capture_mountpoints = _closed_probe_capture_mountpoints_v1(capture)
                 capture_mountpoints.add(str(Path(closed_capture_pin["path"]).parent))
+                capacity_pins = exact(capacity["pins"], {
+                    "schema", "capacity_key", "source_manifest", "request", "artifact", "receipt",
+                }, "closed-recorded verified capacity bundle pins")
+                require(capacity_pins["schema"] == CAPACITY_BUNDLE_PIN_SCHEMA_V2 and
+                        _capacity_key_v2(capacity_pins["capacity_key"]) == capacity["capacity_key"],
+                        "closed-recorded capacity bundle metadata differs")
                 replay_context = _closed_recorded_feedback_context_v1(
                     source_stack, evidence_path_map, source_stack["source_root"],
                     [source_stack["source"], capacity["request"], capacity["context"],
@@ -2347,7 +2353,9 @@ def _verify_context_policy_bundle_v2(
                      capture, owner_result, inventory_value],
                     {
                         source_stack["source_pin"]["path"],
-                        *(pin["path"] for pin in capacity["pins"].values()),
+                        *(_raw_pin(capacity_pins[role],
+                                   f"closed-recorded capacity {role} pin")["path"]
+                          for role in ("source_manifest", "request", "artifact", "receipt")),
                         context_pin["path"], policy_pin["path"], request_pin["path"],
                         probe_pin["path"], resolved_pin["path"], composition_pin["path"],
                         closed_capture_pin["path"], owner_result_pin["path"],

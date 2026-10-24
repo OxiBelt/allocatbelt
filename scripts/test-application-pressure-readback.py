@@ -956,6 +956,195 @@ class PressureReadbackV2Tests(unittest.TestCase):
         self.assertIs(parameters["probe_capture_pins"].default,
                       inspect.Parameter.empty)
 
+    def test_closed_recorded_capacity_projection_uses_typed_pin_roles(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pressure-closed-capacity-pins-") as temporary:
+            root = Path(temporary).resolve()
+
+            def write_document(name: str, value: object) -> dict[str, str]:
+                path = root / name
+                raw = readback.canonical_bytes(value)
+                path.write_bytes(raw)
+                return {"path": str(path), "raw_sha256": readback.sha256_bytes(raw)}
+
+            source_pin = write_document("source-manifest.json", {"source": "r14"})
+            capacity_key = {
+                "host_id": "host-r14", "workload": "cpu",
+                "profile": "steady", "calibration_id": "capacity-r14-01",
+            }
+            capacity_pins = {
+                "schema": readback.CAPACITY_BUNDLE_PIN_SCHEMA_V2,
+                "capacity_key": capacity_key,
+                "source_manifest": source_pin,
+                "request": {"path": str(root / "capacity-request.json"), "raw_sha256": "b" * 64},
+                "artifact": {"path": str(root / "capacity.tsv"), "raw_sha256": "c" * 64},
+                "receipt": {"path": str(root / "capacity-receipt.json"), "raw_sha256": "d" * 64},
+            }
+            capacity_bundle = {
+                "schema": capacity_pins["schema"], "capacity_key": capacity_key,
+                "source_manifest": source_pin, "request": capacity_pins["request"],
+                "artifact": capacity_pins["artifact"], "receipt": capacity_pins["receipt"],
+            }
+            expected_capacity = {
+                name: capacity_pins[name] for name in ("request", "artifact", "receipt")
+            }
+            binary_path = root / "bin" / "allocatbelt"
+            binary_sha = "a" * 64
+            captures: dict[str, dict[str, Any]] = {}
+            capture_rows = []
+            members = []
+            for index, pair in enumerate(("bounded", "tokio")):
+                probe_pin = write_document(f"probe-{index}.json", {"probe": index})
+                probe_pin.update({"allocator": "allocatbelt", "binary_sha256": binary_sha})
+                request = {
+                    "schema": "test-composer-request-v1",
+                    "source_root": str(root), "source_manifest": source_pin,
+                    "context": capacity_key, "construction_probe": probe_pin,
+                    "capacity_bundle": expected_capacity,
+                }
+                request_pin = write_document(f"composer-request-{index}.json", request)
+                resolved_pin = write_document(f"resolved-policy-{index}.json", {})
+                composition_pin = write_document(f"composition-{index}.json", {})
+                descriptor = {"pair": pair, "executor": pair, "allocator": "allocatbelt"}
+                members.append({
+                    "descriptor": descriptor, "request": request_pin,
+                    "construction_probe": probe_pin,
+                    "resolved_policy": resolved_pin,
+                    "composition_receipt": composition_pin,
+                })
+
+                inventory = write_document(f"inventory-{index}.json", {"entries": []})
+                stdout = write_document(f"stdout-{index}.json", {})
+                stderr = write_document(f"stderr-{index}.json", {})
+                capture_doc = write_document(f"capture-{index}.json", {"capture": index})
+                argv = [str(binary_path)]
+                direct = {name: None for name in feedback_reader.DIRECT_CAPTURE_FIELDS}
+                direct.update({
+                    "binary_path": str(binary_path), "binary_sha256": binary_sha,
+                    "binary_size": 1, "requested_argv": argv,
+                })
+                owner_raw = readback.canonical_bytes({"direct": direct})
+                owner_path = root / f"owner-result-{index}.json"
+                owner_path.write_bytes(owner_raw)
+                owner_result = {"path": str(owner_path),
+                                "raw_sha256": readback.sha256_bytes(owner_raw),
+                                "owner_result_sha256": "e" * 64}
+                capture = {
+                    "probe_pin": probe_pin,
+                    "binary": {"path": str(binary_path), "raw_sha256": binary_sha},
+                    "probe_argv": argv,
+                    "owner_result_pin": owner_result,
+                    "tmpdir_inventory_pin": {
+                        "path": inventory["path"], "raw_sha256": inventory["raw_sha256"],
+                        "inventory_sha256": "f" * 64,
+                    },
+                    "stdout": stdout, "stderr": stderr,
+                }
+                captures[capture_doc["raw_sha256"]] = capture
+                capture_rows.append({
+                    "descriptor": descriptor,
+                    "request_pin": request_pin,
+                    "probe_capture_pin": {
+                        "path": capture_doc["path"],
+                        "raw_sha256": capture_doc["raw_sha256"],
+                        "receipt_sha256": "1" * 64,
+                    },
+                })
+
+            policy = {
+                "schema": readback.SOURCE5_PRESSURE_POLICY_SCHEMA,
+                "source_manifest": source_pin, "context": capacity_key,
+                "capacity_bundle": expected_capacity,
+                "base_policy_artifact_sha256": "2" * 64,
+                "base_policy_sha256": "3" * 64,
+                "base_context_sha256": "4" * 64,
+                "resolution_rule_version": "test-rule-v1",
+                "numeric_policy": {}, "baseline": {}, "hard_ceilings": {},
+                "normalization_denominators": {}, "member_resolutions": [],
+            }
+            policy["policy_sha256"] = readback.digest_object(policy)
+            policy_pin = write_document("shared-policy.json", policy)
+            context_bundle = {
+                "schema": readback.CONTEXT_POLICY_BUNDLE_SCHEMA_V2,
+                "artifact": policy_pin, "members": members,
+            }
+            context_bundle_pin = write_document("context-policy-bundle.json", context_bundle)
+
+            class Composer:
+                REQUEST_SCHEMA = "test-composer-request-v1"
+
+                @staticmethod
+                def compose_calibrated_policy_v5_closed_recorded_v1(
+                    request: object, request_sha: str, *, replay_context: object,
+                ) -> object:
+                    raise RuntimeError("reached closed composer boundary")
+
+            class FeedbackReader:
+                DIRECT_CAPTURE_FIELDS = feedback_reader.DIRECT_CAPTURE_FIELDS
+                MAX_APP_BINARY_BYTES = feedback_reader.MAX_APP_BINARY_BYTES
+                MAX_PROBE_CAPTURE_RECEIPT_BYTES = feedback_reader.MAX_PROBE_CAPTURE_RECEIPT_BYTES
+                MAX_PROBE_OWNER_RESULT_BYTES = feedback_reader.MAX_PROBE_OWNER_RESULT_BYTES
+                MAX_PROBE_TMPDIR_INVENTORY_BYTES = feedback_reader.MAX_PROBE_TMPDIR_INVENTORY_BYTES
+
+                @staticmethod
+                def validate_probe_capture_receipt_envelope(
+                    raw: bytes, expected_raw_sha256: str,
+                    expected_receipt_sha256: str,
+                ) -> dict[str, Any]:
+                    return captures[expected_raw_sha256]
+
+            feedback_policy = {
+                "schema": "allocatbelt.application-feedback-policy-artifact.v1",
+                "version": "test-v1", "reader_contract": {}, "algorithm": {},
+                "contexts": [], "source_pins": {},
+            }
+            source_stack = {
+                "source_pin": source_pin, "source_root": root,
+                "source": {"artifacts": {"allocatbelt": {
+                    "path": "bin/allocatbelt", "sha256": binary_sha,
+                }}, "feedback_policy": {
+                    "schema": feedback_policy["schema"],
+                    "policy": feedback_policy,
+                    "policy_sha256": readback.digest_object(feedback_policy),
+                }},
+                "composer": Composer(), "feedback_reader": FeedbackReader(),
+            }
+            capacity = {
+                "capacity_key": capacity_key, "pins": capacity_pins,
+                "request": {}, "context": {}, "capacity_receipt": {},
+            }
+            captured: dict[str, Any] = {}
+
+            def intercept_feedback_context(
+                _source_stack: object, _evidence_map: object, _source_root: object,
+                _documents: object, evidence_files: set[str], *_rest: object,
+            ) -> dict[str, Any]:
+                captured["evidence_files"] = set(evidence_files)
+                return {"test": "intercepted after closed replay file closure"}
+
+            with patch.object(readback, "_closed_probe_capture_mountpoints_v1", return_value=set()), \
+                    patch.object(readback, "_closed_recorded_feedback_context_v1",
+                                 side_effect=intercept_feedback_context):
+                with self.assertRaisesRegex(
+                        readback.ReadbackError,
+                        r"pinned SourceV5 composer replay failed for member\[0\]: RuntimeError: reached closed composer boundary",
+                ):
+                    readback._verify_context_policy_bundle_v2(
+                        source_stack, context_bundle_pin, capacity, source_pin,
+                        closed_recorded=True, probe_capture_pins=capture_rows,
+                        evidence_path_map={
+                            "schema": readback.EVIDENCE_PATH_MAP_SCHEMA_V1,
+                            "entries": [],
+                        },
+                    )
+
+            mapped_inputs = captured["evidence_files"]
+            for role in ("source_manifest", "request", "artifact", "receipt"):
+                self.assertIn(capacity_pins[role]["path"], mapped_inputs)
+            self.assertEqual(
+                mapped_inputs.intersection({capacity_pins["schema"], str(capacity_key)}),
+                set(),
+            )
+
     def test_closed_recorded_source_inventory_checks_literal_symlink_bytes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pressure-closed-symlink-") as temporary:
             root = Path(temporary).resolve()
