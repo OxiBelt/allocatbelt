@@ -2832,6 +2832,158 @@ def run_feedback_offline_fixture(request_path: Path, expected_request_raw_sha256
 
 
 
+class CapturedSource5ModuleLoaderTests(unittest.TestCase):
+    @staticmethod
+    def _name(relative_path: str, source_sha256: str, module: object) -> str:
+        basename = relative_path.rsplit("/", 1)[-1].replace("-", "_")
+        return f"feedback_source5_{basename}_{source_sha256}_{id(module):x}"
+
+    def test_dataclass_source_module_is_temporarily_registered_and_previous_slot_restored(self) -> None:
+        import dataclasses
+        import types
+
+        relative = "scripts/application-source5-campaign.py"
+        path = SCRIPT_DIR / "application-source5-campaign.py"
+        raw = path.read_bytes()
+        info = path.stat(follow_symlinks=False)
+        mode = f"{stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode):06o}"
+        source_manifest = {"source": {"files": [{
+            "path": relative, "kind": "file", "mode": mode,
+            "sha256": _sha(raw), "size": len(raw),
+        }]}}
+        module_stub = types.ModuleType("captured_source5_pending")
+        module_name = self._name(relative, _sha(raw), module_stub)
+        previous = types.ModuleType(module_name)
+        sys.modules[module_name] = previous
+        try:
+            with patch.object(reader.types, "ModuleType", return_value=module_stub):
+                module, observed_sha = reader._captured_source5_module(
+                    source_manifest, relative, "campaign dataclass fixture",
+                    reader.MAX_SOURCE_MANIFEST_BYTES,
+                )
+            self.assertEqual(observed_sha, _sha(raw))
+            self.assertTrue(dataclasses.is_dataclass(module.CampaignContext))
+            self.assertEqual(module.CampaignContext.__module__, module_name)
+            self.assertIs(sys.modules.get(module_name), previous)
+        finally:
+            if sys.modules.get(module_name) is previous:
+                del sys.modules[module_name]
+        unregistered_stub = types.ModuleType("captured_source5_pending")
+        unregistered_name = self._name(relative, _sha(raw), unregistered_stub)
+        with patch.object(reader.types, "ModuleType", return_value=unregistered_stub):
+            unregistered_module, _unregistered_sha = reader._captured_source5_module(
+                source_manifest, relative, "campaign dataclass without prior slot",
+                reader.MAX_SOURCE_MANIFEST_BYTES,
+            )
+        self.assertTrue(dataclasses.is_dataclass(unregistered_module.CampaignContext))
+        self.assertNotIn(unregistered_name, sys.modules)
+
+    def test_captured_module_size_and_hash_guards_precede_exec(self) -> None:
+        import types
+
+        relative = "scripts/loader-bound-fixture.py"
+        raw = b"raise RuntimeError('captured module should not execute')\n"
+        source_manifest = {"source": {"files": [{
+            "path": relative, "kind": "file", "mode": "100644",
+            "sha256": _sha(raw), "size": len(raw),
+        }]}}
+        module_stub = types.ModuleType("captured_source5_pending")
+        module_name = self._name(relative, _sha(raw), module_stub)
+        with patch.object(reader, "_capture_source_v5_sibling", return_value=raw):
+            with patch.object(reader.types, "ModuleType", side_effect=AssertionError("module allocated before size check")):
+                with patch("builtins.exec", side_effect=AssertionError("unexpected captured exec")) as execute:
+                    with self.assertRaisesRegex(reader.ValidationError, "finite module bound"):
+                        reader._captured_source5_module(
+                            source_manifest, relative, "oversized fixture", len(raw) - 1,
+                        )
+                    execute.assert_not_called()
+        self.assertNotIn(module_name, sys.modules)
+
+        actual_path = SCRIPT_DIR / "application-source5-campaign.py"
+        actual_raw = actual_path.read_bytes()
+        actual_info = actual_path.stat(follow_symlinks=False)
+        actual_mode = f"{stat.S_IFMT(actual_info.st_mode) | stat.S_IMODE(actual_info.st_mode):06o}"
+        bad_manifest = {"source": {"files": [{
+            "path": "scripts/application-source5-campaign.py", "kind": "file",
+            "mode": actual_mode, "sha256": "0" * 64, "size": len(actual_raw),
+        }]}}
+        actual_module_stub = types.ModuleType("captured_source5_pending")
+        actual_name = self._name(
+            "scripts/application-source5-campaign.py", "0" * 64,
+            actual_module_stub,
+        )
+        previous = types.ModuleType(actual_name)
+        sys.modules[actual_name] = previous
+        try:
+            with patch.object(reader.types, "ModuleType", side_effect=AssertionError("module allocated before raw pin check")):
+                with patch("builtins.exec", side_effect=AssertionError("hash-mismatched module executed")) as execute:
+                    with self.assertRaisesRegex(reader.ValidationError, "bytes differ from the typed inventory pin"):
+                        reader._captured_source5_module(
+                            bad_manifest, "scripts/application-source5-campaign.py",
+                            "hash mismatch fixture", reader.MAX_SOURCE_MANIFEST_BYTES,
+                        )
+                    execute.assert_not_called()
+            self.assertIs(sys.modules.get(actual_name), previous)
+        finally:
+            if sys.modules.get(actual_name) is previous:
+                del sys.modules[actual_name]
+
+    def test_failed_import_cleanup_restores_only_the_slot_it_owns(self) -> None:
+        import types
+
+        relative = "scripts/loader-failure-fixture.py"
+        raw = b"raise RuntimeError('captured import fixture failure')\n"
+        source_manifest = {"source": {"files": [{
+            "path": relative, "kind": "file", "mode": "100644",
+            "sha256": _sha(raw), "size": len(raw),
+        }]}}
+        module_stub = types.ModuleType("captured_source5_pending")
+        module_name = self._name(relative, _sha(raw), module_stub)
+        with patch.object(reader, "_capture_source_v5_sibling", return_value=raw):
+            with patch.object(reader.types, "ModuleType", return_value=module_stub):
+                with self.assertRaisesRegex(RuntimeError, "captured import fixture failure"):
+                    reader._captured_source5_module(
+                        source_manifest, relative, "failed import fixture", len(raw),
+                    )
+        self.assertNotIn(module_name, sys.modules)
+
+        previous_module_stub = types.ModuleType("captured_source5_pending")
+        previous_module_name = self._name(relative, _sha(raw), previous_module_stub)
+        previous = types.ModuleType(previous_module_name)
+        sys.modules[previous_module_name] = previous
+        try:
+            with patch.object(reader, "_capture_source_v5_sibling", return_value=raw):
+                with patch.object(reader.types, "ModuleType", return_value=previous_module_stub):
+                    with self.assertRaisesRegex(RuntimeError, "captured import fixture failure"):
+                        reader._captured_source5_module(
+                            source_manifest, relative, "failed import with prior slot", len(raw),
+                        )
+            self.assertIs(sys.modules.get(previous_module_name), previous)
+        finally:
+            if sys.modules.get(previous_module_name) is previous:
+                del sys.modules[previous_module_name]
+
+        replacement_raw = (
+            b"import sys\nsys.modules[__name__] = None\n"
+            b"raise RuntimeError('captured import replaced its registry slot')\n"
+        )
+        replacement_manifest = {"source": {"files": [{
+            "path": relative, "kind": "file", "mode": "100644",
+            "sha256": _sha(replacement_raw), "size": len(replacement_raw),
+        }]}}
+        replacement_module_stub = types.ModuleType("captured_source5_pending")
+        replacement_name = self._name(relative, _sha(replacement_raw), replacement_module_stub)
+        with patch.object(reader, "_capture_source_v5_sibling", return_value=replacement_raw):
+            with patch.object(reader.types, "ModuleType", return_value=replacement_module_stub):
+                with self.assertRaisesRegex(RuntimeError, "replaced its registry slot"):
+                    reader._captured_source5_module(
+                        replacement_manifest, relative, "replaced slot fixture",
+                        len(replacement_raw),
+                    )
+        self.assertIsNone(sys.modules.get(replacement_name, "missing"))
+        sys.modules.pop(replacement_name, None)
+
+
 class HelperTests(unittest.TestCase):
     def test_canonical_parser_rejects_duplicate_keys_nonfinite_values_and_boolean_integer(self) -> None:
         with self.assertRaises(reader.ValidationError):

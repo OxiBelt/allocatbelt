@@ -2334,16 +2334,32 @@ def _captured_source5_module(
     source = source_manifest.get("source")
     record = _source_v5_regular_record(source, relative_path, label)
     raw = _capture_source_v5_sibling(relative_path, record, label)
+    require(len(raw) <= maximum, f"pinned {label} exceeds its finite module bound")
     path = Path(__file__).resolve().parent.parent.joinpath(*PurePosixPath(relative_path).parts)
-    name = f"feedback_source5_{relative_path.rsplit('/', 1)[-1].replace('-', '_')}_{record['sha256']}"
-    module = types.ModuleType(name)
+    basename = relative_path.rsplit("/", 1)[-1].replace("-", "_")
+    module = types.ModuleType("captured_source5_pending")
+    name = f"feedback_source5_{basename}_{record['sha256']}_{id(module):x}"
+    module.__name__ = name
     module.__file__ = str(path)
     module.__package__ = ""
     try:
-        exec(compile(raw, str(path), "exec", dont_inherit=True), module.__dict__)
+        captured_code = compile(raw, str(path), "exec", dont_inherit=True)
     except (SyntaxError, ValueError, TypeError) as error:
         raise ValidationError(f"pinned {label} cannot be compiled from captured bytes: {error}") from error
-    require(len(raw) <= maximum, f"pinned {label} exceeds its finite module bound")
+    absent = object()
+    previous = sys.modules.get(name, absent)
+    sys.modules[name] = module
+    try:
+        try:
+            exec(captured_code, module.__dict__)
+        except (SyntaxError, ValueError, TypeError) as error:
+            raise ValidationError(f"pinned {label} cannot be compiled from captured bytes: {error}") from error
+    finally:
+        if sys.modules.get(name) is module:
+            if previous is absent:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
     return module, record["sha256"]
 
 
