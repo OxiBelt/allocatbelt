@@ -2955,6 +2955,82 @@ def _calibration_sample_observations(samples: list[dict[str, Any]]) -> list[dict
     return observations
 
 
+def _calibration_failed_sample_evidence(
+    sample: dict[str, Any], readiness: dict[str, Any],
+    thresholds: dict[str, int],
+) -> dict[str, Any]:
+    """Retain the exact rejected calibration window and its failed readiness gates."""
+    require(type(sample) is dict and type(readiness) is dict and type(thresholds) is dict,
+            "rejected calibration sample evidence is malformed")
+    require(readiness.get("all_ready") is False,
+            "rejected calibration sample evidence requires a failed readiness result")
+    failed_gate_values: dict[str, Any] = {}
+    if not readiness["cpu_ready"]:
+        failed_gate_values["cpu"] = {
+            "busy_basis_points": readiness["cpu_busy_basis_points"],
+            "minimum_busy_basis_points": thresholds["cpu_busy_min_basis_points"],
+        }
+    if not readiness["disk_ready"]:
+        failed_gate_values["disk"] = {
+            "write_bytes_per_second": readiness["disk_write_bytes_per_second"],
+            "minimum_write_bytes_per_second": thresholds["disk_write_min_bytes_per_second"],
+            "writes_completed": sample["block"]["writes_completed"],
+            "minimum_writes_completed": 1,
+            "in_flight": sample["block"]["in_flight"],
+            "minimum_in_flight": 1,
+            "queue_or_stall_microseconds": readiness["disk_queue_or_stall_microseconds"],
+            "minimum_queue_or_stall_microseconds": thresholds["disk_queue_or_stall_min_microseconds"],
+        }
+    if not readiness["loopback_ready"]:
+        counters = sample["loopback_counters"]
+        failed_gate_values["loopback"] = {
+            "requests_per_second": readiness["loopback_requests_per_second"],
+            "minimum_requests_per_second": thresholds["loopback_requests_min_per_second"],
+            "p99_upper_latency_nanoseconds": readiness["loopback_latency_p99_upper_nanoseconds"],
+            "maximum_p99_upper_latency_nanoseconds": thresholds["loopback_latency_p99_max_nanoseconds"],
+            "tx_bytes_per_second": readiness["loopback_tx_bytes_per_second"],
+            "minimum_tx_bytes_per_second": thresholds["loopback_tx_min_bytes_per_second"],
+            "rx_bytes_per_second": readiness["loopback_rx_bytes_per_second"],
+            "minimum_rx_bytes_per_second": thresholds["loopback_rx_min_bytes_per_second"],
+            "rx_errors": counters["rx_errors"], "rx_dropped": counters["rx_dropped"],
+            "tx_errors": counters["tx_errors"], "tx_dropped": counters["tx_dropped"],
+            "maximum_rx_errors": 0, "maximum_rx_dropped": 0,
+            "maximum_tx_errors": 0, "maximum_tx_dropped": 0,
+        }
+    require(failed_gate_values, "rejected calibration sample has no failed gate values")
+    return {
+        "sequence": sample["sequence"],
+        "sample": sample,
+        "observed_readiness": readiness,
+        "original_thresholds": dict(thresholds),
+        "failed_gates": list(failed_gate_values),
+        "failed_gate_values": failed_gate_values,
+    }
+
+
+def _calibration_failure_body(
+    failure: str, samples: list[dict[str, Any]], cleanup: list[dict[str, Any]],
+    scratch_file_removed: bool, finish_monotonic_ns: int,
+    failed_sample: dict[str, Any] | None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "schema": "allocatbelt.application-pressure-calibration-failure.v1",
+        "failure": failure,
+        "sample_count": len(samples),
+        "device_write_sample_count": sum(
+            1 for item in samples
+            if item["block"]["writes_completed"] > 0 and item["block"]["write_bytes"] > 0
+        ),
+        "sample_observations": _calibration_sample_observations(samples),
+        "worker_cleanup": cleanup,
+        "scratch_file_removed": scratch_file_removed,
+        "finish_monotonic_ns": finish_monotonic_ns,
+    }
+    if failed_sample is not None:
+        body["failed_sample"] = failed_sample
+    return body
+
+
 def _launch_binding(path: Path, recipe: dict[str, Any]) -> tuple[dict[str, Any], bytes, str]:
     value, raw, raw_sha = verify_canonical_json(path, "application launch binding", 256 * 1024)
     binding = exact_object(value, {"schema", "recipe_sha256", "nonce", "process", "launch_binding_sha256"}, "application launch binding")
@@ -3600,6 +3676,7 @@ def _calibrate_request(request_path: Path, output_path: Path, *, context_v2: boo
     workers = WorkerSet(fake_recipe)
     samples: list[dict[str, Any]] = []
     failure: str | None = None
+    failed_sample_evidence: dict[str, Any] | None = None
     cleanup: list[dict[str, Any]] = []
     ownership_path = run_dir / "worker-ownership.json"
     authorization_path = run_dir / "worker-authorization.json"
@@ -3681,6 +3758,10 @@ def _calibrate_request(request_path: Path, output_path: Path, *, context_v2: boo
             if context_v2:
                 prospective = normalized["scope"]["pressure_thresholds"]
                 observed = _readiness_from_sample(sample, prospective)
+                if not observed["all_ready"]:
+                    failed_sample_evidence = _calibration_failed_sample_evidence(
+                        sample, observed, prospective,
+                    )
                 require(observed["all_ready"], f"calibration sample[{seq}] fails its prospectively frozen Source5 pressure thresholds")
             if seq % max(1, 1000 // schedule["sample_interval_ms"]) == 0:
                 _storage_reserve(fake_recipe, run_dir, scratch_reserved=True)
@@ -3711,18 +3792,11 @@ def _calibrate_request(request_path: Path, output_path: Path, *, context_v2: boo
         for item in cleanup if item.get("role") != "scratch_cleanup"
     ) and not any(item.get("role") == "scratch_cleanup" and item.get("error") for item in cleanup)
     if failure is not None or not cleanup_ok or not workers.scratch_removed:
-        failure_body = {
-            "schema": "allocatbelt.application-pressure-calibration-failure.v1",
-            "failure": failure or "calibration process cleanup or scratch removal failed",
-            "sample_count": len(samples),
-            "device_write_sample_count": sum(
-                1 for item in samples if item["block"]["writes_completed"] > 0 and item["block"]["write_bytes"] > 0
-            ),
-            "sample_observations": _calibration_sample_observations(samples),
-            "worker_cleanup": cleanup,
-            "scratch_file_removed": workers.scratch_removed,
-            "finish_monotonic_ns": time.monotonic_ns(),
-        }
+        failure_body = _calibration_failure_body(
+            failure or "calibration process cleanup or scratch removal failed",
+            samples, cleanup, workers.scratch_removed, time.monotonic_ns(),
+            failed_sample_evidence,
+        )
         try:
             safe_write_new(run_dir / "failure.json", canonical_bytes(failure_body), "pressure calibration failure evidence", maximum=MAX_FAILURE_BYTES)
         except (OSError, PressureError):

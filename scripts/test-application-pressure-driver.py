@@ -443,6 +443,92 @@ class PressureDriverTests(unittest.TestCase):
         self.assertEqual(proposal["disk_queue_or_stall_min_microseconds"], 6)
         self.assertEqual(proposal["loopback_latency_p99_max_nanoseconds"], 100_000)
 
+    def test_rejected_calibration_sample_failure_evidence_preserves_exact_gate_values(self) -> None:
+        thresholds = {
+            "cpu_busy_min_basis_points": 5000,
+            "disk_write_min_bytes_per_second": 500_000,
+            "disk_queue_or_stall_min_microseconds": 1000,
+            "loopback_requests_min_per_second": 500,
+            "loopback_latency_p99_max_nanoseconds": 2000,
+            "loopback_tx_min_bytes_per_second": 500_000,
+            "loopback_rx_min_bytes_per_second": 500_000,
+        }
+        cases = (
+            ("cpu", 4999, 1000),
+            ("loopback", 6000, 2001),
+        )
+        for expected_gate, cpu_busy, p99 in cases:
+            with self.subTest(gate=expected_gate):
+                sample = {
+                    "schema": driver.EVENT_SCHEMA,
+                    "sequence": 203,
+                    "interval_start_monotonic_ns": 10_000_000_000,
+                    "interval_end_monotonic_ns": 10_100_000_000,
+                    "app_active": False,
+                    "cpu": {"busy_basis_points": cpu_busy, "online_cpus": 8},
+                    "cpu_psi_delta_microseconds": 0,
+                    "block": {
+                        "write_bytes": 100_000,
+                        "writes_completed": 24,
+                        "in_flight": 1,
+                        "weighted_io_milliseconds": 1,
+                        "sectors_written": 200,
+                        "write_milliseconds": 1,
+                        "io_milliseconds": 1,
+                    },
+                    "io_psi_delta_microseconds": 0,
+                    "block_device_chain": {"application_device": {"major": 8, "minor": 0}},
+                    "loopback_counters": {
+                        "tx_bytes": 100_000, "rx_bytes": 100_000,
+                        "tx_packets": 100, "rx_packets": 100,
+                        "tx_errors": 0, "rx_errors": 0,
+                        "tx_dropped": 0, "rx_dropped": 0,
+                    },
+                    "loopback": {
+                        "requests_completed": 100,
+                        "p99_upper_latency_nanoseconds": p99,
+                        "latency_histogram": [100] + [0] * 63,
+                    },
+                    "pressure_generators": {
+                        "cpu": [{"cpu": 0, "thread_cpu_time_ns": 90_000_000,
+                                 "spin_witness": 1, "start_monotonic_ns": 10_000_000_000,
+                                 "end_monotonic_ns": 10_100_000_000}],
+                        "disk": {"write_bytes": 100_000, "write_mode": "direct",
+                                 "fdatasync_count": 1, "fdatasync_time_nanoseconds": 10,
+                                 "start_monotonic_ns": 10_000_000_000,
+                                 "end_monotonic_ns": 10_100_000_000},
+                    },
+                    "worker_process_io": {
+                        "disk": {"write_bytes_delta": 100_000, "syscw_delta": 24},
+                    },
+                }
+                readiness = driver._readiness_from_sample(sample, thresholds)
+                sample["readiness"] = readiness
+                self.assertFalse(readiness["all_ready"])
+                failed = driver._calibration_failed_sample_evidence(sample, readiness, thresholds)
+                body = driver._calibration_failure_body(
+                    "PressureError: calibration sample[203] fails frozen thresholds",
+                    [sample], [], True, sample["interval_end_monotonic_ns"], failed,
+                )
+                encoded = driver.canonical_bytes(body)
+                self.assertLessEqual(len(encoded), driver.MAX_FAILURE_BYTES)
+                decoded = json.loads(encoded)
+                evidence = decoded["failed_sample"]
+                self.assertEqual(evidence["sample"], sample)
+                self.assertEqual(evidence["observed_readiness"], readiness)
+                self.assertEqual(evidence["original_thresholds"], thresholds)
+                self.assertEqual(evidence["failed_gates"], [expected_gate])
+                self.assertFalse(evidence["observed_readiness"]["all_ready"])
+                if expected_gate == "cpu":
+                    self.assertEqual(evidence["failed_gate_values"]["cpu"], {
+                        "busy_basis_points": 4999,
+                        "minimum_busy_basis_points": thresholds["cpu_busy_min_basis_points"],
+                    })
+                else:
+                    self.assertEqual(evidence["failed_gate_values"]["loopback"]["p99_upper_latency_nanoseconds"], 2001)
+                    self.assertEqual(evidence["failed_gate_values"]["loopback"]["maximum_p99_upper_latency_nanoseconds"], 2000)
+                    self.assertEqual(evidence["failed_gate_values"]["loopback"]["maximum_rx_errors"], 0)
+
     def test_calibration_host_does_not_claim_physical_network_pressure(self) -> None:
         route = driver._loopback_route()
         self.assertEqual(route["destination"], "127.0.0.1")
