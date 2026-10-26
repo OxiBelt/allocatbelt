@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import errno
 import pathlib
 import time
@@ -73,7 +74,12 @@ class FakeSocket:
         self.on_receive = None
         self.on_send = None
         self.corrupt_send = False
+        self.events = []
     def send(self, data):
+        self.events.append(self.name + '.send')
+        if not self.writes_enabled:
+            self.clock.advance(100)
+            raise BlockingIOError(errno.EAGAIN, 'scripted not-writable send')
         if self.first_send_attempt_ns is None:
             self.first_send_attempt_ns = self.clock.now()
         if self.fail_sends:
@@ -94,6 +100,7 @@ class FakeSocket:
             self.on_send()
         return len(block)
     def recv(self, size):
+        self.events.append(self.name + '.recv')
         if self.fail_recvs:
             self.fail_recvs -= 1
             self.clock.advance(100)
@@ -143,6 +150,7 @@ def fake_waiter(clock, never_ready=False, first_delay_ns=0):
     return wait, waits
 
 class LoopbackPumpTests(unittest.TestCase):
+
     def test_actual_worker_caller_includes_helper_work_and_rejects_late_return(self):
         worker = next(node for node in ast.parse(DRIVER.read_text()).body
                       if isinstance(node, ast.FunctionDef) and node.name == '_worker_loopback')
@@ -183,6 +191,127 @@ class LoopbackPumpTests(unittest.TestCase):
                     exec(code, namespace)
                     self.assertEqual(namespace['latency'], delay)
 
+    def test_full_driver_compiles_and_exchange_api_is_unchanged(self):
+        source = DRIVER.read_text(encoding='utf-8')
+        compile(source, str(DRIVER), 'exec', dont_inherit=True)
+        function = next(node for node in CANDIDATE_TREE.body
+                        if isinstance(node, ast.FunctionDef) and node.name == '_loopback_echo_exchange')
+        self.assertEqual([arg.arg for arg in function.args.args], ['client', 'server', 'payload', 'deadline_ns'])
+        self.assertEqual([arg.arg for arg in function.args.kwonlyargs],
+                         ['stop_requested', 'clock_ns', 'wait_ready'])
+
+    def test_fully_ready_echo_does_not_call_select(self):
+        clock = FakeClock()
+        client, server = paired_sockets(clock)
+        payload = b'one-turn-echo'
+        client.max_send = client.max_recv = len(payload)
+        server.max_send = server.max_recv = len(payload)
+        order = []
+        for sock, operation in ((client, 'send'), (server, 'recv'), (server, 'send'), (client, 'recv')):
+            original = getattr(sock, operation)
+            def record(data, *, _original=original, _label=sock.name + '.' + operation):
+                order.append(_label)
+                return _original(data)
+            setattr(sock, operation, record)
+        def unexpected_wait(*_args):
+            self.fail('select must not be called when the nonblocking pump makes progress')
+        result = timed_exchange(EXCHANGE, client, server, payload, clock, unexpected_wait)
+        self.assertEqual(result[2], payload)
+        self.assertEqual(order, ['client.send', 'server.recv', 'server.send', 'client.recv'])
+        self.assertEqual(bytes(client.sent), payload)
+        self.assertEqual(bytes(server.received), payload)
+        self.assertEqual(bytes(server.sent), payload)
+        self.assertEqual(bytes(client.received), payload)
+
+    def test_real_eagain_turn_waits_once_then_retries_without_busy_spin(self):
+        clock = FakeClock()
+        client, server = paired_sockets(clock)
+        client.fail_sends = 1
+        payload = b'eagain-then-progress'
+        waits = []
+        ready_wait, _ = fake_waiter(clock)
+        def waiter(reads, writes, errors, timeout):
+            waits.append(timeout)
+            return ready_wait(reads, writes, errors, timeout)
+        result = timed_exchange(EXCHANGE, client, server, payload, clock, waiter)
+        self.assertEqual(result[2], payload)
+        self.assertEqual(len(waits), 1)
+        self.assertLessEqual(waits[0], 0.05)
+        self.assertGreaterEqual(client.events.count('client.send'), 2)
+
+    def _full_sockets_with_call_order(self, clock, payload):
+        client, server = paired_sockets(clock)
+        client.max_send = client.max_recv = len(payload)
+        server.max_send = server.max_recv = len(payload)
+        order = []
+        for sock, operation in ((client, 'send'), (server, 'recv'), (server, 'send'), (client, 'recv')):
+            original = getattr(sock, operation)
+            def record(data, *, _original=original, _label=sock.name + '.' + operation):
+                order.append(_label)
+                return _original(data)
+            setattr(sock, operation, record)
+        return client, server, order
+
+    def test_fast_path_stop_after_each_io_stage_prevents_later_io(self):
+        stages = ('client.send', 'server.recv', 'server.send', 'client.recv')
+        for index, stage in enumerate(stages):
+            with self.subTest(stage=stage):
+                clock = FakeClock()
+                payload = b'full-fast-path'
+                client, server, order = self._full_sockets_with_call_order(clock, payload)
+                stopped = [False]
+                if stage == 'client.send': client.on_send = lambda: stopped.__setitem__(0, True)
+                elif stage == 'server.recv': server.on_receive = lambda: stopped.__setitem__(0, True)
+                elif stage == 'server.send': server.on_send = lambda: stopped.__setitem__(0, True)
+                else: client.on_receive = lambda: stopped.__setitem__(0, True)
+                def unexpected_wait(*_args): self.fail('fast path must not poll')
+                result = timed_exchange(EXCHANGE, client, server, payload, clock, unexpected_wait,
+                                        stop_requested=lambda: stopped[0])
+                self.assertIsNone(result)
+                self.assertEqual(order, list(stages[:index + 1]))
+
+    def test_fast_path_deadline_after_each_io_stage_prevents_later_io(self):
+        stages = ('client.send', 'server.recv', 'server.send', 'client.recv')
+        for index, stage in enumerate(stages):
+            with self.subTest(stage=stage):
+                clock = FakeClock()
+                payload = b'full-fast-path'
+                client, server, order = self._full_sockets_with_call_order(clock, payload)
+                def expire(): clock.advance(2_000_000_001)
+                if stage == 'client.send': client.on_send = expire
+                elif stage == 'server.recv': server.on_receive = expire
+                elif stage == 'server.send': server.on_send = expire
+                else: client.on_receive = expire
+                def unexpected_wait(*_args): self.fail('fast path must not poll')
+                with self.assertRaisesRegex(PressureError, '2s I/O bound'):
+                    timed_exchange(EXCHANGE, client, server, payload, clock, unexpected_wait)
+                self.assertEqual(order, list(stages[:index + 1]))
+
+    def test_request_frame_copy_deadline_prevents_server_send(self):
+        clock = FakeClock()
+        client, server, order = self._full_sockets_with_call_order(clock, b'copy-boundary')
+        original_bytes = EXCHANGE_GLOBALS.get('bytes', builtins.bytes)
+        old_bytes = EXCHANGE_GLOBALS.get('bytes')
+        calls = [0]
+        def slow_request_copy(value):
+            result = original_bytes(value)
+            if isinstance(value, bytearray):
+                calls[0] += 1
+                clock.advance(2_000_000_001)
+            return result
+        EXCHANGE_GLOBALS['bytes'] = slow_request_copy
+        try:
+            def unexpected_wait(*_args): self.fail('fast path must not poll')
+            with self.assertRaisesRegex(PressureError, '2s I/O bound'):
+                timed_exchange(EXCHANGE, client, server, b'copy-boundary', clock, unexpected_wait)
+        finally:
+            if old_bytes is None:
+                EXCHANGE_GLOBALS.pop('bytes', None)
+            else:
+                EXCHANGE_GLOBALS['bytes'] = old_bytes
+        self.assertEqual(calls[0], 1)
+        self.assertEqual(order, ['client.send', 'server.recv'])
+
     def test_partial_four_direction_io_eagain_and_caller_timestamps(self):
         clock = FakeClock()
         client, server = paired_sockets(clock)
@@ -201,11 +330,11 @@ class LoopbackPumpTests(unittest.TestCase):
         self.assertEqual(bytes(server.received), payload)
         self.assertEqual(bytes(server.sent), payload)
         self.assertEqual(bytes(client.received), payload)
-        self.assertLess(sent, client.first_send_attempt_ns)
+        self.assertEqual(sent, client.first_send_attempt_ns)
         self.assertEqual(received, clock.now())
         self.assertGreaterEqual(server.first_send_ns, server.full_receive_ns)
         self.assertGreater(received, sent)
-        self.assertGreater(len(waits), 1)
+        self.assertEqual(len(waits), 1)
         self.assertLessEqual(max(waits), 0.05)
 
     def test_helper_return_and_frame_assembly_delay_stay_inside_rtt(self):
@@ -292,6 +421,7 @@ class LoopbackPumpTests(unittest.TestCase):
     def test_timeout_is_bounded_and_waits_without_busy_spin(self):
         clock = FakeClock()
         client, server = paired_sockets(clock)
+        client.writes_enabled = server.writes_enabled = False
         waiter, waits = fake_waiter(clock, never_ready=True)
         with self.assertRaises(PressureError):
             timed_exchange(EXCHANGE, client, server, b'bounded-frame', clock, waiter)

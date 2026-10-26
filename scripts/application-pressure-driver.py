@@ -2662,12 +2662,135 @@ def _loopback_echo_exchange(
     server_sent = 0
     client_echo = bytearray()
 
-    while True:
+    def active(stage: str = "") -> bool:
         if stop_requested():
+            return False
+        if clock_ns() > deadline_ns:
+            raise PressureError("loopback echo exchange exceeded its 2s I/O bound" + stage)
+        return True
+
+    while True:
+        if not active():
             return None
-        now_ns = clock_ns()
-        if now_ns > deadline_ns:
-            raise PressureError("loopback echo exchange exceeded its 2s I/O bound")
+        progressed = False
+
+        # The sockets are nonblocking. Try each eligible step in fixed order
+        # before paying for readiness polling; a completed step may enable the
+        # next step in this same turn.
+        if client_sent < size:
+            if not active():
+                return None
+            try:
+                count = client.send(payload[client_sent:])
+            except (BlockingIOError, InterruptedError, TimeoutError):
+                count = None
+            except OSError as error:
+                if not active():
+                    return None
+                raise PressureError(f"loopback client send failed: {type(error).__name__}: {error}") from error
+            if not active():
+                return None
+            if count is not None:
+                if count <= 0:
+                    if stop_requested():
+                        return None
+                    raise PressureError("loopback client send returned no progress")
+                client_sent += count
+                progressed = True
+
+        if len(server_request) < size:
+            if not active():
+                return None
+            try:
+                chunk = server.recv(min(65536, size - len(server_request)))
+            except (BlockingIOError, InterruptedError, TimeoutError):
+                chunk = None
+            except OSError as error:
+                if not active():
+                    return None
+                raise PressureError(f"loopback server receive failed: {type(error).__name__}: {error}") from error
+            if not active():
+                return None
+            if chunk == b"":
+                if stop_requested():
+                    return None
+                raise PressureError("loopback echo peer closed before receiving a full request")
+            if chunk:
+                if not active():
+                    return None
+                server_request.extend(chunk)
+                if not active():
+                    return None
+                progressed = True
+                if len(server_request) == size:
+                    if not active():
+                        return None
+                    server_response = bytes(server_request)
+                    if not active():
+                        return None
+
+        if server_response is not None and server_sent < size:
+            if not active():
+                return None
+            try:
+                count = server.send(server_response[server_sent:])
+            except (BlockingIOError, InterruptedError, TimeoutError):
+                count = None
+            except OSError as error:
+                if not active():
+                    return None
+                raise PressureError(f"loopback server send failed: {type(error).__name__}: {error}") from error
+            if not active():
+                return None
+            if count is not None:
+                if count <= 0:
+                    if stop_requested():
+                        return None
+                    raise PressureError("loopback server send returned no progress")
+                server_sent += count
+                progressed = True
+
+        if client_sent == size and len(client_echo) < size:
+            if not active():
+                return None
+            try:
+                chunk = client.recv(min(65536, size - len(client_echo)))
+            except (BlockingIOError, InterruptedError, TimeoutError):
+                chunk = None
+            except OSError as error:
+                if not active():
+                    return None
+                raise PressureError(f"loopback client receive failed: {type(error).__name__}: {error}") from error
+            if not active(" after final receive"):
+                return None
+            if chunk == b"":
+                if stop_requested():
+                    return None
+                raise PressureError("loopback echo peer closed before the full echo was observed")
+            if chunk:
+                if not active():
+                    return None
+                client_echo.extend(chunk)
+                if not active():
+                    return None
+                progressed = True
+                if len(client_echo) == size:
+                    if not active():
+                        return None
+                    echoed = bytes(client_echo)
+                    if not active(" after frame assembly"):
+                        return None
+                    return echoed
+
+        if progressed:
+            continue
+        if not active():
+            return None
+
+        # Poll only when every currently eligible nonblocking operation made
+        # no progress. The returned readiness is a hint; the next turn retries
+        # the operations in the same deterministic order and handles stale
+        # readiness through the existing nonblocking error paths.
         read_sockets = []
         write_sockets = []
         if len(server_request) < size:
@@ -2678,95 +2801,24 @@ def _loopback_echo_exchange(
             write_sockets.append(client)
         if client_sent == size and len(client_echo) < size:
             read_sockets.append(client)
-        wait_seconds = min(0.05, (deadline_ns - now_ns) / 1_000_000_000)
+        wait_now_ns = clock_ns()
+        if wait_now_ns > deadline_ns:
+            raise PressureError("loopback echo exchange exceeded its 2s I/O bound")
+        wait_seconds = min(0.05, (deadline_ns - wait_now_ns) / 1_000_000_000)
         try:
             readable, writable, _ = wait_ready(read_sockets, write_sockets, [], wait_seconds)
         except (InterruptedError, BlockingIOError):
+            if not active():
+                return None
             continue
         except (OSError, ValueError) as error:
-            if stop_requested():
+            if not active():
                 return None
             raise PressureError(f"loopback echo readiness failed: {type(error).__name__}: {error}") from error
+        if not active():
+            return None
         if not readable and not writable:
             continue
-        if clock_ns() > deadline_ns:
-            raise PressureError("loopback echo exchange exceeded its 2s I/O bound")
-
-        # Advance client request bytes before draining the peer, so a single
-        # readiness turn can make progress in both directions without blocking.
-        if client in writable and client_sent < size:
-            try:
-                count = client.send(payload[client_sent:])
-            except (BlockingIOError, InterruptedError, TimeoutError):
-                count = None
-            except OSError as error:
-                if stop_requested():
-                    return None
-                raise PressureError(f"loopback client send failed: {type(error).__name__}: {error}") from error
-            if count is not None:
-                if count <= 0:
-                    if stop_requested():
-                        return None
-                    raise PressureError("loopback client send returned no progress")
-                client_sent += count
-
-        if server in readable and len(server_request) < size:
-            try:
-                chunk = server.recv(min(65536, size - len(server_request)))
-            except (BlockingIOError, InterruptedError, TimeoutError):
-                chunk = None
-            except OSError as error:
-                if stop_requested():
-                    return None
-                raise PressureError(f"loopback server receive failed: {type(error).__name__}: {error}") from error
-            if chunk == b"":
-                if stop_requested():
-                    return None
-                raise PressureError("loopback echo peer closed before receiving a full request")
-            if chunk:
-                server_request.extend(chunk)
-                if len(server_request) == size:
-                    server_response = bytes(server_request)
-
-        if server in writable and server_response is not None and server_sent < size:
-            try:
-                count = server.send(server_response[server_sent:])
-            except (BlockingIOError, InterruptedError, TimeoutError):
-                count = None
-            except OSError as error:
-                if stop_requested():
-                    return None
-                raise PressureError(f"loopback server send failed: {type(error).__name__}: {error}") from error
-            if count is not None:
-                if count <= 0:
-                    if stop_requested():
-                        return None
-                    raise PressureError("loopback server send returned no progress")
-                server_sent += count
-
-        if client in readable and client_sent == size and len(client_echo) < size:
-            try:
-                chunk = client.recv(min(65536, size - len(client_echo)))
-            except (BlockingIOError, InterruptedError, TimeoutError):
-                chunk = None
-            except OSError as error:
-                if stop_requested():
-                    return None
-                raise PressureError(f"loopback client receive failed: {type(error).__name__}: {error}") from error
-            if chunk == b"":
-                if stop_requested():
-                    return None
-                raise PressureError("loopback echo peer closed before the full echo was observed")
-            if chunk:
-                client_echo.extend(chunk)
-                if len(client_echo) == size:
-                    if clock_ns() > deadline_ns:
-                        raise PressureError("loopback echo exchange exceeded its 2s I/O bound after final receive")
-                    echoed = bytes(client_echo)
-                    if clock_ns() > deadline_ns:
-                        raise PressureError("loopback echo exchange exceeded its 2s I/O bound after frame assembly")
-                    return echoed
-
 
 def _worker_loopback(args: argparse.Namespace) -> None:
     global _WORKER_STOP_REQUESTED
