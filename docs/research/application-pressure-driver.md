@@ -201,6 +201,22 @@ sparse samples, failed readiness, early application exit, deadline breach,
 storage reserve loss, worker error, scratch mismatch or incomplete cleanup.
 It writes a failed run receipt when bounded artifacts can still be preserved.
 
+One loopback worker owns both TCP endpoints and advances their nonblocking
+I/O in a single thread. It preserves partial reads and writes, seeded payload
+validation, `TCP_NODELAY`, request pacing and the worker ownership protocol.
+Each exchange has an absolute two-second deadline. Its RTT starts before the
+entire exchange helper and ends after the assembled client echo returns,
+before payload validation; readiness waits and frame assembly remain inside
+that interval. The 64-bucket histogram and readiness thresholds are unchanged.
+This changes the generator's internal scheduling topology and requires fresh
+source provenance for subsequent measurements.
+
+The socket-state and timing tests can run without network access:
+
+```sh
+python3 -I -B scripts/test-application-pressure-loopback-pump.py
+```
+
 Every new driver run and calibration uses a durable three-step worker start
 protocol. The parent first records and syncs the exact isolated worker PID,
 `/proc` start ticks, PGID, session, role and nonce. A worker verifies that row

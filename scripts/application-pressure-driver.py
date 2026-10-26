@@ -2639,97 +2639,174 @@ def _worker_disk(args: argparse.Namespace) -> None:
         os.close(descriptor)
 
 
-def _recv_exact(sock: socket.socket, size: int) -> bytes:
-    chunks: list[bytes] = []
-    remaining = size
-    while remaining:
-        block = sock.recv(remaining)
-        require(block, "loopback echo peer closed early")
-        chunks.append(block)
-        remaining -= len(block)
-    return b"".join(chunks)
+def _loopback_echo_exchange(
+    client: Any,
+    server: Any,
+    payload: bytes,
+    deadline_ns: int,
+    *,
+    stop_requested: Any = None,
+    clock_ns: Any = None,
+    wait_ready: Any = None,
+) -> bytes | None:
+    """Pump one TCP echo frame through both sockets from their sole owner."""
+    stop_requested = stop_requested or (lambda: _WORKER_STOP_REQUESTED)
+    clock_ns = clock_ns or time.monotonic_ns
+    wait_ready = wait_ready or select.select
+    size = len(payload)
+    require(size > 0, "loopback echo frame must not be empty")
+    require(type(deadline_ns) is int, "loopback echo deadline must be an absolute monotonic timestamp")
+    client_sent = 0
+    server_request = bytearray()
+    server_response: bytes | None = None
+    server_sent = 0
+    client_echo = bytearray()
 
-
-def _recv_echo_frame(sock: socket.socket, size: int) -> bytes | None:
-    chunks: list[bytes] = []
-    remaining = size
-    while remaining and not _WORKER_STOP_REQUESTED:
+    while True:
+        if stop_requested():
+            return None
+        now_ns = clock_ns()
+        if now_ns > deadline_ns:
+            raise PressureError("loopback echo exchange exceeded its 2s I/O bound")
+        read_sockets = []
+        write_sockets = []
+        if len(server_request) < size:
+            read_sockets.append(server)
+        if server_response is not None and server_sent < size:
+            write_sockets.append(server)
+        if client_sent < size:
+            write_sockets.append(client)
+        if client_sent == size and len(client_echo) < size:
+            read_sockets.append(client)
+        wait_seconds = min(0.05, (deadline_ns - now_ns) / 1_000_000_000)
         try:
-            block = sock.recv(remaining)
-        except TimeoutError:
+            readable, writable, _ = wait_ready(read_sockets, write_sockets, [], wait_seconds)
+        except (InterruptedError, BlockingIOError):
             continue
-        if not block:
-            if _WORKER_STOP_REQUESTED:
+        except (OSError, ValueError) as error:
+            if stop_requested():
                 return None
-            raise PressureError("loopback echo peer closed early")
-        chunks.append(block)
-        remaining -= len(block)
-    return b"".join(chunks) if remaining == 0 else None
+            raise PressureError(f"loopback echo readiness failed: {type(error).__name__}: {error}") from error
+        if not readable and not writable:
+            continue
+        if clock_ns() > deadline_ns:
+            raise PressureError("loopback echo exchange exceeded its 2s I/O bound")
+
+        # Advance client request bytes before draining the peer, so a single
+        # readiness turn can make progress in both directions without blocking.
+        if client in writable and client_sent < size:
+            try:
+                count = client.send(payload[client_sent:])
+            except (BlockingIOError, InterruptedError, TimeoutError):
+                count = None
+            except OSError as error:
+                if stop_requested():
+                    return None
+                raise PressureError(f"loopback client send failed: {type(error).__name__}: {error}") from error
+            if count is not None:
+                if count <= 0:
+                    if stop_requested():
+                        return None
+                    raise PressureError("loopback client send returned no progress")
+                client_sent += count
+
+        if server in readable and len(server_request) < size:
+            try:
+                chunk = server.recv(min(65536, size - len(server_request)))
+            except (BlockingIOError, InterruptedError, TimeoutError):
+                chunk = None
+            except OSError as error:
+                if stop_requested():
+                    return None
+                raise PressureError(f"loopback server receive failed: {type(error).__name__}: {error}") from error
+            if chunk == b"":
+                if stop_requested():
+                    return None
+                raise PressureError("loopback echo peer closed before receiving a full request")
+            if chunk:
+                server_request.extend(chunk)
+                if len(server_request) == size:
+                    server_response = bytes(server_request)
+
+        if server in writable and server_response is not None and server_sent < size:
+            try:
+                count = server.send(server_response[server_sent:])
+            except (BlockingIOError, InterruptedError, TimeoutError):
+                count = None
+            except OSError as error:
+                if stop_requested():
+                    return None
+                raise PressureError(f"loopback server send failed: {type(error).__name__}: {error}") from error
+            if count is not None:
+                if count <= 0:
+                    if stop_requested():
+                        return None
+                    raise PressureError("loopback server send returned no progress")
+                server_sent += count
+
+        if client in readable and client_sent == size and len(client_echo) < size:
+            try:
+                chunk = client.recv(min(65536, size - len(client_echo)))
+            except (BlockingIOError, InterruptedError, TimeoutError):
+                chunk = None
+            except OSError as error:
+                if stop_requested():
+                    return None
+                raise PressureError(f"loopback client receive failed: {type(error).__name__}: {error}") from error
+            if chunk == b"":
+                if stop_requested():
+                    return None
+                raise PressureError("loopback echo peer closed before the full echo was observed")
+            if chunk:
+                client_echo.extend(chunk)
+                if len(client_echo) == size:
+                    if clock_ns() > deadline_ns:
+                        raise PressureError("loopback echo exchange exceeded its 2s I/O bound after final receive")
+                    echoed = bytes(client_echo)
+                    if clock_ns() > deadline_ns:
+                        raise PressureError("loopback echo exchange exceeded its 2s I/O bound after frame assembly")
+                    return echoed
 
 
 def _worker_loopback(args: argparse.Namespace) -> None:
     global _WORKER_STOP_REQUESTED
     require(hasattr(socket, "AF_INET"), "host has no IPv4 socket support")
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
-    listener.bind(("127.0.0.1", 0))
-    listener.listen(1)
-    listener.settimeout(0.05)
-    address = listener.getsockname()
-    server_ready = threading.Event()
-    server_errors: list[str] = []
-
-    def serve_echo() -> None:
-        connection: socket.socket | None = None
-        try:
-            while not _WORKER_STOP_REQUESTED:
-                try:
-                    connection, peer = listener.accept()
-                    require(peer[0] == "127.0.0.1", "loopback server accepted a non-loopback peer")
-                    connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    connection.settimeout(0.1)
-                    server_ready.set()
-                    break
-                except TimeoutError:
-                    continue
-            while connection is not None and not _WORKER_STOP_REQUESTED:
-                request = _recv_echo_frame(connection, args.payload_bytes)
-                if request is None:
-                    continue
-                connection.sendall(request)
-        except (OSError, PressureError) as error:
-            if not _WORKER_STOP_REQUESTED:
-                server_errors.append(f"{type(error).__name__}: {error}")
-            server_ready.set()
-        finally:
-            if connection is not None:
-                connection.close()
-            listener.close()
-
-    server_thread = threading.Thread(target=serve_echo, name="pressure-loopback-echo", daemon=False)
-    server_thread.start()
-    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    client.settimeout(2.0)
-    client.connect(address)
-    require(server_ready.wait(2.0) and not server_errors, "loopback echo server did not become ready")
-    _worker_emit({
-        "event": "ready", "role": "loopback", "recipe_sha256": args.recipe_sha256,
-        "address": ["127.0.0.1", address[1]], "network_namespace_inode": os.stat("/proc/self/ns/net").st_ino,
-    })
-    ownership = _worker_read_ownership(args)
-    start_ns = _worker_read_start(args, ownership)
-    _worker_wait_until(start_ns)
-    interval_ns = args.interval_ms * 1_000_000
-    sample_count = args.duration_seconds * 1000 // args.interval_ms
-    grant_deadline_ns = start_ns + max(500_000_000, interval_ns // 2)
-    previous_window_end_ns: int | None = None
-    payload_size = args.payload_bytes
-    payload = hashlib.sha256(str(args.seed).encode("ascii")).digest()
-    body = (payload * ((payload_size - 8 + len(payload) - 1) // len(payload)))[:payload_size - 8]
-    next_request = 0
-    request_id = 0
+    client: socket.socket | None = None
+    connection: socket.socket | None = None
     try:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(2.0)
+        address = listener.getsockname()
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        client.settimeout(2.0)
+        client.connect(address)
+        connection, peer = listener.accept()
+        require(peer[0] == "127.0.0.1", "loopback server accepted a non-loopback peer")
+        connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        require(client.getpeername()[0] == "127.0.0.1" and connection.getpeername()[0] == "127.0.0.1",
+                "loopback TCP peer changed away from 127.0.0.1")
+        client.setblocking(False)
+        connection.setblocking(False)
+        _worker_emit({
+            "event": "ready", "role": "loopback", "recipe_sha256": args.recipe_sha256,
+            "address": ["127.0.0.1", address[1]], "network_namespace_inode": os.stat("/proc/self/ns/net").st_ino,
+        })
+        ownership = _worker_read_ownership(args)
+        start_ns = _worker_read_start(args, ownership)
+        _worker_wait_until(start_ns)
+        interval_ns = args.interval_ms * 1_000_000
+        sample_count = args.duration_seconds * 1000 // args.interval_ms
+        grant_deadline_ns = start_ns + max(500_000_000, interval_ns // 2)
+        previous_window_end_ns: int | None = None
+        payload_size = args.payload_bytes
+        payload = hashlib.sha256(str(args.seed).encode("ascii")).digest()
+        body = (payload * ((payload_size - 8 + len(payload) - 1) // len(payload)))[:payload_size - 8]
+        next_request = 0
+        request_id = 0
         for sequence in range(sample_count):
             if _WORKER_STOP_REQUESTED:
                 break
@@ -2755,14 +2832,13 @@ def _worker_loopback(args: argparse.Namespace) -> None:
                 request_id += 1
                 payload_bytes = struct.pack("!Q", request_id) + body
                 sent = time.monotonic_ns()
-                try:
-                    client.sendall(payload_bytes)
-                    echoed = _recv_exact(client, payload_size)
-                except (OSError, PressureError):
-                    if _WORKER_STOP_REQUESTED:
-                        break
-                    raise
+                deadline_ns = sent + 2_000_000_000
+                echoed = _loopback_echo_exchange(client, connection, payload_bytes, deadline_ns)
+                if echoed is None:
+                    break
                 received = time.monotonic_ns()
+                require(received <= deadline_ns,
+                        "loopback echo exchange exceeded its 2s I/O bound before caller timestamp")
                 require(echoed == payload_bytes, "loopback echo payload differs from the seeded request")
                 latency = max(1, received - sent)
                 bucket = min(63, latency.bit_length())
@@ -2789,10 +2865,12 @@ def _worker_loopback(args: argparse.Namespace) -> None:
             _worker_wait_for_final_capture(args, ownership, sample_count - 1, grant_deadline_ns)
     finally:
         _WORKER_STOP_REQUESTED = True
-        client.close()
-        server_thread.join(timeout=1.0)
-        require(not server_thread.is_alive(), "loopback echo server did not stop")
-        require(not server_errors, "loopback echo server failed: " + "; ".join(server_errors))
+        for endpoint in (client, connection, listener):
+            if endpoint is not None:
+                try:
+                    endpoint.close()
+                except OSError:
+                    pass
 
 
 def worker_main(args: argparse.Namespace) -> int:

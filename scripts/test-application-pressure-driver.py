@@ -541,7 +541,7 @@ class PressureDriverTests(unittest.TestCase):
             self.skipTest("the pressure lane is Linux-only")
         if shutil.which("ip") is None:
             self.fail("native target is missing iproute2 `ip` required by the loopback route pin")
-        root = Path(tempfile.mkdtemp(prefix=f"allocatbelt-pressure-test-{os.getpid()}-", dir="/var/tmp")).resolve()
+        root = Path(tempfile.mkdtemp(prefix=f"allocatbelt-pressure-test-{os.getpid()}-")).resolve()
         succeeded = False
         driver_process: subprocess.Popen[bytes] | None = None
         app_process: subprocess.Popen[bytes] | None = None
@@ -1188,6 +1188,15 @@ module.run_pressure(Path(recipe_path), recipe_sha, Path(launch_path), Path(outpu
                 shutil.rmtree(root)
             else:
                 print(f"pressure test fixture preserved at {root}", file=sys.stderr)
+
+
+def load_tests(loader: unittest.TestLoader, tests: unittest.TestSuite, _pattern: str | None) -> unittest.TestSuite:
+    pump_tests = _load_module(
+        "pressure_loopback_pump_test_target",
+        SCRIPT_DIR / "test-application-pressure-loopback-pump.py",
+    )
+    tests.addTests(loader.loadTestsFromModule(pump_tests))
+    return tests
 
 
 if __name__ == "__main__":
