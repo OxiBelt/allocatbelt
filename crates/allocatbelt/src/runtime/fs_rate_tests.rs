@@ -374,36 +374,44 @@ fn public_blocking_adapter_commits_real_file_prefix_and_recovers_cancelled_entry
 }
 
 #[test]
-fn public_blocking_adapter_waits_for_credit_then_observes_cancellation() {
-  let bucket = bucket(1);
-  bucket.try_reserve(1).unwrap().commit(1).unwrap();
-  let adapter = BlockingByteIo::new(&bucket, None).unwrap();
-  let cancelled = Arc::new(AtomicBool::new(false));
-  let stop = cancelled.clone();
-  let (waited_tx, waited_rx) = mpsc::channel();
-  let worker = std::thread::spawn(move || {
-    let mut checks = 0;
-    adapter.run(
-      1,
-      || {
-        checks += 1;
-        // The first admission failed against the empty bucket, so this second
-        // check happens after the actual credit-wait branch has slept.
-        if checks == 2 {
-          waited_tx.send(()).unwrap();
-        }
-        stop.load(Ordering::Acquire)
-      },
-      |_| panic!("cancelled empty-bucket endpoint must not run"),
-    )
-  });
-  waited_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-  cancelled.store(true, Ordering::Release);
-  assert_eq!(
-    worker.join().unwrap().unwrap_err().kind(),
-    io::ErrorKind::Interrupted
-  );
-  assert_eq!(bucket.snapshot().reserved_bytes, 0);
+fn public_blocking_adapter_observes_cancellation_before_operation_entry() {
+  for initially_empty in [true, false] {
+    let bucket = bucket(1);
+    if initially_empty {
+      bucket.try_reserve(1).unwrap().commit(1).unwrap();
+    }
+    let adapter = BlockingByteIo::new(&bucket, None).unwrap();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let stop = cancelled.clone();
+    let (checked_tx, checked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+      let mut checks = 0;
+      adapter.run(
+        1,
+        || {
+          checks += 1;
+          // This can follow a credit wait or precede operation entry if credit
+          // refilled while descheduled. Let cancellation precede the returned
+          // predicate value in either case; sending alone is not a handoff.
+          if checks == 2 {
+            checked_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+          }
+          stop.load(Ordering::Acquire)
+        },
+        |_| panic!("cancelled endpoint must not run"),
+      )
+    });
+    checked_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    cancelled.store(true, Ordering::Release);
+    release_tx.send(()).unwrap();
+    assert_eq!(
+      worker.join().unwrap().unwrap_err().kind(),
+      io::ErrorKind::Interrupted
+    );
+    assert_eq!(bucket.snapshot().reserved_bytes, 0);
+  }
 }
 
 #[test]

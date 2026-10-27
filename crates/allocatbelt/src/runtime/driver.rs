@@ -2099,6 +2099,9 @@ mod tests {
   };
 
   static NEXT_FILE: AtomicUsize = AtomicUsize::new(1);
+  // Service threads compete with the full all-feature suite; keep elapsed-time
+  // watchdogs generous enough for scheduling while still bounding a deadlock.
+  const DRIVER_TEST_WATCHDOG: Duration = Duration::from_secs(10);
 
   fn assert_send_sync<T: Send + Sync>() {}
 
@@ -2311,7 +2314,7 @@ mod tests {
 
   fn shutdown_current_driver(driver: &mut CurrentThreadDriver) {
     driver.request_shutdown(CurrentShutdown::default()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + DRIVER_TEST_WATCHDOG;
     loop {
       match driver.drive_shutdown_step().unwrap() {
         ShutdownProgress::Complete => break,
@@ -2325,12 +2328,35 @@ mod tests {
 
   fn shutdown_multi_driver(driver: &mut MultiThreadDriver) {
     driver.request_shutdown(MultiShutdown::default()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + DRIVER_TEST_WATCHDOG;
     loop {
       match driver.try_shutdown().unwrap() {
         ShutdownProgress::Complete => break,
         ShutdownProgress::Pending => {
-          assert!(Instant::now() < deadline, "multithread driver did not stop");
+          if Instant::now() >= deadline {
+            #[cfg(feature = "resource-feedback")]
+            let feedback_complete = driver
+              .feedback_metrics()
+              .map(|metrics| metrics.snapshot().shutdown_complete);
+            #[cfg(not(feature = "resource-feedback"))]
+            let feedback_complete: Option<bool> = None;
+            let rate_timer_closed = driver
+              .rate_timer
+              .as_ref()
+              .map(|timer| timer.handle().is_closed());
+            panic!(
+              "multithread driver did not stop: async={}, blocking={:?}, process={:?}, feedback={feedback_complete:?}, rate_timer_closed={rate_timer_closed:?}",
+              driver.asynchronous.shutdown_complete(),
+              driver
+                .blocking
+                .as_ref()
+                .map(|blocking| blocking.shutdown_complete()),
+              driver
+                .process
+                .as_ref()
+                .map(|process| process.shutdown_complete()),
+            );
+          }
           std::thread::yield_now();
         }
       }
@@ -2706,25 +2732,45 @@ mod tests {
     let pool = driver
       .blocking()
       .unwrap_or_else(|| panic!("blocking pool is missing"));
-    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (registered_tx, registered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
     let job = pool
       .try_spawn(Resources::ZERO, move |_token| {
-        let _ = started_tx.send(());
-        handle
-          .block_on(async move {
-            let sleep = timer
-              .sleep(Duration::from_millis(20))
-              .map_err(|_| "sleep creation failed")?;
-            sleep
-              .await
-              .map_err(|_| "timer closed during blocking drain")
+        let mut sleep = Box::pin(
+          timer
+            .sleep(Duration::from_secs(30))
+            .map_err(|_| "sleep creation failed")?,
+        );
+        let result = handle.block_on(async move {
+          std::future::poll_fn(|cx| match sleep.as_mut().poll(cx) {
+            std::task::Poll::Pending => {
+              std::task::Poll::Ready(registered_tx.send(()).map_err(|_| "parent went away"))
+            }
+            std::task::Poll::Ready(Ok(())) => {
+              std::task::Poll::Ready(Err("sleep elapsed before shutdown"))
+            }
+            std::task::Poll::Ready(Err(_)) => {
+              std::task::Poll::Ready(Err("timer closed before shutdown"))
+            }
           })
-          .map_err(|_| "nested block_on failed")?
+          .await?;
+          release_rx
+            .recv()
+            .map_err(|_| "shutdown release channel closed")?;
+          sleep
+            .as_mut()
+            .reset_after(Duration::from_millis(20))
+            .map_err(|_| "timer closed during blocking drain")?;
+          sleep
+            .await
+            .map_err(|_| "timer closed during blocking drain")
+        });
+        result.map_err(|_| "nested block_on failed")?
       })
       .unwrap_or_else(|error| panic!("blocking job admission failed: {error}"));
-    started_rx
-      .recv_timeout(Duration::from_secs(2))
-      .unwrap_or_else(|error| panic!("blocking job did not start: {error}"));
+    registered_rx
+      .recv_timeout(DRIVER_TEST_WATCHDOG)
+      .unwrap_or_else(|error| panic!("nested timer sleep was not registered: {error}"));
 
     driver
       .request_shutdown(MultiShutdown {
@@ -2733,7 +2779,22 @@ mod tests {
         processes: ProcessShutdownMode::Wait,
       })
       .unwrap_or_else(|error| panic!("shutdown request failed: {error}"));
-    let deadline = Instant::now() + Duration::from_secs(2);
+    assert_eq!(driver.try_shutdown().unwrap(), ShutdownProgress::Pending);
+    let async_deadline = Instant::now() + DRIVER_TEST_WATCHDOG;
+    while !driver.asynchronous.shutdown_complete() {
+      assert!(
+        Instant::now() < async_deadline,
+        "async driver did not drain"
+      );
+      assert_eq!(driver.try_shutdown().unwrap(), ShutdownProgress::Pending);
+      std::thread::yield_now();
+    }
+    assert!(driver.asynchronous.shutdown_complete());
+    assert!(!driver.timer().unwrap().is_closed());
+    release_tx
+      .send(())
+      .unwrap_or_else(|error| panic!("blocking job release failed: {error}"));
+    let deadline = Instant::now() + DRIVER_TEST_WATCHDOG;
     loop {
       match driver.try_shutdown() {
         Ok(ShutdownProgress::Complete) => break,
@@ -3430,7 +3491,7 @@ mod tests {
       .unwrap_or_else(|error| panic!("network I/O failed: {error}"));
     assert_eq!(meter.snapshot().committed_bytes, 1);
 
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + DRIVER_TEST_WATCHDOG;
     loop {
       let cpu_limit = tenant.snapshot().unwrap().limit.get(DomainResource::Cpu);
       let disk_limit = driver.disk_rate().unwrap().snapshot().bytes_per_second;
@@ -3476,7 +3537,7 @@ mod tests {
       .feedback_sources(factory)
       .build()
       .unwrap_or_else(|error| panic!("feedback driver build failed: {error}"));
-    assert!(gate.wait_until_entered(Duration::from_secs(2)));
+    assert!(gate.wait_until_entered(DRIVER_TEST_WATCHDOG));
     driver
       .request_shutdown(CurrentShutdown::default())
       .unwrap_or_else(|error| panic!("shutdown request failed: {error}"));
@@ -3492,7 +3553,7 @@ mod tests {
     );
 
     gate.release();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + DRIVER_TEST_WATCHDOG;
     loop {
       match driver.drive_shutdown_step() {
         Ok(ShutdownProgress::Complete) => break,
