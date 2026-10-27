@@ -1,6 +1,7 @@
 //! Runtime tests on real worker threads. Ordering comes from channels and
 //! barriers; the only waits on time are bounded polls of the snapshot.
 
+use std::cell::Cell;
 use std::panic;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -525,19 +526,46 @@ fn user_drops_run_outside_the_lock_and_their_panics_are_contained() {
 #[test]
 fn a_detached_panic_payload_with_a_panicking_drop_is_contained() {
   let mut rt = runtime(1, 2, cpu(1));
+  let handle = rt.handle();
   let dropped = Arc::new(AtomicUsize::new(0));
+  let phase = Cell::new("initial admission");
   let c = LocksOnDrop {
-    handle: rt.handle(),
+    handle: handle.clone(),
     dropped: Arc::clone(&dropped),
     panic: true,
   };
-  quiet_panics(|| {
-    drop(rt.try_spawn(cpu(1), move |_| panic::panic_any(c)).unwrap());
-    wait_for(&rt.handle(), |s| s.outstanding == 0);
-  });
-  assert_eq!(rt.try_spawn(cpu(1), |_| 4).unwrap().join().unwrap(), 4);
-  rt.shutdown(ShutdownMode::Drain).unwrap();
-  assert_eq!(dropped.load(Ordering::SeqCst), 1);
+  let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+    quiet_panics(|| {
+      drop(rt.try_spawn(cpu(1), move |_| panic::panic_any(c)).unwrap());
+      phase.set("submitted");
+      wait_for(&handle, |s| s.outstanding == 0);
+      phase.set("outstanding zero");
+    });
+    phase.set("replacement admission");
+    let replacement = rt.try_spawn(cpu(1), |_| 4).unwrap();
+    phase.set("replacement join");
+    let value = replacement.join().unwrap();
+    phase.set("replacement joined");
+    assert_eq!(value, 4);
+    phase.set("shutdown");
+    rt.shutdown(ShutdownMode::Drain).unwrap();
+    phase.set("drop count");
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+  }));
+  if let Err(payload) = result {
+    let message = payload
+      .downcast_ref::<&str>()
+      .copied()
+      .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+      .unwrap_or("<non-string panic payload>");
+    eprintln!(
+      "detached panic diagnostic: phase={}, panic={message:?}, snapshot={:?}, dropped={}",
+      phase.get(),
+      handle.snapshot(),
+      dropped.load(Ordering::SeqCst)
+    );
+    panic::resume_unwind(payload);
+  }
 }
 
 #[test]
