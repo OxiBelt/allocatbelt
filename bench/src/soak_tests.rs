@@ -1353,9 +1353,8 @@ fn emergency_stop_wakes_both_waiters_with_the_fixed_handler_window_full() {
   fixture.shutdown();
 }
 
-#[test]
-fn short_native_soak_progresses_past_one_window_and_emits_reference_receipts() {
-  let directory = temp_path("e2e");
+fn short_soak_inputs(label: &str) -> (PathBuf, super::SoakArgs, super::SoakIdentity) {
+  let directory = temp_path(label);
   fs::create_dir(&directory).expect("create output directory");
   #[cfg(unix)]
   {
@@ -1390,7 +1389,25 @@ fn short_native_soak_progresses_past_one_window_and_emits_reference_receipts() {
     resource_ceiling_sha256: "c".repeat(64),
     comparison_mode: crate::application::runtime_bindings::ApplicationMode::Fixed,
   };
-  super::run_soak(args, identity).expect("run one-second native soak");
+  (directory, args, identity)
+}
+
+#[test]
+fn controlled_sampling_soak_runs_the_complete_functional_path_and_emits_receipts() {
+  // This exercises the full controller and receipt pipeline with deterministic
+  // sample timestamps. It does not measure native timer cadence or performance.
+  let (directory, args, identity) = short_soak_inputs("controlled-e2e");
+  let interval_ns = args.sample_interval.as_nanos();
+  let mut scheduled_sample_clock = |sample_index: u64, started_monotonic_ns: u128| {
+    let offset = interval_ns
+      .checked_mul(u128::from(sample_index))
+      .ok_or_else(|| "test sample offset overflow".to_owned())?;
+    started_monotonic_ns
+      .checked_add(offset)
+      .ok_or_else(|| "test sample timestamp overflow".to_owned())
+  };
+  super::run_soak_with_test_sample_clock(args, identity, &mut scheduled_sample_clock)
+    .expect("run controlled-sampling functional soak");
 
   let receipt = fs::read_to_string(directory.join("soak-receipt.json")).expect("read soak receipt");
   assert!(receipt.starts_with('{') && receipt.ends_with('}'));
@@ -1442,4 +1459,61 @@ fn short_native_soak_progresses_past_one_window_and_emits_reference_receipts() {
     super::SAMPLE_HEADER.split('\t').count()
   );
   fs::remove_dir_all(directory).expect("remove soak artifacts");
+}
+
+#[test]
+fn late_sample_rejects_and_preserves_incomplete_soak_outputs() {
+  // The injected clock changes only sample timestamps. The real runtime,
+  // workload, scheduled horizon, shutdown and output cleanup still run.
+  let (directory, args, identity) = short_soak_inputs("late-sample");
+  let interval_ns = args.sample_interval.as_nanos();
+  let mut late_sample_clock = |sample_index: u64, started_monotonic_ns: u128| {
+    let offset = interval_ns
+      .checked_mul(u128::from(sample_index))
+      .ok_or_else(|| "test sample offset overflow".to_owned())?;
+    let scheduled = started_monotonic_ns
+      .checked_add(offset)
+      .ok_or_else(|| "test sample timestamp overflow".to_owned())?;
+    if sample_index == 20 {
+      scheduled
+        .checked_add(super::SAMPLE_LATE_TOLERANCE_NS + 1)
+        .ok_or_else(|| "late test sample timestamp overflow".to_owned())
+    } else {
+      Ok(scheduled)
+    }
+  };
+  let result = super::run_soak_with_test_sample_clock(args, identity, &mut late_sample_clock);
+  assert_eq!(
+    result.unwrap_err(),
+    "soak sample 20 missed its 100 ms monotonic cadence"
+  );
+
+  let receipt =
+    fs::read_to_string(directory.join("soak-receipt.json")).expect("read incomplete soak marker");
+  assert!(receipt.contains("allocatbelt.runtime-soak-incomplete.v1"));
+  assert!(directory.join("terminal-records.tsv").is_file());
+  assert!(directory.join("resource-samples.tsv").is_file());
+  assert!(!directory.join("soak-receipt.incomplete.tmp").exists());
+
+  let terminals = fs::read_to_string(directory.join("terminal-records.tsv"))
+    .expect("read retained terminal stream");
+  let terminal_lines = terminals.lines().collect::<Vec<_>>();
+  assert_eq!(
+    terminal_lines[0],
+    "schema\tallocatbelt.runtime-soak-terminals.v1"
+  );
+  assert_eq!(terminal_lines[3], super::TERMINAL_HEADER);
+  assert!(terminal_lines.len() > 4 + super::WINDOW);
+  assert!(
+    terminal_lines[4..]
+      .iter()
+      .all(|row| row.split('\t').nth(3) == Some("completed"))
+  );
+
+  let samples = fs::read_to_string(directory.join("resource-samples.tsv"))
+    .expect("read retained sample stream");
+  let sample_lines = samples.lines().collect::<Vec<_>>();
+  assert_eq!(sample_lines[0], super::SAMPLE_HEADER);
+  assert_eq!(sample_lines.len(), 21);
+  fs::remove_dir_all(directory).expect("remove incomplete soak artifacts");
 }

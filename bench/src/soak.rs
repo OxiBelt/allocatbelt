@@ -579,6 +579,26 @@ struct SampleAccumulator<'a> {
   final_hour_rss: &'a mut Vec<u64>,
 }
 
+enum SampleClock<'a> {
+  Real,
+  #[cfg(test)]
+  Injected(&'a mut dyn FnMut(u64, u128) -> Result<u128, String>),
+  #[cfg(not(test))]
+  _Lifetime(std::marker::PhantomData<&'a ()>),
+}
+
+impl SampleClock<'_> {
+  fn capture(&mut self, _sample_index: u64, _started_monotonic_ns: u128) -> Result<u128, String> {
+    match self {
+      Self::Real => monotonic_ns(),
+      #[cfg(test)]
+      Self::Injected(clock) => clock(_sample_index, _started_monotonic_ns),
+      #[cfg(not(test))]
+      Self::_Lifetime(_) => monotonic_ns(),
+    }
+  }
+}
+
 /// Runs the dedicated native soak binary's validated command line.
 pub fn run_cli() -> ExitCode {
   match run_from_process() {
@@ -2075,6 +2095,26 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
 }
 
 fn run_soak(args: SoakArgs, identity: SoakIdentity) -> Result<(), String> {
+  run_soak_inner(args, identity, &mut SampleClock::Real)
+}
+
+#[cfg(test)]
+fn run_soak_with_test_sample_clock<F>(
+  args: SoakArgs,
+  identity: SoakIdentity,
+  sample_clock: &mut F,
+) -> Result<(), String>
+where
+  F: FnMut(u64, u128) -> Result<u128, String>,
+{
+  run_soak_inner(args, identity, &mut SampleClock::Injected(sample_clock))
+}
+
+fn run_soak_inner(
+  args: SoakArgs,
+  identity: SoakIdentity,
+  sample_clock: &mut SampleClock<'_>,
+) -> Result<(), String> {
   if application_mode_from_environment()? != args.comparison_mode {
     return Err("soak comparison family changed after argument validation".into());
   }
@@ -2125,6 +2165,7 @@ fn run_soak(args: SoakArgs, identity: SoakIdentity) -> Result<(), String> {
     &mut outputs,
     &mut first_hour_rss,
     &mut final_hour_rss,
+    sample_clock,
   );
   let mut session = session?;
   let mut stats = session.stats;
@@ -2672,6 +2713,7 @@ fn run_native_session(
   outputs: &mut OutputFiles,
   first_hour_rss: &mut Vec<u64>,
   final_hour_rss: &mut Vec<u64>,
+  sample_clock: &mut SampleClock<'_>,
 ) -> Result<SoakSessionResult, String> {
   let workers = if args.profile == "oversubscribed" {
     2
@@ -2820,7 +2862,7 @@ fn run_native_session(
         first_hour_rss,
         final_hour_rss,
       };
-      sample_runtime(&bindings, outputs, 0, &mut samples)?;
+      sample_runtime(&bindings, outputs, 0, &mut samples, sample_clock)?;
     }
     let future = drive_window(
       handle,
@@ -2841,6 +2883,7 @@ fn run_native_session(
       stats,
       cpu_start,
       &feedback_trace,
+      sample_clock,
     );
     if std::mem::size_of_val(&future) > MAX_ROOT_FUTURE_BYTES {
       return Err("soak root future exceeded its precharged 64 KiB Control bound".into());
@@ -3080,6 +3123,7 @@ async fn drive_window(
   mut stats: SoakStats,
   cpu_start: u128,
   feedback_trace: &SoakFeedbackTrace,
+  sample_clock: &mut SampleClock<'_>,
 ) -> Result<SoakStats, String> {
   let events = Arc::new(EventQueue::new());
   let stop = Arc::new(StopSignal::new());
@@ -3292,7 +3336,13 @@ async fn drive_window(
             first_hour_rss,
             final_hour_rss,
           };
-          sample_runtime(bindings, outputs, next_sample_index, &mut samples)?;
+          sample_runtime(
+            bindings,
+            outputs,
+            next_sample_index,
+            &mut samples,
+            sample_clock,
+          )?;
         }
         if final_sample_due {
           final_sample_written = true;
@@ -3345,11 +3395,12 @@ fn sample_runtime(
   outputs: &mut OutputFiles,
   sample_index: u64,
   accumulator: &mut SampleAccumulator<'_>,
+  sample_clock: &mut SampleClock<'_>,
 ) -> Result<u128, String> {
   let rss_kib = crate::application::sample_process_memory()?.rss_kib;
   let (global, tenant, scope) = bindings.snapshots()?;
   let io_rows = bindings.io().readback_rows();
-  let timestamp = monotonic_ns()?;
+  let timestamp = sample_clock.capture(sample_index, accumulator.started_monotonic_ns)?;
   if !sample_cadence_matches(
     sample_index,
     accumulator.interval,
