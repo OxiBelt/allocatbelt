@@ -3374,8 +3374,9 @@ mod tests {
   #[test]
   fn refused_registrations_return_the_original_value_unchanged() {
     let (reactor, handle) = reactor(1, 1);
-    // epoll cannot watch a regular file: the kernel's own error.
-    let file = File::open(std::env::current_exe().unwrap()).unwrap();
+    // Use a non-pollable device for the kernel rejection. A regular file on a
+    // filesystem with poll support (such as FUSE) need not be rejected.
+    let file = File::open("/dev/null").unwrap();
     let raw = file.as_raw_fd();
     let refused = handle.register(file).unwrap_err();
     assert_eq!(refused.error().raw_os_error(), Some(libc::EPERM));
