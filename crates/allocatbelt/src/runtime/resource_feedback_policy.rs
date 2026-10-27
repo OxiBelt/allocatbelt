@@ -196,6 +196,8 @@ pub struct PlanTicket {
   generation: u64,
   from_limit: u64,
   to_limit: u64,
+  /// Measurement time of the telemetry that justified this ticket.
+  telemetry_at: Instant,
   planned_at: Instant,
 }
 
@@ -566,6 +568,41 @@ impl ResourceFeedbackPolicy {
     ]
   }
 
+  /// Expires a planned ticket when its required telemetry is sparse or stale.
+  ///
+  /// Call this immediately before beginning the actuator write, after any
+  /// potentially blocking pre-write readback. A stale ticket is removed
+  /// without faulting the control, changing its breach streak, or charging
+  /// actuation cooldown. The caller must only use this for a ticket whose
+  /// actuator write has not been attempted.
+  pub(crate) fn expire_stale_ticket(
+    &mut self,
+    ticket: PlanTicket,
+    now: Instant,
+  ) -> Result<TelemetryStatus, PolicyError> {
+    let index = ticket.resource.index();
+    match self.dimensions[index].pending {
+      None => return Err(PolicyError::NoPendingTicket),
+      Some(pending) if pending != ticket => return Err(PolicyError::StaleTicket),
+      Some(_) => {}
+    }
+
+    let age = now
+      .checked_duration_since(ticket.telemetry_at)
+      .unwrap_or(Duration::MAX);
+    let telemetry = if age > TELEMETRY_FRESHNESS {
+      TelemetryStatus::Stale
+    } else if age > MAX_DENSE_SAMPLE_GAP {
+      TelemetryStatus::Sparse
+    } else {
+      TelemetryStatus::Fresh
+    };
+    if telemetry != TelemetryStatus::Fresh {
+      self.dimensions[index].pending = None;
+    }
+    Ok(telemetry)
+  }
+
   fn observe_at(&mut self, sample: FeedbackSample, now: Instant) -> Result<(), PolicyError> {
     validate_event_time(now, self.last_event_at)?;
     if sample.at > now {
@@ -698,6 +735,7 @@ impl ResourceFeedbackPolicy {
             generation,
             from_limit: from,
             to_limit: to,
+            telemetry_at: self.dimensions[index].latest_at.unwrap_or(now),
             planned_at: now,
           };
           self.dimensions[index].pending = Some(ticket);

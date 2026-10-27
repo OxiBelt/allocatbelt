@@ -1884,6 +1884,25 @@ fn record_acknowledgement(
   }
 }
 
+fn record_expired_ticket(
+  shared: &Shared,
+  policy: &ResourceFeedbackPolicy,
+  resource: FeedbackResource,
+  telemetry: TelemetryStatus,
+) {
+  let index = resource as usize;
+  let mut state = lock_state(shared);
+  let control = &mut state.metrics.controls[index];
+  control.current_limit = policy.current_limits()[index];
+  control.telemetry = telemetry;
+  control.no_change = Some(NoChangeReason::TelemetryUnavailable);
+  control.pending_generation = policy.pending_tickets()[index].map(PlanTicket::generation);
+  control.policy_faulted = policy.faults()[index];
+  let diagnostic = FeedbackDiagnostic::TelemetryUnavailable(telemetry);
+  control.last_diagnostic = Some(diagnostic);
+  state.metrics.last_diagnostic = Some(diagnostic);
+}
+
 fn process_ticket<A: FeedbackActuator>(
   shared: &Shared,
   policy: &mut ResourceFeedbackPolicy,
@@ -1949,6 +1968,22 @@ fn process_ticket<A: FeedbackActuator>(
     }
   }
   if stop_requested(shared) {
+    return;
+  }
+
+  let telemetry = match policy.expire_stale_ticket(ticket, Instant::now()) {
+    Ok(telemetry) => telemetry,
+    Err(error) => {
+      record_control_diagnostic(
+        shared,
+        resource,
+        FeedbackDiagnostic::PolicyOperationRejected(error),
+      );
+      return;
+    }
+  };
+  if telemetry != TelemetryStatus::Fresh {
+    record_expired_ticket(shared, policy, resource, telemetry);
     return;
   }
 
@@ -2294,6 +2329,7 @@ mod tests {
   #[derive(Clone, Copy)]
   enum Signal {
     CpuPressure,
+    AllPressure,
     CpuPressureDiskMissing,
     DiskHealthy,
     DiskHealthyExternalDrift,
@@ -2471,6 +2507,7 @@ mod tests {
       }
       let (cpu, disk, network) = match self.signal {
         Signal::CpuPressure => (Some(9_000), Some(7_000), Some(7_000)),
+        Signal::AllPressure => (Some(9_000), Some(9_000), Some(9_000)),
         Signal::CpuPressureDiskMissing => (Some(9_000), None, Some(7_000)),
         Signal::DiskHealthy | Signal::DiskHealthyExternalDrift => {
           (Some(7_000), Some(3_000), Some(7_000))
@@ -2539,6 +2576,8 @@ mod tests {
     state: Arc<ActuatorState>,
     disk_mode: DiskApplyMode,
     panic_payload_gate: Option<(Flag, Flag)>,
+    readback_gate: Option<(FeedbackResource, usize, Flag, Flag)>,
+    did_block_readback: bool,
     dropped: Option<Arc<AtomicBool>>,
   }
 
@@ -2548,6 +2587,8 @@ mod tests {
         state,
         disk_mode: DiskApplyMode::Normal,
         panic_payload_gate: None,
+        readback_gate: None,
+        did_block_readback: false,
         dropped: None,
       }
     }
@@ -2557,6 +2598,8 @@ mod tests {
         state,
         disk_mode,
         panic_payload_gate: None,
+        readback_gate: None,
+        did_block_readback: false,
         dropped: None,
       }
     }
@@ -2571,7 +2614,26 @@ mod tests {
         state,
         disk_mode: DiskApplyMode::TargetThenBlockingPanic,
         panic_payload_gate: Some((entered, release)),
+        readback_gate: None,
+        did_block_readback: false,
         dropped: Some(dropped),
+      }
+    }
+
+    fn blocking_readback(
+      state: Arc<ActuatorState>,
+      resource: FeedbackResource,
+      call_number: usize,
+      entered: Flag,
+      release: Flag,
+    ) -> Self {
+      Self {
+        state,
+        disk_mode: DiskApplyMode::Normal,
+        panic_payload_gate: None,
+        readback_gate: Some((resource, call_number, entered, release)),
+        did_block_readback: false,
+        dropped: None,
       }
     }
   }
@@ -2587,7 +2649,18 @@ mod tests {
   impl FeedbackActuator for TestActuator {
     fn readback(&mut self, resource: FeedbackResource) -> Result<u64, FeedbackActuatorError> {
       let index = resource as usize;
-      self.state.readbacks[index].fetch_add(1, Ordering::SeqCst);
+      let call_number = self.state.readbacks[index].fetch_add(1, Ordering::SeqCst) + 1;
+      if !self.did_block_readback
+        && let Some((blocked_resource, blocked_call, entered, release)) = &self.readback_gate
+        && resource == *blocked_resource
+        && call_number == *blocked_call
+      {
+        self.did_block_readback = true;
+        set_flag(entered);
+        if !wait_flag(release, Duration::from_secs(3)) {
+          return Err(FeedbackActuatorError::Unavailable);
+        }
+      }
       Ok(self.state.limits[index].load(Ordering::SeqCst))
     }
 
@@ -3232,6 +3305,105 @@ mod tests {
     assert!(cpu_times.len() >= 2);
     assert!(cpu_times[1].duration_since(cpu_times[0]) >= ACTUATION_COOLDOWN);
     assert_eq!(state.actual(FeedbackResource::CpuConcurrency), 81);
+    stop_and_join(&mut service);
+  }
+
+  #[test]
+  fn stale_ticket_after_its_preapply_readback_is_cancelled_and_recovers() {
+    let state = ActuatorState::new([100, 100, 100]);
+    let entered = new_flag();
+    let release = new_flag();
+    let (sensor, _) = TestSensor::new(Signal::AllPressure);
+    let actuator = TestActuator::blocking_readback(
+      Arc::clone(&state),
+      FeedbackResource::CpuConcurrency,
+      2,
+      Arc::clone(&entered),
+      Arc::clone(&release),
+    );
+    let mut service = ResourceFeedbackService::start(config(), sensor, actuator).unwrap();
+
+    assert!(wait_flag(&entered, Duration::from_secs(2)));
+    assert_eq!(state.applies.load(Ordering::SeqCst), 0);
+    thread::sleep(Duration::from_millis(600));
+    set_flag(&release);
+
+    assert!(wait_until(Duration::from_secs(2), || {
+      let snapshot = service.metrics();
+      snapshot.sample_count >= 4
+        && snapshot.control(FeedbackResource::CpuConcurrency).telemetry == TelemetryStatus::Sparse
+        && snapshot
+          .control(FeedbackResource::CpuConcurrency)
+          .pending_generation
+          .is_none()
+    }));
+    assert_eq!(state.applies.load(Ordering::SeqCst), 0);
+    for resource in [
+      FeedbackResource::CpuConcurrency,
+      FeedbackResource::DiskRate,
+      FeedbackResource::NetworkRate,
+    ] {
+      assert!(!service.metrics().control(resource).policy_faulted);
+    }
+
+    assert!(wait_until(Duration::from_secs(2), || {
+      state.actual(FeedbackResource::CpuConcurrency) == 90
+        && state.actual(FeedbackResource::DiskRate) == 90
+        && state.actual(FeedbackResource::NetworkRate) == 90
+    }));
+    stop_and_join(&mut service);
+  }
+
+  #[test]
+  fn earlier_control_postreadback_delay_expires_later_tickets() {
+    let state = ActuatorState::new([100, 100, 100]);
+    let entered = new_flag();
+    let release = new_flag();
+    let (sensor, _) = TestSensor::new(Signal::AllPressure);
+    let actuator = TestActuator::blocking_readback(
+      Arc::clone(&state),
+      FeedbackResource::CpuConcurrency,
+      3,
+      Arc::clone(&entered),
+      Arc::clone(&release),
+    );
+    let mut service = ResourceFeedbackService::start(config(), sensor, actuator).unwrap();
+
+    assert!(wait_flag(&entered, Duration::from_secs(2)));
+    assert_eq!(state.actual(FeedbackResource::CpuConcurrency), 90);
+    assert_eq!(state.actual(FeedbackResource::DiskRate), 100);
+    assert_eq!(state.actual(FeedbackResource::NetworkRate), 100);
+    thread::sleep(Duration::from_millis(600));
+    set_flag(&release);
+
+    assert!(wait_until(Duration::from_secs(2), || {
+      let snapshot = service.metrics();
+      snapshot.sample_count >= 4
+        && snapshot.control(FeedbackResource::DiskRate).telemetry == TelemetryStatus::Sparse
+        && snapshot
+          .control(FeedbackResource::DiskRate)
+          .pending_generation
+          .is_none()
+    }));
+    assert_eq!(state.actual(FeedbackResource::DiskRate), 100);
+    assert_eq!(state.actual(FeedbackResource::NetworkRate), 100);
+    assert!(
+      !service
+        .metrics()
+        .control(FeedbackResource::DiskRate)
+        .policy_faulted
+    );
+    assert!(
+      !service
+        .metrics()
+        .control(FeedbackResource::NetworkRate)
+        .policy_faulted
+    );
+
+    assert!(wait_until(Duration::from_secs(2), || {
+      state.actual(FeedbackResource::DiskRate) == 90
+        && state.actual(FeedbackResource::NetworkRate) == 90
+    }));
     stop_and_join(&mut service);
   }
 
