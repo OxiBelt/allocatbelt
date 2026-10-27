@@ -12014,7 +12014,7 @@ def _source5_validate_selected_plan_templates(
                 (identity["workload"], identity["profile"]) in expected_contexts and
                 identity["allocator"] in (
                     "allocatbelt", "mimalloc-secure", "mimalloc-standard", "system",
-                ) and identity["executor"] in ("allocatbelt", "tokio-1.53.1"),
+                ) and identity["executor"] in ("allocatbelt", "tokio-1.53.3"),
                 f"selected PlanV3 feedback template[{index}] identity is outside the original matrix")
         matrix_key = (host_id, identity["workload"], identity["profile"])
         require(matrix_key in capacity_bindings and
@@ -12085,7 +12085,7 @@ def _source5_validate_selected_plan_templates(
         for workload, profile in expected_contexts
         for family in ("fixed_policy", "external_pressure")
         for allocator in ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system")
-        for executor in ("allocatbelt", "tokio-1.53.1")
+        for executor in ("allocatbelt", "tokio-1.53.3")
     }
     require(feedback_matrix == expected_feedback_matrix,
             "selected PlanV3 feedback templates do not cover the exact source/condition/allocator/executor matrix")

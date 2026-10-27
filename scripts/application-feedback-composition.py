@@ -3763,7 +3763,7 @@ def _build_calibrated_feedback_expectation_v5(
         "host_id", "run_id", "report_nonce", "process_id", "allocator", "executor", "workload", "profile",
         "mode", "source_sha256", "binary_sha256", "pressure_qualification",
     }, "post-Popen V5 identity")
-    require(identity["allocator"] in ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system") and identity["executor"] in ("allocatbelt", "tokio-1.53.1"), "V5 expectation role is outside the original APP artifact/executor set")
+    require(identity["allocator"] in ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system") and identity["executor"] in ("allocatbelt", "tokio-1.53.3"), "V5 expectation role is outside the current APP artifact/executor set")
     require(identity["allocator"] == policy["context"]["allocator"], "actual APP allocator differs from the prelaunch selected artifact")
     require(identity["host_id"] == policy["context"]["host_id"] and identity["workload"] == policy["context"]["workload"] and identity["profile"] == policy["context"]["profile"], "actual APP identity differs from the prelaunch calibrated context")
     require(identity["source_sha256"] == policy["source_tree_sha256"] and identity["binary_sha256"] == policy["app_binary_sha256"], "actual APP source or binary differs from the prelaunch composition")

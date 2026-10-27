@@ -1908,7 +1908,7 @@ def _job_identity(job: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]
     return {
         "host_id": key["host_id"], "run_id": job["run_id"],
         "report_nonce": job["nonce"], "allocator": template["calibrator"]["allocator"],
-        "executor": {"bounded": "allocatbelt", "tokio": "tokio-1.53.1"}[
+        "executor": {"bounded": "allocatbelt", "tokio": "tokio-1.53.3"}[
             template["calibrator"]["executor"]
         ], "workload": key["workload"],
         "profile": key["profile"], "mode": "capacity",

@@ -34,7 +34,7 @@ OWNERS = ("global", "tenant")
 DIRECTIONS = ("disk", "upload", "download")
 
 ALLOCATORS = ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system")
-EXECUTORS = ("allocatbelt", "tokio-1.53.1")
+EXECUTORS = ("allocatbelt", "tokio-1.53.3")
 WORKLOADS = ("cpu", "memory", "http", "disk", "mixed")
 PROFILES = ("steady", "mixed", "burst", "oversubscribed", "safety_overload")
 MODES = ("capacity", "open_loop")
@@ -300,7 +300,7 @@ def build_fixed_expectation(recipe: dict[str, Any]) -> dict[str, Any]:
         "network_operation_limit": str(network_limit),
         "fixed_global_control_baseline": str(baseline),
         "blocking_disk_adapter_constructed": str(
-            identity["executor"] == "tokio-1.53.1" and disk_limit != 0
+            identity["executor"] == "tokio-1.53.3" and disk_limit != 0
         ).lower(),
     }
     accounting = {

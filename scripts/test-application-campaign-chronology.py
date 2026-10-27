@@ -2376,7 +2376,7 @@ class Source5JournalInputValidationTests(unittest.TestCase):
             for profile in profiles
         ]
         allocators = ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system")
-        executors = ("allocatbelt", "tokio-1.53.1")
+        executors = ("allocatbelt", "tokio-1.53.3")
         source_documents: dict[str, dict[str, Any]] = {}
         capacity_templates: list[dict[str, Any]] = []
         for host_index, host_id in enumerate(host_ids):

@@ -76,7 +76,7 @@ The two original member descriptors are `(bounded, bounded, allocator)` and
 `(tokio, tokio, allocator)` for executor jobs, or `(candidate, bounded,
 candidate_allocator)` and `(baseline, bounded, baseline_allocator)` for
 allocator jobs. Feedback executor identities are `allocatbelt` and
-`tokio-1.53.1`. The report nonce is derived from the original reusable plan
+`tokio-1.53.3`. The report nonce is derived from the original reusable plan
 template, campaign ID, run ID, member name and job ordinal. Each member pins
 its normal application binary, construction probe, resolver request/policy/
 receipt, feedback template, full APP argv and environment, cwd, TMPDIR,

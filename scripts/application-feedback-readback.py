@@ -53,7 +53,7 @@ RUNTIME_BINDING_SCHEMA_V2 = "allocatbelt.application-runtime-binding.v2"
 RUNTIME_SOAK_SCHEMA_V2 = "allocatbelt.runtime-soak.v2"
 SOAK_READBACK_SCHEMA_V2 = "allocatbelt.application-soak-readback.v2"
 APPLICATION_ALLOCATOR_LABELS = ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system")
-V5_EXECUTOR_LABELS = ("allocatbelt", "tokio-1.53.1")
+V5_EXECUTOR_LABELS = ("allocatbelt", "tokio-1.53.3")
 
 SOAK_PARENT_IDENTITY_FIELDS = {
     "campaign_id", "host_id", "run_id", "nonce", "allocator", "executor", "workload",

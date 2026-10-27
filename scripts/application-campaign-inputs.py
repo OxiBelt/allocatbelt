@@ -1582,7 +1582,7 @@ def build_qualification_plan_inputs(
             for allocator in ALLOCATORS:
                 binary_sha = source["artifacts"][allocator]["sha256"]
                 for executor in EXECUTORS:
-                    executor_name = "allocatbelt" if executor == "bounded" else "tokio-1.53.1"
+                    executor_name = "allocatbelt" if executor == "bounded" else "tokio-1.53.3"
                     for comparison_family in ("fixed_policy", "external_pressure"):
                         policy_context = {
                             "version": policy_body["version"],
@@ -1718,7 +1718,7 @@ def validate_qualification_plan_maps(value: dict[str, Any]) -> None:
         for field in ("campaign_id", "host_id", "workload", "profile", "capacity_calibration_id", "allocator"):
             _token(identity[field], f"feedback process template[{index}] {field}")
         _require(identity["comparison_family"] in ("fixed_policy", "external_pressure"), f"feedback process template[{index}] comparison family is unknown")
-        _require(identity["executor"] in ("allocatbelt", "tokio-1.53.1"), f"feedback process template[{index}] executor is unknown")
+        _require(identity["executor"] in ("allocatbelt", "tokio-1.53.3"), f"feedback process template[{index}] executor is unknown")
         matrix_key = (identity["host_id"], identity["workload"], identity["profile"])
         _require(matrix_key in capacity_bindings and identity["capacity_calibration_id"] == capacity_bindings[matrix_key][0], f"feedback process template[{index}] does not bind its capacity calibration")
         feedback_key = (*matrix_key, identity["comparison_family"], identity["allocator"], identity["executor"])
@@ -1811,6 +1811,6 @@ def validate_qualification_plan_maps(value: dict[str, Any]) -> None:
         for context in capacity_bindings
         for family in ("fixed_policy", "external_pressure")
         for allocator in ALLOCATORS
-        for executor in ("allocatbelt", "tokio-1.53.1")
+        for executor in ("allocatbelt", "tokio-1.53.3")
     }
     _require(feedback_matrix == expected_feedback, "feedback process templates do not cover the exact source/condition/allocator/executor matrix")

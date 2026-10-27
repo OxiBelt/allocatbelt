@@ -1668,8 +1668,11 @@ and qualification requirements.
 
 Task utilities, resource-bound polling, the synchronization families,
 processes, signals, concurrency helpers and explicit cgroup feedback are
-implemented with the contracts above. The stable Linux Tokio 1.53.1 capability
-baseline still requires these implementation and qualification steps:
+implemented with the contracts above. The stable-Linux capability inventory
+was recorded against Tokio 1.53.1. The current development and comparison
+dependency baseline is Tokio 1.53.3; this patch update does not change the
+inventory's API scope or historical traces. The listed capabilities still
+require these implementation and qualification steps:
 
 1. Qualify the implemented cooperative progress paths, including public
    readiness, child waits and signal receives, and preserve the documented

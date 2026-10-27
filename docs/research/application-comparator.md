@@ -1,7 +1,7 @@
 # Application runtime comparison lane
 
 This development-only lane compares allocatbelt's bounded runtime and Tokio
-1.53.1 on shared CPU, retained-memory, loopback HTTP, and positional-file
+1.53.3 on shared CPU, retained-memory, loopback HTTP, and positional-file
 transaction kernels. It is an implementation and correctness-qualified harness;
 no performance result is claimed until the preregistered native campaign runs.
 Earlier isolated pilots are descriptive-only and do not qualify the current
@@ -75,11 +75,16 @@ retried after admission rejection or syscall entry.
 
 The compared cooperative schedulers have different internal quanta. The
 allocatbelt runtime uses a shared 64-operation budget across its supported
-ready primitives/checkpoints during one owned task poll. Tokio 1.53.1's pinned
+ready primitives/checkpoints during one owned task poll. Tokio 1.53.3's pinned
 `task::coop` source initializes its internal budget to 128. These implementation
 budgets are not normalized; the benchmark matches external task windows,
 arrival policy, and resource ceilings, and reports that fairness-policy
 difference as part of the executor configuration.
+
+The development and comparison dependency baseline is Tokio 1.53.3. The
+stable-Linux capability inventory was originally recorded against Tokio 1.53.1;
+this patch update does not change that inventory's API scope or its historical
+traces.
 
 Capacity/reference validation is performed after the response-completion
 timestamp. CPU outputs are checked individually against their stable job ID's

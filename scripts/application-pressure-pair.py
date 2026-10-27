@@ -50,7 +50,7 @@ PAIR_PROCESS_HEADER_FALLBACK = (
 ).split()
 
 ALLOCATORS = ("allocatbelt", "mimalloc-secure", "mimalloc-standard", "system")
-EXECUTOR_LABELS = {"bounded": "allocatbelt", "tokio": "tokio-1.53.1"}
+EXECUTOR_LABELS = {"bounded": "allocatbelt", "tokio": "tokio-1.53.3"}
 U64_MAX = (1 << 64) - 1
 U128_MAX = (1 << 128) - 1
 MAX_RECIPE_BYTES = 16 * 1024 * 1024

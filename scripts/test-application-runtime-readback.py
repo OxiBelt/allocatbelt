@@ -121,8 +121,12 @@ def receipt_text(fields, schema=module.SCHEMA):
 
 
 class ReadbackTests(unittest.TestCase):
+    def test_old_tokio_executor_label_is_rejected(self):
+        with self.assertRaisesRegex(module.ReadbackError, "scheduled executor label is unknown"):
+            module.build_fixed_expectation(recipe(executor="tokio-1.53.1"))
+
     def test_refilled_tokens_and_two_live_owners_validate_at_setup(self):
-        for executor in ("allocatbelt", "tokio-1.53.1"):
+        for executor in ("allocatbelt", "tokio-1.53.3"):
             with self.subTest(executor=executor):
                 fields, expected = fixture(executor=executor, workload="disk")
                 burst = expected["contract"]["byte_buckets"]["disk"]["ceiling_burst_bytes"]
@@ -165,7 +169,7 @@ class ReadbackTests(unittest.TestCase):
             module.validate_runtime_readback(fields, expected)
 
     def test_complete_bounded_and_tokio_fixed_receipts_validate(self):
-        for executor in ("allocatbelt", "tokio-1.53.1"):
+        for executor in ("allocatbelt", "tokio-1.53.3"):
             with self.subTest(executor=executor):
                 fields, expected = fixture(executor=executor, workload="disk")
                 result = module.validate_runtime_readback(fields, expected)
@@ -174,7 +178,7 @@ class ReadbackTests(unittest.TestCase):
                 self.assertEqual(set(fields), self.expected_complete_registry(expected))
                 self.assertEqual(
                     expected["contract"]["configuration"]["blocking_disk_adapter_constructed"],
-                    "true" if executor == "tokio-1.53.1" else "false",
+                    "true" if executor == "tokio-1.53.3" else "false",
                 )
 
     def test_v1_historical_receipt_remains_valid_with_its_exact_legacy_keys(self):

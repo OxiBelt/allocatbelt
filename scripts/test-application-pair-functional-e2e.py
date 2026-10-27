@@ -1319,7 +1319,7 @@ def validate_functional_pair(
         output_header, output_rows = _CAMPAIGN.read_tsv_bytes(output_raw, str(output_path), 1)
         require(len(output_header) == 53, "functional benchmark stdout has the wrong output schema width")
         output = output_rows[0]
-        runtime_name = "allocatbelt" if row["executor"] == "bounded" else "tokio-1.53.1"
+        runtime_name = "allocatbelt" if row["executor"] == "bounded" else "tokio-1.53.3"
         require((output["allocator"], output["executor"], output["workload"], output["mode"]) == (row["allocator"], runtime_name, WORKLOAD, MODE), "functional benchmark row identity differs")
         require(int(output["attempted"]) == job["arrivals"] and int(output["admitted"]) == job["arrivals"], "functional benchmark did not admit its full bounded trace")
         require(int(output["completed_on_time"]) + int(output["completed_late"]) == job["arrivals"], "functional benchmark completion count differs")
@@ -1608,7 +1608,7 @@ def source_v4_runtime_bindings(
                 "report_nonce": nonce,
                 "run_id": run_id,
                 "allocator": allocator,
-                "executor": "allocatbelt" if descriptor["executor"] == "bounded" else "tokio-1.53.1",
+                "executor": "allocatbelt" if descriptor["executor"] == "bounded" else "tokio-1.53.3",
                 "source_sha256": source["source"]["source_tree_sha256"],
                 "binary_sha256": binary_sha256,
                 "comparison_family": "fixed_policy",
@@ -1797,7 +1797,7 @@ def validate_v4_shutdown_report(
     text, digest = _read_bounded_text(path, "functional shutdown report", MAX_SMALL_ARTIFACT_BYTES)
     lines = text.splitlines()
     require(lines and lines[0] == "schema\tallocatbelt-app-phase-v1\t", "functional shutdown report schema differs")
-    expected_executor = "allocatbelt" if binding["executor"] == "bounded" else "tokio-1.53.1"
+    expected_executor = "allocatbelt" if binding["executor"] == "bounded" else "tokio-1.53.3"
     identity = [line.split("\t") for line in lines[1:9]]
     expected_identity = [
         ["identity", "report_nonce", binding["report_nonce"]],
@@ -1886,7 +1886,7 @@ def validate_v4_open_loop_ids(
     require(digest == row["ids_sha256"], "functional per-ID ledger SHA-256 differs from the process ledger")
     fields = text.splitlines()
     require(len(fields) >= 3 and fields[0] == "schema\tallocatbelt-app-arrivals-v3", "functional per-ID ledger schema differs")
-    expected_executor = "allocatbelt" if binding["executor"] == "bounded" else "tokio-1.53.1"
+    expected_executor = "allocatbelt" if binding["executor"] == "bounded" else "tokio-1.53.3"
     require(fields[1].split("\t") == [
         "identity", binding["report_nonce"], binding["recipe"]["identity"]["run_id"],
         expected_executor, binding["allocator"], context["workload"], context["profile"],
@@ -1956,7 +1956,7 @@ def validate_v4_capacity_family(
     require(digest == row["capacity_family_sha256"], "mixed capacity family ledger SHA-256 differs")
     lines = text.splitlines()
     require(lines and lines[0] == "schema\tallocatbelt-app-capacity-families-v1\t", "mixed capacity family ledger schema differs")
-    expected_executor = "allocatbelt" if binding["executor"] == "bounded" else "tokio-1.53.1"
+    expected_executor = "allocatbelt" if binding["executor"] == "bounded" else "tokio-1.53.3"
     identity_expected = {
         "report_nonce": binding["report_nonce"],
         "run_id": binding["recipe"]["identity"]["run_id"],
@@ -2017,7 +2017,7 @@ def validate_v4_process_argv(
     require(type(argv) is list and all(type(item) is str for item in argv), "functional process argv is not a string array")
     pair = binding["pair"]
     executor = binding["executor"]
-    expected_executor = "allocatbelt" if executor == "bounded" else "tokio-1.53.1"
+    expected_executor = "allocatbelt" if executor == "bounded" else "tokio-1.53.3"
     timing_path = str(Path(raw_root) / binding["recipe"]["identity"]["run_id"] / f"{pair}-{executor}.time.txt")
     prefix = [
         "taskset", "-c", cpu_set, "/usr/bin/time", "-v", "-o", timing_path,
@@ -2077,7 +2077,7 @@ def validate_v4_output_row(
     header, rows = _CAMPAIGN.read_tsv_bytes(raw, label, 1)
     require(header == RUNNER_RESULT_HEADER and len(header) == 53, "functional application result header differs")
     output = rows[0]
-    runtime_name = "allocatbelt" if process_row["executor"] == "bounded" else "tokio-1.53.1"
+    runtime_name = "allocatbelt" if process_row["executor"] == "bounded" else "tokio-1.53.3"
     require(
         (output["allocator"], output["executor"], output["workload"], output["mode"])
         == (process_row["allocator"], runtime_name, context["workload"], context["mode"]),

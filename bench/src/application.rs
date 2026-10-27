@@ -244,7 +244,7 @@ impl Executor {
   fn label(self) -> &'static str {
     match self {
       Self::Bounded => "allocatbelt",
-      Self::Tokio => "tokio-1.53.1",
+      Self::Tokio => "tokio-1.53.3",
     }
   }
 }
@@ -1857,7 +1857,7 @@ impl RuntimeBindingWriter {
     }
     let expected_executor = match options.executor {
       Executor::Bounded => "allocatbelt",
-      Executor::Tokio => "tokio-1.53.1",
+      Executor::Tokio => "tokio-1.53.3",
     };
     if executor != expected_executor {
       return Err("runtime readback executor differs from the selected executor".into());

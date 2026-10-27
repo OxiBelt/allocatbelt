@@ -3864,7 +3864,7 @@ def extract_process_metrics(
     require(executor in ("bounded", "tokio"), f"unknown pair executor: {executor}")
     process_allocator = process_row["allocator"]
     require(process_allocator in ALLOCATORS, f"unknown process allocator: {process_allocator}")
-    label = "allocatbelt" if executor == "bounded" else "tokio-1.53.1"
+    label = "allocatbelt" if executor == "bounded" else "tokio-1.53.3"
     stdout_name = process_row["stdout"]
     require(Path(stdout_name).name == stdout_name and stdout_name.endswith(".stdout.tsv"), "runner stdout reference is not a basename")
     stdout_path = pair_dir / stdout_name
@@ -4355,7 +4355,7 @@ def build_runtime_process_bindings(
     result: list[dict[str, Any]] = []
     for descriptor in process_descriptors(job):
         allocator = descriptor["allocator"]
-        executor = "allocatbelt" if descriptor["executor"] == "bounded" else "tokio-1.53.1"
+        executor = "allocatbelt" if descriptor["executor"] == "bounded" else "tokio-1.53.3"
         binary_sha = source["artifacts"][allocator]["sha256"]
         nonce_identity = {
             "campaign_id": spec["campaign_id"],
@@ -4523,7 +4523,7 @@ def verify_plan(
             except (TypeError, ValueError) as error:
                 raise CampaignError(f"runtime process recipe is invalid for {run_id}: {error}") from error
             require(recipe["identity"]["run_id"] == run_id and recipe["identity"]["report_nonce"] == item["report_nonce"], f"runtime process recipe identity differs for {run_id}")
-            require(recipe["identity"]["allocator"] == item["allocator"] and recipe["identity"]["executor"] == ("allocatbelt" if item["executor"] == "bounded" else "tokio-1.53.1"), f"runtime process recipe allocator/executor differs for {run_id}")
+            require(recipe["identity"]["allocator"] == item["allocator"] and recipe["identity"]["executor"] == ("allocatbelt" if item["executor"] == "bounded" else "tokio-1.53.3"), f"runtime process recipe allocator/executor differs for {run_id}")
             require(recipe["identity"]["comparison_family"] == "fixed_policy" and recipe["identity"]["resource_ceiling_sha256"] == item["resource_ceiling_sha256"] and recipe["identity"]["policy_sha256"] == item["policy_sha256"], f"runtime process recipe source bindings differ for {run_id}")
             require(type(item["fixed_global_control_baseline"]) is int and item["fixed_global_control_baseline"] == recipe["fixed_global_control_baseline"], f"runtime process recipe baseline differs for {run_id}")
             require(hashlib.sha256(canonical_bytes(recipe)).hexdigest() == item["recipe_sha256"], f"runtime process recipe hash mismatch for {run_id}")

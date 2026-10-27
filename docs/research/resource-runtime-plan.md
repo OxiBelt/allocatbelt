@@ -7,9 +7,11 @@ depend on Tokio. Implementation remains on `feat/resource-runtime-foundation` un
 passes. Integrate its complete history (including `research/rust-allocator`)
 into `main` with a signed normal merge commit; release publication is separate.
 
-The compatibility baseline is Tokio 1.53.1's stable Linux capabilities. This
-requires explicit application ports rather than claiming binary or exact API
-compatibility. Stable behavior includes current-thread paused-clock automatic
+The stable-Linux capability inventory in this plan was recorded against Tokio
+1.53.1. The current development and comparison dependency baseline is Tokio
+1.53.3; this patch update does not change the inventory's API scope or its
+historical traces. The design requires explicit application ports rather than
+claiming binary or exact API compatibility. Stable behavior includes current-thread paused-clock automatic
 advance, pause/resume, randomized selection with refutable patterns, rotating
 joins, stable runtime metrics and thread lifecycle configuration. Declarative macros and functions replace procedural entry
 macros. Bounded submission and channel capacities require applications to

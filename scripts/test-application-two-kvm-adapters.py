@@ -309,7 +309,7 @@ class TwoKvmProfilePropagationTests(unittest.TestCase):
                 source = sources[host_id]
                 for family in ("fixed_policy", "external_pressure"):
                     for allocator in campaign.ALLOCATORS:
-                        for executor in ("allocatbelt", "tokio-1.53.1"):
+                        for executor in ("allocatbelt", "tokio-1.53.3"):
                             source_policy = source["feedback_policy"]["policy"]
                             policy = {
                                 "version": source_policy["version"],

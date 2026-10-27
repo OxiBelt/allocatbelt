@@ -233,7 +233,7 @@ impl TraceIdentity {
     Self {
       report_nonce: FixedText::from_literal("0123456789abcdef0123456789abcdef"),
       run_id: FixedText::from_literal("feedback-trace-test"),
-      executor: FixedText::from_literal("tokio-1.53.1"),
+      executor: FixedText::from_literal("tokio-1.53.3"),
       allocator: FixedText::from_literal("allocatbelt"),
       workload: FixedText::from_literal("cpu"),
       profile: FixedText::from_literal("steady"),

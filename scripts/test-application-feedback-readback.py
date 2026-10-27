@@ -192,7 +192,7 @@ class Fixture:
             "report_nonce": "0123456789abcdef0123456789abcdef",
             "process_id": 42424,
             "allocator": "allocatbelt",
-            "executor": "tokio-1.53.1",
+            "executor": "tokio-1.53.3",
             "workload": workload,
             "profile": profile or ("mixed" if workload == "mixed" else "steady"),
             "mode": "capacity",

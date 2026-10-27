@@ -51,7 +51,7 @@ it could reap the leader before ownership is verified.
 
 The resolved policy can be bound to any original application artifact label
 (`allocatbelt`, `mimalloc-secure`, `mimalloc-standard`, or `system`) and to
-either original executor label (`allocatbelt` or `tokio-1.53.1`). The capacity
+either current executor label (`allocatbelt` or `tokio-1.53.3`). The capacity
 calibrator has its own allocator/executor identity and must match its own
 SourceV5 artifact; it may differ from the target application artifact that
 consumes the shared capacity result.

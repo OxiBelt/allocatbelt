@@ -3244,7 +3244,7 @@ def _source5_runtime_snapshot_record_template(
             "run_id": job["run_id"],
             "allocator": descriptor["allocator"],
             "executor": ("allocatbelt" if descriptor["executor"] == "bounded"
-                         else "tokio-1.53.1"),
+                         else "tokio-1.53.3"),
             "comparison_family": comparison_family,
             "resource_ceiling_sha256": job.get(
                 "resource_ceiling_sha256", "f" * 64,

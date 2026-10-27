@@ -612,7 +612,7 @@ try:
     if set(binding) != {"pair", "executor", "allocator", "report_nonce", "recipe", "recipe_sha256", "expectation_sha256", "resource_ceiling_sha256", "policy_sha256", "fixed_global_control_baseline"}:
         fail()
     recipe = binding["recipe"]
-    expected_executor = "allocatbelt" if executor == "bounded" else "tokio-1.53.1"
+    expected_executor = "allocatbelt" if executor == "bounded" else "tokio-1.53.3"
     run = recipe["run"]
     expected_rate = None if mode == "capacity" else int(rate_text)
     expected_arrivals = 5000 if mode == "capacity" else int(arrivals_text)
@@ -1241,7 +1241,7 @@ try:
         recipe = binding.get("recipe")
         if type(recipe) is not dict or recipe.get("run") != expected_run:
             fail("functional v4 runtime recipe differs from the selected workload/profile/mode")
-        expected_executor = "allocatbelt" if descriptor[1] == "bounded" else "tokio-1.53.1"
+        expected_executor = "allocatbelt" if descriptor[1] == "bounded" else "tokio-1.53.3"
         artifact = source_manifest["artifacts"].get(descriptor[2])
         if (type(artifact) is not dict or recipe.get("identity", {}).get("executor") != expected_executor
             or recipe.get("identity", {}).get("allocator") != descriptor[2]
@@ -2162,7 +2162,7 @@ PY
 
 run_one() {
   local pair=$1 executor=$2 process_allocator=$3 process_binary_arg=$4 process_oracle_arg=$5 process_oracle_sha_expected=$6
-  local expected_executor=tokio-1.53.1
+  local expected_executor=tokio-1.53.3
   [[ "$executor" == bounded ]] && expected_executor=allocatbelt
   local process_binary
   process_binary=$(realpath "$process_binary_arg") || { failed=1; return 1; }
