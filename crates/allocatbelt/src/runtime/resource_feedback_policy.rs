@@ -575,6 +575,7 @@ impl ResourceFeedbackPolicy {
   /// without faulting the control, changing its breach streak, or charging
   /// actuation cooldown. The caller must only use this for a ticket whose
   /// actuator write has not been attempted.
+  #[cfg(feature = "resource-feedback")]
   pub(crate) fn expire_stale_ticket(
     &mut self,
     ticket: PlanTicket,
