@@ -10,5 +10,8 @@ publish = false
 [dependencies]
 allocatbelt = { workspace = true, features = ["runtime"] }
 
+[dev-dependencies]
+rustix = { workspace = true, features = ["event"] }
+
 [lints]
 workspace = true

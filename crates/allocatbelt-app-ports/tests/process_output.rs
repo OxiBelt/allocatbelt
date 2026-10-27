@@ -2274,6 +2274,7 @@ fn run_pending_cancellation(cancel_task: bool, kill_on_drop: bool) {
     driver
       .shutdown(ProcessShutdownMode::Wait)
       .expect("kill-on-drop request must be reaped before shutdown returns");
+    wait_for_gate_readers_to_close(&gate_writer);
     match gate_writer.write(b"release") {
       Err(error) => assert_eq!(error.kind(), io::ErrorKind::BrokenPipe),
       Ok(_) => panic!("kill-on-drop must close the blocked helper's gate reader"),
@@ -2309,6 +2310,30 @@ fn run_pending_cancellation(cancel_task: bool, kill_on_drop: bool) {
       abort_join_cancelled,
       "task abort must publish its cancelled join result before scope close: {abort_join_result:?}"
     );
+  }
+}
+
+fn wait_for_gate_readers_to_close(writer: &io::PipeWriter) {
+  use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+  // Another concurrent spawn can briefly inherit this CLOEXEC reader before
+  // its exec, even after our own child has been reaped. Observe kernel reader
+  // closure without sending a byte that could release a still-live helper.
+  let deadline = Instant::now() + WATCHDOG;
+  loop {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    assert!(!remaining.is_zero(), "kill-on-drop gate still has a reader");
+    let timeout = Timespec::try_from(remaining).expect("watchdog fits poll timeout");
+    let mut fds = [PollFd::new(writer, PollFlags::ERR)];
+    match poll(&mut fds, Some(&timeout)) {
+      Ok(0) => panic!("kill-on-drop gate still has a reader"),
+      Ok(_) => {
+        assert_eq!(fds[0].revents(), PollFlags::ERR);
+        return;
+      }
+      Err(rustix::io::Errno::INTR) => {}
+      Err(error) => panic!("gate closure poll failed: {error}"),
+    }
   }
 }
 

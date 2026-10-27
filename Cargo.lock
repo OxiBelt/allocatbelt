@@ -25,6 +25,7 @@ name = "allocatbelt-app-ports"
 version = "0.1.0"
 dependencies = [
  "allocatbelt",
+ "rustix",
 ]
 
 [[package]]
