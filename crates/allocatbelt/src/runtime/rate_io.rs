@@ -6,6 +6,8 @@
 //! Partial completions commit their reported prefix; Pending, errors and EOF
 //! refund unused credit. Rate waits use the supplied real-clock timer and do
 //! not poll or retain the endpoint's input while waiting.
+//! A panicking endpoint may already have transferred bytes. Unwinding spends
+//! its complete offer conservatively and invalidates its directional telemetry.
 //!
 //! Vectored calls use the scalar trait fallback and offer only the first
 //! nonempty slice. This keeps the adapter allocation-free and bounds each
@@ -35,6 +37,30 @@ struct FeedbackMeters {
   write: IoFeedbackMeter,
   _read_registration: IoFeedbackRegistration,
   _write_registration: IoFeedbackRegistration,
+}
+
+struct PanicOffer<'a> {
+  reservation: Option<ByteReservation>,
+  #[cfg(feature = "resource-feedback")]
+  meter: Option<&'a IoFeedbackMeter>,
+  #[cfg(not(feature = "resource-feedback"))]
+  _lifetime: std::marker::PhantomData<&'a ()>,
+}
+
+impl Drop for PanicOffer<'_> {
+  fn drop(&mut self) {
+    let Some(reservation) = self.reservation.take() else {
+      return;
+    };
+    if std::thread::panicking() {
+      let offered = reservation.bytes();
+      let _ = reservation.commit(offered);
+      #[cfg(feature = "resource-feedback")]
+      if let Some(meter) = self.meter {
+        meter.mark_invalid_io();
+      }
+    }
+  }
 }
 
 #[cfg(feature = "resource-feedback")]
@@ -530,7 +556,22 @@ impl<T: AsyncRead + Unpin> AsyncRead for RateLimitedIo<T> {
         return Poll::Ready(Err(error));
       }
 
-      match Pin::new(&mut this.inner).poll_read(cx, &mut output[..offered]) {
+      let mut guarded = PanicOffer {
+        reservation: Some(reservation),
+        #[cfg(feature = "resource-feedback")]
+        meter: this.feedback.as_ref().map(|feedback| feedback.meter(true)),
+        #[cfg(not(feature = "resource-feedback"))]
+        _lifetime: std::marker::PhantomData,
+      };
+      let polled = Pin::new(&mut this.inner).poll_read(cx, &mut output[..offered]);
+      // A normal return reports the transfer precisely, including when called
+      // by a destructor during an unrelated unwind. Disarm before settling it.
+      let reservation = guarded
+        .reservation
+        .take()
+        .unwrap_or_else(|| unreachable!("byte offer was consumed"));
+      drop(guarded);
+      match polled {
         Poll::Pending => {
           drop(reservation);
           Poll::Pending
@@ -604,7 +645,20 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for RateLimitedIo<T> {
         return Poll::Ready(Err(error));
       }
 
-      match Pin::new(&mut this.inner).poll_write(cx, &input[..offered]) {
+      let mut guarded = PanicOffer {
+        reservation: Some(reservation),
+        #[cfg(feature = "resource-feedback")]
+        meter: this.feedback.as_ref().map(|feedback| feedback.meter(false)),
+        #[cfg(not(feature = "resource-feedback"))]
+        _lifetime: std::marker::PhantomData,
+      };
+      let polled = Pin::new(&mut this.inner).poll_write(cx, &input[..offered]);
+      let reservation = guarded
+        .reservation
+        .take()
+        .unwrap_or_else(|| unreachable!("byte offer was consumed"));
+      drop(guarded);
+      match polled {
         Poll::Pending => {
           drop(reservation);
           Poll::Pending

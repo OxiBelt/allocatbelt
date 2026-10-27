@@ -18,6 +18,7 @@ use crate::runtime::time::TimerDriver;
 #[derive(Debug)]
 enum Action {
   Count(usize),
+  PanicAfterCount(usize),
   Pending,
   Error(ErrorKind),
 }
@@ -65,6 +66,11 @@ impl AsyncRead for ScriptIo {
         output[..filled].fill(b'r');
         Poll::Ready(Ok(count))
       }
+      Action::PanicAfterCount(count) => {
+        let filled = count.min(output.len());
+        output[..filled].fill(b'r');
+        panic!("endpoint panicked after consuming a read prefix");
+      }
       Action::Pending => Poll::Pending,
       Action::Error(kind) => Poll::Ready(Err(kind.into())),
     }
@@ -88,6 +94,11 @@ impl AsyncWrite for ScriptIo {
         let accepted = count.min(input.len());
         this.accepted.extend_from_slice(&input[..accepted]);
         Poll::Ready(Ok(count))
+      }
+      Action::PanicAfterCount(count) => {
+        let accepted = count.min(input.len());
+        this.accepted.extend_from_slice(&input[..accepted]);
+        panic!("endpoint panicked after accepting a write prefix");
       }
       Action::Pending => Poll::Pending,
       Action::Error(kind) => Poll::Ready(Err(kind.into())),
@@ -218,6 +229,88 @@ fn pending_would_block_and_errors_refund_all_unreported_credit() {
     assert_eq!(write.snapshot().available_bytes, 4);
     assert_eq!(write.snapshot().reserved_bytes, 0);
   }
+}
+
+#[test]
+fn panicking_endpoints_spend_the_offer_before_a_sibling_can_reuse_credit() {
+  use std::panic::{AssertUnwindSafe, catch_unwind};
+
+  let (_driver, timer) = timer(4);
+  let read = bucket(1, 4096, 1);
+  let write = bucket(1, 4096, 1);
+  let mut stream = RateLimitedIo::new(
+    ScriptIo::new([Action::PanicAfterCount(3)], [Action::PanicAfterCount(3)]),
+    read.clone(),
+    write.clone(),
+    timer.clone(),
+  )
+  .expect("real-clock adapter");
+  let mut cx = context();
+  let mut output = [0; 4096];
+  assert!(
+    catch_unwind(AssertUnwindSafe(|| {
+      let _ = Pin::new(&mut stream).poll_read(&mut cx, &mut output);
+    }))
+    .is_err()
+  );
+  assert_eq!(&output[..3], b"rrr");
+  assert_eq!(read.snapshot().reserved_bytes, 0);
+  assert!(read.snapshot().available_bytes < 4096);
+
+  assert!(
+    catch_unwind(AssertUnwindSafe(|| {
+      let _ = Pin::new(&mut stream).poll_write(&mut cx, &[b'w'; 4096]);
+    }))
+    .is_err()
+  );
+  assert_eq!(stream.get_ref().accepted, b"www");
+  assert_eq!(write.snapshot().reserved_bytes, 0);
+  assert!(write.snapshot().available_bytes < 4096);
+
+  let mut sibling = RateLimitedIo::new(ScriptIo::new([], []), read, write, timer)
+    .expect("real-clock sibling adapter");
+  if let Poll::Ready(Ok(bytes)) = Pin::new(&mut sibling).poll_write(&mut cx, &[b'x'; 4096]) {
+    assert!(bytes < 4096, "a panic must not refund the complete offer");
+  }
+}
+
+#[test]
+#[cfg(feature = "resource-feedback")]
+fn panicking_endpoints_invalidate_only_their_directional_feedback() {
+  use std::panic::{AssertUnwindSafe, catch_unwind};
+
+  let (_driver, timer) = timer(4);
+  let read_meter = IoFeedbackMeter::new();
+  let write_meter = IoFeedbackMeter::new();
+  let mut stream = RateLimitedIo::new(
+    ScriptIo::new([Action::PanicAfterCount(1)], [Action::PanicAfterCount(1)]),
+    bucket(1, 4096, 1),
+    bucket(1, 4096, 1),
+    timer,
+  )
+  .expect("real-clock adapter")
+  .with_feedback_meters(read_meter.clone(), write_meter.clone());
+  let mut cx = context();
+  assert!(
+    catch_unwind(AssertUnwindSafe(|| {
+      let _ = Pin::new(&mut stream).poll_read(&mut cx, &mut [0; 4096]);
+    }))
+    .is_err()
+  );
+  assert!(read_meter.snapshot().diagnostics.invalid_io);
+  assert!(!write_meter.snapshot().diagnostics.invalid_io);
+  assert_eq!(read_meter.snapshot().committed_bytes, 0);
+  assert_eq!(read_meter.snapshot().completions, 0);
+
+  assert!(
+    catch_unwind(AssertUnwindSafe(|| {
+      let _ = Pin::new(&mut stream).poll_write(&mut cx, &[b'w'; 4096]);
+    }))
+    .is_err()
+  );
+  assert!(write_meter.snapshot().diagnostics.invalid_io);
+  assert_eq!(write_meter.snapshot().committed_bytes, 0);
+  assert_eq!(write_meter.snapshot().completions, 0);
 }
 
 #[test]
