@@ -527,20 +527,22 @@ fn gated_cpu_execution_makes_cross_runtime_job_join_fail_fast() {
     resources,
   )
   .unwrap_or_else(|error| panic!("blocking runtime setup failed: {error}"));
-  let job = runtime
-    .try_spawn(
-      Resources {
-        cpu: 1,
-        ..Resources::ZERO
-      },
-      |_| 29,
-    )
-    .unwrap_or_else(|error| panic!("blocking task admission failed: {}", error.kind));
-
-  let joined = gate
+  let (job, joined) = gate
     .run(|| {
+      // Hold the only CPU ticket before submitting the job, so the worker
+      // cannot finish before this test observes its CPU admission wait.
+      let job = runtime
+        .try_spawn(
+          Resources {
+            cpu: 1,
+            ..Resources::ZERO
+          },
+          |_| 29,
+        )
+        .unwrap_or_else(|error| panic!("blocking task admission failed: {}", error.kind));
       wait_until(|| runtime.snapshot().running == 1, "blocking job CPU wait");
-      matches!(job.join(), Err(JoinError::WouldDeadlock))
+      let joined = matches!(job.join(), Err(JoinError::WouldDeadlock));
+      (job, joined)
     })
     .unwrap_or_else(|error| panic!("CPU gate closure admission failed: {error}"));
   assert!(joined);
