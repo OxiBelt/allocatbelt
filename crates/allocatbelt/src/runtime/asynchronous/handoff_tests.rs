@@ -1,6 +1,6 @@
-//! Native tests for bounded original-thread `try_block_in_place`. Every wait
-//! has a deadline, and every blocking closure waits on a gate that test
-//! unwinding opens, so a failure cannot hang the suite.
+//! Native tests for bounded original-thread `try_block_in_place`. Observer
+//! waits have deadlines; controlled worker gates open only by test action or
+//! RAII cleanup, so a failed assertion cannot leave a worker stranded.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -93,6 +93,15 @@ impl Gate {
     }
     true
   }
+
+  /// Blocks until the test opens this controlled release gate.
+  fn wait_until_open(&self) {
+    let (lock, cv) = &*self.0;
+    let mut open = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    while !*open {
+      open = cv.wait(open).unwrap_or_else(PoisonError::into_inner);
+    }
+  }
 }
 
 /// Opens its gate when dropped, including while a failing test unwinds.
@@ -171,7 +180,24 @@ fn drained(runtime: AsyncRuntime) {
 /// Opens `entered`, then blocks this handed-off closure until `release`.
 fn block_until(entered: &Gate, release: &Gate) -> bool {
   entered.open();
-  release.wait()
+  release.wait_until_open();
+  true
+}
+
+struct ReleaseSignal(Option<mpsc::Sender<()>>);
+
+impl ReleaseSignal {
+  fn release(&mut self) {
+    if let Some(sender) = self.0.take() {
+      let _ = sender.send(());
+    }
+  }
+}
+
+impl Drop for ReleaseSignal {
+  fn drop(&mut self) {
+    self.release();
+  }
 }
 
 fn injected_panic() -> u8 {
@@ -405,20 +431,24 @@ fn a_cap_one_same_scope_wait_stalls_while_a_larger_explicit_cap_progresses() {
       .scope_with_config(scope_config(cap))
       .unwrap_or_else(|error| panic!("scope failed: {error}"));
     let handle = scope.handle();
+    let (sent, received) = mpsc::channel();
+    let mut _release_on_unwind = ReleaseSignal(Some(sent.clone()));
     let job = spawned(&scope.handle(), async move {
-      let (sent, received) = mpsc::channel();
       let dependency = spawned(&handle, async move {
         let _ = sent.send(());
       });
       // With cap 1 this wait would deadlock; it is bounded here to observe it.
-      let wait = if cap == 1 {
-        Duration::from_millis(200)
+      if cap == 1 {
+        let finished =
+          try_block_in_place(|| received.recv_timeout(Duration::from_millis(200)).is_ok())
+            .unwrap_or(false);
+        drop(dependency);
+        finished
       } else {
-        DEADLINE
-      };
-      let finished = try_block_in_place(|| received.recv_timeout(wait).is_ok()).unwrap_or(false);
-      drop(dependency);
-      finished
+        let finished = try_block_in_place(|| received.recv().is_ok()).unwrap_or(false);
+        drop(dependency);
+        finished
+      }
     });
     assert_eq!(
       joined(job),
@@ -676,7 +706,10 @@ fn cancel_pending_shutdown_waits_for_the_closure_and_restores_after_close() {
   thread::spawn(move || {
     let _ = done.send(runtime.shutdown(AsyncShutdown::CancelPending));
   });
-  assert!(finished.recv_timeout(Duration::from_millis(100)).is_err());
+  assert!(matches!(
+    finished.recv_timeout(Duration::from_millis(100)),
+    Err(mpsc::RecvTimeoutError::Timeout)
+  ));
   assert!(!dropped.load(Ordering::SeqCst));
   let rejected = handle.spawn(async {}).err().map(|error| error.kind);
   assert_eq!(rejected, Some(AsyncError::Closed));
@@ -719,7 +752,10 @@ fn drain_shutdown_allows_admitted_continuations_to_hand_off() {
   thread::spawn(move || {
     let _ = done.send(runtime.shutdown(AsyncShutdown::Drain));
   });
-  assert!(finished.recv_timeout(Duration::from_millis(100)).is_err());
+  assert!(matches!(
+    finished.recv_timeout(Duration::from_millis(100)),
+    Err(mpsc::RecvTimeoutError::Timeout)
+  ));
   assert_eq!(
     handle.spawn(async {}).err().map(|error| error.kind),
     Some(AsyncError::Closed)

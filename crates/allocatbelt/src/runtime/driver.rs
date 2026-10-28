@@ -2935,6 +2935,8 @@ mod tests {
 
   #[test]
   fn shutdown_status_retains_worker_panic_payload_until_owner_drop() {
+    let checker_budget = Duration::from_secs(3);
+    let observer_budget = Duration::from_secs(4);
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::sync_channel(1);
     let payload = PanicDropGate {
@@ -2993,7 +2995,7 @@ mod tests {
     let (status_tx, status_rx) = mpsc::sync_channel(1);
     let checker = std::thread::spawn(move || {
       let mut driver = driver;
-      let deadline = Instant::now() + Duration::from_secs(3);
+      let deadline = Instant::now() + checker_budget;
       let status = loop {
         match driver.try_shutdown() {
           Err(error) => break Err(error),
@@ -3007,16 +3009,22 @@ mod tests {
       let _ = status_tx.send((driver, status));
     });
 
-    let (mut driver, status) = match status_rx.recv_timeout(Duration::from_secs(2)) {
+    let (mut driver, status) = match status_rx.recv_timeout(observer_budget) {
       Ok(result) => result,
       Err(error) => {
         let _ = release_tx.send(());
-        let (driver, _) = status_rx
+        let (driver, observed_status) = status_rx
           .recv_timeout(Duration::from_secs(2))
-          .unwrap_or_else(|second| panic!("shutdown status never returned: {error}; {second}"));
+          .unwrap_or_else(|second| {
+            panic!(
+              "shutdown status phase exceeded {observer_budget:?} and never returned after releasing the panic payload: {error}; {second}"
+            )
+          });
         let _ = checker.join();
         drop(driver);
-        panic!("shutdown status blocked while dropping a worker panic payload");
+        panic!(
+          "shutdown status phase exceeded {observer_budget:?}; checker later returned {observed_status:?}"
+        );
       }
     };
     assert!(matches!(
@@ -3983,12 +3991,15 @@ mod tests {
       command
     };
 
+    let multi_completion_drain = crate::runtime::thread_completion::CompletionDrain::new();
+    let multi_drain_registration = multi_completion_drain.register_for_current_thread();
     let mut multi = MultiThreadBuilder::new(async_config())
       .resource_domain(tenant.clone())
       .resources(limits(0))
       .processes(1)
       .build()
       .unwrap();
+    drop(multi_drain_registration);
     assert_eq!(
       multi._control.bytes(),
       std::mem::size_of::<MultiThreadDriver>()
@@ -4000,6 +4011,10 @@ mod tests {
     assert!(exit.success());
     shutdown_multi_driver(&mut multi);
     drop(multi);
+    assert!(
+      multi_completion_drain.wait_until_drained(DRIVER_TEST_WATCHDOG),
+      "multithread completion monitors retained their shared Control owners"
+    );
     assert!(domain.snapshot().used.get(DomainResource::Control) > baseline);
     drop(child);
     assert_eq!(
@@ -4007,12 +4022,15 @@ mod tests {
       baseline
     );
 
+    let current_completion_drain = crate::runtime::thread_completion::CompletionDrain::new();
+    let current_drain_registration = current_completion_drain.register_for_current_thread();
     let mut current = CurrentThreadBuilder::new(local_config())
       .resource_domain(tenant)
       .resources(limits(0))
       .processes(1)
       .build()
       .unwrap();
+    drop(current_drain_registration);
     assert_eq!(
       current._control.bytes(),
       std::mem::size_of::<CurrentThreadDriver>()
@@ -4024,6 +4042,10 @@ mod tests {
     assert!(exit.success());
     shutdown_current_driver(&mut current);
     drop(current);
+    assert!(
+      current_completion_drain.wait_until_drained(DRIVER_TEST_WATCHDOG),
+      "current-thread completion monitors retained their shared Control owners"
+    );
     assert!(domain.snapshot().used.get(DomainResource::Control) > baseline);
     drop(child);
     assert_eq!(

@@ -34,38 +34,38 @@ use super::task::drop_contained;
 type JoinResult = thread::Result<()>;
 const MONITOR_THREAD_NAME: &str = "allocatbelt-join-monitor";
 
-#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+#[cfg(all(test, not(loom)))]
 struct CompletionDrainState {
   state: Mutex<(usize, usize)>,
   changed: Condvar,
 }
 
-#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+#[cfg(all(test, not(loom)))]
 #[derive(Clone)]
 pub(crate) struct CompletionDrain(Arc<CompletionDrainState>);
 
-#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+#[cfg(all(test, not(loom)))]
 pub(crate) struct CompletionDrainRegistration {
   previous: Option<Arc<CompletionDrainState>>,
 }
 
-#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+#[cfg(all(test, not(loom)))]
 struct CompletionDrainToken {
   state: Arc<CompletionDrainState>,
   active: bool,
 }
 
-#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+#[cfg(all(test, not(loom)))]
 thread_local! {
   static ACTIVE_COMPLETION_DRAIN: std::cell::RefCell<Option<Arc<CompletionDrainState>>> = const {
     std::cell::RefCell::new(None)
   };
 }
 
-#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+#[cfg(all(test, not(loom)))]
 static COMPLETION_DRAINS: Mutex<Vec<(usize, Arc<CompletionDrainState>)>> = Mutex::new(Vec::new());
 
-#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+#[cfg(all(test, not(loom)))]
 impl CompletionDrain {
   pub(crate) fn new() -> Self {
     Self(Arc::new(CompletionDrainState {
@@ -102,7 +102,7 @@ impl CompletionDrain {
   }
 }
 
-#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+#[cfg(all(test, not(loom)))]
 impl Drop for CompletionDrainRegistration {
   fn drop(&mut self) {
     ACTIVE_COMPLETION_DRAIN.with(|active| {
@@ -111,7 +111,7 @@ impl Drop for CompletionDrainRegistration {
   }
 }
 
-#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+#[cfg(all(test, not(loom)))]
 impl CompletionDrainToken {
   fn complete(mut self) {
     self.record_completion();
@@ -131,7 +131,7 @@ impl CompletionDrainToken {
   }
 }
 
-#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+#[cfg(all(test, not(loom)))]
 impl Drop for CompletionDrainToken {
   fn drop(&mut self) {
     if self.active {
@@ -147,7 +147,7 @@ impl Drop for CompletionDrainToken {
   }
 }
 
-#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+#[cfg(all(test, not(loom)))]
 fn associate_completion_drain(shared: &Arc<Shared>) {
   let Some(drain) = ACTIVE_COMPLETION_DRAIN.with(|active| active.borrow().clone()) else {
     return;
@@ -159,7 +159,7 @@ fn associate_completion_drain(shared: &Arc<Shared>) {
     .push((address, drain));
 }
 
-#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+#[cfg(all(test, not(loom)))]
 fn completion_drain_token(shared: &Arc<Shared>) -> Option<CompletionDrainToken> {
   let address = Arc::as_ptr(shared) as usize;
   let drain = COMPLETION_DRAINS
@@ -177,7 +177,7 @@ fn completion_drain_token(shared: &Arc<Shared>) -> Option<CompletionDrainToken> 
   })
 }
 
-#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+#[cfg(all(test, not(loom)))]
 fn forget_completion_drain(shared: &Shared) {
   let address = shared as *const Shared as usize;
   COMPLETION_DRAINS
@@ -365,7 +365,7 @@ impl PreparedJoin {
       monitor_name,
       _control: control,
     });
-    #[cfg(all(test, not(loom), feature = "resource-feedback"))]
+    #[cfg(all(test, not(loom)))]
     associate_completion_drain(&shared);
     Ok(Self { shared })
   }
@@ -461,11 +461,11 @@ impl DeferredJoin {
       });
     }
     self.try_join_with(|shared, name| {
-      #[cfg(all(test, not(loom), feature = "resource-feedback"))]
+      #[cfg(all(test, not(loom)))]
       let drain_token = completion_drain_token(&shared);
       thread::Builder::new().name(name).spawn(move || {
         monitor_join(shared);
-        #[cfg(all(test, not(loom), feature = "resource-feedback"))]
+        #[cfg(all(test, not(loom)))]
         if let Some(token) = drain_token {
           token.complete();
         }
@@ -573,7 +573,7 @@ impl Drop for Shared {
     if let Some(Err(payload)) = result {
       drop_contained(payload);
     }
-    #[cfg(all(test, not(loom), feature = "resource-feedback"))]
+    #[cfg(all(test, not(loom)))]
     forget_completion_drain(self);
   }
 }

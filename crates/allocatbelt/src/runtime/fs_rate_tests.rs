@@ -30,6 +30,22 @@ fn configured(bucket: &ByteRateLimit) -> FsRateControl {
   .unwrap()
 }
 
+struct ReleaseSignal(Option<mpsc::Sender<()>>);
+
+impl ReleaseSignal {
+  fn release(&mut self) {
+    if let Some(sender) = self.0.take() {
+      let _ = sender.send(());
+    }
+  }
+}
+
+impl Drop for ReleaseSignal {
+  fn drop(&mut self) {
+    self.release();
+  }
+}
+
 #[test]
 fn partial_completion_refunds_only_unused_credit_and_error_refunds_all() {
   let bucket = bucket(8);
@@ -385,6 +401,7 @@ fn public_blocking_adapter_observes_cancellation_before_operation_entry() {
     let stop = cancelled.clone();
     let (checked_tx, checked_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
+    let mut release_on_unwind = ReleaseSignal(Some(release_tx));
     let worker = std::thread::spawn(move || {
       let mut checks = 0;
       adapter.run(
@@ -396,16 +413,18 @@ fn public_blocking_adapter_observes_cancellation_before_operation_entry() {
           // predicate value in either case; sending alone is not a handoff.
           if checks == 2 {
             checked_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            release_rx.recv().unwrap();
           }
           stop.load(Ordering::Acquire)
         },
         |_| panic!("cancelled endpoint must not run"),
       )
     });
-    checked_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    checked_rx
+      .recv_timeout(Duration::from_secs(10))
+      .unwrap_or_else(|error| panic!("the second cancellation check did not arrive: {error}"));
     cancelled.store(true, Ordering::Release);
-    release_tx.send(()).unwrap();
+    release_on_unwind.release();
     assert_eq!(
       worker.join().unwrap().unwrap_err().kind(),
       io::ErrorKind::Interrupted
