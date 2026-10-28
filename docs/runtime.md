@@ -1836,7 +1836,11 @@ The optional `resource-feedback` feature permits an explicitly selected
 directional application-byte meters; feedback is off by default. The sampler
 uses real monotonic time, bounded policy state, explicit floors and ceilings,
 readback verification and fixed diagnostics. Missing, sparse or stale telemetry
-freezes its affected control. Feedback stops before other selected services.
+freezes its affected control. Shutdown closes executor admission immediately
+and continues local or async cleanup, while feedback shutdown completes before
+the driver requests shutdown of blocking workers, managed processes, timers or
+the readiness reactor. Those services remain available to feedback callbacks
+until the feedback owner has stopped.
 These source and ownership fixtures do not establish native performance or
 complete replacement qualification.
 

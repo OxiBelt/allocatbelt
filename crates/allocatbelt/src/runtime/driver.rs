@@ -1592,7 +1592,7 @@ impl CurrentThreadDriver {
     let feedback_complete = true;
     let local_complete = self.local.shutdown_complete();
     let mut blocking_complete = false;
-    if local_complete {
+    if local_complete && feedback_complete {
       if let Some(policy) = self.shutdown {
         self.request_blocking_shutdown(policy)?;
       }
@@ -1610,7 +1610,7 @@ impl CurrentThreadDriver {
     }
 
     let mut process_complete = false;
-    if blocking_complete {
+    if blocking_complete && feedback_complete {
       if let Some(policy) = self.shutdown {
         self.request_process_shutdown(policy)?;
       }
@@ -1628,7 +1628,7 @@ impl CurrentThreadDriver {
     }
 
     let mut io_complete = false;
-    if process_complete {
+    if process_complete && feedback_complete {
       self.request_io_shutdown()?;
       io_complete = true;
       if let Some(timer) = self.timer.as_mut() {
@@ -1683,11 +1683,6 @@ impl CurrentThreadDriver {
         &mut self.shutdown_failure,
         DriverShutdownError::Local(error),
       );
-    }
-    if self.local.shutdown_complete()
-      && let Some(policy) = self.shutdown
-    {
-      self.request_blocking_shutdown(policy)?;
     }
     if let Some(blocking) = self.blocking.as_mut()
       && self.blocking_shutdown_requested
@@ -1963,7 +1958,7 @@ impl MultiThreadDriver {
     }
     let async_complete = self.asynchronous.shutdown_complete();
     let mut blocking_complete = false;
-    if async_complete {
+    if async_complete && feedback_complete {
       if let Some(policy) = self.shutdown {
         self.request_blocking_shutdown(policy)?;
       }
@@ -1981,7 +1976,7 @@ impl MultiThreadDriver {
     }
 
     let mut process_complete = false;
-    if blocking_complete {
+    if blocking_complete && feedback_complete {
       if let Some(policy) = self.shutdown {
         self.request_process_shutdown(policy)?;
       }
@@ -1999,7 +1994,7 @@ impl MultiThreadDriver {
     }
 
     let mut io_complete = false;
-    if process_complete {
+    if process_complete && feedback_complete {
       self.request_io_shutdown()?;
       io_complete = true;
       if let Some(timer) = self.timer.as_mut() {
@@ -2254,6 +2249,16 @@ mod tests {
     fn sample(&mut self) -> Result<FeedbackSample, FeedbackSensorError> {
       self.0.enter_and_wait();
       Ok(FeedbackSample::new(Instant::now(), None, None, None))
+    }
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  struct ReleaseSampleGate(Arc<SampleGate>);
+
+  #[cfg(feature = "resource-feedback")]
+  impl Drop for ReleaseSampleGate {
+    fn drop(&mut self) {
+      self.0.release();
     }
   }
 
@@ -3522,6 +3527,173 @@ mod tests {
 
   #[cfg(feature = "resource-feedback")]
   #[test]
+  fn current_thread_feedback_shutdown_precedes_supporting_services() {
+    let gate = Arc::new(SampleGate::default());
+    let _release_on_exit = ReleaseSampleGate(Arc::clone(&gate));
+    let sensor_gate = Arc::clone(&gate);
+    let factory = feedback_sources(feedback_policy(), move |_| {
+      Ok((
+        GatedFeedbackSensor(Arc::clone(&sensor_gate)),
+        TestFeedbackActuator {
+          limits: [16, 1000, 1000],
+        },
+      ))
+    });
+    let mut driver = CurrentThreadBuilder::new(local_config())
+      .timer(4)
+      .reactor(ReactorConfig {
+        max_registrations: 4,
+        max_waiters: 4,
+      })
+      .blocking(BlockingConfig {
+        workers: 1,
+        max_outstanding: 2,
+        capacity: Resources::ZERO,
+      })
+      .processes(1)
+      .feedback_sources(factory)
+      .build()
+      .unwrap_or_else(|error| panic!("feedback driver build failed: {error}"));
+    assert!(gate.wait_until_entered(DRIVER_TEST_WATCHDOG));
+    driver
+      .request_shutdown(CurrentShutdown::default())
+      .unwrap_or_else(|error| panic!("shutdown request failed: {error}"));
+
+    for _ in 0..8 {
+      assert_eq!(driver.drive_shutdown_step(), Ok(ShutdownProgress::Pending));
+      assert!(driver.local.shutdown_complete());
+      assert!(!driver.blocking_shutdown_requested);
+      assert!(!driver.process_shutdown_requested);
+      assert!(!driver.io_shutdown_requested);
+      assert!(!driver.timer().unwrap().is_closed());
+      assert!(!driver.reactor().unwrap().is_closed());
+      assert!(
+        !driver
+          .feedback_metrics()
+          .unwrap()
+          .snapshot()
+          .shutdown_complete
+      );
+      std::thread::yield_now();
+    }
+
+    gate.release();
+    let deadline = Instant::now() + DRIVER_TEST_WATCHDOG;
+    loop {
+      match driver.drive_shutdown_step() {
+        Ok(ShutdownProgress::Complete) => break,
+        Ok(ShutdownProgress::Pending) => {
+          assert!(Instant::now() < deadline, "current driver did not stop");
+          std::thread::yield_now();
+        }
+        Err(error) => panic!("current driver shutdown failed: {error}"),
+      }
+    }
+    assert!(driver.blocking_shutdown_requested);
+    assert!(driver.process_shutdown_requested);
+    assert!(driver.io_shutdown_requested);
+    assert!(driver.timer().unwrap().is_closed());
+    assert!(driver.reactor().unwrap().is_closed());
+    assert!(
+      driver
+        .feedback_metrics()
+        .unwrap()
+        .snapshot()
+        .shutdown_complete
+    );
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
+  fn multithread_feedback_shutdown_precedes_supporting_services() {
+    let gate = Arc::new(SampleGate::default());
+    let _release_on_exit = ReleaseSampleGate(Arc::clone(&gate));
+    let sensor_gate = Arc::clone(&gate);
+    let factory = feedback_sources(feedback_policy(), move |_| {
+      Ok((
+        GatedFeedbackSensor(Arc::clone(&sensor_gate)),
+        TestFeedbackActuator {
+          limits: [16, 1000, 1000],
+        },
+      ))
+    });
+    let mut driver = MultiThreadBuilder::new(async_config())
+      .timer(4)
+      .reactor(ReactorConfig {
+        max_registrations: 4,
+        max_waiters: 4,
+      })
+      .blocking(BlockingConfig {
+        workers: 1,
+        max_outstanding: 2,
+        capacity: Resources::ZERO,
+      })
+      .processes(1)
+      .feedback_sources(factory)
+      .build()
+      .unwrap_or_else(|error| panic!("feedback driver build failed: {error}"));
+    assert!(gate.wait_until_entered(DRIVER_TEST_WATCHDOG));
+    driver
+      .request_shutdown(MultiShutdown::default())
+      .unwrap_or_else(|error| panic!("shutdown request failed: {error}"));
+
+    let async_deadline = Instant::now() + DRIVER_TEST_WATCHDOG;
+    while !driver.asynchronous.shutdown_complete() {
+      assert_eq!(driver.drive_shutdown_step(), Ok(ShutdownProgress::Pending));
+      assert!(!driver.blocking_shutdown_requested);
+      assert!(!driver.process_shutdown_requested);
+      assert!(!driver.io_shutdown_requested);
+      assert!(!driver.timer().unwrap().is_closed());
+      assert!(!driver.reactor().unwrap().is_closed());
+      assert!(
+        !driver
+          .feedback_metrics()
+          .unwrap()
+          .snapshot()
+          .shutdown_complete
+      );
+      assert!(
+        Instant::now() < async_deadline,
+        "async cleanup did not finish while feedback was held"
+      );
+      std::thread::yield_now();
+    }
+    assert_eq!(driver.drive_shutdown_step(), Ok(ShutdownProgress::Pending));
+    assert!(driver.asynchronous.shutdown_complete());
+    assert!(!driver.blocking_shutdown_requested);
+    assert!(!driver.process_shutdown_requested);
+    assert!(!driver.io_shutdown_requested);
+    assert!(!driver.timer().unwrap().is_closed());
+    assert!(!driver.reactor().unwrap().is_closed());
+
+    gate.release();
+    let deadline = Instant::now() + DRIVER_TEST_WATCHDOG;
+    loop {
+      match driver.drive_shutdown_step() {
+        Ok(ShutdownProgress::Complete) => break,
+        Ok(ShutdownProgress::Pending) => {
+          assert!(Instant::now() < deadline, "multithread driver did not stop");
+          std::thread::yield_now();
+        }
+        Err(error) => panic!("multithread driver shutdown failed: {error}"),
+      }
+    }
+    assert!(driver.blocking_shutdown_requested);
+    assert!(driver.process_shutdown_requested);
+    assert!(driver.io_shutdown_requested);
+    assert!(driver.timer().unwrap().is_closed());
+    assert!(driver.reactor().unwrap().is_closed());
+    assert!(
+      driver
+        .feedback_metrics()
+        .unwrap()
+        .snapshot()
+        .shutdown_complete
+    );
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
   fn blocked_feedback_sensor_keeps_the_driver_pending_until_owner_cleanup() {
     let gate = Arc::new(SampleGate::default());
     let sensor_gate = Arc::clone(&gate);
@@ -3860,10 +4032,12 @@ mod tests {
     );
   }
 
-  #[cfg(feature = "resource-feedback")]
+  #[cfg(all(feature = "resource-feedback", not(loom)))]
   #[test]
   fn bound_builder_charges_values_once_and_retained_handles_keep_metadata() {
     let (domain, tenant) = feedback_domain();
+    let completion_drain = crate::runtime::thread_completion::CompletionDrain::new();
+    let completion_drain_registration = completion_drain.register_for_current_thread();
     let baseline = domain.snapshot().used.get(DomainResource::Control);
     let seen = Arc::new(Mutex::new(None));
     let observed = seen.clone();
@@ -3884,6 +4058,7 @@ mod tests {
       .feedback_sources(factory)
       .build()
       .unwrap();
+    drop(completion_drain_registration);
     assert!(driver.resources().is_control_accounted());
     assert_eq!(
       driver._control.bytes(),
@@ -3899,6 +4074,10 @@ mod tests {
     let metrics = driver.feedback_metrics().unwrap();
     shutdown_multi_driver(&mut driver);
     drop(driver);
+    assert!(
+      completion_drain.wait_until_drained(DRIVER_TEST_WATCHDOG),
+      "runtime completion monitors retained their shared Control owners"
+    );
     let before = domain.snapshot().used.get(DomainResource::Control);
     assert!(before > baseline);
     drop(metrics);

@@ -34,6 +34,158 @@ use super::task::drop_contained;
 type JoinResult = thread::Result<()>;
 const MONITOR_THREAD_NAME: &str = "allocatbelt-join-monitor";
 
+#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+struct CompletionDrainState {
+  state: Mutex<(usize, usize)>,
+  changed: Condvar,
+}
+
+#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+#[derive(Clone)]
+pub(crate) struct CompletionDrain(Arc<CompletionDrainState>);
+
+#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+pub(crate) struct CompletionDrainRegistration {
+  previous: Option<Arc<CompletionDrainState>>,
+}
+
+#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+struct CompletionDrainToken {
+  state: Arc<CompletionDrainState>,
+  active: bool,
+}
+
+#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+thread_local! {
+  static ACTIVE_COMPLETION_DRAIN: std::cell::RefCell<Option<Arc<CompletionDrainState>>> = const {
+    std::cell::RefCell::new(None)
+  };
+}
+
+#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+static COMPLETION_DRAINS: Mutex<Vec<(usize, Arc<CompletionDrainState>)>> = Mutex::new(Vec::new());
+
+#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+impl CompletionDrain {
+  pub(crate) fn new() -> Self {
+    Self(Arc::new(CompletionDrainState {
+      state: Mutex::new((0, 0)),
+      changed: Condvar::new(),
+    }))
+  }
+
+  pub(crate) fn register_for_current_thread(&self) -> CompletionDrainRegistration {
+    let previous =
+      ACTIVE_COMPLETION_DRAIN.with(|active| active.borrow_mut().replace(Arc::clone(&self.0)));
+    CompletionDrainRegistration { previous }
+  }
+
+  pub(crate) fn wait_until_drained(&self, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+    while state.1 < state.0 {
+      let now = std::time::Instant::now();
+      if now >= deadline {
+        return false;
+      }
+      let (next, result) = self
+        .0
+        .changed
+        .wait_timeout(state, deadline.saturating_duration_since(now))
+        .unwrap_or_else(PoisonError::into_inner);
+      state = next;
+      if result.timed_out() && state.1 < state.0 {
+        return false;
+      }
+    }
+    state.0 != 0
+  }
+}
+
+#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+impl Drop for CompletionDrainRegistration {
+  fn drop(&mut self) {
+    ACTIVE_COMPLETION_DRAIN.with(|active| {
+      *active.borrow_mut() = self.previous.take();
+    });
+  }
+}
+
+#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+impl CompletionDrainToken {
+  fn complete(mut self) {
+    self.record_completion();
+  }
+
+  fn record_completion(&mut self) {
+    if self.active {
+      let mut state = self
+        .state
+        .state
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+      state.1 += 1;
+      self.active = false;
+      self.state.changed.notify_all();
+    }
+  }
+}
+
+#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+impl Drop for CompletionDrainToken {
+  fn drop(&mut self) {
+    if self.active {
+      let mut state = self
+        .state
+        .state
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+      state.0 -= 1;
+      self.active = false;
+      self.state.changed.notify_all();
+    }
+  }
+}
+
+#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+fn associate_completion_drain(shared: &Arc<Shared>) {
+  let Some(drain) = ACTIVE_COMPLETION_DRAIN.with(|active| active.borrow().clone()) else {
+    return;
+  };
+  let address = Arc::as_ptr(shared) as usize;
+  COMPLETION_DRAINS
+    .lock()
+    .unwrap_or_else(PoisonError::into_inner)
+    .push((address, drain));
+}
+
+#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+fn completion_drain_token(shared: &Arc<Shared>) -> Option<CompletionDrainToken> {
+  let address = Arc::as_ptr(shared) as usize;
+  let drain = COMPLETION_DRAINS
+    .lock()
+    .unwrap_or_else(PoisonError::into_inner)
+    .iter()
+    .find(|(candidate, _)| *candidate == address)
+    .map(|(_, drain)| Arc::clone(drain))?;
+  let mut state = drain.state.lock().unwrap_or_else(PoisonError::into_inner);
+  state.0 += 1;
+  drop(state);
+  Some(CompletionDrainToken {
+    state: drain,
+    active: true,
+  })
+}
+
+#[cfg(all(test, not(loom), feature = "resource-feedback"))]
+fn forget_completion_drain(shared: &Shared) {
+  let address = shared as *const Shared as usize;
+  COMPLETION_DRAINS
+    .lock()
+    .unwrap_or_else(PoisonError::into_inner)
+    .retain(|(candidate, _)| *candidate != address);
+}
+
 #[cfg(all(test, not(loom)))]
 thread_local! {
   static FAIL_NEXT_MONITOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -213,6 +365,8 @@ impl PreparedJoin {
       monitor_name,
       _control: control,
     });
+    #[cfg(all(test, not(loom), feature = "resource-feedback"))]
+    associate_completion_drain(&shared);
     Ok(Self { shared })
   }
 
@@ -307,9 +461,15 @@ impl DeferredJoin {
       });
     }
     self.try_join_with(|shared, name| {
-      thread::Builder::new()
-        .name(name)
-        .spawn(move || monitor_join(shared))
+      #[cfg(all(test, not(loom), feature = "resource-feedback"))]
+      let drain_token = completion_drain_token(&shared);
+      thread::Builder::new().name(name).spawn(move || {
+        monitor_join(shared);
+        #[cfg(all(test, not(loom), feature = "resource-feedback"))]
+        if let Some(token) = drain_token {
+          token.complete();
+        }
+      })
     })
   }
 
@@ -413,6 +573,8 @@ impl Drop for Shared {
     if let Some(Err(payload)) = result {
       drop_contained(payload);
     }
+    #[cfg(all(test, not(loom), feature = "resource-feedback"))]
+    forget_completion_drain(self);
   }
 }
 
