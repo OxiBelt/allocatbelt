@@ -262,6 +262,26 @@ The original missing-tool failures remain recorded. See the
 These results qualify the stated source and checks. Native performance gates,
 real-pressure acceptance and three-hour mixed-load soaks remain open.
 
+At signed source `33c3821ef4e84c38a9c4352881626ddfd07bded1`, two independent
+KVM-host correctness packets each matched 483 tracked source files to the same
+source archive. On both hosts, tool setup, formatting, all-target/all-feature
+Clippy, the full all-feature release workspace tests, packaging with 15
+consumers, and all 20 feature combinations passed. The CPU-gate regression
+also passed on both hosts. Native suites retained their existing documented
+skips. These checks establish source-specific correctness; they do not qualify
+host throughput or p99 performance.
+
+For that same source, Linux 7 full-system guest asset validation, payload
+construction, and vector-disabled and vector-enabled boots passed. Each
+scenario passed the selected 1,061 runtime tests, four platform-gate tests,
+and eleven region tests, with no ignored tests in the selected guest checks.
+The vector-enabled scenario exercised saved-pointer kernel permission
+rechecking and actual vector-permission behavior. This is emulated correctness
+evidence for the recorded guest kernel and assets; later environment changes
+need separate validation. It adds no Miri coverage beyond the recorded isolated
+core campaign. Native performance gates, real-pressure acceptance, three-hour
+mixed-load soaks, and release artifacts remain open.
+
 ### FIFO application acceptance scope
 
 Five focused [FIFO application cases](../../crates/allocatbelt-app-ports/tests/fifo_pipeline.rs)
