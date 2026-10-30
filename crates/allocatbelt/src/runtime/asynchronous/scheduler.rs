@@ -1108,8 +1108,9 @@ impl Wake for TaskWake {
   }
 }
 
-/// The admission-independent wake handle. It holds no task, future, or
-/// result, so a retained stale waker cannot keep completed user data alive.
+/// Creates the admission-independent wake handle cached per task generation.
+/// It holds no task, future, or result, so a retained stale waker cannot keep
+/// completed user data alive.
 fn task_waker(
   shared: &Arc<Shared>,
   task: TaskRef,
@@ -1511,8 +1512,9 @@ enum Stop {
   Exit,
 }
 
-/// Runs owned turns on an executor thread. Each turn's task, waker and
-/// published values are dropped before the turn's permit is released.
+/// Runs owned turns on an executor thread. Each turn's task, waker clone and
+/// published values are dropped before the turn's permit is released; the
+/// task keeps its cached waker until it finishes.
 fn run_turns(
   shared: &Arc<Shared>,
   shard: usize,
@@ -1525,17 +1527,18 @@ fn run_turns(
       Work::Poll(task_ref, task, permit, turn) => {
         handoff::enter_turn(turn);
         super::entry::reset_budget();
-        let waker = match task_waker(shared, task_ref, task.tenant_domain()) {
-          Ok(waker) => waker,
-          Err(error) => {
-            task.fail_resource(error);
-            finish_poll(shared, task_ref, PollResult::Ready);
-            drop(permit);
-            drop(task);
-            finished = handoff::leave_turn();
-            continue;
-          }
-        };
+        let waker =
+          match task.task_waker(&mut || task_waker(shared, task_ref, task.tenant_domain())) {
+            Ok(waker) => waker,
+            Err(error) => {
+              task.fail_resource(error);
+              finish_poll(shared, task_ref, PollResult::Ready);
+              drop(permit);
+              drop(task);
+              finished = handoff::leave_turn();
+              continue;
+            }
+          };
         let mut context = Context::from_waker(&waker);
         match task.acquire_cpu(&waker) {
           DomainCpuAdmission::Unbounded => {
@@ -1782,6 +1785,135 @@ mod tests {
   use crate::runtime::managed::{ResourceLimits, ResourceScope};
   use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
   use std::future::Future;
+
+  #[test]
+  fn completed_task_releases_cached_waker_before_task_drop() {
+    struct Probe(std::sync::atomic::AtomicUsize);
+    impl Wake for Probe {
+      fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+      }
+    }
+
+    let admission = Task::<std::future::Ready<()>>::reserve_domain_admission(None)
+      .unwrap_or_else(|error| panic!("admission failed: {error}"));
+    let (task, _job) = Task::create(
+      std::future::ready(()),
+      super::super::identity::TaskId::test_sentinel(),
+      None,
+      admission,
+      Weak::new(),
+      TaskRef {
+        index: 0,
+        generation: 1,
+      },
+    );
+    let probe = Arc::new(Probe(std::sync::atomic::AtomicUsize::new(0)));
+    let waker = task
+      .task_waker(&mut || Ok(Waker::from(Arc::clone(&probe))))
+      .unwrap_or_else(|error| panic!("waker creation failed: {error}"));
+    assert_eq!(Arc::strong_count(&probe), 3);
+    let permit = PollPermit {
+      shared: Weak::new(),
+      scope: ScopeRef {
+        index: 0,
+        generation: 1,
+      },
+      cpu_ticket: None,
+    };
+    assert!(matches!(
+      task.poll(&mut Context::from_waker(&waker), permit),
+      PollResult::Ready
+    ));
+    assert_eq!(Arc::strong_count(&probe), 2);
+    drop(waker);
+    assert_eq!(Arc::strong_count(&probe), 1);
+  }
+
+  #[derive(Default)]
+  struct CountingWake(AtomicUsize);
+
+  impl Wake for CountingWake {
+    fn wake(self: Arc<Self>) {
+      self.0.fetch_add(1, Ordering::Relaxed);
+    }
+  }
+
+  /// Creates an unbound task with a cached probe waker, runs one terminal
+  /// path, and checks that the task released its cached reference.
+  fn assert_terminal_path_releases_cached_waker<F>(future: F, finish: impl FnOnce(&dyn ErasedTask))
+  where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+  {
+    let admission = Task::<F>::reserve_domain_admission(None)
+      .unwrap_or_else(|error| panic!("admission failed: {error}"));
+    let (task, _job) = Task::create(
+      future,
+      super::super::identity::TaskId::test_sentinel(),
+      None,
+      admission,
+      Weak::new(),
+      TaskRef {
+        index: 0,
+        generation: 1,
+      },
+    );
+    let probe = Arc::new(CountingWake::default());
+    let waker = task
+      .task_waker(&mut || Ok(Waker::from(Arc::clone(&probe))))
+      .unwrap_or_else(|error| panic!("waker creation failed: {error}"));
+    assert_eq!(Arc::strong_count(&probe), 3);
+    finish(task.as_ref());
+    assert_eq!(Arc::strong_count(&probe), 2);
+    drop(waker);
+    assert_eq!(Arc::strong_count(&probe), 1);
+  }
+
+  fn unscheduled_permit() -> PollPermit {
+    PollPermit {
+      shared: Weak::new(),
+      scope: ScopeRef {
+        index: 0,
+        generation: 1,
+      },
+      cpu_ticket: None,
+    }
+  }
+
+  #[test]
+  fn cancel_panic_and_resource_failure_release_cached_waker() {
+    assert_terminal_path_releases_cached_waker(std::future::pending::<()>(), |task| task.cancel());
+    assert_terminal_path_releases_cached_waker(std::future::pending::<()>(), |task| {
+      task.fail_resource(DomainError::WaitersFull);
+    });
+    assert_terminal_path_releases_cached_waker(
+      std::future::poll_fn(|_| -> std::task::Poll<()> { panic!("contained poll panic") }),
+      |task| {
+        let waker = Waker::noop();
+        assert!(matches!(
+          task.poll(&mut Context::from_waker(waker), unscheduled_permit()),
+          PollResult::Ready
+        ));
+      },
+    );
+    // A dispatch after cleanup finds no future and releases a recreated waker.
+    assert_terminal_path_releases_cached_waker(std::future::pending::<()>(), |task| {
+      task.cancel();
+      let probe = Arc::new(CountingWake::default());
+      let recreated = task
+        .task_waker(&mut || Ok(Waker::from(Arc::clone(&probe))))
+        .unwrap_or_else(|error| panic!("waker creation failed: {error}"));
+      assert_eq!(Arc::strong_count(&probe), 3);
+      assert!(matches!(
+        task.poll(&mut Context::from_waker(&recreated), unscheduled_permit()),
+        PollResult::Ready
+      ));
+      assert_eq!(Arc::strong_count(&probe), 2);
+      drop(recreated);
+      assert_eq!(Arc::strong_count(&probe), 1);
+    });
+  }
 
   fn shared_with_task_slots(max_outstanding: usize) -> (Arc<Shared>, ScopeRef) {
     shared_with_config(AsyncConfig {

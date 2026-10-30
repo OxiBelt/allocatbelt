@@ -1812,7 +1812,10 @@ When a tenant resource domain is bound, root
 polls, owned tasks and blocking execution share its CPU and task admission.
 Declared scheduler payloads, owning facades, controlled scopes, queues, metrics,
 flags, waiter owners, byte buckets and feedback state retain Control charges
-through their final handles. Bound filesystem requests reserve their shared
+through their final handles. An owned async task charges one scheduler waker
+on its first poll and reuses it until the task finishes, so a later poll cannot
+fail for lack of waker Control; clones the future retains keep that charge.
+Bound filesystem requests reserve their shared
 input-and-mutex payload before disk or job admission; that charge survives
 queued cancellation and detached execution. Caller-owned allocations reachable
 from an input remain outside this declared-payload charge. This accounting excludes

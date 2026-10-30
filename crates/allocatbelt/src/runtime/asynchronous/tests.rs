@@ -1154,6 +1154,45 @@ struct WakeCount {
   current: Arc<Mutex<Option<Waker>>>,
 }
 
+struct RepeatedWake {
+  wakers: Arc<Mutex<Vec<Waker>>>,
+}
+
+impl Future for RepeatedWake {
+  type Output = ();
+
+  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    let mut wakers = self.wakers.lock().unwrap_or_else(|e| e.into_inner());
+    wakers.push(cx.waker().clone());
+    if wakers.len() == 3 {
+      Poll::Ready(())
+    } else {
+      cx.waker().wake_by_ref();
+      Poll::Pending
+    }
+  }
+}
+
+#[test]
+fn task_reuses_waker_across_polls() {
+  let runtime = runtime(1, 4, 2);
+  let wakers = Arc::new(Mutex::new(Vec::new()));
+  let job = runtime
+    .handle()
+    .spawn(RepeatedWake {
+      wakers: Arc::clone(&wakers),
+    })
+    .unwrap_or_else(|e| panic!("spawn failed: {e}"));
+  assert!(matches!(block_on(job), Ok(())));
+  let wakers = wakers.lock().unwrap_or_else(|e| e.into_inner());
+  assert_eq!(wakers.len(), 3);
+  assert!(wakers.windows(2).all(|pair| pair[0].will_wake(&pair[1])));
+  drop(wakers);
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
+}
+
 impl Future for WakeCount {
   type Output = usize;
 

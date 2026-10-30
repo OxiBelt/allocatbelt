@@ -4,7 +4,7 @@ use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::task::Context;
+use std::task::{Context, Waker};
 
 use super::entry::TaskContextGuard;
 use super::identity::TaskId;
@@ -59,8 +59,14 @@ pub(super) trait ErasedTask: Send + Sync {
   /// Attempts to take one CPU ticket or enrolls the task's scheduler waker.
   fn acquire_cpu(&self, waker: &std::task::Waker) -> DomainCpuAdmission;
 
-  /// The tenant whose Control ledger also charges each runtime-created task
-  /// waker retained by this future.
+  /// Returns the cached waker, creating it on first use.
+  fn task_waker(
+    &self,
+    create: &mut dyn FnMut() -> Result<Waker, DomainError>,
+  ) -> Result<Waker, DomainError>;
+
+  /// The tenant whose Control ledger charges the cached task waker for this
+  /// task generation, including any clones retained after completion.
   fn tenant_domain(&self) -> Option<&TenantDomain>;
 
   /// Stages a typed resource failure without polling user code.
@@ -80,6 +86,7 @@ pub(super) struct Task<F: Future + Send + 'static> {
   resources: Option<ResourceScope>,
   tenant: Option<TenantDomain>,
   waiter: Mutex<Option<Arc<ChargedDomainWaiter>>>,
+  waker: Mutex<Option<Waker>>,
   task_admission: Mutex<Option<DomainReservation>>,
   _abort_metadata: Arc<dyn AbortMetadata>,
   task_control: Mutex<Option<ControlCharge>>,
@@ -135,6 +142,15 @@ impl<F: Future + Send + 'static> Task<F> {
     drop(admission);
   }
 
+  fn release_task_waker(&self) {
+    let waker = self
+      .waker
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .take();
+    drop(waker);
+  }
+
   fn drop_future_and_stage(&self, error: AsyncJoinError) {
     if let Some(payload) = self.finish_future() {
       self.stage(Err(AsyncJoinError::Panicked(payload)));
@@ -142,6 +158,7 @@ impl<F: Future + Send + 'static> Task<F> {
       self.stage(Err(error));
     }
     self.release_waiter();
+    self.release_task_waker();
     self.release_task_admission();
   }
 }
@@ -156,6 +173,7 @@ where
       TaskContextGuard::enter_with_resource(Some(self.id), self.resources.clone());
     let Some(mut future) = self.lock_future().take() else {
       self.release_waiter();
+      self.release_task_waker();
       self.release_task_admission();
       return PollResult::Ready;
     };
@@ -185,6 +203,7 @@ where
           self.stage(Ok(output));
         }
         self.release_waiter();
+        self.release_task_waker();
         self.release_task_admission();
         PollResult::Ready
       }
@@ -195,6 +214,7 @@ where
         self.release_future_frame_control();
         self.stage(Err(AsyncJoinError::Panicked(payload)));
         self.release_waiter();
+        self.release_task_waker();
         self.release_task_admission();
         PollResult::Ready
       }
@@ -211,6 +231,7 @@ where
     };
     self.stage(outcome);
     self.release_waiter();
+    self.release_task_waker();
     self.release_task_admission();
   }
 
@@ -253,6 +274,19 @@ where
 
   fn tenant_domain(&self) -> Option<&TenantDomain> {
     self.tenant.as_ref()
+  }
+
+  fn task_waker(
+    &self,
+    create: &mut dyn FnMut() -> Result<Waker, DomainError>,
+  ) -> Result<Waker, DomainError> {
+    let mut cached = self.waker.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(waker) = cached.as_ref() {
+      return Ok(waker.clone());
+    }
+    let waker = create()?;
+    *cached = Some(waker.clone());
+    Ok(waker)
   }
 
   fn fail_resource(&self, error: DomainError) {
@@ -368,6 +402,7 @@ where
       id,
       resources,
       tenant,
+      waker: Mutex::new(None),
       waiter: Mutex::new(waiter.map(|waiter| {
         Arc::new(ChargedDomainWaiter {
           waiter,
