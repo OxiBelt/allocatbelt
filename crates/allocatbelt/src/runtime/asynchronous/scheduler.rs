@@ -648,13 +648,14 @@ impl Shared {
       let capacity_available = slot.quota.release();
       if capacity_available && slot.quota_blocked {
         refresh_scope_schedule(&mut state, scope_ref);
-        true
+        state.idle > 0
       } else {
         false
       }
     };
     if notify {
-      self.work.notify_all();
+      // One released quota adds one RR token; only parked dispatchers need a wake.
+      self.work.notify_one();
     }
   }
 
@@ -785,8 +786,12 @@ impl Shared {
       .alive_tasks
       .fetch_add(1, Ordering::Relaxed);
     schedule(&mut state, task_ref, &self.metrics.inner().queue_depth);
+    let notify = state.idle > 0;
     drop(state);
-    self.work.notify_one();
+    if notify {
+      // Non-idle dispatchers recheck the ready list under the same mutex.
+      self.work.notify_one();
+    }
     Ok(job)
   }
 
@@ -874,8 +879,10 @@ impl Shared {
     if inserted {
       push_ready(&mut state, task_ref, &self.metrics.inner().queue_depth);
     }
+    let notify = inserted && state.idle > 0;
     drop(state);
-    if inserted {
+    if notify {
+      // One inserted task needs one waiter; non-idle threads recheck before parking.
       self.work.notify_one();
     }
   }
@@ -1450,6 +1457,13 @@ fn take_next(
       && let Some(turn) = state.turns.try_begin_turn()
     {
       if let Some(selected) = dequeue(shared, &mut state) {
+        // Pass a remaining backlog to one parked thread, which repeats this
+        // step, so dispatch scales out without waking every waiter per poll.
+        let propagate = !state.round_robin.is_empty() && state.idle > 0;
+        drop(state);
+        if propagate {
+          shared.work.notify_one();
+        }
         return selected.into_work(turn);
       }
       end_turn(shared, &mut state, turn);
@@ -1713,13 +1727,17 @@ fn finish_cancel(shared: &Arc<Shared>, task_ref: TaskRef, task: Arc<dyn ErasedTa
   {
     completed_scope = scope.scope.as_ref().map(Arc::clone);
   }
+  let closed = state.closed;
   drop(state);
   drop(slot_task);
   task.publish();
   if let Some(scope) = completed_scope {
     scope.completed();
   }
-  shared.work.notify_all();
+  if closed {
+    // Removing admission can enable exit only after runtime closure.
+    shared.work.notify_all();
+  }
 }
 
 fn finish_poll(shared: &Arc<Shared>, task_ref: TaskRef, result: PollResult) {
@@ -1760,6 +1778,8 @@ fn finish_poll(shared: &Arc<Shared>, task_ref: TaskRef, result: PollResult) {
     PollFinish::Idle => {}
     PollFinish::Stale => return,
   }
+  let closed = state.closed;
+  let notify = finish == PollFinish::Requeue && !state.round_robin.is_empty() && state.idle > 0;
   drop(state);
   if let Some(task) = cancel {
     task.cancel();
@@ -1772,7 +1792,13 @@ fn finish_poll(shared: &Arc<Shared>, task_ref: TaskRef, result: PollResult) {
   if let Some(scope) = completed_scope {
     scope.completed();
   }
-  shared.work.notify_all();
+  if closed {
+    // Closed admission needs every dispatcher to recheck cleanup and exit.
+    shared.work.notify_all();
+  } else if notify {
+    // A requeue with an RR token needs one waiter; idle/complete add no work.
+    shared.work.notify_one();
+  }
 }
 
 pub(super) fn is_worker(shared: &Shared) -> bool {
@@ -1781,10 +1807,262 @@ pub(super) fn is_worker(shared: &Shared) -> bool {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
+  use super::super::{AsyncJoinError, AsyncRuntime, AsyncShutdown, yield_now};
   use super::*;
   use crate::runtime::managed::{ResourceLimits, ResourceScope};
   use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
   use std::future::Future;
+  use std::pin::Pin;
+  use std::sync::atomic::AtomicBool;
+  use std::sync::mpsc;
+  use std::task::Poll;
+  use std::time::{Duration, Instant};
+
+  fn wait_for_scheduler(predicate: impl Fn() -> bool, message: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !predicate() {
+      assert!(Instant::now() < deadline, "timed out waiting for {message}");
+      std::thread::yield_now();
+    }
+  }
+
+  fn wait_for_parked_workers(shared: &Shared) {
+    wait_for_scheduler(
+      || {
+        let state = shared.lock();
+        // Parks are counted under this lock immediately before the condvar wait.
+        state.idle == shared.workers
+          && shared
+            .metrics
+            .snapshot()
+            .threads
+            .iter()
+            .all(|thread| thread.parks > thread.unparks)
+      },
+      "every worker to park",
+    );
+  }
+
+  fn finish_job<T>(mut job: AsyncJob<T>) -> Result<T, AsyncJoinError> {
+    wait_for_scheduler(|| job.is_finished(), "task completion");
+    match Pin::new(&mut job).poll(&mut Context::from_waker(Waker::noop())) {
+      Poll::Ready(result) => result,
+      Poll::Pending => panic!("finished job was still pending"),
+    }
+  }
+
+  fn shutdown_with_deadline(runtime: AsyncRuntime, mode: AsyncShutdown) {
+    let (sender, receiver) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+      let _ = sender.send(runtime.shutdown(mode));
+    });
+    receiver
+      .recv_timeout(Duration::from_secs(30))
+      .unwrap_or_else(|_| panic!("shutdown timed out"))
+      .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+    thread
+      .join()
+      .unwrap_or_else(|_| panic!("shutdown thread panicked"));
+  }
+
+  async fn wait_for_external_wake(ready: Arc<AtomicBool>, registered: mpsc::Sender<Waker>) {
+    let mut registered = Some(registered);
+    std::future::poll_fn(move |context| {
+      if ready.load(Ordering::Acquire) {
+        Poll::Ready(())
+      } else {
+        if let Some(sender) = registered.take() {
+          sender.send(context.waker().clone()).unwrap();
+        }
+        Poll::Pending
+      }
+    })
+    .await;
+  }
+
+  /// A regression guard: a self-waking task keeps its only worker
+  /// dispatching. It does not count condvar notifications.
+  #[test]
+  fn yielding_on_one_worker_does_not_park_per_poll() {
+    const YIELDS: usize = 16_384;
+    let parks = Arc::new(AtomicUsize::new(0));
+    let unparks = Arc::new(AtomicUsize::new(0));
+    let options = AsyncThreadOptions::new()
+      .on_thread_park({
+        let parks = Arc::clone(&parks);
+        move |_| {
+          parks.fetch_add(1, Ordering::Relaxed);
+        }
+      })
+      .on_thread_unpark({
+        let unparks = Arc::clone(&unparks);
+        move |_| {
+          unparks.fetch_add(1, Ordering::Relaxed);
+        }
+      });
+    let runtime = AsyncRuntime::new_with_thread_options(
+      AsyncConfig {
+        workers: 1,
+        max_outstanding: 1,
+        max_scopes: 1,
+      },
+      options,
+    )
+    .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
+    wait_for_parked_workers(&runtime.shared);
+    let polls = Arc::new(AtomicUsize::new(0));
+    let task_polls = Arc::clone(&polls);
+    let job = runtime
+      .handle()
+      .spawn(std::future::poll_fn(move |context| {
+        if task_polls.fetch_add(1, Ordering::Relaxed) < YIELDS {
+          context.waker().wake_by_ref();
+          Poll::Pending
+        } else {
+          Poll::Ready(())
+        }
+      }))
+      .unwrap_or_else(|error| panic!("spawn failed: {error}"));
+    finish_job(job).unwrap();
+    wait_for_parked_workers(&runtime.shared);
+    assert_eq!(polls.load(Ordering::Relaxed), YIELDS + 1);
+    shutdown_with_deadline(runtime, AsyncShutdown::Drain);
+    // Allow a few spurious waits, while rejecting park cycles proportional to polls.
+    assert!(parks.load(Ordering::Relaxed) < 16);
+    assert_eq!(
+      parks.load(Ordering::Relaxed),
+      unparks.load(Ordering::Relaxed)
+    );
+  }
+
+  #[test]
+  fn many_ready_tasks_and_external_wakes_make_progress() {
+    const TASKS: usize = 2048;
+    const EXTERNAL_TASKS: usize = 32;
+    let runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 4,
+      max_outstanding: TASKS + EXTERNAL_TASKS,
+      max_scopes: 1,
+    })
+    .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
+    let start = Arc::new(AtomicBool::new(false));
+    let external_ready = Arc::new(AtomicBool::new(false));
+    let (registered, registrations) = mpsc::channel();
+    let (external_registered, external_registrations) = mpsc::channel();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mut jobs = Vec::new();
+    for _ in 0..TASKS {
+      let start = Arc::clone(&start);
+      let registered = registered.clone();
+      let polls = Arc::clone(&polls);
+      jobs.push(
+        runtime
+          .handle()
+          .spawn(async move {
+            wait_for_external_wake(start, registered).await;
+            for _ in 0..8 {
+              polls.fetch_add(1, Ordering::Relaxed);
+              yield_now().await;
+            }
+          })
+          .unwrap_or_else(|error| panic!("spawn failed: {error}")),
+      );
+    }
+    let mut external_jobs = Vec::new();
+    for _ in 0..EXTERNAL_TASKS {
+      external_jobs.push(
+        runtime
+          .handle()
+          .spawn(wait_for_external_wake(
+            Arc::clone(&external_ready),
+            external_registered.clone(),
+          ))
+          .unwrap_or_else(|error| panic!("external spawn failed: {error}")),
+      );
+    }
+    let wakers: Vec<_> = (0..TASKS)
+      .map(|_| registrations.recv_timeout(Duration::from_secs(30)).unwrap())
+      .collect();
+    let external_wakers: Vec<_> = (0..EXTERNAL_TASKS)
+      .map(|_| {
+        external_registrations
+          .recv_timeout(Duration::from_secs(30))
+          .unwrap()
+      })
+      .collect();
+    wait_for_parked_workers(&runtime.shared);
+    start.store(true, Ordering::Release);
+    for waker in wakers {
+      waker.wake();
+    }
+    for job in jobs {
+      finish_job(job).unwrap();
+    }
+    assert_eq!(polls.load(Ordering::Relaxed), TASKS * 8);
+    wait_for_parked_workers(&runtime.shared);
+    let external = std::thread::spawn(move || {
+      // Only creates a longer park opportunity; registration and parking are observed above.
+      std::thread::sleep(Duration::from_millis(10));
+      external_ready.store(true, Ordering::Release);
+      for waker in external_wakers {
+        waker.wake();
+      }
+    });
+    for job in external_jobs {
+      finish_job(job).unwrap();
+    }
+    external.join().unwrap();
+    shutdown_with_deadline(runtime, AsyncShutdown::Drain);
+  }
+
+  #[test]
+  fn parked_workers_finish_cancellation_and_graceful_shutdown() {
+    for mode in [AsyncShutdown::CancelPending, AsyncShutdown::Drain] {
+      let runtime = AsyncRuntime::new(AsyncConfig {
+        workers: 4,
+        max_outstanding: 16,
+        max_scopes: 1,
+      })
+      .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
+      let ready = Arc::new(AtomicBool::new(false));
+      let (registered, registrations) = mpsc::channel();
+      let jobs: Vec<_> = (0..16)
+        .map(|_| {
+          runtime
+            .handle()
+            .spawn(wait_for_external_wake(
+              Arc::clone(&ready),
+              registered.clone(),
+            ))
+            .unwrap_or_else(|error| panic!("spawn failed: {error}"))
+        })
+        .collect();
+      let wakers: Vec<_> = (0..16)
+        .map(|_| registrations.recv_timeout(Duration::from_secs(30)).unwrap())
+        .collect();
+      wait_for_parked_workers(&runtime.shared);
+      let shared = Arc::clone(&runtime.shared);
+      let external = std::thread::spawn(move || {
+        wait_for_scheduler(|| shared.lock().closed, "runtime closure");
+        if mode == AsyncShutdown::Drain {
+          ready.store(true, Ordering::Release);
+          for waker in wakers {
+            waker.wake();
+          }
+        }
+      });
+      shutdown_with_deadline(runtime, mode);
+      external.join().unwrap();
+      for job in jobs {
+        match mode {
+          AsyncShutdown::CancelPending => {
+            assert!(matches!(finish_job(job), Err(AsyncJoinError::Cancelled)))
+          }
+          AsyncShutdown::Drain => finish_job(job).unwrap(),
+        }
+      }
+    }
+  }
 
   #[test]
   fn completed_task_releases_cached_waker_before_task_drop() {
