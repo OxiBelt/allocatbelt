@@ -4,7 +4,8 @@
 //! its queued tasks in an intrusive FIFO list threaded through the task table,
 //! so queueing, selection and schedule refresh do not scan other scopes' work.
 
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -115,6 +116,7 @@ struct State {
   closed: bool,
   cancel_all: bool,
   tasks: Vec<TaskSlot>,
+  free_tasks: BinaryHeap<Reverse<usize>>,
   scopes: Vec<ScopeSlot>,
   round_robin: VecDeque<ScopeRef>,
   idle: usize,
@@ -215,6 +217,8 @@ impl Shared {
     let mut requested_control = std::mem::size_of::<Shared>();
     for bytes in [
       payload_bytes::<TaskSlot>(config.max_outstanding).map_err(AsyncError::ResourceDomain)?,
+      payload_bytes::<Reverse<usize>>(config.max_outstanding)
+        .map_err(AsyncError::ResourceDomain)?,
       payload_bytes::<ScopeSlot>(config.max_scopes).map_err(AsyncError::ResourceDomain)?,
       payload_bytes::<ScopeRef>(config.max_scopes).map_err(AsyncError::ResourceDomain)?,
       std::mem::size_of::<ScopeCell>(),
@@ -231,6 +235,13 @@ impl Shared {
       .try_reserve_exact(config.max_outstanding)
       .map_err(|_| AsyncError::OutOfMemory)?;
     tasks.resize_with(config.max_outstanding, TaskSlot::new);
+    let mut free_tasks = BinaryHeap::new();
+    free_tasks
+      .try_reserve_exact(config.max_outstanding)
+      .map_err(|_| AsyncError::OutOfMemory)?;
+    for index in 0..config.max_outstanding {
+      free_tasks.push(Reverse(index));
+    }
     let mut scopes = Vec::new();
     scopes
       .try_reserve_exact(config.max_scopes)
@@ -279,6 +290,7 @@ impl Shared {
     let mut actual_control = std::mem::size_of::<Shared>();
     for bytes in [
       payload_bytes::<TaskSlot>(tasks.capacity()).map_err(AsyncError::ResourceDomain)?,
+      payload_bytes::<Reverse<usize>>(free_tasks.capacity()).map_err(AsyncError::ResourceDomain)?,
       payload_bytes::<ScopeSlot>(scopes.capacity()).map_err(AsyncError::ResourceDomain)?,
       payload_bytes::<ScopeRef>(round_robin.capacity()).map_err(AsyncError::ResourceDomain)?,
       std::mem::size_of::<ScopeCell>(),
@@ -301,6 +313,7 @@ impl Shared {
           closed: false,
           cancel_all: false,
           tasks,
+          free_tasks,
           scopes,
           round_robin,
           idle: 0,
@@ -679,11 +692,7 @@ impl Shared {
       if scope_cell.protocol.is_closed() {
         return Err(AsyncSpawnError::new(AsyncError::Closed, future));
       }
-      if !state.tasks.iter().any(|slot| {
-        slot.task.is_none()
-          && !slot.protocol.admitted()
-          && slot.protocol.next_generation().is_some()
-      }) {
+      if state.free_tasks.peek().is_none() {
         return Err(AsyncSpawnError::new(AsyncError::Full, future));
       }
       scope_cell
@@ -753,20 +762,22 @@ impl Shared {
       drop(domain);
       return Err(AsyncSpawnError::new(AsyncError::Full, future));
     }
-    let Some((index, generation)) = state.tasks.iter().enumerate().find_map(|(index, slot)| {
-      if slot.task.is_none() && !slot.protocol.admitted() {
-        slot
-          .protocol
-          .next_generation()
-          .map(|generation| (index, generation))
-      } else {
-        None
-      }
-    }) else {
+    let Some(Reverse(index)) = state.free_tasks.peek().copied() else {
       drop(state);
       drop(domain);
       return Err(AsyncSpawnError::new(AsyncError::Full, future));
     };
+    let slot = &state.tasks[index];
+    let Some(generation) = (slot.task.is_none() && !slot.protocol.admitted())
+      .then(|| slot.protocol.next_generation())
+      .flatten()
+    else {
+      drop(state);
+      drop(domain);
+      return Err(AsyncSpawnError::new(AsyncError::Full, future));
+    };
+    let popped = state.free_tasks.pop();
+    debug_assert_eq!(popped, Some(Reverse(index)));
     let task_ref = TaskRef { index, generation };
     let (task, job) = Task::create(
       future,
@@ -1716,6 +1727,7 @@ fn finish_cancel(shared: &Arc<Shared>, task_ref: TaskRef, task: Arc<dyn ErasedTa
   let slot_task = slot.task.take();
   let scope_ref = slot.scope.take();
   slot.protocol.finish_cancel();
+  let reusable = slot.protocol.next_generation().is_some();
   shared
     .metrics
     .inner()
@@ -1726,6 +1738,9 @@ fn finish_cancel(shared: &Arc<Shared>, task_ref: TaskRef, task: Arc<dyn ErasedTa
     && scope.generation == scope_ref.generation
   {
     completed_scope = scope.scope.as_ref().map(Arc::clone);
+  }
+  if reusable {
+    state.free_tasks.push(Reverse(task_ref.index));
   }
   let closed = state.closed;
   drop(state);
@@ -1764,6 +1779,10 @@ fn finish_poll(shared: &Arc<Shared>, task_ref: TaskRef, result: PollResult) {
         .fetch_sub(1, Ordering::Relaxed);
       publish = slot.task.take();
       let scope_ref = slot.scope.take();
+      let reusable = slot.protocol.next_generation().is_some();
+      if reusable {
+        state.free_tasks.push(Reverse(task_ref.index));
+      }
       if let Some(scope_ref) = scope_ref
         && let Some(scope) = state.scopes.get(scope_ref.index)
         && scope.generation == scope_ref.generation
@@ -2230,6 +2249,7 @@ mod tests {
     let (shared, root) = shared_with_task_slots(2);
     {
       let mut state = shared.lock();
+      discard_free_task_for_test(&mut state, 0);
       state.tasks[0].protocol.admit(u64::MAX);
       state.tasks[0].protocol.finish_cancel();
     }
@@ -2255,6 +2275,9 @@ mod tests {
     let (shared, root) = shared_with_task_slots(2);
     {
       let mut state = shared.lock();
+      for index in 0..state.tasks.len() {
+        discard_free_task_for_test(&mut state, index);
+      }
       for slot in &mut state.tasks {
         slot.protocol.admit(u64::MAX);
         slot.protocol.finish_cancel();
@@ -2398,9 +2421,37 @@ mod tests {
     );
   }
 
+  /// Removes a slot from the free heap before a test makes it unusable.
+  fn discard_free_task_for_test(state: &mut State, index: usize) {
+    state
+      .free_tasks
+      .retain(|Reverse(candidate)| *candidate != index);
+  }
+
   /// Walks every scope's ready list and checks its links, length and abort
-  /// count against the task table and the queue-depth metric.
+  /// count against the task table and the queue-depth metric. Also checks
+  /// that the free heap holds exactly the free reusable slots.
   fn check_ready_lists(shared: &Shared, state: &State) {
+    let mut free_heap = state
+      .free_tasks
+      .iter()
+      .map(|Reverse(index)| *index)
+      .collect::<Vec<_>>();
+    free_heap.sort_unstable();
+    assert!(free_heap.windows(2).all(|pair| pair[0] != pair[1]));
+    let expected_free = state
+      .tasks
+      .iter()
+      .enumerate()
+      .filter_map(|(index, slot)| {
+        (slot.task.is_none()
+          && !slot.protocol.admitted()
+          && slot.protocol.next_generation().is_some())
+        .then_some(index)
+      })
+      .collect::<Vec<_>>();
+    assert_eq!(free_heap, expected_free, "free task heap is inconsistent");
+
     let mut linked = 0;
     for (scope_index, scope) in state.scopes.iter().enumerate() {
       let mut len = 0;
@@ -2522,6 +2573,37 @@ mod tests {
     }
     assert!(take(&shared).is_none());
     drop(tasks);
+    finish(shared);
+  }
+
+  #[test]
+  fn free_task_heap_reuses_the_lowest_completed_slot() {
+    let (shared, root) = shared_with_task_slots(4);
+    let jobs: Vec<_> = (0..4).map(|_| spawn_pending(&shared, root)).collect();
+    let task_refs = jobs
+      .iter()
+      .map(|(task_ref, _)| *task_ref)
+      .collect::<Vec<_>>();
+    for task_ref in &task_refs {
+      assert_eq!(poll_idle(&shared), *task_ref);
+    }
+
+    for index in [2, 0, 3, 1] {
+      let task_ref = task_refs[index];
+      shared.wake(task_ref);
+      let (selected, task, permit) = take_poll(&shared);
+      assert_eq!(selected, task_ref);
+      finish_poll(&shared, selected, PollResult::Ready);
+      drop(permit);
+      drop(task);
+      check_ready_lists(&shared, &shared.lock());
+    }
+
+    let (reused, job) = spawn_pending(&shared, root);
+    assert_eq!(reused.index, 0);
+    check_ready_lists(&shared, &shared.lock());
+    drop(job);
+    drop(jobs);
     finish(shared);
   }
 
