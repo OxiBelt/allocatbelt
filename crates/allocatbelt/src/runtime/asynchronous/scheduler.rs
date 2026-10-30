@@ -1,6 +1,8 @@
 //! Bounded async task admission and scheduling. Scheduler state is reserved
 //! before workers start; the mutex protects bookkeeping only and is released
-//! before polling, dropping task values, or invoking wakers.
+//! before polling, dropping task values, or invoking wakers. Each scope keeps
+//! its queued tasks in an intrusive FIFO list threaded through the task table,
+//! so queueing, selection and schedule refresh do not scan other scopes' work.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -51,19 +53,68 @@ struct ScopeSlot {
   ready: bool,
   quota_blocked: bool,
   quota: PollQuota,
+  /// The scope's queued tasks in push order, linked through `TaskSlot`.
+  ready_head: Option<usize>,
+  ready_tail: Option<usize>,
+  ready_len: usize,
+  /// Linked tasks counted as `aborting_queued`.
+  aborting: usize,
 }
 
+impl ScopeSlot {
+  const fn new(generation: u64, scope: Option<Arc<ScopeCell>>, quota: PollQuota) -> Self {
+    Self {
+      generation,
+      scope,
+      ready: false,
+      quota_blocked: false,
+      quota,
+      ready_head: None,
+      ready_tail: None,
+      ready_len: 0,
+      aborting: 0,
+    }
+  }
+
+  fn ready_empty(&self) -> bool {
+    self.ready_head.is_none()
+      && self.ready_tail.is_none()
+      && self.ready_len == 0
+      && self.aborting == 0
+  }
+}
+
+/// A task is linked into its scope's ready list exactly while its
+/// `PollProtocol` is queued.
 struct TaskSlot {
   protocol: PollProtocol,
   task: Option<Arc<dyn ErasedTask>>,
   scope: Option<ScopeRef>,
+  ready_linked: bool,
+  ready_prev: Option<usize>,
+  ready_next: Option<usize>,
+  /// Whether this linked task is counted in its scope's `aborting`.
+  ready_abort: bool,
+}
+
+impl TaskSlot {
+  const fn new() -> Self {
+    Self {
+      protocol: PollProtocol::new(),
+      task: None,
+      scope: None,
+      ready_linked: false,
+      ready_prev: None,
+      ready_next: None,
+      ready_abort: false,
+    }
+  }
 }
 
 struct State {
   closed: bool,
   cancel_all: bool,
   tasks: Vec<TaskSlot>,
-  ready: VecDeque<TaskRef>,
   scopes: Vec<ScopeSlot>,
   round_robin: VecDeque<ScopeRef>,
   idle: usize,
@@ -164,7 +215,6 @@ impl Shared {
     let mut requested_control = std::mem::size_of::<Shared>();
     for bytes in [
       payload_bytes::<TaskSlot>(config.max_outstanding).map_err(AsyncError::ResourceDomain)?,
-      payload_bytes::<TaskRef>(config.max_outstanding).map_err(AsyncError::ResourceDomain)?,
       payload_bytes::<ScopeSlot>(config.max_scopes).map_err(AsyncError::ResourceDomain)?,
       payload_bytes::<ScopeRef>(config.max_scopes).map_err(AsyncError::ResourceDomain)?,
       std::mem::size_of::<ScopeCell>(),
@@ -180,25 +230,13 @@ impl Shared {
     tasks
       .try_reserve_exact(config.max_outstanding)
       .map_err(|_| AsyncError::OutOfMemory)?;
-    tasks.resize_with(config.max_outstanding, || TaskSlot {
-      protocol: PollProtocol::new(),
-      task: None,
-      scope: None,
-    });
-    let mut ready = VecDeque::new();
-    ready
-      .try_reserve_exact(config.max_outstanding)
-      .map_err(|_| AsyncError::OutOfMemory)?;
+    tasks.resize_with(config.max_outstanding, TaskSlot::new);
     let mut scopes = Vec::new();
     scopes
       .try_reserve_exact(config.max_scopes)
       .map_err(|_| AsyncError::OutOfMemory)?;
-    scopes.resize_with(config.max_scopes, || ScopeSlot {
-      generation: 0,
-      scope: None,
-      ready: false,
-      quota_blocked: false,
-      quota: PollQuota::new(1),
+    scopes.resize_with(config.max_scopes, || {
+      ScopeSlot::new(0, None, PollQuota::new(1))
     });
     let mut round_robin = VecDeque::new();
     round_robin
@@ -233,13 +271,7 @@ impl Shared {
       root_waiters,
       None,
     ));
-    scopes[0] = ScopeSlot {
-      generation: 1,
-      scope: Some(root_scope),
-      ready: false,
-      quota_blocked: false,
-      quota: PollQuota::new(config.workers),
-    };
+    scopes[0] = ScopeSlot::new(1, Some(root_scope), PollQuota::new(config.workers));
     let root = ScopeRef {
       index: 0,
       generation: 1,
@@ -247,7 +279,6 @@ impl Shared {
     let mut actual_control = std::mem::size_of::<Shared>();
     for bytes in [
       payload_bytes::<TaskSlot>(tasks.capacity()).map_err(AsyncError::ResourceDomain)?,
-      payload_bytes::<TaskRef>(ready.capacity()).map_err(AsyncError::ResourceDomain)?,
       payload_bytes::<ScopeSlot>(scopes.capacity()).map_err(AsyncError::ResourceDomain)?,
       payload_bytes::<ScopeRef>(round_robin.capacity()).map_err(AsyncError::ResourceDomain)?,
       std::mem::size_of::<ScopeCell>(),
@@ -270,7 +301,6 @@ impl Shared {
           closed: false,
           cancel_all: false,
           tasks,
-          ready,
           scopes,
           round_robin,
           idle: 0,
@@ -379,6 +409,7 @@ impl Shared {
       {
         return;
       }
+      debug_assert!(slot.ready_empty());
       slot.ready = false;
       slot.quota_blocked = false;
       cell.protocol.mark_reclaimed();
@@ -486,6 +517,7 @@ impl Shared {
       drop(cell);
       return Err(AsyncError::TooManyScopes);
     }
+    debug_assert!(state.scopes[index].ready_empty());
     state.scopes[index].generation = generation;
     state.scopes[index].scope = Some(Arc::clone(&cell));
     state.scopes[index].ready = false;
@@ -773,6 +805,7 @@ impl Shared {
           if inserted {
             push_ready(&mut state, task_ref, &self.metrics.inner().queue_depth);
           }
+          sync_ready_abort(&mut state, index);
           refresh_task_scope(&mut state, task_ref);
         }
       }
@@ -802,6 +835,7 @@ impl Shared {
         if inserted {
           push_ready(&mut state, task, &self.metrics.inner().queue_depth);
         }
+        sync_ready_abort(&mut state, index);
         refresh_task_scope(&mut state, task);
       }
     }
@@ -813,6 +847,7 @@ impl Shared {
         .as_ref()
         .is_some_and(|cell| cell.protocol.can_reclaim())
     {
+      debug_assert!(slot.ready_empty());
       slot.ready = false;
       slot.quota_blocked = false;
       if let Some(cell) = &slot.scope {
@@ -857,6 +892,7 @@ impl Shared {
     if inserted {
       push_ready(&mut state, task_ref, &self.metrics.inner().queue_depth);
     }
+    sync_ready_abort(&mut state, task_ref.index);
     refresh_task_scope(&mut state, task_ref);
     drop(state);
     self.work.notify_all();
@@ -1095,7 +1131,7 @@ fn get_scope(state: &State, scope: ScopeRef) -> Option<&Arc<ScopeCell>> {
     .and_then(|slot| slot.scope.as_ref())
 }
 
-/// Adds an admitted task to the single bounded ready queue at most once.
+/// Adds an admitted task to its scope's ready list at most once.
 fn schedule(state: &mut State, task_ref: TaskRef, queue_depth: &AtomicUsize) -> bool {
   let Some(slot) = state.tasks.get_mut(task_ref.index) else {
     return false;
@@ -1107,8 +1143,8 @@ fn schedule(state: &mut State, task_ref: TaskRef, queue_depth: &AtomicUsize) -> 
   true
 }
 
-/// Publishes a queue token after `PollProtocol` has reserved the task's one
-/// ready position.
+/// Appends a task to its scope's ready list after `PollProtocol` has reserved
+/// the task's one ready position.
 fn push_ready(state: &mut State, task_ref: TaskRef, queue_depth: &AtomicUsize) {
   let Some(slot) = state.tasks.get(task_ref.index) else {
     return;
@@ -1116,9 +1152,93 @@ fn push_ready(state: &mut State, task_ref: TaskRef, queue_depth: &AtomicUsize) {
   let Some(scope_ref) = slot.scope else {
     return;
   };
-  state.ready.push_back(task_ref);
+  link_ready(state, task_ref.index, scope_ref);
   queue_depth.fetch_add(1, Ordering::Relaxed);
   refresh_scope_schedule(state, scope_ref);
+}
+
+/// Links a newly queued task at its scope's ready-list tail.
+fn link_ready(state: &mut State, index: usize, scope_ref: ScopeRef) {
+  let Some(scope) = state.scopes.get_mut(scope_ref.index) else {
+    return;
+  };
+  let tail = scope.ready_tail.replace(index);
+  if tail.is_none() {
+    scope.ready_head = Some(index);
+  }
+  scope.ready_len += 1;
+  let slot = &mut state.tasks[index];
+  debug_assert!(!slot.ready_linked && !slot.ready_abort);
+  slot.ready_linked = true;
+  slot.ready_prev = tail;
+  slot.ready_next = None;
+  if let Some(tail) = tail {
+    state.tasks[tail].ready_next = Some(index);
+  }
+  sync_ready_abort(state, index);
+}
+
+/// Removes a linked task from its scope's ready list before its protocol
+/// leaves the queued state.
+fn unlink_ready(state: &mut State, index: usize, scope_ref: ScopeRef) {
+  let slot = &mut state.tasks[index];
+  debug_assert!(slot.ready_linked);
+  slot.ready_linked = false;
+  let prev = slot.ready_prev.take();
+  let next = slot.ready_next.take();
+  let counted_abort = std::mem::take(&mut slot.ready_abort);
+  match prev {
+    Some(prev) => state.tasks[prev].ready_next = next,
+    None => state.scopes[scope_ref.index].ready_head = next,
+  }
+  match next {
+    Some(next) => state.tasks[next].ready_prev = prev,
+    None => state.scopes[scope_ref.index].ready_tail = prev,
+  }
+  let scope = &mut state.scopes[scope_ref.index];
+  scope.ready_len -= 1;
+  if counted_abort {
+    scope.aborting -= 1;
+  }
+}
+
+/// Recounts a linked task's abort status after a protocol change. An abort
+/// request can mark an already queued task without requeueing it.
+fn sync_ready_abort(state: &mut State, index: usize) {
+  let Some(slot) = state.tasks.get_mut(index) else {
+    return;
+  };
+  if !slot.ready_linked {
+    return;
+  }
+  let aborting = slot.protocol.aborting_queued();
+  if aborting == slot.ready_abort {
+    return;
+  }
+  let Some(scope_ref) = slot.scope else {
+    return;
+  };
+  slot.ready_abort = aborting;
+  let scope = &mut state.scopes[scope_ref.index];
+  if aborting {
+    scope.aborting += 1;
+  } else {
+    scope.aborting -= 1;
+  }
+}
+
+/// Returns the scope's first ready task in push order that is counted as
+/// aborting. Only called while the scope has aborting entries.
+fn first_ready_abort(state: &State, scope_ref: ScopeRef) -> Option<usize> {
+  let mut cursor = state.scopes[scope_ref.index].ready_head;
+  while let Some(index) = cursor {
+    let slot = &state.tasks[index];
+    if slot.ready_abort {
+      return Some(index);
+    }
+    cursor = slot.ready_next;
+  }
+  None
 }
 
 fn refresh_task_scope(state: &mut State, task_ref: TaskRef) {
@@ -1142,25 +1262,12 @@ fn refresh_scope_schedule(state: &mut State, scope_ref: ScopeRef) {
   if scope.generation != scope_ref.generation || scope.scope.is_none() {
     return;
   }
-  let has_queued = state.ready.iter().any(|task_ref| {
-    state.tasks.get(task_ref.index).is_some_and(|task| {
-      task.protocol.matches(task_ref.generation) && task.scope == Some(scope_ref)
-    })
-  });
-  if !has_queued {
-    let scope = &mut state.scopes[scope_ref.index];
+  let scope = &mut state.scopes[scope_ref.index];
+  if scope.ready_len == 0 {
     scope.quota_blocked = false;
     return;
   }
-  let has_abort = state.ready.iter().any(|task_ref| {
-    state.tasks.get(task_ref.index).is_some_and(|task| {
-      task.protocol.matches(task_ref.generation)
-        && task.scope == Some(scope_ref)
-        && task.protocol.aborting_queued()
-    })
-  });
-  let scope = &mut state.scopes[scope_ref.index];
-  if scope.quota.active() < scope.quota.maximum() || has_abort {
+  if scope.quota.active() < scope.quota.maximum() || scope.aborting > 0 {
     scope.quota_blocked = false;
     if !scope.ready {
       scope.ready = true;
@@ -1233,33 +1340,32 @@ impl Drop for PollPermit {
 }
 
 /// Selects the next poll or cancellation cleanup from the scope round-robin
-/// queue, or returns `None` once that queue is empty.
+/// queue, or returns `None` once that queue is empty. Within a scope, the
+/// first aborting task in push order wins; otherwise the ready-list head is
+/// polled when the scope's quota allows.
 fn dequeue(shared: &Arc<Shared>, state: &mut State) -> Option<Selected> {
   while let Some(scope_ref) = state.round_robin.pop_front() {
-    if let Some(scope) = state.scopes.get_mut(scope_ref.index)
-      && scope.generation == scope_ref.generation
-    {
-      scope.ready = false;
-    }
-    let matches_scope = |task_ref: &&TaskRef| {
-      state.tasks.get(task_ref.index).is_some_and(|task| {
-        task.protocol.matches(task_ref.generation) && task.scope == Some(scope_ref)
-      })
+    // A token from a retired generation has no linked tasks.
+    let Some(scope) = state.scopes.get_mut(scope_ref.index) else {
+      continue;
     };
-    let abort_position = state.ready.iter().position(|task_ref| {
-      matches_scope(&task_ref) && state.tasks[task_ref.index].protocol.aborting_queued()
-    });
-    let normal_position = state.ready.iter().position(|task_ref| {
-      matches_scope(&task_ref) && !state.tasks[task_ref.index].protocol.aborting_queued()
-    });
-    let quota_available = state.scopes.get(scope_ref.index).is_some_and(|scope| {
-      scope.generation == scope_ref.generation
-        && scope.scope.is_some()
-        && scope.quota.active() < scope.quota.maximum()
-    });
-    let position = abort_position.or_else(|| quota_available.then_some(normal_position).flatten());
-    if let Some(position) = position {
-      let selected_abort = abort_position.is_some();
+    if scope.generation != scope_ref.generation {
+      continue;
+    }
+    scope.ready = false;
+    let quota_available = scope.scope.is_some() && scope.quota.active() < scope.quota.maximum();
+    let head = scope.ready_head;
+    let abort = if scope.aborting > 0 {
+      first_ready_abort(state, scope_ref)
+    } else {
+      None
+    };
+    debug_assert_eq!(abort.is_some(), state.scopes[scope_ref.index].aborting > 0);
+    let (index, selected_abort) = match abort {
+      Some(index) => (Some(index), true),
+      None => (head.filter(|_| quota_available), false),
+    };
+    if let Some(index) = index {
       let acquired = if selected_abort {
         false
       } else {
@@ -1269,11 +1375,10 @@ fn dequeue(shared: &Arc<Shared>, state: &mut State) -> Option<Selected> {
         refresh_scope_schedule(state, scope_ref);
         continue;
       }
-      let Some(task_ref) = state.ready.remove(position) else {
-        if acquired {
-          state.scopes[scope_ref.index].quota.release();
-        }
-        continue;
+      unlink_ready(state, index, scope_ref);
+      let task_ref = TaskRef {
+        index,
+        generation: state.tasks[index].protocol.generation(),
       };
       shared
         .metrics
@@ -1389,6 +1494,9 @@ fn take_next(
           };
           push_ready(&mut state, reference, &shared.metrics.inner().queue_depth);
         }
+        // `close(true)` already counted queued aborts; this keeps the count
+        // exact if a later path sets `cancel_all` first.
+        sync_ready_abort(&mut state, index);
       }
     }
     if state.round_robin.is_empty() && !state.closed {
@@ -1676,6 +1784,16 @@ mod tests {
   use std::future::Future;
 
   fn shared_with_task_slots(max_outstanding: usize) -> (Arc<Shared>, ScopeRef) {
+    shared_with_config(AsyncConfig {
+      workers: 1,
+      max_outstanding,
+      max_scopes: 1,
+    })
+  }
+
+  /// Builds scheduler state without starting executor threads, so tests
+  /// drive `dequeue` and the poll/cancel completions directly.
+  fn shared_with_config(config: AsyncConfig) -> (Arc<Shared>, ScopeRef) {
     let metrics = RuntimeMetrics::try_new(
       1,
       [AsyncThreadContext {
@@ -1688,11 +1806,7 @@ mod tests {
     )
     .unwrap_or_else(|error| panic!("metrics allocation failed: {error:?}"));
     Shared::new(
-      AsyncConfig {
-        workers: 1,
-        max_outstanding,
-        max_scopes: 1,
-      },
+      config,
       0,
       None,
       super::super::ControlledThreadOptions::unbounded(AsyncThreadOptions::default()),
@@ -1715,6 +1829,7 @@ mod tests {
       .unwrap_or_else(|error| panic!("usable task slot was hidden: {}", error.kind));
     {
       let state = shared.lock();
+      check_ready_lists(&shared, &state);
       assert_eq!(state.tasks[0].protocol.generation(), u64::MAX);
       assert!(!state.tasks[0].protocol.admitted());
       assert_eq!(state.tasks[1].protocol.generation(), 1);
@@ -1743,6 +1858,7 @@ mod tests {
     assert_eq!(error.kind, AsyncError::Full);
     {
       let state = shared.lock();
+      check_ready_lists(&shared, &state);
       assert!(state.tasks.iter().all(|slot| {
         slot.protocol.generation() == u64::MAX && !slot.protocol.admitted() && slot.task.is_none()
       }));
@@ -1870,5 +1986,233 @@ mod tests {
       tenant.snapshot().unwrap().used.get(DomainResource::Control),
       tenant_base
     );
+  }
+
+  /// Walks every scope's ready list and checks its links, length and abort
+  /// count against the task table and the queue-depth metric.
+  fn check_ready_lists(shared: &Shared, state: &State) {
+    let mut linked = 0;
+    for (scope_index, scope) in state.scopes.iter().enumerate() {
+      let mut len = 0;
+      let mut aborting = 0;
+      let mut prev = None;
+      let mut cursor = scope.ready_head;
+      while let Some(index) = cursor {
+        let slot = &state.tasks[index];
+        assert!(slot.ready_linked, "unlinked task {index} reachable");
+        assert_eq!(slot.ready_prev, prev, "task {index} has a stale back link");
+        assert_eq!(slot.scope.map(|scope| scope.index), Some(scope_index));
+        assert_eq!(
+          slot.scope.map(|scope| scope.generation),
+          Some(scope.generation)
+        );
+        assert!(slot.protocol.admitted() && slot.task.is_some());
+        assert_eq!(slot.ready_abort, slot.protocol.aborting_queued());
+        aborting += usize::from(slot.ready_abort);
+        len += 1;
+        assert!(len <= state.tasks.len(), "ready list cycle");
+        prev = Some(index);
+        cursor = slot.ready_next;
+      }
+      assert_eq!(scope.ready_tail, prev);
+      assert_eq!(scope.ready_len, len);
+      assert_eq!(scope.aborting, aborting);
+      if scope.scope.is_none() {
+        assert!(scope.ready_empty());
+      }
+      linked += len;
+    }
+    assert_eq!(
+      state.tasks.iter().filter(|slot| slot.ready_linked).count(),
+      linked
+    );
+    assert_eq!(
+      shared.metrics.inner().queue_depth.load(Ordering::Relaxed),
+      linked
+    );
+  }
+
+  fn take(shared: &Arc<Shared>) -> Option<Selected> {
+    let mut state = shared.lock();
+    let selected = dequeue(shared, &mut state);
+    check_ready_lists(shared, &state);
+    selected
+  }
+
+  fn take_poll(shared: &Arc<Shared>) -> (TaskRef, Arc<dyn ErasedTask>, PollPermit) {
+    match take(shared) {
+      Some(Selected::Poll(task_ref, task, permit)) => (task_ref, task, permit),
+      Some(Selected::Cancel(task_ref, _)) => panic!("unexpected cancel of {}", task_ref.index),
+      None => panic!("no dispatchable task"),
+    }
+  }
+
+  /// Polls the next task without running it and leaves it idle.
+  fn poll_idle(shared: &Arc<Shared>) -> TaskRef {
+    let (task_ref, task, permit) = take_poll(shared);
+    finish_poll(shared, task_ref, PollResult::Pending);
+    drop(permit);
+    drop(task);
+    check_ready_lists(shared, &shared.lock());
+    task_ref
+  }
+
+  fn cancel_next(shared: &Arc<Shared>) -> TaskRef {
+    match take(shared) {
+      Some(Selected::Cancel(task_ref, task)) => {
+        task.cancel();
+        finish_cancel(shared, task_ref, task);
+        check_ready_lists(shared, &shared.lock());
+        task_ref
+      }
+      Some(Selected::Poll(task_ref, ..)) => panic!("unexpected poll of {}", task_ref.index),
+      None => panic!("no dispatchable task"),
+    }
+  }
+
+  fn spawn_pending(shared: &Arc<Shared>, scope: ScopeRef) -> (TaskRef, AsyncJob<()>) {
+    let job = shared
+      .spawn(scope, std::future::pending::<()>())
+      .unwrap_or_else(|error| panic!("spawn failed: {}", error.kind));
+    let state = shared.lock();
+    check_ready_lists(shared, &state);
+    let index = state.scopes[scope.index]
+      .ready_tail
+      .unwrap_or_else(|| panic!("spawned task was not queued"));
+    let task_ref = TaskRef {
+      index,
+      generation: state.tasks[index].protocol.generation(),
+    };
+    (task_ref, job)
+  }
+
+  fn finish(shared: Arc<Shared>) {
+    shared.close(true);
+    check_ready_lists(&shared, &shared.lock());
+    drop(shared);
+  }
+
+  #[test]
+  fn ready_list_keeps_push_order_within_a_scope() {
+    let (shared, root) = shared_with_task_slots(16);
+    let tasks: Vec<_> = (0..16).map(|_| spawn_pending(&shared, root)).collect();
+    for (task_ref, _) in &tasks {
+      assert_eq!(poll_idle(&shared), *task_ref);
+    }
+    assert!(take(&shared).is_none());
+    // Wake order, not slot order, defines the next pass.
+    for (task_ref, _) in tasks.iter().rev() {
+      shared.wake(*task_ref);
+    }
+    shared.wake(tasks[3].0);
+    check_ready_lists(&shared, &shared.lock());
+    assert_eq!(shared.lock().scopes[0].ready_len, 16);
+    for (task_ref, _) in tasks.iter().rev() {
+      assert_eq!(poll_idle(&shared), *task_ref);
+    }
+    assert!(take(&shared).is_none());
+    drop(tasks);
+    finish(shared);
+  }
+
+  #[test]
+  fn newly_queued_abort_passes_earlier_ordinary_entries() {
+    let (shared, root) = shared_with_task_slots(4);
+    let tasks: Vec<_> = (0..4).map(|_| spawn_pending(&shared, root)).collect();
+    for _ in &tasks {
+      poll_idle(&shared);
+    }
+    shared.wake(tasks[0].0);
+    shared.wake(tasks[1].0);
+    shared.abort(tasks[3].0);
+    shared.wake(tasks[2].0);
+    assert_eq!(shared.lock().scopes[0].aborting, 1);
+    assert_eq!(cancel_next(&shared), tasks[3].0);
+    assert_eq!(shared.lock().scopes[0].aborting, 0);
+    for (task_ref, _) in &tasks[..3] {
+      assert_eq!(poll_idle(&shared), *task_ref);
+    }
+    assert!(take(&shared).is_none());
+    drop(tasks);
+    finish(shared);
+  }
+
+  #[test]
+  fn abort_of_queued_task_is_counted_and_selected_first() {
+    let (shared, root) = shared_with_task_slots(5);
+    let tasks: Vec<_> = (0..5).map(|_| spawn_pending(&shared, root)).collect();
+    shared.abort(tasks[3].0);
+    shared.abort(tasks[1].0);
+    {
+      let state = shared.lock();
+      assert_eq!(state.scopes[0].ready_len, 5);
+      assert_eq!(state.scopes[0].aborting, 2);
+    }
+    // Cancellation keeps push order among aborting entries.
+    assert_eq!(cancel_next(&shared), tasks[1].0);
+    assert_eq!(cancel_next(&shared), tasks[3].0);
+    for index in [0, 2, 4] {
+      assert_eq!(poll_idle(&shared), tasks[index].0);
+    }
+    assert!(take(&shared).is_none());
+    drop(tasks);
+    finish(shared);
+  }
+
+  #[test]
+  fn quota_blocked_scope_keeps_order_and_admits_cancellation() {
+    let (shared, root) = shared_with_task_slots(4);
+    let tasks: Vec<_> = (0..4).map(|_| spawn_pending(&shared, root)).collect();
+    let (first, task, permit) = take_poll(&shared);
+    assert_eq!(first, tasks[0].0);
+    assert!(shared.lock().scopes[0].quota_blocked);
+    assert!(take(&shared).is_none());
+
+    shared.abort(tasks[2].0);
+    assert!(!shared.lock().scopes[0].quota_blocked);
+    assert_eq!(cancel_next(&shared), tasks[2].0);
+    assert!(take(&shared).is_none());
+    assert!(shared.lock().scopes[0].quota_blocked);
+
+    finish_poll(&shared, first, PollResult::Pending);
+    drop(permit);
+    drop(task);
+    for index in [1, 3] {
+      assert_eq!(poll_idle(&shared), tasks[index].0);
+    }
+    assert!(take(&shared).is_none());
+    drop(tasks);
+    finish(shared);
+  }
+
+  #[test]
+  fn ready_scopes_alternate_one_poll_per_turn() {
+    let (shared, _) = shared_with_config(AsyncConfig {
+      workers: 1,
+      max_outstanding: 6,
+      max_scopes: 3,
+    });
+    let first = shared
+      .new_scope(1, None)
+      .unwrap_or_else(|error| panic!("scope construction failed: {error}"));
+    let second = shared
+      .new_scope(1, None)
+      .unwrap_or_else(|error| panic!("scope construction failed: {error}"));
+    let a: Vec<_> = (0..3)
+      .map(|_| spawn_pending(&shared, first.scope))
+      .collect();
+    let b: Vec<_> = (0..3)
+      .map(|_| spawn_pending(&shared, second.scope))
+      .collect();
+    for index in 0..3 {
+      assert_eq!(poll_idle(&shared), a[index].0);
+      assert_eq!(poll_idle(&shared), b[index].0);
+    }
+    assert!(take(&shared).is_none());
+    drop((a, b));
+    drop(first);
+    drop(second);
+    check_ready_lists(&shared, &shared.lock());
+    finish(shared);
   }
 }

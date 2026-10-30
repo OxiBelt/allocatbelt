@@ -125,7 +125,7 @@ impl RuntimeMetrics {
     self.0.alive_tasks.load(Ordering::Relaxed)
   }
 
-  /// Returns the current number of tokens in the bounded ready queue.
+  /// Returns the current number of tasks queued across all scope ready lists.
   #[must_use]
   pub fn global_queue_depth(&self) -> usize {
     self.0.queue_depth.load(Ordering::Relaxed)
@@ -219,7 +219,7 @@ pub struct RuntimeMetricsSnapshot {
   pub dispatch_ceiling: usize,
   /// Admitted task slots still owned by the executor, including cleanup.
   pub num_alive_tasks: usize,
-  /// Current tokens in the single bounded global ready queue.
+  /// Current tasks queued across all scope ready lists.
   pub global_queue_depth: usize,
   /// Number of contained lifecycle hook panics. A naming callback panic
   /// rejects construction before a metrics handle is returned.
