@@ -1149,6 +1149,140 @@ fn retained_waker_does_not_keep_completed_future_alive() {
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
+struct SelfWakeLoop {
+  polls: usize,
+  remaining: usize,
+}
+
+impl Future for SelfWakeLoop {
+  type Output = usize;
+
+  fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {
+    self.polls += 1;
+    if self.remaining == 0 {
+      return Poll::Ready(self.polls);
+    }
+    self.remaining -= 1;
+    for _ in 0..3 {
+      cx.waker().wake_by_ref();
+    }
+    Poll::Pending
+  }
+}
+
+/// Fails instead of hanging when a lost wake leaves a job pending forever.
+fn wait_finished<T>(jobs: &[super::AsyncJob<T>], message: &str) {
+  let deadline = Instant::now() + Duration::from_secs(30);
+  while !jobs.iter().all(super::AsyncJob::is_finished) {
+    assert!(Instant::now() < deadline, "timed out waiting for {message}");
+    std::thread::yield_now();
+  }
+}
+
+#[test]
+fn tasks_that_wake_themselves_many_times_complete_with_one_poll_per_round() {
+  const ROUNDS: usize = 10_000;
+  let runtime = runtime(4, 8, 2);
+  let jobs: Vec<_> = (0..8)
+    .map(|_| {
+      runtime
+        .handle()
+        .spawn(SelfWakeLoop {
+          polls: 0,
+          remaining: ROUNDS,
+        })
+        .unwrap_or_else(|e| panic!("spawn failed: {e}"))
+    })
+    .collect();
+  wait_finished(&jobs, "self-woken tasks");
+  for job in jobs {
+    // Each poll's coalesced self-wakes requeue it exactly once.
+    assert!(matches!(block_on(job), Ok(polls) if polls == ROUNDS + 1));
+  }
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
+}
+
+struct ExternalWakeTarget {
+  sent: Arc<AtomicUsize>,
+  waker: Arc<Mutex<Option<Waker>>>,
+  total: usize,
+}
+
+impl Future for ExternalWakeTarget {
+  type Output = ();
+
+  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    let mut waker = self.waker.lock().unwrap_or_else(|e| e.into_inner());
+    if waker.is_none() {
+      *waker = Some(cx.waker().clone());
+    }
+    drop(waker);
+    if self.sent.load(Ordering::Acquire) >= self.total {
+      Poll::Ready(())
+    } else {
+      Poll::Pending
+    }
+  }
+}
+
+#[test]
+fn external_wakes_racing_poll_completion_are_never_lost() {
+  const TASKS: usize = 4;
+  const WAKES: usize = 20_000;
+  let runtime = runtime(4, TASKS, 2);
+  let mut jobs = Vec::new();
+  let mut wakers = Vec::new();
+  for _ in 0..TASKS {
+    let sent = Arc::new(AtomicUsize::new(0));
+    let waker = Arc::new(Mutex::new(None));
+    jobs.push(
+      runtime
+        .handle()
+        .spawn(ExternalWakeTarget {
+          sent: Arc::clone(&sent),
+          waker: Arc::clone(&waker),
+          total: WAKES,
+        })
+        .unwrap_or_else(|e| panic!("spawn failed: {e}")),
+    );
+    wakers.push((sent, waker));
+  }
+  let threads: Vec<_> = wakers
+    .into_iter()
+    .map(|(sent, waker)| {
+      std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let waker = loop {
+          if let Some(waker) = waker.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            break waker;
+          }
+          assert!(Instant::now() < deadline, "task was never polled");
+          std::thread::yield_now();
+        };
+        for sent_count in 1..=WAKES {
+          sent.store(sent_count, Ordering::Release);
+          waker.wake_by_ref();
+        }
+      })
+    })
+    .collect();
+  for thread in threads {
+    thread
+      .join()
+      .unwrap_or_else(|_| panic!("waking thread panicked"));
+  }
+  // A lost final wake leaves its task pending forever.
+  wait_finished(&jobs, "the final external wakes");
+  for job in jobs {
+    assert!(matches!(block_on(job), Ok(())));
+  }
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
+}
+
 struct WakeCount {
   polls: Arc<AtomicUsize>,
   current: Arc<Mutex<Option<Waker>>>,

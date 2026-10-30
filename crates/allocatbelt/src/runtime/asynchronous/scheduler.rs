@@ -17,7 +17,7 @@ use super::handoff_protocol::{DispatchTurn, HandoffLoan, HelperLease, TurnCoordi
 use super::identity;
 use super::join::AsyncJob;
 use super::metrics::RuntimeMetrics;
-use super::protocol::{PollFinish, PollProtocol, PollQuota, ScopeProtocol};
+use super::protocol::{PollFinish, PollProtocol, PollQuota, PollWord, ScopeProtocol};
 use super::task::{DomainCpuAdmission, ErasedTask, PollResult, Task};
 use super::thread_options::AsyncThreadContext;
 #[cfg(test)]
@@ -129,6 +129,9 @@ pub(super) struct Shared {
   workers: usize,
   pub(super) metrics: RuntimeMetrics,
   thread_options: super::ControlledThreadOptions,
+  /// One wake record per task slot, indexed like `State::tasks` and read
+  /// without the scheduler mutex.
+  poll_words: Vec<PollWord>,
   state: Mutex<State>,
   work: Condvar,
   /// Inactive helpers and restoring threads wait here; `work` waiters are
@@ -219,6 +222,7 @@ impl Shared {
       payload_bytes::<TaskSlot>(config.max_outstanding).map_err(AsyncError::ResourceDomain)?,
       payload_bytes::<Reverse<usize>>(config.max_outstanding)
         .map_err(AsyncError::ResourceDomain)?,
+      payload_bytes::<PollWord>(config.max_outstanding).map_err(AsyncError::ResourceDomain)?,
       payload_bytes::<ScopeSlot>(config.max_scopes).map_err(AsyncError::ResourceDomain)?,
       payload_bytes::<ScopeRef>(config.max_scopes).map_err(AsyncError::ResourceDomain)?,
       std::mem::size_of::<ScopeCell>(),
@@ -242,6 +246,11 @@ impl Shared {
     for index in 0..config.max_outstanding {
       free_tasks.push(Reverse(index));
     }
+    let mut poll_words = Vec::new();
+    poll_words
+      .try_reserve_exact(config.max_outstanding)
+      .map_err(|_| AsyncError::OutOfMemory)?;
+    poll_words.resize_with(config.max_outstanding, PollWord::new);
     let mut scopes = Vec::new();
     scopes
       .try_reserve_exact(config.max_scopes)
@@ -291,6 +300,7 @@ impl Shared {
     for bytes in [
       payload_bytes::<TaskSlot>(tasks.capacity()).map_err(AsyncError::ResourceDomain)?,
       payload_bytes::<Reverse<usize>>(free_tasks.capacity()).map_err(AsyncError::ResourceDomain)?,
+      payload_bytes::<PollWord>(poll_words.capacity()).map_err(AsyncError::ResourceDomain)?,
       payload_bytes::<ScopeSlot>(scopes.capacity()).map_err(AsyncError::ResourceDomain)?,
       payload_bytes::<ScopeRef>(round_robin.capacity()).map_err(AsyncError::ResourceDomain)?,
       std::mem::size_of::<ScopeCell>(),
@@ -309,6 +319,7 @@ impl Shared {
         workers: config.workers,
         metrics,
         thread_options,
+        poll_words,
         state: Mutex::new(State {
           closed: false,
           cancel_all: false,
@@ -879,6 +890,15 @@ impl Shared {
   }
 
   fn wake(&self, task_ref: TaskRef) {
+    // A wake of the running poll, often the task's own, only records
+    // `NOTIFIED`; `finish_poll` hands it to `PollProtocol` under the mutex.
+    if self
+      .poll_words
+      .get(task_ref.index)
+      .is_some_and(|word| word.notify_running(task_ref.generation))
+    {
+      return;
+    }
     let mut state = self.lock();
     let Some(task) = state.tasks.get_mut(task_ref.index) else {
       return;
@@ -1424,6 +1444,7 @@ fn dequeue(shared: &Arc<Shared>, state: &mut State) -> Option<Selected> {
         if aborting || selected_abort {
           return Some(Selected::Cancel(task_ref, task));
         } else if let Some(permit) = permit {
+          shared.poll_words[task_ref.index].begin(task_ref.generation);
           return Some(Selected::Poll(task_ref, task, permit));
         }
         continue;
@@ -1766,6 +1787,11 @@ fn finish_poll(shared: &Arc<Shared>, task_ref: TaskRef, result: PollResult) {
   };
   if !slot.protocol.matches(task_ref.generation) || slot.task.is_none() {
     return;
+  }
+  // A wake taken from the word is the same pending wake as a locked one.
+  if shared.poll_words[task_ref.index].finish() {
+    let inserted = slot.protocol.wake();
+    debug_assert!(!inserted);
   }
   let finish = slot
     .protocol
@@ -2674,6 +2700,77 @@ mod tests {
     }
     assert!(take(&shared).is_none());
     drop(tasks);
+    finish(shared);
+  }
+
+  #[test]
+  fn running_wakes_use_the_word_and_requeue_once_at_finish() {
+    let (shared, root) = shared_with_task_slots(2);
+    let (task_ref, job) = spawn_pending(&shared, root);
+    let (polled, task, permit) = take_poll(&shared);
+    assert_eq!(polled, task_ref);
+    assert_eq!(shared.poll_words[task_ref.index].flags(), (true, false));
+    for _ in 0..3 {
+      shared.wake(task_ref);
+    }
+    assert_eq!(shared.poll_words[task_ref.index].flags(), (true, true));
+    assert!(
+      !shared.lock().tasks[task_ref.index]
+        .protocol
+        .aborting_queued()
+    );
+    assert_eq!(shared.lock().scopes[0].ready_len, 0);
+    finish_poll(&shared, task_ref, PollResult::Pending);
+    drop(permit);
+    drop(task);
+    assert_eq!(shared.poll_words[task_ref.index].flags(), (false, false));
+    assert_eq!(shared.lock().scopes[0].ready_len, 1);
+    // Once queued, a wake takes the locked path and coalesces.
+    shared.wake(task_ref);
+    check_ready_lists(&shared, &shared.lock());
+    assert_eq!(shared.lock().scopes[0].ready_len, 1);
+    assert_eq!(poll_idle(&shared), task_ref);
+    assert!(take(&shared).is_none());
+    drop(job);
+    finish(shared);
+  }
+
+  #[test]
+  fn stale_generation_wake_of_a_running_reused_slot_is_inert() {
+    let (shared, root) = shared_with_task_slots(1);
+    let (old, old_job) = spawn_pending(&shared, root);
+    assert_eq!(poll_idle(&shared), old);
+    shared.abort(old);
+    assert_eq!(cancel_next(&shared), old);
+    drop(old_job);
+    let (current, job) = spawn_pending(&shared, root);
+    assert_eq!(current.index, old.index);
+    assert_ne!(current.generation, old.generation);
+
+    let (polled, task, permit) = take_poll(&shared);
+    assert_eq!(polled, current);
+    shared.wake(old);
+    assert_eq!(shared.poll_words[current.index].flags(), (true, false));
+    finish_poll(&shared, current, PollResult::Pending);
+    assert!(take(&shared).is_none());
+    shared.wake(old);
+    assert!(take(&shared).is_none());
+    drop((permit, task));
+
+    // A truncated-tag alias can only cost the occupant one spurious poll.
+    shared.wake(current);
+    let (polled, task, permit) = take_poll(&shared);
+    assert_eq!(polled, current);
+    shared.wake(TaskRef {
+      index: current.index,
+      generation: current.generation.wrapping_add(1 << 62),
+    });
+    assert_eq!(shared.poll_words[current.index].flags(), (true, true));
+    finish_poll(&shared, current, PollResult::Pending);
+    drop((permit, task));
+    assert_eq!(poll_idle(&shared), current);
+    assert!(take(&shared).is_none());
+    drop(job);
     finish(shared);
   }
 

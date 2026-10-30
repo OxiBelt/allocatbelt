@@ -1074,6 +1074,11 @@ after any in-flight poll returns. Owned scopes cancel their children on drop;
 Future cleanup and admission release precede join publication. Scheduler locks
 never cover user polling, destructors or completion callbacks. Generation tags
 make retained stale wakers harmless without retaining completed futures.
+A wake of a task whose poll is running, including its own, sets a per-slot
+atomic flag tagged with the low 62 generation bits instead of taking the
+scheduler mutex; the poll's completion takes that flag under the mutex as its
+one pending wake. Other wakes, abort and cancellation are taken under the
+scheduler mutex, and a tag alias can cause at most one spurious poll.
 
 `AsyncJob::abort_handle` returns a clonable thread-safe control handle,
 including for local jobs whose outputs are `!Send`. It retains cancellation

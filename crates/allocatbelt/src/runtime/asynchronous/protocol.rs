@@ -1,11 +1,12 @@
 //! Per-task dispatch, wake, abort, and generation transitions. Production
 //! holds this state under the scheduler mutex; Loom tests use the same helper
-//! under Loom's mutex to explore operation orderings.
+//! under Loom's mutex to explore operation orderings. `PollWord` is the one
+//! per-task word a wake may change without that mutex.
 
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PollFinish {
@@ -197,6 +198,72 @@ impl PollProtocol {
   }
 }
 
+const RUNNING: u64 = 1;
+const NOTIFIED: u64 = 1 << 1;
+const FLAGS: u64 = RUNNING | NOTIFIED;
+
+/// A task slot's lock-free wake record: the low 62 bits of the polled
+/// generation, shifted above `RUNNING` and `NOTIFIED`. The scheduler mutex
+/// owns every transition except `notify_running`, which only sets `NOTIFIED`
+/// on a running word with the waker's tag. Admission, generation and abort
+/// state stay in `PollProtocol`.
+pub(super) struct PollWord(AtomicU64);
+
+impl PollWord {
+  pub(super) fn new() -> Self {
+    Self(AtomicU64::new(0))
+  }
+
+  /// A stale waker whose generation aliases the current one after 2^62 slot
+  /// reuses can only set `NOTIFIED`, which requests one spurious poll; futures
+  /// must already tolerate that.
+  const fn tag(generation: u64) -> u64 {
+    generation << 2
+  }
+
+  /// Marks a poll of `generation` as running. Called under the scheduler
+  /// mutex while the flags are clear, so no unlocked writer races the store.
+  pub(super) fn begin(&self, generation: u64) {
+    debug_assert_eq!(self.0.load(Ordering::Relaxed) & FLAGS, 0);
+    self
+      .0
+      .store(Self::tag(generation) | RUNNING, Ordering::Release);
+  }
+
+  /// Records a wake of a running `generation` poll without the scheduler
+  /// mutex. Each success is a release RMW, so `finish` acquires the waker's
+  /// prior writes. False sends the caller to the locked wake path.
+  pub(super) fn notify_running(&self, generation: u64) -> bool {
+    let running = Self::tag(generation) | RUNNING;
+    let mut current = self.0.load(Ordering::Acquire);
+    while current & !NOTIFIED == running {
+      match self.0.compare_exchange(
+        current,
+        current | NOTIFIED,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+      ) {
+        Ok(_) => return true,
+        Err(actual) => current = actual,
+      }
+    }
+    false
+  }
+
+  /// Ends the running poll under the scheduler mutex, clearing `RUNNING` and
+  /// taking `NOTIFIED` in one RMW. Later wakes take the locked path.
+  pub(super) fn finish(&self) -> bool {
+    self.0.fetch_and(!FLAGS, Ordering::AcqRel) & NOTIFIED != 0
+  }
+
+  /// Returns the `RUNNING` and `NOTIFIED` flags.
+  #[cfg(test)]
+  pub(super) fn flags(&self) -> (bool, bool) {
+    let word = self.0.load(Ordering::Acquire);
+    (word & RUNNING != 0, word & NOTIFIED != 0)
+  }
+}
+
 /// The atomics that gate owned-scope close readiness. Scheduler slot removal
 /// is serialized separately; a close is ready only after that removal sets
 /// `reclaimed` for the same generation.
@@ -260,7 +327,7 @@ mod loom_tests {
   use loom::sync::{Arc, Mutex};
   use loom::thread;
 
-  use super::{PollFinish, PollProtocol, PollQuota, ScopeProtocol};
+  use super::{PollFinish, PollProtocol, PollQuota, PollWord, ScopeProtocol};
 
   fn lock<T>(mutex: &Mutex<T>) -> loom::sync::MutexGuard<'_, T> {
     mutex
@@ -546,6 +613,157 @@ mod loom_tests {
       state.finish_cancel();
       assert!(!state.admitted());
       assert!(!state.queued);
+    });
+  }
+
+  /// One task slot as the scheduler holds it: `PollProtocol` and a count of
+  /// ready-list insertions under the mutex, and the unlocked wake word.
+  struct WordSlot {
+    locked: Mutex<(PollProtocol, usize)>,
+    word: PollWord,
+  }
+
+  /// Admits `generation`, queues it and begins its poll, as `dequeue` does.
+  fn running_slot(generation: u64) -> Arc<WordSlot> {
+    let mut protocol = PollProtocol::new();
+    protocol.admit(generation);
+    assert!(protocol.queue());
+    assert_eq!(protocol.begin_poll(), Some(false));
+    let word = PollWord::new();
+    word.begin(generation);
+    Arc::new(WordSlot {
+      locked: Mutex::new((protocol, 0)),
+      word,
+    })
+  }
+
+  fn locked_wake(slot: &WordSlot, generation: u64) {
+    let mut locked = lock(&slot.locked);
+    if locked.0.matches(generation) && locked.0.wake() {
+      locked.1 += 1;
+    }
+  }
+
+  fn word_wake(slot: &WordSlot, generation: u64) {
+    if !slot.word.notify_running(generation) {
+      locked_wake(slot, generation);
+    }
+  }
+
+  fn word_finish(slot: &WordSlot, ready: bool) -> PollFinish {
+    let mut locked = lock(&slot.locked);
+    if slot.word.finish() {
+      assert!(!locked.0.wake());
+    }
+    let finish = locked.0.finish_poll(ready, false);
+    if finish == PollFinish::Requeue {
+      locked.1 += 1;
+    }
+    finish
+  }
+
+  #[test]
+  fn loom_lock_free_self_wake_racing_finish_and_wakes_queues_once() {
+    bounded_model(|| {
+      let slot = running_slot(1);
+      let poller = {
+        let slot = Arc::clone(&slot);
+        thread::spawn(move || {
+          word_wake(&slot, 1);
+          word_finish(&slot, false)
+        })
+      };
+      let waker = {
+        let slot = Arc::clone(&slot);
+        thread::spawn(move || word_wake(&slot, 1))
+      };
+      let locked = {
+        let slot = Arc::clone(&slot);
+        thread::spawn(move || locked_wake(&slot, 1))
+      };
+      let finish = poller.join().unwrap();
+      waker.join().unwrap();
+      locked.join().unwrap();
+      assert_eq!(finish, PollFinish::Requeue);
+      assert_eq!(slot.word.flags(), (false, false));
+      let mut locked = lock(&slot.locked);
+      assert_eq!(locked.1, 1);
+      assert!(locked.0.queued);
+      assert_eq!(locked.0.begin_poll(), Some(false));
+      assert_eq!(locked.0.finish_poll(true, false), PollFinish::Complete);
+    });
+  }
+
+  #[test]
+  fn loom_lock_free_wake_racing_pending_finish_is_never_lost() {
+    bounded_model(|| {
+      let slot = running_slot(1);
+      let poller = {
+        let slot = Arc::clone(&slot);
+        thread::spawn(move || word_finish(&slot, false))
+      };
+      let waker = {
+        let slot = Arc::clone(&slot);
+        thread::spawn(move || word_wake(&slot, 1))
+      };
+      let _ = poller.join().unwrap();
+      waker.join().unwrap();
+      assert_eq!(slot.word.flags(), (false, false));
+      let locked = lock(&slot.locked);
+      // Either `finish` took `NOTIFIED`, or the wake saw `RUNNING` clear and
+      // queued under the mutex; never both, never neither.
+      assert_eq!(locked.1, 1);
+      assert!(locked.0.queued && !locked.0.running);
+    });
+  }
+
+  #[test]
+  fn loom_lock_free_wake_racing_ready_finish_releases_without_queueing() {
+    bounded_model(|| {
+      let slot = running_slot(1);
+      let poller = {
+        let slot = Arc::clone(&slot);
+        thread::spawn(move || word_finish(&slot, true))
+      };
+      let waker = {
+        let slot = Arc::clone(&slot);
+        thread::spawn(move || word_wake(&slot, 1))
+      };
+      assert_eq!(poller.join().unwrap(), PollFinish::Complete);
+      waker.join().unwrap();
+      assert_eq!(slot.word.flags(), (false, false));
+      let locked = lock(&slot.locked);
+      assert_eq!(locked.1, 0);
+      assert!(!locked.0.admitted() && !locked.0.queued);
+    });
+  }
+
+  #[test]
+  fn loom_stale_generation_word_wake_cannot_queue_a_reused_slot() {
+    bounded_model(|| {
+      let slot = running_slot(2);
+      let stale = {
+        let slot = Arc::clone(&slot);
+        thread::spawn(move || word_wake(&slot, 1))
+      };
+      let poller = {
+        let slot = Arc::clone(&slot);
+        thread::spawn(move || word_finish(&slot, false))
+      };
+      stale.join().unwrap();
+      assert_eq!(poller.join().unwrap(), PollFinish::Idle);
+      assert_eq!(slot.word.flags(), (false, false));
+      let mut locked = lock(&slot.locked);
+      assert_eq!(locked.1, 0);
+      assert!(!locked.0.queued);
+      // A truncated-tag alias of the running generation only adds one poll.
+      assert!(locked.0.queue());
+      assert_eq!(locked.0.begin_poll(), Some(false));
+      slot.word.begin(2);
+      drop(locked);
+      assert!(slot.word.notify_running(2 + (1 << 62)));
+      assert_eq!(word_finish(&slot, false), PollFinish::Requeue);
+      assert_eq!(lock(&slot.locked).1, 1);
     });
   }
 
