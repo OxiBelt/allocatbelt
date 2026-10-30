@@ -46,7 +46,8 @@ pub(super) enum PollResult {
 pub(super) trait ErasedTask: Send + Sync {
   /// Polls once without a scheduler lock. The future mutex prevents a
   /// cancellation cleanup from taking the future concurrently with poll.
-  fn poll(&self, cx: &mut Context<'_>, permit: PollPermit) -> PollResult;
+  /// Pending returns the quota permit for the caller's locked completion.
+  fn poll(&self, cx: &mut Context<'_>, permit: PollPermit) -> (PollResult, Option<PollPermit>);
 
   /// Drops a cancelled future and stages its terminal outcome, with no
   /// scheduler lock held.
@@ -168,14 +169,15 @@ where
   F: Future + Send + 'static,
   F::Output: Send + 'static,
 {
-  fn poll(&self, cx: &mut Context<'_>, permit: PollPermit) -> PollResult {
+  fn poll(&self, cx: &mut Context<'_>, permit: PollPermit) -> (PollResult, Option<PollPermit>) {
     let _task_context =
       TaskContextGuard::enter_with_resource(Some(self.id), self.resources.clone());
     let Some(mut future) = self.lock_future().take() else {
       self.release_waiter();
       self.release_task_waker();
       self.release_task_admission();
-      return PollResult::Ready;
+      drop(permit);
+      return (PollResult::Ready, None);
     };
     // Take ownership before calling user code. The task-state mutex is never
     // held while polling or dropping the future.
@@ -185,15 +187,14 @@ where
       panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx)))
     };
     drop(cpu_execution);
-    // Polling is the only quota-protected region. Release before user
-    // destructors, output staging, or cancellation cleanup can execute.
-    drop(permit);
     match result {
       Ok(std::task::Poll::Pending) => {
         *self.lock_future() = Some(future);
-        PollResult::Pending
+        (PollResult::Pending, Some(permit))
       }
       Ok(std::task::Poll::Ready(output)) => {
+        // Release before user destructors, output staging or cleanup.
+        drop(permit);
         let cleanup_panic = panic::catch_unwind(AssertUnwindSafe(|| drop(future))).err();
         self.release_future_frame_control();
         if let Some(payload) = cleanup_panic {
@@ -205,9 +206,10 @@ where
         self.release_waiter();
         self.release_task_waker();
         self.release_task_admission();
-        PollResult::Ready
+        (PollResult::Ready, None)
       }
       Err(payload) => {
+        drop(permit);
         if let Err(cleanup_payload) = panic::catch_unwind(AssertUnwindSafe(|| drop(future))) {
           drop_contained(cleanup_payload);
         }
@@ -216,7 +218,7 @@ where
         self.release_waiter();
         self.release_task_waker();
         self.release_task_admission();
-        PollResult::Ready
+        (PollResult::Ready, None)
       }
     }
   }

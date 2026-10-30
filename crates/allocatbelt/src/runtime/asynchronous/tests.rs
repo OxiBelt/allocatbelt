@@ -2375,3 +2375,56 @@ fn a_handle_retained_after_shutdown_rejects_spawn_and_returns_future() {
   assert!(matches!(error.kind, super::AsyncError::Closed));
   assert_eq!(block_on(error.into_future()), 19);
 }
+
+#[test]
+fn cpu_limited_self_yielding_tasks_progress_and_return_cpu() {
+  use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
+
+  let ceiling = DomainResources::ZERO
+    .with(DomainResource::Cpu, 1)
+    .with(DomainResource::Tasks, 8)
+    .with(DomainResource::Control, 1 << 20);
+  let domain = ResourceDomain::with_waiters(ceiling, 1, 8).unwrap();
+  let tenant = domain.tenant(ceiling).unwrap();
+  let runtime = AsyncRuntime::with_resources(
+    AsyncConfig {
+      workers: 2,
+      max_outstanding: 4,
+      max_scopes: 1,
+    },
+    ResourceScope::from_tenant(ResourceLimits::default(), tenant),
+  )
+  .unwrap_or_else(|error| panic!("runtime setup failed: {error}"));
+  // Two tasks share one CPU ticket. A pending poll must return its ticket
+  // before the scheduler lock is retaken, so the other worker can admit the
+  // requeued task instead of stalling behind it.
+  let jobs: Vec<_> = (0..2)
+    .map(|_| {
+      let mut polls = 0;
+      runtime
+        .handle()
+        .spawn(std::future::poll_fn(move |cx| {
+          polls += 1;
+          if polls == 2_000 {
+            Poll::Ready(polls)
+          } else {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+          }
+        }))
+        .unwrap_or_else(|error| panic!("spawn failed: {}", error.kind))
+    })
+    .collect();
+  let deadline = Instant::now() + Duration::from_secs(30);
+  while !jobs.iter().all(|job| job.is_finished()) {
+    assert!(Instant::now() < deadline, "CPU-limited tasks stalled");
+    std::thread::sleep(Duration::from_millis(1));
+  }
+  for job in jobs {
+    assert_eq!(runtime.block_on(job).unwrap().unwrap(), 2_000);
+  }
+  assert_eq!(domain.snapshot().used.get(DomainResource::Cpu), 0);
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+}

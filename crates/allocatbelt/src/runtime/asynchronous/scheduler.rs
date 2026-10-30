@@ -140,6 +140,8 @@ pub(super) struct Shared {
   /// Deterministic admission interleavings; absent from non-test builds.
   #[cfg(all(test, not(loom)))]
   spawn_admission_test_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+  #[cfg(all(test, not(loom)))]
+  lock_acquisitions: AtomicUsize,
   _control: ControlCharge,
 }
 
@@ -334,6 +336,8 @@ impl Shared {
         handoff: Condvar::new(),
         #[cfg(all(test, not(loom)))]
         spawn_admission_test_hook: Mutex::new(None),
+        #[cfg(all(test, not(loom)))]
+        lock_acquisitions: AtomicUsize::new(0),
         _control: control,
       }),
       root,
@@ -341,6 +345,8 @@ impl Shared {
   }
 
   fn lock(&self) -> MutexGuard<'_, State> {
+    #[cfg(all(test, not(loom)))]
+    self.lock_acquisitions.fetch_add(1, Ordering::Relaxed);
     self.state.lock().unwrap_or_else(PoisonError::into_inner)
   }
 
@@ -663,19 +669,7 @@ impl Shared {
   fn release_poll(&self, scope_ref: ScopeRef) {
     let notify = {
       let mut state = self.lock();
-      let Some(slot) = state.scopes.get_mut(scope_ref.index) else {
-        return;
-      };
-      if slot.generation != scope_ref.generation || slot.scope.is_none() {
-        return;
-      }
-      let capacity_available = slot.quota.release();
-      if capacity_available && slot.quota_blocked {
-        refresh_scope_schedule(&mut state, scope_ref);
-        state.idle > 0
-      } else {
-        false
-      }
+      release_poll_locked(&mut state, scope_ref)
     };
     if notify {
       // One released quota adds one RR token; only parked dispatchers need a wake.
@@ -1012,6 +1006,23 @@ impl Shared {
   }
 }
 
+/// Returns whether releasing this quota unblocked a scope with an idle waiter.
+fn release_poll_locked(state: &mut State, scope_ref: ScopeRef) -> bool {
+  let Some(slot) = state.scopes.get_mut(scope_ref.index) else {
+    return false;
+  };
+  if slot.generation != scope_ref.generation || slot.scope.is_none() {
+    return false;
+  }
+  let capacity_available = slot.quota.release();
+  if capacity_available && slot.quota_blocked {
+    refresh_scope_schedule(state, scope_ref);
+    state.idle > 0
+  } else {
+    false
+  }
+}
+
 /// Releases one dispatcher permit and wakes whoever it unblocks: a restorer,
 /// or, for the final release after close, every thread waiting to exit.
 fn end_turn(shared: &Shared, state: &mut State, turn: DispatchTurn) {
@@ -1341,8 +1352,8 @@ impl Selected {
   }
 }
 
-/// Releases one scope's active-poll reservation on every exit path. The task
-/// drops this immediately after the user's `Future::poll` returns, before any
+/// Releases one scope's active-poll reservation on every exit path. Pending
+/// polls return it for locked completion; terminal polls drop it before any
 /// future/output cleanup can run.
 pub(super) struct PollPermit {
   shared: Weak<Shared>,
@@ -1356,6 +1367,20 @@ impl PollPermit {
       .cpu_ticket
       .as_ref()
       .map(DomainReservation::domain_identity)
+  }
+
+  /// Releases the poll slot under the caller's scheduler lock. The fallback
+  /// release is disarmed first, so a panic here cannot relock the scheduler.
+  /// The CPU ticket must already be gone: its drop may run wakers.
+  fn release_locked(mut self, state: &mut State) -> bool {
+    debug_assert!(self.cpu_ticket.is_none());
+    self.shared = Weak::new();
+    release_poll_locked(state, self.scope)
+  }
+
+  /// Returns the CPU ticket so it can be dropped as soon as the poll ends.
+  fn take_cpu_ticket(&mut self) -> Option<DomainReservation> {
+    self.cpu_ticket.take()
   }
 
   fn set_cpu_ticket(&mut self, ticket: DomainReservation) {
@@ -1458,17 +1483,87 @@ fn dequeue(shared: &Arc<Shared>, state: &mut State) -> Option<Selected> {
   None
 }
 
-/// Ends the caller's finished turn, then returns its next turn, a park or
-/// retirement between turns, or exit. A new turn needs one of the `workers`
-/// dispatcher permits and yields to waiting restorations.
+struct PendingFinish {
+  task: TaskRef,
+  permit: Option<PollPermit>,
+}
+
+/// Finishes a pending poll while retaining the turn for cancellation cleanup.
+fn finish_pending_locked(
+  shared: &Shared,
+  state: &mut State,
+  task_ref: TaskRef,
+) -> Option<Arc<dyn ErasedTask>> {
+  let cancel_all = state.cancel_all;
+  let slot = state.tasks.get_mut(task_ref.index)?;
+  if !slot.protocol.matches(task_ref.generation) || slot.task.is_none() {
+    return None;
+  }
+  if shared.poll_words[task_ref.index].finish() {
+    let inserted = slot.protocol.wake();
+    debug_assert!(!inserted);
+  }
+  match slot.protocol.finish_poll(false, cancel_all) {
+    PollFinish::CancelCleanup => slot.task.as_ref().map(Arc::clone),
+    PollFinish::Requeue => {
+      push_ready(state, task_ref, &shared.metrics.inner().queue_depth);
+      None
+    }
+    PollFinish::Idle | PollFinish::Stale => None,
+    PollFinish::Complete => unreachable!("pending poll completed admission"),
+  }
+}
+
+/// Completes the caller's pending poll, if any, under the same lock: it
+/// releases the poll slot, finishes the task and requeues it. Cancellation
+/// cleanup keeps the finished turn and returns as `Work::Cancel`. Otherwise
+/// ends that turn, then returns the next turn, a park or retirement between
+/// turns, or exit. A new turn needs one of the `workers` dispatcher permits
+/// and yields to waiting restorations.
 fn take_next(
   shared: &Arc<Shared>,
   shard: usize,
   context: AsyncThreadContext,
   lease: &mut Option<HelperLease>,
   finished: Option<DispatchTurn>,
+  pending: Option<PendingFinish>,
 ) -> Work {
   let mut state = shared.lock();
+  let mut notify_pending = pending.is_some();
+  if let Some(PendingFinish { task, permit }) = pending {
+    if let Some(permit) = permit {
+      // Dispatch below consumes the released capacity; on other paths the
+      // backlog notification below replaces the quota/requeue notifications.
+      permit.release_locked(&mut state);
+    }
+    let cancel = finish_pending_locked(shared, &mut state, task);
+    // Pending completion, including idle/stale, must let closed waiters
+    // recheck cancellation and exit just as the separate finish did.
+    let broadcast = state.closed;
+    if let Some(cancel) = cancel {
+      // Cleanup keeps this turn and cannot consume released quota's work.
+      let notify = !state.round_robin.is_empty() && state.idle > 0;
+      drop(state);
+      if broadcast {
+        shared.work.notify_all();
+      } else if notify {
+        shared.work.notify_one();
+      }
+      if let Some(turn) = finished {
+        return Work::Cancel(task, cancel, turn);
+      }
+      // Without a TLS turn, the old finish_poll still cleaned up
+      // synchronously before dispatching any new work.
+      cancel.cancel();
+      finish_cancel(shared, task, cancel);
+      return take_next(shared, shard, context, lease, None, None);
+    }
+    if broadcast {
+      drop(state);
+      shared.work.notify_all();
+      state = shared.lock();
+    }
+  }
   if let Some(turn) = finished {
     end_turn(shared, &mut state, turn);
   }
@@ -1477,9 +1572,11 @@ fn take_next(
       match state.turns.retire_helper(held) {
         Ok(()) => {
           if !state.round_robin.is_empty() {
-            // A wake meant for a dispatcher may have reached this helper.
+            // Retirement cannot consume the pending quota/requeue backlog;
+            // a wake meant for a dispatcher may have reached this helper.
             shared.work.notify_all();
           }
+          drop(state);
           return Work::Retire;
         }
         Err(held) => *lease = Some(held),
@@ -1500,11 +1597,22 @@ fn take_next(
       }
       end_turn(shared, &mut state, turn);
     }
+    // No dispatch: exit, park, or a restorer preventing a new turn must
+    // pass any quota/requeue backlog to an idle dispatcher.
+    let backlog = notify_pending && !state.round_robin.is_empty() && state.idle > 0;
+    notify_pending = false;
     if state.turns.may_exit(admission_empty(&state)) {
+      drop(state);
+      if backlog {
+        shared.work.notify_one();
+      }
       return Work::Exit;
     }
     state.idle += 1;
     drop(state);
+    if backlog {
+      shared.work.notify_one();
+    }
     cache::flush();
     state = shared.lock();
     let excess = lease.is_some() && state.turns.helper_is_excess();
@@ -1568,8 +1676,16 @@ fn run_turns(
   lease: &mut Option<HelperLease>,
 ) -> Stop {
   let mut finished = None;
+  let mut pending = None;
   loop {
-    match take_next(shared, shard, context, lease, finished.take()) {
+    match take_next(
+      shared,
+      shard,
+      context,
+      lease,
+      finished.take(),
+      pending.take(),
+    ) {
       Work::Poll(task_ref, task, permit, turn) => {
         handoff::enter_turn(turn);
         super::entry::reset_budget();
@@ -1586,25 +1702,38 @@ fn run_turns(
             }
           };
         let mut context = Context::from_waker(&waker);
-        match task.acquire_cpu(&waker) {
-          DomainCpuAdmission::Unbounded => {
-            let result = task.poll(&mut context, permit);
-            finish_poll(shared, task_ref, result);
-          }
+        let (result, permit) = match task.acquire_cpu(&waker) {
+          DomainCpuAdmission::Unbounded => task.poll(&mut context, permit),
           DomainCpuAdmission::Acquired(ticket) => {
             let mut permit = permit;
             permit.set_cpu_ticket(ticket);
-            let result = task.poll(&mut context, permit);
-            finish_poll(shared, task_ref, result);
+            task.poll(&mut context, permit)
           }
-          DomainCpuAdmission::Waiting => {
-            finish_poll(shared, task_ref, PollResult::Pending);
-            drop(permit);
-          }
+          DomainCpuAdmission::Waiting => (PollResult::Pending, Some(permit)),
           DomainCpuAdmission::Rejected(error) => {
             task.fail_resource(error);
             finish_poll(shared, task_ref, PollResult::Ready);
             drop(permit);
+            drop(task);
+            drop(waker);
+            finished = handoff::leave_turn();
+            continue;
+          }
+        };
+        match result {
+          PollResult::Pending => {
+            let mut permit = permit;
+            // Return CPU capacity now, unlocked: a ticket held until the
+            // next dispatch would refuse the requeued task's admission, and
+            // its release may run wakers.
+            drop(permit.as_mut().and_then(PollPermit::take_cpu_ticket));
+            pending = Some(PendingFinish {
+              task: task_ref,
+              permit,
+            })
+          }
+          PollResult::Ready => {
+            finish_poll(shared, task_ref, PollResult::Ready);
           }
         }
         drop(task);
@@ -2146,7 +2275,7 @@ mod tests {
     };
     assert!(matches!(
       task.poll(&mut Context::from_waker(&waker), permit),
-      PollResult::Ready
+      (PollResult::Ready, None)
     ));
     assert_eq!(Arc::strong_count(&probe), 2);
     drop(waker);
@@ -2216,7 +2345,7 @@ mod tests {
         let waker = Waker::noop();
         assert!(matches!(
           task.poll(&mut Context::from_waker(waker), unscheduled_permit()),
-          PollResult::Ready
+          (PollResult::Ready, None)
         ));
       },
     );
@@ -2230,7 +2359,7 @@ mod tests {
       assert_eq!(Arc::strong_count(&probe), 3);
       assert!(matches!(
         task.poll(&mut Context::from_waker(&recreated), unscheduled_permit()),
-        PollResult::Ready
+        (PollResult::Ready, None)
       ));
       assert_eq!(Arc::strong_count(&probe), 2);
       drop(recreated);
@@ -2577,6 +2706,265 @@ mod tests {
     shared.close(true);
     check_ready_lists(&shared, &shared.lock());
     drop(shared);
+  }
+
+  #[test]
+  fn pending_self_yields_take_one_scheduler_lock_per_poll() {
+    let runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 1,
+      max_scopes: 1,
+    })
+    .unwrap();
+    let shared = Arc::clone(&runtime.shared);
+    let mut previous = None;
+    let mut pending_polls = 0;
+    let job = runtime
+      .handle()
+      .spawn(std::future::poll_fn(move |cx| {
+        let locks = shared.lock_acquisitions.load(Ordering::Relaxed);
+        if let Some(previous) = previous {
+          assert_eq!(locks - previous, 1);
+        }
+        previous = Some(locks);
+        if pending_polls == 1_000 {
+          return Poll::Ready(pending_polls);
+        }
+        pending_polls += 1;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+      }))
+      .unwrap();
+    assert_eq!(finish_job(job).unwrap(), 1_000);
+    shutdown_with_deadline(runtime, AsyncShutdown::Drain);
+  }
+
+  #[test]
+  fn quota_one_pending_tasks_alternate_until_both_complete() {
+    let (shared, _) = shared_with_config(AsyncConfig {
+      workers: 1,
+      max_outstanding: 2,
+      max_scopes: 2,
+    });
+    let scope = shared.new_scope(1, None).unwrap();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let jobs: Vec<_> = (0..2)
+      .map(|id| {
+        let order = Arc::clone(&order);
+        let mut polls = 0;
+        shared
+          .spawn(
+            scope.scope,
+            std::future::poll_fn(move |cx| {
+              order.lock().unwrap().push(id);
+              polls += 1;
+              if polls == 4 {
+                Poll::Ready(())
+              } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+              }
+            }),
+          )
+          .unwrap()
+      })
+      .collect();
+    // Start both tasks queued so the FIFO witness is deterministic.
+    let context = AsyncThreadContext {
+      role: super::super::thread_options::AsyncThreadRole::Worker,
+      index: 0,
+      physical_index: 0,
+    };
+    shared.close(false);
+    // A leaked poll slot would park this dispatcher forever; fail instead.
+    let (done, finished) = mpsc::channel();
+    let dispatcher = Arc::clone(&shared);
+    std::thread::spawn(move || {
+      let _dispatcher = handoff::DispatcherGuard::install(&dispatcher, context);
+      let _ = done.send(run_turns(&dispatcher, 0, context, &mut None));
+    });
+    assert_eq!(
+      finished
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap_or_else(|error| panic!("dispatcher did not exit: {error}")),
+      Stop::Exit
+    );
+    assert_eq!(*order.lock().unwrap(), vec![0, 1, 0, 1, 0, 1, 0, 1]);
+    for job in jobs {
+      finish_job(job).unwrap();
+    }
+    assert_eq!(scope.snapshot().active_polls, 0);
+    drop(scope);
+  }
+
+  struct PendingAbortProbe {
+    shared: Arc<Shared>,
+    entered: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+    polls: Arc<AtomicUsize>,
+    cleanup_turns: Arc<AtomicUsize>,
+  }
+
+  impl Future for PendingAbortProbe {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+      self.polls.fetch_add(1, Ordering::Relaxed);
+      self.entered.send(()).unwrap();
+      self.release.recv_timeout(Duration::from_secs(30)).unwrap();
+      cx.waker().wake_by_ref();
+      Poll::Pending
+    }
+  }
+
+  impl Drop for PendingAbortProbe {
+    fn drop(&mut self) {
+      let state = self.shared.lock();
+      self
+        .cleanup_turns
+        .store(state.turns.counts().0, Ordering::Relaxed);
+      assert_eq!(state.scopes[1].quota.active(), 0);
+    }
+  }
+
+  #[test]
+  fn abort_during_pending_poll_cleans_up_in_the_same_turn() {
+    let runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 1,
+      max_scopes: 2,
+    })
+    .unwrap();
+    let scope = runtime
+      .scope_with_config(super::super::AsyncScopeConfig {
+        max_active_polls: 1,
+      })
+      .unwrap();
+    let (entered, arrival) = mpsc::channel();
+    let (release, resume) = mpsc::channel();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let cleanup_turns = Arc::new(AtomicUsize::new(0));
+    let job = scope
+      .handle()
+      .spawn(PendingAbortProbe {
+        shared: Arc::clone(&runtime.shared),
+        entered,
+        release: resume,
+        polls: Arc::clone(&polls),
+        cleanup_turns: Arc::clone(&cleanup_turns),
+      })
+      .unwrap();
+    arrival.recv_timeout(Duration::from_secs(30)).unwrap();
+    job.abort();
+    let mut close = Box::pin(scope.close());
+    assert!(
+      close
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending()
+    );
+    release.send(()).unwrap();
+    assert!(matches!(finish_job(job), Err(AsyncJoinError::Cancelled)));
+    assert_eq!(polls.load(Ordering::Relaxed), 1);
+    assert_eq!(cleanup_turns.load(Ordering::Relaxed), 1);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while close
+      .as_mut()
+      .poll(&mut Context::from_waker(Waker::noop()))
+      .is_pending()
+    {
+      assert!(Instant::now() < deadline, "scope close timed out");
+      std::thread::yield_now();
+    }
+    shutdown_with_deadline(runtime, AsyncShutdown::Drain);
+  }
+
+  #[test]
+  fn pending_cancellation_without_a_tls_turn_cleans_up_before_exit() {
+    let (shared, root) = shared_with_task_slots(1);
+    let (task_ref, job) = spawn_pending(&shared, root);
+    let (selected, task, permit) = take_poll(&shared);
+    assert_eq!(selected, task_ref);
+    let (result, permit) = task.poll(&mut Context::from_waker(Waker::noop()), permit);
+    assert!(matches!(result, PollResult::Pending));
+    shared.abort(task_ref);
+    shared.close(false);
+    drop(task);
+    let context = AsyncThreadContext {
+      role: super::super::thread_options::AsyncThreadRole::Worker,
+      index: 0,
+      physical_index: 0,
+    };
+    assert!(matches!(
+      take_next(
+        &shared,
+        0,
+        context,
+        &mut None,
+        None,
+        Some(PendingFinish {
+          task: task_ref,
+          permit,
+        })
+      ),
+      Work::Exit
+    ));
+    assert!(matches!(finish_job(job), Err(AsyncJoinError::Cancelled)));
+    assert_eq!(shared.turn_counts(), (0, 0, 0, 0));
+    assert_eq!(shared.lock().scopes[0].quota.active(), 0);
+  }
+
+  #[test]
+  fn closed_runtime_finishes_pending_self_yields_with_a_deadline() {
+    for mode in [AsyncShutdown::Drain, AsyncShutdown::CancelPending] {
+      let runtime = AsyncRuntime::new(AsyncConfig {
+        workers: 4,
+        max_outstanding: 8,
+        max_scopes: 1,
+      })
+      .unwrap();
+      let release = Arc::new(AtomicBool::new(false));
+      let mut jobs = Vec::new();
+      let started = Arc::new(AtomicUsize::new(0));
+      for _ in 0..8 {
+        let started = Arc::clone(&started);
+        let shared = Arc::clone(&runtime.shared);
+        let release = Arc::clone(&release);
+        let mut polls = 0;
+        let mut first = true;
+        jobs.push(
+          runtime
+            .handle()
+            .spawn(std::future::poll_fn(move |cx| {
+              if first {
+                first = false;
+                started.fetch_add(1, Ordering::Release);
+              }
+              // Keep self-yielding through closure; Drain must finish these
+              // through the merged path after admission closes.
+              if release.load(Ordering::Acquire) && shared.lock().closed {
+                polls += 1;
+                if polls == 10 {
+                  return Poll::Ready(());
+                }
+              }
+              cx.waker().wake_by_ref();
+              Poll::Pending
+            }))
+            .unwrap(),
+        );
+      }
+      wait_for_scheduler(|| started.load(Ordering::Acquire) == 8, "initial polls");
+      release.store(true, Ordering::Release);
+      shutdown_with_deadline(runtime, mode);
+      for job in jobs {
+        match finish_job(job) {
+          Ok(()) => assert_eq!(mode, AsyncShutdown::Drain),
+          Err(AsyncJoinError::Cancelled) => assert_eq!(mode, AsyncShutdown::CancelPending),
+          Err(error) => panic!("unexpected join error: {error}"),
+        }
+      }
+    }
   }
 
   #[test]

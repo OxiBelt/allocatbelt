@@ -1289,3 +1289,29 @@ fn outside_any_runtime_the_closure_runs_inline() {
     Some(caller)
   );
 }
+
+#[test]
+fn handoff_restores_a_poll_that_then_returns_pending() {
+  let runtime = handoff_runtime(1, 1, 2, 2);
+  let scope = own_scope(&runtime);
+  let helper_handle = runtime.handle();
+  let mut polls = 0;
+  let job = scope
+    .spawn(std::future::poll_fn(move |cx| {
+      polls += 1;
+      if polls == 4 {
+        return Poll::Ready(polls);
+      }
+      let helper = spawned(&helper_handle, async { 7 });
+      let result = try_block_in_place(|| joined(helper))
+        .unwrap_or_else(|error| panic!("handoff failed: {:?}", error.kind));
+      assert_eq!(result, 7);
+      assert!(try_task_id().is_some());
+      cx.waker().wake_by_ref();
+      Poll::Pending
+    }))
+    .unwrap_or_else(|error| panic!("spawn failed: {}", error.kind));
+  assert_eq!(joined(job), 4);
+  runtime.handle().block_on(scope.close()).unwrap();
+  drained(runtime);
+}
