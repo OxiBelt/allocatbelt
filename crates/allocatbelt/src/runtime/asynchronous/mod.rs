@@ -19,7 +19,7 @@
 //! on a bounded set of prestarted helpers meanwhile.
 
 //! Strict dispatch preserves per-scope order; opt-in Distributed uses FIFO
-//! lanes with bounded stealing and currently requires handoffs to be disabled.
+//! lanes with bounded stealing and seat adoption by prestarted handoff helpers.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
@@ -143,8 +143,11 @@ pub struct AsyncConfig {
 #[cfg_attr(not(test), derive(Default))]
 #[non_exhaustive]
 pub enum AsyncDispatch {
-  /// FIFO lanes with bounded stealing. Available without handoffs; combining
-  /// this mode with handoffs returns [`AsyncError::InvalidConfig`].
+  /// FIFO lanes with bounded stealing. Handoff helpers adopt vacant seats;
+  /// restorers receive a vacant seat or a helper seat at its next poll boundary.
+  /// If only workers hold seats, one yields between polls to restore a
+  /// helper-origin loan. With handoffs, the unchanged root limit (`W`) binds
+  /// below `W + B`, so root quota acquisition and release use its scope mutex.
   Distributed,
   /// Ordinary ready work keeps per-scope FIFO order, with ready scopes
   /// rotating one poll per turn. Cancellation cleanup can pass queued
@@ -512,9 +515,6 @@ impl AsyncRuntime {
     options: AsyncThreadOptions,
     dispatch: AsyncDispatch,
   ) -> Result<Self, AsyncError> {
-    if dispatch == AsyncDispatch::Distributed && max_handoffs != 0 {
-      return Err(AsyncError::InvalidConfig);
-    }
     if config.workers == 0 || config.max_outstanding == 0 || config.max_scopes == 0 {
       return Err(AsyncError::InvalidConfig);
     }

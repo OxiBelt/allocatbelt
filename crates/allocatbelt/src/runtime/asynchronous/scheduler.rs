@@ -330,7 +330,7 @@ impl Shared {
       generation: 1,
     };
     let distributed = if distributed_mode {
-      Some(Distributed::new(config)?)
+      Some(Distributed::new(config, max_handoffs)?)
     } else {
       None
     };
@@ -1010,6 +1010,9 @@ impl Shared {
   /// Converts the caller's turn into a handoff loan, or returns the turn
   /// unchanged when every slot is loaned.
   pub(super) fn hand_off(&self, turn: DispatchTurn) -> Result<HandoffLoan, DispatchTurn> {
+    if let Some(d) = &self.distributed {
+      return d.hand_off(turn);
+    }
     let loan = self.lock().turns.try_hand_off(turn)?;
     // The released permit may serve a helper, a dispatcher or a restorer.
     self.handoff.notify_all();
@@ -1020,6 +1023,9 @@ impl Shared {
   /// Waits, with priority over new turns, until the loan's thread holds a
   /// dispatcher permit again. Admission closure does not prevent this.
   pub(super) fn restore(&self, loan: HandoffLoan, context: AsyncThreadContext) -> DispatchTurn {
+    if let Some(d) = &self.distributed {
+      return d.restore(self, loan, context);
+    }
     let mut state = self.lock();
     let mut ticket = state.turns.begin_restore(loan);
     let mut flushed = false;
@@ -1067,6 +1073,9 @@ impl Shared {
   /// and helper counts.
   #[cfg(all(test, not(loom)))]
   pub(super) fn turn_counts(&self) -> (usize, usize, usize, usize) {
+    if let Some(d) = &self.distributed {
+      return d.turn_counts();
+    }
     let state = self.lock();
     state.turns.check();
     state.turns.counts()
@@ -1929,6 +1938,11 @@ pub(super) fn helper(
 ) {
   let shard = context.physical_index;
   executor_thread(&shared, context, context_control, || {
+    if let Some(d) = &shared.distributed {
+      d.helper(&shared, context);
+      cache::flush();
+      return;
+    }
     while let Some(lease) = wait_for_activation(&shared, shard, context) {
       let mut lease = Some(lease);
       let stop = run_turns(&shared, shard, context, &mut lease);

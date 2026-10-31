@@ -72,9 +72,8 @@ fn dispatch_defaults_to_strict_and_is_retained_by_metrics() {
 }
 
 #[test]
-fn distributed_handoffs_are_rejected_before_thread_callbacks() {
-  use super::{AsyncDispatch, AsyncError, AsyncRuntimeOptions, AsyncThreadOptions};
-
+fn distributed_handoffs_construct_with_thread_options_and_resources() {
+  use super::{AsyncDispatch, AsyncRuntimeOptions, AsyncThreadOptions, HandoffConfig};
   let config = AsyncConfig {
     workers: 1,
     max_outstanding: 2,
@@ -84,24 +83,30 @@ fn distributed_handoffs_are_rejected_before_thread_callbacks() {
   let calls = Arc::clone(&name_calls);
   let options = AsyncRuntimeOptions::new()
     .dispatch(AsyncDispatch::Distributed)
-    .handoffs(super::HandoffConfig { max_handoffs: 1 })
+    .handoffs(HandoffConfig { max_handoffs: 1 })
     .thread_options(AsyncThreadOptions::new().thread_name_fn(move |_| {
       calls.fetch_add(1, Ordering::Relaxed);
-      String::from("unavailable-dispatch")
+      String::from("dispatch-handoff")
     }));
-  assert!(matches!(
-    AsyncRuntime::new_with_options(config, options.clone()),
-    Err(AsyncError::InvalidConfig)
-  ));
-  assert!(matches!(
+  for runtime in [
+    AsyncRuntime::new_with_options(config, options.clone()).unwrap(),
     AsyncRuntime::with_resources_and_options(
       config,
       ResourceScope::new(ResourceLimits::default()),
       options,
-    ),
-    Err(AsyncError::InvalidConfig)
-  ));
-  assert_eq!(name_calls.load(Ordering::Relaxed), 0);
+    )
+    .unwrap(),
+  ] {
+    let job = runtime
+      .handle()
+      .spawn(async { super::try_block_in_place(|| 7).ok() })
+      .unwrap();
+    assert_eq!(runtime.block_on(job).unwrap().unwrap(), Some(7));
+    runtime
+      .shutdown_before_deadline(AsyncShutdown::Drain)
+      .unwrap();
+  }
+  assert_eq!(name_calls.load(Ordering::Relaxed), 4);
 }
 
 #[test]
@@ -2365,7 +2370,13 @@ impl Future for ManyGate {
 
 #[test]
 fn concurrent_last_scope_children_release_scope_capacity() {
-  let runtime = runtime(2, 8, 2);
+  // Distributed can leave a lone ready entry behind a blocking poll.
+  let runtime = strict_runtime(AsyncConfig {
+    workers: 2,
+    max_outstanding: 8,
+    max_scopes: 2,
+  })
+  .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
   let scope = runtime
     .scope()
     .unwrap_or_else(|e| panic!("scope failed: {e}"));

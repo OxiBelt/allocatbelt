@@ -251,6 +251,11 @@ impl ParkedMask {
     self.dead[lane / 64].fetch_or(1 << (lane % 64), Ordering::SeqCst);
   }
 
+  /// An adopted seat has a live server again. Caller serializes with its lane.
+  pub(super) fn revive(&self, lane: usize) {
+    self.dead[lane / 64].fetch_and(!(1 << (lane % 64)), Ordering::SeqCst);
+  }
+
   pub(super) fn is_dead(&self, lane: usize) -> bool {
     self.dead[lane / 64].load(Ordering::SeqCst) & (1 << (lane % 64)) != 0
   }

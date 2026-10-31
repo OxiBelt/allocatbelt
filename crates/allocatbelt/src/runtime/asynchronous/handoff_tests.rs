@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 use super::entry::{block_on_active, budget_remaining, cooperative_poll_active};
 use super::{
   AsyncConfig, AsyncDispatch, AsyncError, AsyncHandle, AsyncJob, AsyncJoinError, AsyncRuntime,
-  AsyncRuntimeOptions, AsyncScopeConfig, AsyncShutdown, BlockInPlaceErrorKind, HandoffConfig,
-  LocalConfig, LocalRuntime, OwnedTaskScope, consume_budget, current_resource_scope,
-  try_block_in_place, try_current_resource_scope, try_task_id, yield_now,
+  AsyncScopeConfig, AsyncShutdown, BlockInPlaceErrorKind, HandoffConfig, LocalConfig, LocalRuntime,
+  OwnedTaskScope, consume_budget, current_resource_scope, try_block_in_place,
+  try_current_resource_scope, try_task_id, yield_now,
 };
 use crate::runtime::cache;
 use crate::runtime::managed::{ResourceLimits, ResourceScope};
@@ -44,21 +44,6 @@ fn handoff_runtime(
   AsyncRuntime::new_with_handoffs(
     config(workers, max_outstanding, max_scopes),
     HandoffConfig { max_handoffs },
-  )
-  .unwrap_or_else(|error| panic!("runtime construction failed: {error}"))
-}
-
-fn strict_handoff_runtime(
-  workers: usize,
-  max_handoffs: usize,
-  max_outstanding: usize,
-  max_scopes: usize,
-) -> AsyncRuntime {
-  AsyncRuntime::new_with_options(
-    config(workers, max_outstanding, max_scopes),
-    AsyncRuntimeOptions::new()
-      .dispatch(AsyncDispatch::Strict)
-      .handoffs(HandoffConfig { max_handoffs }),
   )
   .unwrap_or_else(|error| panic!("runtime construction failed: {error}"))
 }
@@ -240,7 +225,14 @@ fn handoff_configuration_is_explicit_and_checked() {
   assert!(format!("{fixed:?}").contains("workers: 2"));
   let with_helpers = handoff_runtime(2, 3, 1, 1);
   assert!(format!("{with_helpers:?}").contains("workers: 5"));
-  assert_eq!(with_helpers.shared.turn_counts(), (0, 0, 0, 0));
+  if with_helpers.dispatch() == AsyncDispatch::Distributed {
+    wait_until(
+      || with_helpers.shared.turn_counts() == (2, 0, 0, 0),
+      "worker seats to start",
+    );
+  } else {
+    assert_eq!(with_helpers.shared.turn_counts(), (0, 0, 0, 0));
+  }
   drained(fixed);
   drained(with_helpers);
 }
@@ -584,7 +576,11 @@ fn helpers_hand_off_under_the_same_bound_with_distinct_shards() {
   assert_eq!(helper_shards, [Some(1), Some(2)]);
 
   // Both loans are restored, so the helpers retire and only the worker runs.
-  wait_until(|| shared.turn_counts() == (0, 0, 0, 0), "helpers to retire");
+  let idle_turns = usize::from(runtime.dispatch() == AsyncDispatch::Distributed);
+  wait_until(
+    || shared.turn_counts() == (idle_turns, 0, 0, 0),
+    "helpers to retire",
+  );
   for _ in 0..4 {
     assert_eq!(
       joined(spawned(&handle, async { thread::current().id() })),
@@ -788,8 +784,8 @@ fn drain_shutdown_allows_admitted_continuations_to_hand_off() {
 
 #[test]
 fn a_restoring_thread_reenters_before_queued_work() {
-  // Asserts strict priority for restoring threads over new turns.
-  let runtime = strict_handoff_runtime(1, 1, 8, 3);
+  // With one worker both modes give restorers priority over queued work.
+  let runtime = handoff_runtime(1, 1, 8, 3);
   let shared = Arc::clone(&runtime.shared);
   let handle = runtime.handle();
   let (restored_scope, busy_scope) = (own_scope(&runtime), own_scope(&runtime));
@@ -1229,8 +1225,8 @@ impl<F: Future> Future for Counted<F> {
 fn concurrent_handoffs_never_exceed_the_dispatcher_or_handoff_bounds() {
   const WORKERS: usize = 2;
   const HANDOFFS: usize = 2;
-  // Samples the strict turn coordinator directly.
-  let runtime = strict_handoff_runtime(WORKERS, HANDOFFS, 32, 4);
+  // The mode-aware hook also checks seat identity in distributed mode.
+  let runtime = handoff_runtime(WORKERS, HANDOFFS, 32, 4);
   let shared = Arc::clone(&runtime.shared);
   let scopes: Vec<_> = (0..3)
     .map(|_| {
@@ -1330,5 +1326,44 @@ fn handoff_restores_a_poll_that_then_returns_pending() {
     .unwrap_or_else(|error| panic!("spawn failed: {}", error.kind));
   assert_eq!(joined(job), 4);
   runtime.handle().block_on(scope.close()).unwrap();
+  drained(runtime);
+}
+
+#[test]
+fn helper_origin_restore_progresses_after_the_worker_has_already_restored() {
+  let runtime = handoff_runtime(1, 2, 4, 3);
+  let worker_scope = own_scope(&runtime);
+  let helper_scope = own_scope(&runtime);
+  let worker_entered = Gate::default();
+  let worker_release = Gate::default();
+  let helper_entered = Gate::default();
+  let helper_release = Gate::default();
+  let _release = (
+    OpenOnDrop(worker_release.clone()),
+    OpenOnDrop(helper_release.clone()),
+  );
+  let worker = {
+    let (entered, release) = (worker_entered.clone(), worker_release.clone());
+    spawned(&worker_scope.handle(), async move {
+      try_block_in_place(|| block_until(&entered, &release)).unwrap()
+    })
+  };
+  assert!(worker_entered.wait());
+  let helper = {
+    let (entered, release) = (helper_entered.clone(), helper_release.clone());
+    spawned(&helper_scope.handle(), async move {
+      try_block_in_place(|| block_until(&entered, &release)).unwrap()
+    })
+  };
+  assert!(helper_entered.wait());
+  // The second helper must adopt the seat, including its last queued entry.
+  assert_eq!(joined(spawned(&runtime.handle(), async { 9 })), 9);
+  worker_release.open();
+  assert!(joined(worker));
+  // Now the worker owns the seat and its loan is gone. The remaining loan
+  // originated on a helper; restoration must still make progress.
+  helper_release.open();
+  assert!(joined(helper));
+  assert_eq!(joined(spawned(&runtime.handle(), async { 11 })), 11);
   drained(runtime);
 }

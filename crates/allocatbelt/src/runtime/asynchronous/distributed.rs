@@ -1,4 +1,4 @@
-//! Distributed dispatch without handoffs. Admission precedes slot, then scope
+//! Distributed dispatch with seat adoption for bounded handoffs. Admission precedes slot, then scope
 //! locks. Lane, overflow and seat locks stand alone. User code and wakes run
 //! after releasing these locks; a detached chain belongs only to its mover.
 
@@ -8,7 +8,6 @@ use super::super::handoff_protocol::SeatTable;
 use super::super::lane::{LaneQueue, ParkedMask, QueueLink, VictimOrder, choose_lane};
 use super::*;
 use std::ops::{Deref, DerefMut};
-#[cfg(all(test, not(loom)))]
 use std::sync::atomic::AtomicBool;
 
 #[cfg(debug_assertions)]
@@ -137,8 +136,14 @@ pub(super) struct Distributed {
   next_lane: AtomicUsize,
   overflow: Mutex<LaneQueue>,
   seats: Mutex<SeatTable>,
+  seat_cv: Condvar,
+  helper_yield: AtomicBool,
+  worker_yield: AtomicBool,
+  closed_empty: AtomicBool,
   #[cfg(all(test, not(loom)))]
   slot_locks: AtomicUsize,
+  #[cfg(all(test, not(loom)))]
+  seat_locks: AtomicUsize,
   #[cfg(all(test, not(loom)))]
   scope_locks: AtomicUsize,
   #[cfg(all(test, not(loom)))]
@@ -147,6 +152,8 @@ pub(super) struct Distributed {
   steals: AtomicUsize,
   #[cfg(all(test, not(loom)))]
   round_robin: AtomicBool,
+  #[cfg(all(test, not(loom)))]
+  unwind_seat: AtomicUsize,
 }
 
 fn table<T>(len: usize, mut new: impl FnMut() -> T) -> Result<Vec<T>, AsyncError> {
@@ -195,7 +202,7 @@ impl Distributed {
   }
 
   pub(super) fn actual_control(&self) -> Result<usize, AsyncError> {
-    let (vacant, helpers) = lock(&self.seats, 4).capacities();
+    let (vacant, helpers) = self.seats().capacities();
     control_sizes(
       self.slots.capacity(),
       self.links.capacity(),
@@ -206,7 +213,7 @@ impl Distributed {
     )
   }
 
-  pub(super) fn new(config: AsyncConfig) -> Result<Self, AsyncError> {
+  pub(super) fn new(config: AsyncConfig, max_handoffs: usize) -> Result<Self, AsyncError> {
     Ok(Self {
       slots: table(config.max_outstanding, || SlotCell {
         word: PollWord::new(),
@@ -226,10 +233,16 @@ impl Distributed {
       next_lane: AtomicUsize::new(0),
       overflow: Mutex::new(LaneQueue::new()),
       seats: Mutex::new(
-        SeatTable::try_new(config.workers, 0).map_err(|_| AsyncError::OutOfMemory)?,
+        SeatTable::try_new(config.workers, max_handoffs).map_err(|_| AsyncError::OutOfMemory)?,
       ),
+      seat_cv: Condvar::new(),
+      helper_yield: AtomicBool::new(false),
+      worker_yield: AtomicBool::new(false),
+      closed_empty: AtomicBool::new(false),
       #[cfg(all(test, not(loom)))]
       slot_locks: AtomicUsize::new(0),
+      #[cfg(all(test, not(loom)))]
+      seat_locks: AtomicUsize::new(0),
       #[cfg(all(test, not(loom)))]
       scope_locks: AtomicUsize::new(0),
       #[cfg(all(test, not(loom)))]
@@ -238,6 +251,8 @@ impl Distributed {
       steals: AtomicUsize::new(0),
       #[cfg(all(test, not(loom)))]
       round_robin: AtomicBool::new(super::super::lane::ROUND_ROBIN_PLACEMENT),
+      #[cfg(all(test, not(loom)))]
+      unwind_seat: AtomicUsize::new(usize::MAX),
     })
   }
 
@@ -253,6 +268,12 @@ impl Distributed {
       inner: Some(inner),
       previous,
     }
+  }
+
+  fn seats(&self) -> Guard<'_, SeatTable> {
+    #[cfg(all(test, not(loom)))]
+    self.seat_locks.fetch_add(1, Ordering::Relaxed);
+    lock(&self.seats, 4)
   }
 
   fn slot(&self, index: usize) -> Guard<'_, SlotState> {
@@ -566,6 +587,9 @@ impl Distributed {
     {
       let mut state = self.admission(shared);
       state.closed = true;
+      self
+        .closed_empty
+        .store(state.admitted == 0, Ordering::Release);
     }
     if cancel {
       for index in 0..self.slots.len() {
@@ -579,6 +603,7 @@ impl Distributed {
       }
     }
     self.kick_all();
+    self.notify_seats();
   }
 
   pub(super) fn request_scope_close(&self, shared: &Shared, scope: ScopeRef) {
@@ -751,6 +776,8 @@ impl Distributed {
       cell.completed();
     }
     if empty_after_close {
+      self.closed_empty.store(true, Ordering::Release);
+      self.notify_seats();
       self.kick_all();
     }
   }
@@ -856,6 +883,15 @@ impl Distributed {
     context: AsyncThreadContext,
   ) -> Search {
     loop {
+      let should_yield =
+        if context.role == super::super::thread_options::AsyncThreadRole::HandoffHelper {
+          self.helper_yield.load(Ordering::Acquire)
+        } else {
+          self.worker_yield.load(Ordering::Acquire) && self.seats().worker_should_yield()
+        };
+      if should_yield {
+        return Search::Recheck;
+      }
       match self.search(shared, seat, random) {
         Search::Empty => {}
         found => return found,
@@ -906,7 +942,6 @@ impl Distributed {
 
   pub(super) fn abandon_turn(&self, shared: &Shared, turn: DispatchTurn) {
     let seat = turn.seat();
-    lock(&self.seats, 4).end_turn(turn);
     {
       let _queue = self.lane(seat);
       self.parked.mark_dead(seat);
@@ -929,17 +964,257 @@ impl Distributed {
         .overflow_depth
         .store(queue.len(), Ordering::SeqCst);
     }
+    // Keep the seat held until its lane has drained: a helper or restorer
+    // must not adopt it while abandonment is moving entries to overflow.
+    {
+      let mut seats = self.seats();
+      seats.end_turn(turn);
+      self.update_yield(&seats);
+      self.seat_cv.notify_all();
+    }
     self.kick_all();
   }
 
+  fn adopt(&self, turn: &DispatchTurn) {
+    if self.parked.is_dead(turn.seat()) {
+      let _queue = self.lane(turn.seat());
+      self.parked.claim(turn.seat());
+      self.parked.revive(turn.seat());
+    }
+  }
+
+  fn update_yield(&self, seats: &SeatTable) {
+    self
+      .helper_yield
+      .store(seats.helper_should_yield(), Ordering::Release);
+    self
+      .worker_yield
+      .store(seats.worker_should_yield(), Ordering::Release);
+  }
+
+  fn notify_seats(&self) {
+    let _seats = self.seats();
+    self.seat_cv.notify_all();
+  }
+
+  #[cfg(all(test, not(loom)))]
+  pub(super) fn turn_counts(&self) -> (usize, usize, usize, usize) {
+    self.seats().counts()
+  }
+
+  pub(super) fn hand_off(&self, turn: DispatchTurn) -> Result<HandoffLoan, DispatchTurn> {
+    let mut seats = self.seats();
+    let loan = seats.try_hand_off(turn)?;
+    self.update_yield(&seats);
+    self.seat_cv.notify_all();
+    Ok(loan)
+  }
+
+  /// Wait on the seat predicate only after hooks ran outside every lock.
+  fn wait_seat(
+    &self,
+    shared: &Shared,
+    context: AsyncThreadContext,
+    mut seats: Guard<'_, SeatTable>,
+  ) {
+    shared.thread_parked(context);
+    let guard = seats.inner.take().unwrap_or_else(|| unreachable!());
+    seats.inner = Some(
+      self
+        .seat_cv
+        .wait(guard)
+        .unwrap_or_else(PoisonError::into_inner),
+    );
+    drop(seats);
+    shared.thread_unparked(context);
+    cache::set_shard(context.physical_index);
+  }
+
+  pub(super) fn restore(
+    &self,
+    shared: &Shared,
+    loan: HandoffLoan,
+    context: AsyncThreadContext,
+  ) -> DispatchTurn {
+    let mut seats = self.seats();
+    let mut ticket = seats.begin_restore(loan);
+    self.update_yield(&seats);
+    let mut prepared = false;
+    let mut flushed = false;
+    let mut kicked = false;
+    loop {
+      match seats.try_restore(ticket) {
+        Ok(turn) => {
+          self.update_yield(&seats);
+          self.seat_cv.notify_all();
+          drop(seats);
+          if prepared {
+            shared.thread_unpark_callback(context);
+            cache::set_shard(context.physical_index);
+          }
+          self.adopt(&turn);
+          // Retire excess helpers, including those parked on their lanes.
+          // Also release closed, empty workers after the final restoration.
+          if self.helper_yield.load(Ordering::Acquire) || self.closed_empty.load(Ordering::Acquire)
+          {
+            self.kick_all();
+          }
+          return turn;
+        }
+        Err(waiting) => ticket = waiting,
+      }
+      if !kicked {
+        // A helper-origin loan can outlive its worker's loan, so the kick
+        // includes worker lanes for the between-poll fallback. Leaf locks.
+        drop(seats);
+        self.kick_all();
+        seats = self.seats();
+        kicked = true;
+        continue;
+      }
+      if prepared {
+        self.wait_seat(shared, context, seats);
+        prepared = false;
+      } else {
+        drop(seats);
+        if !flushed {
+          cache::flush();
+          flushed = true;
+        }
+        shared.thread_park_attempted(context);
+        prepared = true;
+      }
+      seats = self.seats();
+    }
+  }
+
+  /// Activated helpers acquire a vacant seat and use the worker search loop.
+  pub(super) fn helper(&self, shared: &Arc<Shared>, context: AsyncThreadContext) {
+    let mut lease = None;
+    let mut prepared = false;
+    loop {
+      let mut seats = self.seats();
+      if let Some(active) = lease.take() {
+        lease = seats.retire_helper(active).err();
+        self.update_yield(&seats);
+      }
+      if seats.may_exit(self.closed_empty.load(Ordering::Acquire)) && lease.is_none() {
+        drop(seats);
+        if prepared {
+          shared.thread_unpark_callback(context);
+        }
+        return;
+      }
+      if lease.is_none() {
+        lease = seats.try_activate_helper();
+        self.update_yield(&seats);
+      }
+      if lease.is_some()
+        && let Some(turn) = seats.try_begin_helper_turn()
+      {
+        self.update_yield(&seats);
+        drop(seats);
+        if prepared {
+          shared.thread_unpark_callback(context);
+        }
+        cache::set_shard(context.physical_index);
+        self.adopt(&turn);
+        self.serve(shared, context, turn, true);
+        prepared = false;
+        continue;
+      }
+      if prepared {
+        self.wait_seat(shared, context, seats);
+        prepared = false;
+      } else {
+        drop(seats);
+        cache::flush();
+        shared.thread_park_attempted(context);
+        prepared = true;
+      }
+    }
+  }
+
+  fn resume_worker(&self, shared: &Shared, context: AsyncThreadContext) -> DispatchTurn {
+    let mut prepared = false;
+    loop {
+      let mut seats = self.seats();
+      if let Some(turn) = seats.try_resume_worker() {
+        self.update_yield(&seats);
+        self.seat_cv.notify_all();
+        drop(seats);
+        if prepared {
+          shared.thread_unpark_callback(context);
+        }
+        cache::set_shard(context.physical_index);
+        self.adopt(&turn);
+        return turn;
+      }
+      if prepared {
+        self.wait_seat(shared, context, seats);
+        prepared = false;
+      } else {
+        drop(seats);
+        cache::flush();
+        shared.thread_park_attempted(context);
+        prepared = true;
+      }
+    }
+  }
+
   pub(super) fn run_seat(&self, shared: &Arc<Shared>, context: AsyncThreadContext) {
+    let turn = {
+      let mut seats = self.seats();
+      let turn = seats.claim(context.index);
+      self.update_yield(&seats);
+      self.seat_cv.notify_all();
+      turn
+    };
+    self.serve(shared, context, turn, false);
+  }
+
+  fn serve(
+    &self,
+    shared: &Arc<Shared>,
+    context: AsyncThreadContext,
+    turn: DispatchTurn,
+    helper: bool,
+  ) {
     let mut seat = SeatGuard {
       distributed: self,
       shared,
-      turn: Some(lock(&self.seats, 4).claim(context.index)),
+      turn: Some(turn),
     };
-    let mut random = context.index as u64 + 1;
+    #[cfg(all(test, not(loom)))]
+    assert_ne!(
+      self.unwind_seat.load(Ordering::Relaxed),
+      seat.seat(),
+      "injected dispatcher unwind"
+    );
+    let mut random = context.physical_index as u64 + 1;
     loop {
+      let yield_pending = if helper {
+        self.helper_yield.load(Ordering::Acquire)
+      } else {
+        self.worker_yield.load(Ordering::Acquire)
+      };
+      if yield_pending {
+        let mut seats = self.seats();
+        if helper && seats.helper_should_yield() {
+          seats.end_turn(seat.take());
+          self.update_yield(&seats);
+          self.seat_cv.notify_all();
+          return;
+        }
+        if !helper && seats.worker_should_yield() {
+          seats.yield_worker(seat.take());
+          self.update_yield(&seats);
+          self.seat_cv.notify_all();
+          drop(seats);
+          seat.turn = Some(self.resume_worker(shared, context));
+          continue;
+        }
+      }
       let index = match self.search_or_park(shared, seat.seat(), &mut random, context) {
         Search::Got(index) => index,
         Search::Recheck => {
@@ -947,8 +1222,11 @@ impl Distributed {
             let state = self.admission(shared);
             state.closed && state.admitted == 0
           };
-          if lock(&self.seats, 4).may_exit(empty) {
-            lock(&self.seats, 4).end_turn(seat.take());
+          let mut seats = self.seats();
+          if seats.may_exit(empty) {
+            seats.end_turn(seat.take());
+            self.update_yield(&seats);
+            self.seat_cv.notify_all();
             return;
           }
           continue;

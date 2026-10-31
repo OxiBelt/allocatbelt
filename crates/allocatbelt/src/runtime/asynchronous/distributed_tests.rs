@@ -23,22 +23,21 @@ fn runtime(workers: usize, tasks: usize) -> AsyncRuntime {
   .unwrap()
 }
 fn shared(config: AsyncConfig) -> (Arc<Shared>, ScopeRef) {
+  shared_with_handoffs(config, 0)
+}
+fn shared_with_handoffs(config: AsyncConfig, handoffs: usize) -> (Arc<Shared>, ScopeRef) {
   let metrics = RuntimeMetrics::try_new(
     AsyncDispatch::Distributed,
     config.workers,
-    (0..config.workers).map(|index| AsyncThreadContext {
-      role: AsyncThreadRole::Worker,
-      index,
-      physical_index: index,
-    }),
-    config.workers,
+    super::super::super::thread_contexts(config.workers, handoffs),
+    config.workers + handoffs,
     None,
   )
   .unwrap();
   Shared::new(
     config,
     AsyncDispatch::Distributed,
-    0,
+    handoffs,
     None,
     super::super::super::ControlledThreadOptions::unbounded(AsyncThreadOptions::new()),
     metrics,
@@ -821,52 +820,41 @@ fn cleanup_is_quota_free_and_slot_reuse_ignores_stale_wakes() {
 
 #[test]
 fn unwind_outside_a_poll_moves_orphaned_entries_to_overflow() {
-  let (shared, root) = shared(config(2, 4));
-  let d = engine(&shared);
-  let jobs: Vec<_> = (0..4)
-    .map(|_| {
+  for handoffs in [0, 2] {
+    let (shared, root) = shared_with_handoffs(config(2, 4), handoffs);
+    let d = engine(&shared);
+    let jobs: Vec<_> = (0..4)
+      .map(|index| {
+        d.next_lane.store(0, Ordering::Relaxed);
+        shared.spawn(root, async move { index }).unwrap()
+      })
+      .collect();
+    d.unwind_seat.store(0, Ordering::Relaxed);
+    let failed = start_worker(&shared, 0);
+    wait(|| failed.is_finished());
+    assert!(failed.join().is_err());
+    assert_eq!(
+      shared.metrics.inner().overflow_depth.load(Ordering::SeqCst),
+      4
+    );
+    assert!(d.parked.is_dead(0));
+    check_distributed(&shared);
+    let survivor = start_worker(&shared, 1);
+    for (index, job) in jobs.into_iter().enumerate() {
+      assert_eq!(finish(job).unwrap(), index);
+    }
+    wait(|| shared.metrics.inner().overflow_depth.load(Ordering::SeqCst) == 0);
+    // Future target selection excludes the dead seat, including its last entry.
+    for _ in 0..8 {
       d.next_lane.store(0, Ordering::Relaxed);
-      shared.spawn(root, async {}).unwrap()
-    })
-    .collect();
-  let result = panic::catch_unwind(AssertUnwindSafe(|| {
-    let _seat = SeatGuard {
-      distributed: d,
-      shared: &shared,
-      turn: Some(lock(&d.seats, 4).claim(0)),
-    };
-    panic!("injected dispatcher unwind");
-  }));
-  assert!(result.is_err());
-  assert_eq!(
-    shared.metrics.inner().overflow_depth.load(Ordering::SeqCst),
-    4
-  );
-  check_distributed(&shared);
-  for _ in 0..4 {
-    run(&shared, selected(&shared, 1).unwrap());
+      finish(shared.spawn(root, async {}).unwrap()).unwrap();
+      assert_eq!(d.lane(0).len(), 0);
+    }
+    shared.close(false);
+    join_worker(survivor);
+    assert_eq!(shared.turn_counts(), (0, 0, 0, 0));
+    check_distributed(&shared);
   }
-  for job in jobs {
-    finish(job).unwrap();
-  }
-  assert_eq!(
-    shared.metrics.inner().overflow_depth.load(Ordering::SeqCst),
-    0
-  );
-  check_distributed(&shared);
-  assert!(d.parked.is_dead(0));
-  for _ in 0..8 {
-    d.next_lane.store(0, Ordering::Relaxed);
-    let fresh = shared.spawn(root, async {}).unwrap();
-    assert_eq!(d.lane(0).len(), 0);
-    run(&shared, selected(&shared, 1).unwrap());
-    finish(fresh).unwrap();
-  }
-  let survivor = start_worker(&shared, 1);
-  wait(|| d.parked.is_set(1));
-  shared.close(false);
-  join_worker(survivor);
-  check_distributed(&shared);
 }
 
 #[test]
@@ -1139,4 +1127,479 @@ fn park_rescan_finds_work_published_before_park_advertisement() {
   join_worker(first);
   join_worker(second);
   check_distributed(&shared);
+}
+
+#[derive(Clone, Default)]
+struct HandoffGate(Arc<AtomicBool>);
+impl HandoffGate {
+  fn open(&self) {
+    self.0.store(true, Ordering::Release);
+  }
+  fn wait(&self) {
+    wait(|| self.0.load(Ordering::Acquire));
+  }
+}
+struct ReleaseHandoffs(Vec<HandoffGate>);
+impl Drop for ReleaseHandoffs {
+  fn drop(&mut self) {
+    for gate in &self.0 {
+      gate.open();
+    }
+  }
+}
+
+#[test]
+fn handoff_restores_onto_another_lane_while_other_workers_keep_polling() {
+  use super::super::super::{HandoffConfig, try_block_in_place};
+  let runtime = AsyncRuntime::new_with_options(
+    config(2, 8),
+    AsyncRuntimeOptions::new()
+      .dispatch(AsyncDispatch::Distributed)
+      .handoffs(HandoffConfig { max_handoffs: 2 }),
+  )
+  .unwrap();
+  let shared = Arc::clone(&runtime.shared);
+  let d = engine(&shared);
+  d.round_robin.store(true, Ordering::Relaxed);
+  wait(|| shared.turn_counts() == (2, 0, 0, 0));
+  let scopes: Vec<_> = (0..3)
+    .map(|_| {
+      runtime
+        .scope_with_config(AsyncScopeConfig {
+          max_active_polls: 4,
+        })
+        .unwrap()
+    })
+    .collect();
+  let gates: Vec<_> = (0..6).map(|_| HandoffGate::default()).collect();
+  let _release = ReleaseHandoffs(gates.clone());
+  let (entered, arrival) = mpsc::channel();
+  let (restored, restoration) = mpsc::channel();
+  let first = {
+    let (closure, poll) = (gates[0].clone(), gates[1].clone());
+    d.next_lane.store(0, Ordering::Relaxed);
+    scopes[0]
+      .spawn(async move {
+        try_block_in_place(|| {
+          entered.send(()).unwrap();
+          closure.wait();
+        })
+        .unwrap();
+        restored.send(std::thread::current().id()).unwrap();
+        poll.wait();
+      })
+      .unwrap()
+  };
+  arrival.recv_timeout(Duration::from_secs(30)).unwrap();
+  // A helper must adopt seat zero to run its last (unstealable) entry.
+  let (entered, arrival) = mpsc::channel();
+  let helper = {
+    let gate = gates[2].clone();
+    d.next_lane.store(0, Ordering::Relaxed);
+    scopes[1]
+      .spawn(async move {
+        entered.send(()).unwrap();
+        gate.wait();
+      })
+      .unwrap()
+  };
+  arrival.recv_timeout(Duration::from_secs(30)).unwrap();
+  let (entered, arrival) = mpsc::channel();
+  let (advanced, progress) = mpsc::channel();
+  let other = {
+    let (first_poll, second_poll, closure) = (gates[3].clone(), gates[4].clone(), gates[5].clone());
+    let mut polls = 0;
+    d.next_lane.store(1, Ordering::Relaxed);
+    scopes[2]
+      .spawn(std::future::poll_fn(move |cx| {
+        polls += 1;
+        if polls == 1 {
+          entered.send(()).unwrap();
+          first_poll.wait();
+          cx.waker().wake_by_ref();
+          return Poll::Pending;
+        }
+        advanced.send(()).unwrap();
+        second_poll.wait();
+        try_block_in_place(|| closure.wait()).unwrap();
+        Poll::Ready(())
+      }))
+      .unwrap()
+  };
+  arrival.recv_timeout(Duration::from_secs(30)).unwrap();
+  gates[0].open();
+  wait(|| shared.turn_counts().2 == 1);
+  // The worker on seat one starts another poll while restoration waits on
+  // the helper's busy seat zero. No global restorer gate blocks this poll.
+  d.next_lane.store(1, Ordering::Relaxed);
+  gates[3].open();
+  progress.recv_timeout(Duration::from_secs(30)).unwrap();
+  assert_eq!(shared.turn_counts().2, 1);
+  // That worker now hands off too; the waiting restorer must take seat one.
+  gates[4].open();
+  let original_thread = restoration.recv_timeout(Duration::from_secs(30)).unwrap();
+  assert_eq!(shared.turn_counts().1, 1);
+  d.next_lane.store(1, Ordering::Relaxed);
+  let probe = runtime
+    .handle()
+    .spawn(async { std::thread::current().id() })
+    .unwrap();
+  assert_eq!(d.lane(1).len(), 1);
+  gates[1].open();
+  finish(first).unwrap();
+  let deadline = Instant::now() + Duration::from_secs(5);
+  while !probe.is_finished() {
+    assert!(Instant::now() < deadline, "restored lane probe deadline");
+    std::thread::yield_now();
+  }
+  assert_eq!(
+    finish(probe).unwrap(),
+    original_thread,
+    "restorer must serve its newly acquired lane"
+  );
+  gates[5].open();
+  gates[2].open();
+  finish(other).unwrap();
+  finish(helper).unwrap();
+  wait(|| shared.turn_counts() == (2, 0, 0, 0));
+  check_distributed(&shared);
+  drop(scopes);
+  shutdown(runtime, AsyncShutdown::Drain);
+}
+
+#[test]
+fn handoff_root_limit_stays_binding_and_uses_two_scope_locks() {
+  use super::super::super::HandoffConfig;
+  let runtime = AsyncRuntime::new_with_options(
+    config(2, 4),
+    AsyncRuntimeOptions::new()
+      .dispatch(AsyncDispatch::Distributed)
+      .handoffs(HandoffConfig { max_handoffs: 2 }),
+  )
+  .unwrap();
+  let d = engine(&runtime.shared);
+  wait(|| runtime.shared.turn_counts() == (2, 0, 0, 0));
+  for limit in [2, 3, 4] {
+    let scope = (limit != 2).then(|| {
+      runtime
+        .scope_with_config(AsyncScopeConfig {
+          max_active_polls: limit,
+        })
+        .unwrap()
+    });
+    let handle = scope
+      .as_ref()
+      .map_or_else(|| runtime.handle(), |scope| scope.handle());
+    let before = d.scope_locks.load(Ordering::Relaxed);
+    finish(handle.spawn(async {}).unwrap()).unwrap();
+    let expected = if limit < 4 { 2 } else { 0 };
+    wait(|| d.scope_locks.load(Ordering::Relaxed) - before >= expected);
+    assert_eq!(d.scope_locks.load(Ordering::Relaxed) - before, expected);
+    if let Some(scope) = scope {
+      drop(scope.close());
+    }
+  }
+  shutdown(runtime, AsyncShutdown::Drain);
+}
+
+#[test]
+fn uncontended_handoff_and_restore_take_only_seat_and_kick_locks() {
+  let (shared, _) = shared_with_handoffs(config(2, 4), 2);
+  let d = engine(&shared);
+  let first = d.seats().claim(0);
+  let second = d.seats().claim(1);
+  let counters = || {
+    (
+      d.seat_locks.load(Ordering::Relaxed),
+      d.lane_locks.load(Ordering::Relaxed),
+      d.slot_locks.load(Ordering::Relaxed),
+      d.scope_locks.load(Ordering::Relaxed),
+      shared.lock_acquisitions.load(Ordering::Relaxed),
+    )
+  };
+  let before = counters();
+  let loan = shared.hand_off(first).unwrap();
+  let after = counters();
+  assert_eq!(
+    after,
+    (before.0 + 1, before.1, before.2, before.3, before.4)
+  );
+  let turn = shared.restore(
+    loan,
+    AsyncThreadContext {
+      role: AsyncThreadRole::Worker,
+      index: 0,
+      physical_index: 0,
+    },
+  );
+  assert_eq!(turn.seat(), 0);
+  assert_eq!(
+    counters(),
+    (after.0 + 1, after.1, after.2, after.3, after.4)
+  );
+  d.seats().end_turn(turn);
+  d.seats().end_turn(second);
+  assert_eq!(shared.turn_counts(), (0, 0, 0, 0));
+}
+
+#[test]
+fn restoration_can_adopt_an_abandoned_seat_after_its_lane_has_drained() {
+  let (shared, root) = shared_with_handoffs(config(2, 2), 1);
+  let d = engine(&shared);
+  let failed = d.seats().claim(0);
+  let survivor = d.seats().claim(1);
+  // Exercise a stale parked bit too; a live adopter must clear both masks.
+  d.parked.advertise(0);
+  d.abandon_turn(&shared, failed);
+  assert!(d.parked.is_dead(0));
+  let loan = d.hand_off(survivor).unwrap();
+  let (lease, helper) = {
+    let mut seats = d.seats();
+    (
+      seats.try_activate_helper().unwrap(),
+      seats.try_begin_helper_turn().unwrap(),
+    )
+  };
+  assert_eq!(helper.seat(), 1);
+  let restored = shared.restore(
+    loan,
+    AsyncThreadContext {
+      role: AsyncThreadRole::Worker,
+      index: 1,
+      physical_index: 1,
+    },
+  );
+  assert_eq!(restored.seat(), 0);
+  assert!(!d.parked.is_dead(0));
+  assert!(!d.parked.is_set(0));
+  d.next_lane.store(0, Ordering::Relaxed);
+  let job = shared.spawn(root, async { 7 }).unwrap();
+  assert_eq!(d.lane(0).len(), 1);
+  run(&shared, selected(&shared, 0).unwrap());
+  assert_eq!(finish(job).unwrap(), 7);
+  let mut seats = d.seats();
+  seats.end_turn(helper);
+  seats.retire_helper(lease).unwrap();
+  seats.end_turn(restored);
+  seats.check();
+}
+
+fn run_dispatcher(shared: &Arc<Shared>, context: AsyncThreadContext, run: impl FnOnce()) {
+  let control = super::super::super::entry::PreparedContextNodes::new(None, 1)
+    .unwrap()
+    .pop()
+    .unwrap();
+  super::super::executor_thread(shared, context, control, run);
+}
+
+fn helper_context() -> AsyncThreadContext {
+  AsyncThreadContext {
+    role: AsyncThreadRole::HandoffHelper,
+    index: 0,
+    physical_index: 2,
+  }
+}
+
+fn worker_context(index: usize) -> AsyncThreadContext {
+  AsyncThreadContext {
+    role: AsyncThreadRole::Worker,
+    index,
+    physical_index: index,
+  }
+}
+
+// Stop at a seat boundary with one worker waiting to resume and a restored
+// helper holding its former seat. The second worker can still hand off.
+fn helper_restored_a_yielded_worker_seat(
+  d: &Distributed,
+) -> (
+  DispatchTurn,
+  DispatchTurn,
+  crate::runtime::asynchronous::handoff_protocol::HelperLease,
+) {
+  let mut seats = d.seats();
+  let worker = seats.claim(0);
+  let other = seats.claim(1);
+  let loan = seats.try_hand_off(worker).unwrap();
+  let lease = seats.try_activate_helper().unwrap();
+  let helper = seats.try_begin_helper_turn().unwrap();
+  let helper_loan = seats.try_hand_off(helper).unwrap();
+  let ticket = seats.begin_restore(loan);
+  let worker = seats.try_restore(ticket).unwrap();
+  let ticket = seats.begin_restore(helper_loan);
+  assert!(seats.worker_should_yield());
+  seats.yield_worker(worker);
+  let helper = seats.try_restore(ticket).unwrap();
+  d.update_yield(&seats);
+  seats.check();
+  (other, helper, lease)
+}
+
+#[test]
+fn handoff_helper_parks_instead_of_reacquiring_a_resuming_workers_seat() {
+  let (shared, root) = shared_with_handoffs(config(2, 4), 2);
+  let d = engine(&shared);
+  let (other, helper, lease) = helper_restored_a_yielded_worker_seat(d);
+  let loan = {
+    let mut seats = d.seats();
+    seats.end_turn(helper);
+    seats.retire_helper(lease).unwrap();
+    let loan = seats.try_hand_off(other).unwrap();
+    d.update_yield(&seats);
+    loan
+  };
+  d.round_robin.store(true, Ordering::Relaxed);
+  d.next_lane.store(0, Ordering::Relaxed);
+  let job = shared.spawn(root, async { 7 }).unwrap();
+  let helper = {
+    let shared = Arc::clone(&shared);
+    std::thread::spawn(move || {
+      run_dispatcher(&shared, helper_context(), || {
+        engine(&shared).helper(&shared, helper_context());
+      });
+    })
+  };
+  // A helper that ignores resuming repeatedly acquires and yields the seat
+  // instead of parking. Exercise its actual loop, with a bounded observer.
+  let deadline = Instant::now() + Duration::from_secs(5);
+  let parks = &shared.metrics.inner().thread(2).unwrap().parks;
+  while parks.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+    std::thread::yield_now();
+  }
+  let parked = parks.load(Ordering::Relaxed) != 0;
+  let overtook = job.is_finished();
+  let other = d.restore(&shared, loan, worker_context(1));
+  let worker = d.resume_worker(&shared, worker_context(0));
+  if !job.is_finished() {
+    run(&shared, selected(&shared, worker.seat()).unwrap());
+  }
+  assert_eq!(finish(job).unwrap(), 7);
+  shared.close(false);
+  d.abandon_turn(&shared, worker);
+  d.abandon_turn(&shared, other);
+  join_worker(helper);
+  assert!(
+    parked,
+    "helper reacquired a seat instead of parking for a resuming worker"
+  );
+  assert!(!overtook, "helper polled before the waiting worker resumed");
+  assert_eq!(shared.turn_counts(), (0, 0, 0, 0));
+}
+
+#[test]
+fn handoff_serving_helper_yields_to_a_resuming_worker_without_other_yield_reasons() {
+  let (shared, root) = shared_with_handoffs(config(2, 4), 2);
+  let d = engine(&shared);
+  let (other, helper_turn, lease) = helper_restored_a_yielded_worker_seat(d);
+  let loan = d.hand_off(other).unwrap();
+  // One helper and one remaining loan: neither an excess helper nor a
+  // waiting restoration can mask the resuming-worker condition.
+  assert_eq!(shared.turn_counts(), (1, 1, 0, 1));
+  d.round_robin.store(true, Ordering::Relaxed);
+  d.next_lane.store(helper_turn.seat(), Ordering::Relaxed);
+  let job = shared.spawn(root, async { 11 }).unwrap();
+  let helper = {
+    let shared = Arc::clone(&shared);
+    std::thread::spawn(move || {
+      run_dispatcher(&shared, helper_context(), || {
+        engine(&shared).serve(&shared, helper_context(), helper_turn, true);
+      });
+    })
+  };
+  wait(|| helper.is_finished() || job.is_finished());
+  let yielded = helper.is_finished();
+  let overtook = job.is_finished();
+  // Finish both the ordinary and mutated paths before reporting failure.
+  let other = d.restore(&shared, loan, worker_context(1));
+  let worker = d.resume_worker(&shared, worker_context(0));
+  join_worker(helper);
+  if !job.is_finished() {
+    let work = selected(&shared, worker.seat())
+      .or_else(|| selected(&shared, other.seat()))
+      .unwrap();
+    run(&shared, work);
+  }
+  assert_eq!(finish(job).unwrap(), 11);
+  shared.close(false);
+  {
+    let mut seats = d.seats();
+    seats.retire_helper(lease).unwrap();
+    d.update_yield(&seats);
+  }
+  d.abandon_turn(&shared, worker);
+  d.abandon_turn(&shared, other);
+  assert!(yielded, "serving helper did not yield to a resuming worker");
+  assert!(
+    !overtook,
+    "serving helper polled before the waiting worker resumed"
+  );
+  assert_eq!(shared.turn_counts(), (0, 0, 0, 0));
+}
+
+#[test]
+fn handoff_helper_yield_hint_does_not_lock_worker_seats_per_poll() {
+  let (shared, root) = shared_with_handoffs(config(2, 4), 2);
+  let d = engine(&shared);
+  let (worker, helper, ticket, lease) = {
+    let mut seats = d.seats();
+    let original = seats.claim(0);
+    let worker = seats.claim(1);
+    let loan = seats.try_hand_off(original).unwrap();
+    let lease = seats.try_activate_helper().unwrap();
+    let helper = seats.try_begin_helper_turn().unwrap();
+    let ticket = seats.begin_restore(loan);
+    d.update_yield(&seats);
+    (worker, helper, ticket, lease)
+  };
+  assert!(d.helper_yield.load(Ordering::Acquire));
+  assert!(!d.worker_yield.load(Ordering::Acquire));
+  d.round_robin.store(true, Ordering::Relaxed);
+  d.next_lane.store(1, Ordering::Relaxed);
+  let job = {
+    let task_shared = Arc::clone(&shared);
+    let mut counts = Vec::new();
+    let mut polls = 0;
+    shared
+      .spawn(
+        root,
+        std::future::poll_fn(move |cx| {
+          let d = engine(&task_shared);
+          counts.push(d.seat_locks.load(Ordering::Relaxed));
+          polls += 1;
+          if polls == 16 {
+            Poll::Ready(std::mem::take(&mut counts))
+          } else {
+            d.next_lane.store(1, Ordering::Relaxed);
+            cx.waker().wake_by_ref();
+            Poll::Pending
+          }
+        }),
+      )
+      .unwrap()
+  };
+  let worker = {
+    let shared = Arc::clone(&shared);
+    std::thread::spawn(move || {
+      run_dispatcher(&shared, worker_context(1), || {
+        engine(&shared).serve(&shared, worker_context(1), worker, false);
+      });
+    })
+  };
+  let counts = finish(job).unwrap();
+  {
+    let mut seats = d.seats();
+    seats.end_turn(helper);
+    let original = seats.try_restore(ticket).unwrap();
+    seats.retire_helper(lease).unwrap();
+    seats.end_turn(original);
+    d.update_yield(&seats);
+  }
+  shared.close(false);
+  join_worker(worker);
+  assert_eq!(
+    counts,
+    vec![counts[0]; 16],
+    "worker took seat locks between polls"
+  );
+  assert_eq!(shared.turn_counts(), (0, 0, 0, 0));
 }
