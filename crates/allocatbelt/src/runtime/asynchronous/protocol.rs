@@ -1,7 +1,6 @@
 //! Per-task dispatch, wake, abort, and generation transitions. Production
-//! holds this state under the lock that owns the task: the scheduler mutex
-//! in strict mode, or a slot mutex in distributed mode. Loom uses the same
-//! helpers under its mutexes to explore operation orderings. `PollWord` is the one
+//! holds this state under the task slot mutex. Loom uses the same helpers
+//! under its mutexes to explore operation orderings. `PollWord` is the one
 //! per-task word a wake may change without that mutex.
 
 #[cfg(loom)]
@@ -18,7 +17,7 @@ pub(super) enum PollFinish {
   Idle,
 }
 
-/// A scope's active-poll quota. Scheduler state owns this value under its
+/// A scope's active-poll quota. Scope dispatch owns this value under its
 /// mutex; keeping acquire/release in this helper lets Loom exercise the exact
 /// production counter transition without modeling unrelated queue details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,8 +277,8 @@ impl PollProtocol {
     Some(self.abort)
   }
 
-  /// Resolves one completed poll under the scheduler lock.
-  pub(super) fn finish_poll(&mut self, ready: bool, cancel_all: bool) -> PollFinish {
+  /// Resolves one completed poll under its task lock.
+  pub(super) fn finish_poll(&mut self, ready: bool) -> PollFinish {
     if !self.admitted || !self.running {
       return PollFinish::Stale;
     }
@@ -287,7 +286,7 @@ impl PollProtocol {
       self.release();
       return PollFinish::Complete;
     }
-    if self.abort || cancel_all {
+    if self.abort {
       self.wake_pending = false;
       // Keep `running` set until the worker drops the future and releases the
       // admission; no wake can dispatch cleanup concurrently.
@@ -495,11 +494,11 @@ mod loom_tests {
       let mut state = lock(&state);
       while state.admitted() {
         if state.is_running() {
-          if state.finish_poll(false, false) == PollFinish::CancelCleanup {
+          if state.finish_poll(false) == PollFinish::CancelCleanup {
             state.finish_cancel();
           }
         } else if let Some(aborting) = state.begin_poll() {
-          if aborting || state.finish_poll(false, false) == PollFinish::CancelCleanup {
+          if aborting || state.finish_poll(false) == PollFinish::CancelCleanup {
             state.finish_cancel();
           }
         } else {
@@ -511,7 +510,7 @@ mod loom_tests {
       assert!(!state.admitted());
       assert!(!state.queued);
       assert!(!state.running);
-      assert_eq!(state.finish_poll(false, false), PollFinish::Stale);
+      assert_eq!(state.finish_poll(false), PollFinish::Stale);
     });
   }
 
@@ -597,9 +596,9 @@ mod loom_tests {
       let did_enqueue = wake.join().unwrap();
       let mut state = lock(&state);
       assert!(!did_enqueue);
-      assert_eq!(state.finish_poll(false, false), PollFinish::Requeue);
+      assert_eq!(state.finish_poll(false), PollFinish::Requeue);
       assert_eq!(state.begin_poll(), Some(false));
-      assert_eq!(state.finish_poll(true, false), PollFinish::Complete);
+      assert_eq!(state.finish_poll(true), PollFinish::Complete);
       assert!(!state.admitted());
     });
   }
@@ -612,7 +611,7 @@ mod loom_tests {
       let state = Arc::new(Mutex::new(initial));
       let finish = {
         let state = Arc::clone(&state);
-        thread::spawn(move || lock(&state).finish_poll(false, false))
+        thread::spawn(move || lock(&state).finish_poll(false))
       };
       let wake = {
         let state = Arc::clone(&state);
@@ -624,7 +623,7 @@ mod loom_tests {
       assert!(state.queued);
       assert!(!state.running);
       assert_eq!(state.begin_poll(), Some(false));
-      assert_eq!(state.finish_poll(true, false), PollFinish::Complete);
+      assert_eq!(state.finish_poll(true), PollFinish::Complete);
     });
   }
 
@@ -641,7 +640,7 @@ mod loom_tests {
         };
         let finish = {
           let state = Arc::clone(&state);
-          thread::spawn(move || lock(&state).finish_poll(ready, false))
+          thread::spawn(move || lock(&state).finish_poll(ready))
         };
         let _ = abort.join().unwrap();
         let outcome = finish.join().unwrap();
@@ -661,7 +660,7 @@ mod loom_tests {
           }
           other => panic!("unexpected terminal outcome: {other:?}"),
         }
-        assert_eq!(state.finish_poll(false, false), PollFinish::Stale);
+        assert_eq!(state.finish_poll(false), PollFinish::Stale);
       }
     });
   }
@@ -671,7 +670,7 @@ mod loom_tests {
     loom::model(|| {
       let mut state = admitted();
       assert_eq!(state.begin_poll(), Some(false));
-      assert_eq!(state.finish_poll(true, false), PollFinish::Complete);
+      assert_eq!(state.finish_poll(true), PollFinish::Complete);
       state.admit(2);
       assert!(state.queue());
       if state.matches(1) {
@@ -679,7 +678,7 @@ mod loom_tests {
         let _ = state.abort();
       }
       assert_eq!(state.begin_poll(), Some(false));
-      assert_eq!(state.finish_poll(false, false), PollFinish::Idle);
+      assert_eq!(state.finish_poll(false), PollFinish::Idle);
       assert!(state.admitted());
       assert!(!state.queued);
       assert!(!state.abort);
@@ -706,14 +705,14 @@ mod loom_tests {
 
       let mut state = lock(&state);
       if state.is_running() {
-        assert_eq!(state.finish_poll(false, false), PollFinish::CancelCleanup);
+        assert_eq!(state.finish_poll(false), PollFinish::CancelCleanup);
         state.finish_cancel();
       } else {
         assert_eq!(state.begin_poll(), Some(true));
         state.finish_cancel();
       }
       assert!(!state.admitted());
-      assert_eq!(state.finish_poll(false, false), PollFinish::Stale);
+      assert_eq!(state.finish_poll(false), PollFinish::Stale);
     });
   }
 
@@ -725,7 +724,7 @@ mod loom_tests {
       assert!(!state.abort());
       assert!(!state.wake());
       assert!(!state.wake());
-      assert_eq!(state.finish_poll(false, false), PollFinish::CancelCleanup);
+      assert_eq!(state.finish_poll(false), PollFinish::CancelCleanup);
       assert!(!state.queue());
       assert!(!state.wake());
       assert!(!state.abort());
@@ -735,16 +734,14 @@ mod loom_tests {
     });
   }
 
-  /// A task slot in either dispatch mode. Strict uses the global
-  /// mutex; distributed uses this per-slot mutex.
   /// One task slot as the scheduler holds it: `PollProtocol` and a count of
-  /// ready-list insertions under the mutex, and the unlocked wake word.
+  /// queue insertions under the slot mutex, and the unlocked wake word.
   struct WordSlot {
     locked: Mutex<(PollProtocol, usize)>,
     word: PollWord,
   }
 
-  /// Admits `generation`, queues it and begins its poll, as `dequeue` does.
+  /// Admits `generation`, queues it and begins its poll, as dispatch does.
   fn running_slot(generation: u64) -> Arc<WordSlot> {
     let mut protocol = PollProtocol::new();
     protocol.admit(generation);
@@ -776,7 +773,7 @@ mod loom_tests {
     if slot.word.finish() {
       assert!(!locked.0.wake());
     }
-    let finish = locked.0.finish_poll(ready, false);
+    let finish = locked.0.finish_poll(ready);
     if finish == PollFinish::Requeue {
       locked.1 += 1;
     }
@@ -811,7 +808,7 @@ mod loom_tests {
       assert_eq!(locked.1, 1);
       assert!(locked.0.queued);
       assert_eq!(locked.0.begin_poll(), Some(false));
-      assert_eq!(locked.0.finish_poll(true, false), PollFinish::Complete);
+      assert_eq!(locked.0.finish_poll(true), PollFinish::Complete);
     });
   }
 
@@ -1128,7 +1125,7 @@ mod loom_tests {
       if !std::mem::take(&mut slot.permit) {
         return;
       }
-      assert_eq!(slot.protocol.finish_poll(true, false), PollFinish::Complete);
+      assert_eq!(slot.protocol.finish_poll(true), PollFinish::Complete);
       slot.finished += 1;
       drop(slot);
       self.release();

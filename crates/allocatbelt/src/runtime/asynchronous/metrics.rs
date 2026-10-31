@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use super::AsyncDispatch;
 use super::thread_options::AsyncThreadContext;
 use crate::runtime::resource_domain::{ControlCharge, DomainError, TenantDomain, payload_bytes};
 
@@ -17,10 +16,8 @@ pub(super) enum MetricsBuildError {
 pub(super) struct PaddedCounter(pub(super) AtomicUsize);
 
 pub(super) struct RuntimeMetricsInner {
-  dispatch: AsyncDispatch,
   pub(super) workers: usize,
   pub(super) alive_tasks: AtomicUsize,
-  pub(super) queue_depth: AtomicUsize,
   pub(super) lane_depth: Vec<PaddedCounter>,
   pub(super) blocked_depth: AtomicUsize,
   pub(super) overflow_depth: AtomicUsize,
@@ -75,17 +72,12 @@ pub struct RuntimeMetrics(Arc<RuntimeMetricsInner>);
 
 impl RuntimeMetrics {
   pub(super) fn try_new(
-    dispatch: AsyncDispatch,
     workers: usize,
     contexts: impl IntoIterator<Item = AsyncThreadContext>,
     capacity: usize,
     tenant: Option<&TenantDomain>,
   ) -> Result<Self, MetricsBuildError> {
-    let lanes = if dispatch == AsyncDispatch::Distributed {
-      workers
-    } else {
-      0
-    };
+    let lanes = workers;
     let requested = std::mem::size_of::<RuntimeMetricsInner>()
       .checked_add(
         payload_bytes::<ThreadMetrics>(capacity).map_err(MetricsBuildError::ResourceDomain)?,
@@ -117,10 +109,8 @@ impl RuntimeMetrics {
       .try_resize(actual)
       .map_err(MetricsBuildError::ResourceDomain)?;
     Ok(Self(Arc::new(RuntimeMetricsInner {
-      dispatch,
       workers,
       alive_tasks: AtomicUsize::new(0),
-      queue_depth: AtomicUsize::new(0),
       lane_depth,
       blocked_depth: AtomicUsize::new(0),
       overflow_depth: AtomicUsize::new(0),
@@ -132,12 +122,6 @@ impl RuntimeMetrics {
 
   pub(super) fn inner(&self) -> &Arc<RuntimeMetricsInner> {
     &self.0
-  }
-
-  /// Returns the dispatch mode chosen at construction.
-  #[must_use]
-  pub fn dispatch(&self) -> AsyncDispatch {
-    self.0.dispatch
   }
 
   /// Returns the configured primary worker count.
@@ -158,15 +142,14 @@ impl RuntimeMetrics {
     self.0.alive_tasks.load(Ordering::Relaxed)
   }
 
-  /// Returns the current number of tasks queued in lanes or ready lists, including scope poll waiters.
+  /// Returns the current number of queued tasks, including scope poll waiters.
   #[must_use]
   pub fn global_queue_depth(&self) -> usize {
     self.0.lane_depth.iter().fold(
       self
         .0
-        .queue_depth
+        .blocked_depth
         .load(Ordering::Relaxed)
-        .saturating_add(self.0.blocked_depth.load(Ordering::Relaxed))
         .saturating_add(self.0.overflow_depth.load(Ordering::Relaxed)),
       |sum, depth| sum.saturating_add(depth.0.load(Ordering::Relaxed)),
     )

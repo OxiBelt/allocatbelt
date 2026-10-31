@@ -1,6 +1,6 @@
 //! Dispatcher-turn and handoff-slot accounting for `try_block_in_place`.
-//! Production keeps one [`TurnCoordinator`] under the scheduler mutex; Loom
-//! tests drive the same transitions under Loom's mutex.
+//! Production keeps a [`SeatTable`] under its seat mutex; Loom tests drive
+//! the same transitions under Loom's mutex.
 //!
 //! A *turn* is one owned poll, cancellation or publication step and holds one
 //! of `W` dispatcher permits. A *loan* is one of `B` handoff slots: a turn
@@ -46,19 +46,10 @@ pub(super) struct RestoreTicket {
 #[must_use]
 pub(super) struct HelperLease(());
 
-/// What ending a turn requires the caller to wake.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct TurnEnd {
-  /// A restoring thread may now reacquire the released permit.
-  pub(super) wake_restorer: bool,
-  /// No turn, loan or restoration remains.
-  pub(super) quiescent: bool,
-}
-
 /// Fixed-capacity counters for dispatcher permits, handoff loans, waiting
 /// restorations and activated helpers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct TurnCoordinator {
+struct TurnCoordinator {
   dispatchers: usize,
   max_handoffs: usize,
   turns: usize,
@@ -79,12 +70,9 @@ impl TurnCoordinator {
     }
   }
 
-  pub(super) const fn handoffs_enabled(&self) -> bool {
-    self.max_handoffs != 0
-  }
-
-  /// Whether a new turn could start now. A waiting restoration has priority
-  /// over every new turn.
+  /// Whether a vacant seat may be assigned to a helper or resuming worker.
+  /// Waiting restorations have priority for those seats; dispatchers already
+  /// holding other seats continue polling.
   pub(super) const fn can_begin_turn(&self) -> bool {
     self.turns < self.dispatchers && self.restoring == 0
   }
@@ -97,14 +85,10 @@ impl TurnCoordinator {
     Some(DispatchTurn { seat: 0 })
   }
 
-  pub(super) fn end_turn(&mut self, turn: DispatchTurn) -> TurnEnd {
+  fn end_turn(&mut self, turn: DispatchTurn) {
     let DispatchTurn { seat: _ } = turn;
     debug_assert!(self.turns > 0);
     self.turns = self.turns.saturating_sub(1);
-    TurnEnd {
-      wake_restorer: self.restoring != 0,
-      quiescent: self.quiescent(),
-    }
   }
 
   /// Reserves a handoff slot before releasing the turn's permit. A full or
@@ -154,10 +138,6 @@ impl TurnCoordinator {
     Some(HelperLease(()))
   }
 
-  pub(super) const fn can_activate_helper(&self) -> bool {
-    self.helpers < self.handoffs
-  }
-
   /// Retires an active helper between turns once more helpers than loans
   /// are active; otherwise returns the unchanged lease.
   pub(super) fn retire_helper(&mut self, lease: HelperLease) -> Result<(), HelperLease> {
@@ -171,18 +151,6 @@ impl TurnCoordinator {
 
   pub(super) const fn helper_is_excess(&self) -> bool {
     self.helpers > self.handoffs
-  }
-
-  pub(super) const fn quiescent(&self) -> bool {
-    self.turns == 0 && self.handoffs == 0 && self.restoring == 0
-  }
-
-  /// Threads exit only once admission is empty. With handoffs enabled they
-  /// also wait until no turn, loan or restoration remains, so a closing
-  /// publication or restoration can still hand off or reacquire a permit.
-  /// Without handoffs, exit is unchanged from the fixed worker pool.
-  pub(super) const fn may_exit(&self, admission_empty: bool) -> bool {
-    admission_empty && (!self.handoffs_enabled() || self.quiescent())
   }
 
   #[cfg(test)]
@@ -203,8 +171,7 @@ impl TurnCoordinator {
   }
 }
 
-/// Seat identity around the existing turn counters. This table is only
-/// used by distributed dispatch; strict keeps using the counters.
+/// Seat identity and handoff counters for dispatchers and helpers.
 #[derive(Debug)]
 pub(super) struct SeatTable {
   turns: TurnCoordinator,
@@ -306,7 +273,7 @@ impl SeatTable {
       && self.helper_seats().next().is_none()
   }
 
-  pub(super) fn end_turn(&mut self, turn: DispatchTurn) -> TurnEnd {
+  pub(super) fn end_turn(&mut self, turn: DispatchTurn) {
     self.vacant.push(turn.seat());
     self.helper_held[turn.seat()] = false;
     self.turns.end_turn(turn)
@@ -414,78 +381,10 @@ fn waiting_helper_restorer(
   (seats, turns, ticket, lease)
 }
 
-#[cfg(all(test, not(loom)))]
-mod tests {
-  use super::TurnCoordinator;
-
-  #[test]
-  fn full_and_disabled_handoffs_return_the_unchanged_turn() {
-    let mut disabled = TurnCoordinator::new(1, 0);
-    let turn = disabled.try_begin_turn().unwrap();
-    let turn = disabled.try_hand_off(turn).unwrap_err();
-    assert_eq!(disabled.counts(), (1, 0, 0, 0));
-    let end = disabled.end_turn(turn);
-    assert!(end.quiescent && !end.wake_restorer);
-
-    let mut full = TurnCoordinator::new(2, 1);
-    let first = full.try_begin_turn().unwrap();
-    let second = full.try_begin_turn().unwrap();
-    assert!(full.try_begin_turn().is_none());
-    let loan = full.try_hand_off(first).unwrap();
-    let second = full.try_hand_off(second).unwrap_err();
-    assert_eq!(full.counts(), (1, 1, 0, 0));
-    full.check();
-    let _ = full.end_turn(second);
-    let ticket = full.begin_restore(loan);
-    let turn = full.try_restore(ticket).unwrap();
-    let _ = full.end_turn(turn);
-    assert!(full.quiescent());
-  }
-
-  #[test]
-  fn restoration_has_priority_and_excess_helpers_retire_between_turns() {
-    let mut state = TurnCoordinator::new(1, 1);
-    let original = state.try_begin_turn().unwrap();
-    let loan = state.try_hand_off(original).unwrap();
-    let lease = state.try_activate_helper().unwrap();
-    assert!(state.try_activate_helper().is_none());
-    let helper_turn = state.try_begin_turn().unwrap();
-    let ticket = state.begin_restore(loan);
-    // The original cannot preempt the helper's turn; it waits.
-    let ticket = state.try_restore(ticket).unwrap_err();
-    let lease = state.retire_helper(lease).unwrap_err();
-    let end = state.end_turn(helper_turn);
-    assert!(end.wake_restorer && !end.quiescent);
-    // A new turn cannot overtake the waiting restoration.
-    assert!(state.try_begin_turn().is_none());
-    assert!(!state.may_exit(true));
-    let original = state.try_restore(ticket).unwrap();
-    assert!(state.helper_is_excess());
-    state.retire_helper(lease).unwrap();
-    assert!(!state.may_exit(true));
-    let end = state.end_turn(original);
-    assert!(end.quiescent && !end.wake_restorer);
-    assert!(state.may_exit(true));
-    assert!(!state.may_exit(false));
-    state.check();
-  }
-
-  #[test]
-  fn without_handoffs_exit_depends_only_on_admission() {
-    let mut state = TurnCoordinator::new(2, 0);
-    let turn = state.try_begin_turn().unwrap();
-    assert!(state.may_exit(true));
-    assert!(!state.may_exit(false));
-    let _ = state.end_turn(turn);
-  }
-}
-
 #[cfg(all(test, loom))]
-mod loom_tests {
+mod seat_loom_tests {
   use loom::sync::{Arc, Mutex};
   use loom::thread;
-
-  use super::{DispatchTurn, HelperLease, TurnCoordinator};
 
   fn lock<T>(mutex: &Mutex<T>) -> loom::sync::MutexGuard<'_, T> {
     mutex
@@ -497,230 +396,6 @@ mod loom_tests {
     let mut model = loom::model::Builder::new();
     model.max_permutations = Some(10_000);
     model.check(check);
-  }
-
-  struct Model {
-    turns: TurnCoordinator,
-    restored: bool,
-    closure_done: bool,
-    helper_turns: usize,
-  }
-
-  impl Model {
-    fn new(dispatchers: usize, handoffs: usize) -> (Self, DispatchTurn) {
-      let mut turns = TurnCoordinator::new(dispatchers, handoffs);
-      let original = turns.try_begin_turn().unwrap();
-      (
-        Self {
-          turns,
-          restored: false,
-          closure_done: false,
-          helper_turns: 0,
-        },
-        original,
-      )
-    }
-  }
-
-  /// The original thread: hand off, run the closure, restore, end the turn.
-  fn original(state: &Mutex<Model>, turn: DispatchTurn) {
-    let loan = {
-      let mut state = lock(state);
-      let loan = state.turns.try_hand_off(turn).unwrap();
-      state.turns.check();
-      loan
-    };
-    thread::yield_now();
-    let mut ticket = {
-      let mut state = lock(state);
-      state.closure_done = true;
-      let ticket = state.turns.begin_restore(loan);
-      state.turns.check();
-      ticket
-    };
-    let turn = loop {
-      {
-        let mut state = lock(state);
-        match state.turns.try_restore(ticket) {
-          Ok(turn) => {
-            state.restored = true;
-            state.turns.check();
-            break turn;
-          }
-          Err(waiting) => ticket = waiting,
-        }
-      }
-      thread::yield_now();
-    };
-    let mut state = lock(state);
-    let _ = state.turns.end_turn(turn);
-    state.turns.check();
-  }
-
-  /// A helper: activate while a loan exists, run turns, retire when excess.
-  /// Stops once the protocol is quiescent and it holds no lease.
-  fn helper(state: &Mutex<Model>, try_nested_handoff: bool) {
-    let mut lease: Option<HelperLease> = None;
-    loop {
-      {
-        let mut state = lock(state);
-        if let Some(held) = lease.take() {
-          match state.turns.retire_helper(held) {
-            Ok(()) => {}
-            Err(held) => {
-              if let Some(turn) = state.turns.try_begin_turn() {
-                assert!(!state.restored || state.closure_done);
-                state.helper_turns += 1;
-                let turn = if try_nested_handoff {
-                  // The single slot is held by the original: the helper's
-                  // nested request is rejected and keeps its turn.
-                  state.turns.try_hand_off(turn).unwrap_err()
-                } else {
-                  turn
-                };
-                state.turns.check();
-                let _ = state.turns.end_turn(turn);
-              }
-              lease = Some(held);
-            }
-          }
-        } else if let Some(held) = state.turns.try_activate_helper() {
-          lease = Some(held);
-        } else if state.turns.quiescent() {
-          state.turns.check();
-          return;
-        }
-        state.turns.check();
-      }
-      thread::yield_now();
-    }
-  }
-
-  #[test]
-  fn loom_handoff_activation_and_reentry_conserve_permits_and_slots() {
-    bounded_model(|| {
-      let (model, turn) = Model::new(1, 1);
-      let state = Arc::new(Mutex::new(model));
-      let original_thread = {
-        let state = Arc::clone(&state);
-        thread::spawn(move || original(&state, turn))
-      };
-      let helper_thread = {
-        let state = Arc::clone(&state);
-        thread::spawn(move || helper(&state, false))
-      };
-      original_thread.join().unwrap();
-      helper_thread.join().unwrap();
-      let state = lock(&state);
-      assert!(state.restored);
-      assert_eq!(state.turns.counts(), (0, 0, 0, 0));
-      assert!(state.turns.may_exit(true));
-    });
-  }
-
-  #[test]
-  fn loom_helper_origin_handoff_is_bounded_by_the_shared_slots() {
-    bounded_model(|| {
-      let (model, turn) = Model::new(1, 1);
-      let state = Arc::new(Mutex::new(model));
-      let original_thread = {
-        let state = Arc::clone(&state);
-        thread::spawn(move || original(&state, turn))
-      };
-      let helper_thread = {
-        let state = Arc::clone(&state);
-        thread::spawn(move || helper(&state, true))
-      };
-      original_thread.join().unwrap();
-      helper_thread.join().unwrap();
-      assert_eq!(lock(&state).turns.counts(), (0, 0, 0, 0));
-    });
-  }
-
-  #[test]
-  fn loom_waiting_restoration_has_priority_over_new_turns() {
-    bounded_model(|| {
-      let (mut model, original_turn) = Model::new(1, 1);
-      let loan = model.turns.try_hand_off(original_turn).unwrap();
-      // A dispatcher already occupies the freed permit.
-      let busy = model.turns.try_begin_turn().unwrap();
-      let ticket = model.turns.begin_restore(loan);
-      let state = Arc::new(Mutex::new(model));
-      let restorer = {
-        let state = Arc::clone(&state);
-        thread::spawn(move || {
-          let mut ticket = ticket;
-          let turn = loop {
-            {
-              let mut state = lock(&state);
-              match state.turns.try_restore(ticket) {
-                Ok(turn) => {
-                  state.restored = true;
-                  break turn;
-                }
-                Err(waiting) => ticket = waiting,
-              }
-            }
-            thread::yield_now();
-          };
-          let mut state = lock(&state);
-          let _ = state.turns.end_turn(turn);
-        })
-      };
-      let dispatcher = {
-        let state = Arc::clone(&state);
-        thread::spawn(move || {
-          let end = lock(&state).turns.end_turn(busy);
-          assert!(end.wake_restorer || lock(&state).restored);
-        })
-      };
-      let newcomer = {
-        let state = Arc::clone(&state);
-        thread::spawn(move || {
-          let mut state = lock(&state);
-          if let Some(turn) = state.turns.try_begin_turn() {
-            assert!(state.restored, "a new turn overtook a waiting restoration");
-            let _ = state.turns.end_turn(turn);
-          }
-        })
-      };
-      restorer.join().unwrap();
-      dispatcher.join().unwrap();
-      newcomer.join().unwrap();
-      assert_eq!(lock(&state).turns.counts(), (0, 0, 0, 0));
-    });
-  }
-
-  #[test]
-  fn loom_close_cannot_observe_exit_before_restoration_finishes() {
-    bounded_model(|| {
-      let (model, turn) = Model::new(1, 1);
-      let state = Arc::new(Mutex::new(model));
-      let original_thread = {
-        let state = Arc::clone(&state);
-        thread::spawn(move || original(&state, turn))
-      };
-      let helper_thread = {
-        let state = Arc::clone(&state);
-        thread::spawn(move || helper(&state, false))
-      };
-      let closer = {
-        let state = Arc::clone(&state);
-        thread::spawn(move || {
-          // Admission is already empty and closed: exit is allowed only when
-          // the original has restored and ended its turn.
-          let state = lock(&state);
-          if state.turns.may_exit(true) {
-            assert!(state.restored);
-            assert_eq!(state.turns.counts().0, 0);
-          }
-        })
-      };
-      original_thread.join().unwrap();
-      helper_thread.join().unwrap();
-      closer.join().unwrap();
-      assert!(lock(&state).turns.may_exit(true));
-    });
   }
 
   #[test]
@@ -902,7 +577,7 @@ mod loom_tests {
             thread::yield_now();
           };
           let mut state = lock(&state);
-          let _ = state.0.end_turn(turn);
+          state.0.end_turn(turn);
           state.0.check();
         })
       };
@@ -915,7 +590,7 @@ mod loom_tests {
             {
               let mut state = lock(&state);
               if let Some(held) = turn.take() {
-                let _ = state.0.end_turn(held);
+                state.0.end_turn(held);
               }
               if let Some(held) = lease.take() {
                 match state.0.retire_helper(held) {
@@ -934,7 +609,7 @@ mod loom_tests {
               if state.0.may_exit(state.1) {
                 assert!(state.1, "exit before restoration");
                 if let Some(held) = turn.take() {
-                  let _ = state.0.end_turn(held);
+                  state.0.end_turn(held);
                 }
                 if let Some(held) = lease.take() {
                   assert!(state.0.helper_is_excess());
@@ -955,7 +630,7 @@ mod loom_tests {
           let mut state = lock(&state);
           assert_eq!(second.seat(), 1);
           assert!(!state.0.vacant.contains(&second.seat()));
-          let _ = state.0.end_turn(second);
+          state.0.end_turn(second);
           state.0.check();
         })
       };
@@ -991,7 +666,7 @@ mod seat_tests {
     seats.check();
     let ticket = seats.begin_restore(loan);
     let ticket = seats.try_restore(ticket).unwrap_err();
-    assert!(seats.end_turn(helper).wake_restorer);
+    seats.end_turn(helper);
     assert!(seats.try_begin_helper_turn().is_none());
     let first = seats.try_restore(ticket).unwrap();
     assert_eq!(first.seat(), 0);
@@ -1001,8 +676,8 @@ mod seat_tests {
     seats.check();
     assert!(seats.may_exit(true));
     assert!(!seats.may_exit(false));
-    let _ = seats.end_turn(first);
-    let _ = seats.end_turn(second);
+    seats.end_turn(first);
+    seats.end_turn(second);
     seats.check();
     assert_eq!(seats.vacant.len(), 2);
   }
@@ -1024,11 +699,11 @@ mod seat_tests {
     seats.check();
     let ticket = seats.begin_restore(loan);
     let ticket = seats.try_restore(ticket).unwrap_err();
-    let _ = seats.end_turn(helper);
+    seats.end_turn(helper);
     let first = seats.try_restore(ticket).unwrap();
     seats.retire_helper(lease).unwrap();
-    let _ = seats.end_turn(first);
-    let _ = seats.end_turn(second);
+    seats.end_turn(first);
+    seats.end_turn(second);
     seats.check();
     assert!(seats.may_exit(true));
   }

@@ -101,6 +101,12 @@ struct Lane {
   cv: Condvar,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadyInsertion {
+  Publish,
+  PollRequeue,
+}
+
 struct SeatGuard<'a> {
   distributed: &'a Distributed,
   shared: &'a Shared,
@@ -150,6 +156,8 @@ pub(super) struct Distributed {
   lane_locks: AtomicUsize,
   #[cfg(all(test, not(loom)))]
   steals: AtomicUsize,
+  #[cfg(all(test, not(loom)))]
+  wake_searches: AtomicUsize,
   #[cfg(all(test, not(loom)))]
   round_robin: AtomicBool,
   #[cfg(all(test, not(loom)))]
@@ -250,7 +258,9 @@ impl Distributed {
       #[cfg(all(test, not(loom)))]
       steals: AtomicUsize::new(0),
       #[cfg(all(test, not(loom)))]
-      round_robin: AtomicBool::new(super::super::lane::ROUND_ROBIN_PLACEMENT),
+      wake_searches: AtomicUsize::new(0),
+      #[cfg(all(test, not(loom)))]
+      round_robin: AtomicBool::new(false),
       #[cfg(all(test, not(loom)))]
       unwind_seat: AtomicUsize::new(usize::MAX),
     })
@@ -300,18 +310,17 @@ impl Distributed {
       .store(queue.len(), Ordering::SeqCst);
   }
 
-  fn push_ready(&self, shared: &Shared, index: usize) {
+  fn push_ready(&self, shared: &Shared, index: usize, insertion: ReadyInsertion) {
     let next = self.next_lane.fetch_add(1, Ordering::Relaxed);
     #[cfg(all(test, not(loom)))]
-    let round_robin = self.round_robin.load(Ordering::Relaxed);
-    #[cfg(any(not(test), loom))]
-    let round_robin = super::super::lane::ROUND_ROBIN_PLACEMENT;
-    let seat = if round_robin {
+    let (seat, claimed_parked) = if self.round_robin.load(Ordering::Relaxed) {
       super::super::lane::choose_lane_round_robin(next, &self.parked)
     } else {
       choose_lane(next, &self.parked)
     };
-    let (notify, remains) = {
+    #[cfg(any(not(test), loom))]
+    let (seat, claimed_parked) = choose_lane(next, &self.parked);
+    let (notify, search) = {
       let mut queue = self.lane(seat);
       // Serialize with abort's lane scan and seat retirement. A publisher or
       // quota transfer that was in flight when abort ran must use overflow.
@@ -322,14 +331,18 @@ impl Distributed {
       }
       let notify = queue.push(&self.links, index);
       self.publish_depth(shared, seat, &queue);
-      // A single entry on a busy lane is stealable too. A sleeping owner
-      // already receives the notification; otherwise kick a parked searcher.
-      (notify, queue.len() >= 2 || !notify)
+      // Newly ready work may sit behind a blocked poll, even as a lone entry.
+      // A poll-end requeue leaves its finishing dispatcher available to search.
+      // Selection may already have claimed this lane's parked owner; the
+      // lane notification below is then the insertion's only wake.
+      let search =
+        insertion == ReadyInsertion::Publish && !claimed_parked && !self.parked.is_set(seat);
+      (notify, search)
     };
     if notify {
       self.lanes[seat].cv.notify_one();
     }
-    if remains {
+    if search {
       self.wake_one_parked();
     }
   }
@@ -359,6 +372,8 @@ impl Distributed {
     }
   }
   fn wake_one_parked(&self) {
+    #[cfg(all(test, not(loom)))]
+    self.wake_searches.fetch_add(1, Ordering::Relaxed);
     if let Some(seat) = self
       .parked
       .claim_any(self.next_lane.load(Ordering::Relaxed))
@@ -499,7 +514,7 @@ impl Distributed {
     state.admitted += 1;
     drop(slot);
     drop(state);
-    self.push_ready(shared, index);
+    self.push_ready(shared, index, ReadyInsertion::Publish);
     Ok(job)
   }
 
@@ -518,7 +533,7 @@ impl Distributed {
       slot.protocol.wake()
     };
     if inserted {
-      self.push_ready(shared, task_ref.index);
+      self.push_ready(shared, task_ref.index, ReadyInsertion::Publish);
     }
   }
 
@@ -644,7 +659,7 @@ impl Distributed {
     if let Some(index) = transfer {
       // The removed entry is in hand; abort cannot unlink or dispatch it.
       self.slot(index).reserved_permit = true;
-      self.push_ready(shared, index);
+      self.push_ready(shared, index, ReadyInsertion::Publish);
     }
   }
 
@@ -712,7 +727,7 @@ impl Distributed {
       let inserted = slot.protocol.wake();
       debug_assert!(!inserted);
     }
-    match slot.protocol.finish_poll(ready, false) {
+    match slot.protocol.finish_poll(ready) {
       PollFinish::Complete => {
         let task = slot.task.take();
         let scope = slot.scope.take();
@@ -730,7 +745,7 @@ impl Distributed {
       }
       PollFinish::Requeue => {
         drop(slot);
-        self.push_ready(shared, task_ref.index);
+        self.push_ready(shared, task_ref.index, ReadyInsertion::PollRequeue);
       }
       PollFinish::Idle | PollFinish::Stale => {}
     }

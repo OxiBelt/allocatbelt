@@ -128,9 +128,6 @@ jobs:
       - name: Cargo release correctness tests
         run: cargo test --release --all-features --locked
 
-      - name: Distributed runtime correctness tests without handoffs
-        run: scripts/check-async-distributed.sh
-
   scalar-isa-arm64:
     name: ARM64 scalar instruction probes
     runs-on: ubuntu-26.04-arm
@@ -538,7 +535,7 @@ jobs:
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::model
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::asynchronous::lane::loom_tests
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::asynchronous::protocol::loom_tests
-          cargo test --release --locked -p allocatbelt-runtime --lib runtime::asynchronous::handoff_protocol::loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::asynchronous::handoff_protocol::seat_loom_tests
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::asynchronous::task_set::model
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::asynchronous::join::model
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::managed::model

@@ -16,10 +16,10 @@ use std::time::{Duration, Instant};
 
 use super::entry::{block_on_active, budget_remaining, cooperative_poll_active};
 use super::{
-  AsyncConfig, AsyncDispatch, AsyncError, AsyncHandle, AsyncJob, AsyncJoinError, AsyncRuntime,
-  AsyncScopeConfig, AsyncShutdown, BlockInPlaceErrorKind, HandoffConfig, LocalConfig, LocalRuntime,
-  OwnedTaskScope, consume_budget, current_resource_scope, try_block_in_place,
-  try_current_resource_scope, try_task_id, yield_now,
+  AsyncConfig, AsyncError, AsyncHandle, AsyncJob, AsyncJoinError, AsyncRuntime, AsyncScopeConfig,
+  AsyncShutdown, BlockInPlaceErrorKind, HandoffConfig, LocalConfig, LocalRuntime, OwnedTaskScope,
+  consume_budget, current_resource_scope, try_block_in_place, try_current_resource_scope,
+  try_task_id, yield_now,
 };
 use crate::runtime::cache;
 use crate::runtime::managed::{ResourceLimits, ResourceScope};
@@ -225,14 +225,11 @@ fn handoff_configuration_is_explicit_and_checked() {
   assert!(format!("{fixed:?}").contains("workers: 2"));
   let with_helpers = handoff_runtime(2, 3, 1, 1);
   assert!(format!("{with_helpers:?}").contains("workers: 5"));
-  if with_helpers.dispatch() == AsyncDispatch::Distributed {
-    wait_until(
-      || with_helpers.shared.turn_counts() == (2, 0, 0, 0),
-      "worker seats to start",
-    );
-  } else {
-    assert_eq!(with_helpers.shared.turn_counts(), (0, 0, 0, 0));
-  }
+  wait_until(
+    || with_helpers.shared.turn_counts() == (2, 0, 0, 0),
+    "worker seats to start",
+  );
+
   drained(fixed);
   drained(with_helpers);
 }
@@ -576,7 +573,7 @@ fn helpers_hand_off_under_the_same_bound_with_distinct_shards() {
   assert_eq!(helper_shards, [Some(1), Some(2)]);
 
   // Both loans are restored, so the helpers retire and only the worker runs.
-  let idle_turns = usize::from(runtime.dispatch() == AsyncDispatch::Distributed);
+  let idle_turns = 1;
   wait_until(
     || shared.turn_counts() == (idle_turns, 0, 0, 0),
     "helpers to retire",

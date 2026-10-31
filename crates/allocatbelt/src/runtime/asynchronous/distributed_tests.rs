@@ -16,18 +16,13 @@ fn config(workers: usize, tasks: usize) -> AsyncConfig {
   }
 }
 fn runtime(workers: usize, tasks: usize) -> AsyncRuntime {
-  AsyncRuntime::new_with_options(
-    config(workers, tasks),
-    AsyncRuntimeOptions::new().dispatch(AsyncDispatch::Distributed),
-  )
-  .unwrap()
+  AsyncRuntime::new_with_options(config(workers, tasks), AsyncRuntimeOptions::new()).unwrap()
 }
 fn shared(config: AsyncConfig) -> (Arc<Shared>, ScopeRef) {
   shared_with_handoffs(config, 0)
 }
 fn shared_with_handoffs(config: AsyncConfig, handoffs: usize) -> (Arc<Shared>, ScopeRef) {
   let metrics = RuntimeMetrics::try_new(
-    AsyncDispatch::Distributed,
     config.workers,
     super::super::super::thread_contexts(config.workers, handoffs),
     config.workers + handoffs,
@@ -36,7 +31,6 @@ fn shared_with_handoffs(config: AsyncConfig, handoffs: usize) -> (Arc<Shared>, S
   .unwrap();
   Shared::new(
     config,
-    AsyncDispatch::Distributed,
     handoffs,
     None,
     super::super::super::ControlledThreadOptions::unbounded(AsyncThreadOptions::new()),
@@ -45,7 +39,7 @@ fn shared_with_handoffs(config: AsyncConfig, handoffs: usize) -> (Arc<Shared>, S
   .unwrap()
 }
 fn engine(shared: &Shared) -> &Distributed {
-  shared.distributed.as_ref().unwrap()
+  &shared.distributed
 }
 fn wait(mut predicate: impl FnMut() -> bool) {
   let deadline = Instant::now() + Duration::from_secs(30);
@@ -119,6 +113,27 @@ fn run(shared: &Arc<Shared>, work: Selected) {
 }
 
 #[test]
+fn one_spawn_into_four_parked_lanes_wakes_only_its_dispatcher() {
+  let (shared, root) = shared(config(4, 1));
+  let d = engine(&shared);
+  // Model all four parked dispatchers without racing their next search.
+  for seat in 0..4 {
+    d.parked.advertise(seat);
+    assert!(d.lane(seat).prepare_sleep());
+  }
+  let searches = d.wake_searches.load(Ordering::Relaxed);
+  let locks = d.lane_locks.load(Ordering::Relaxed);
+  let job = shared.spawn(root, async {}).unwrap();
+  assert_eq!(d.wake_searches.load(Ordering::Relaxed) - searches, 0);
+  assert_eq!(d.lane_locks.load(Ordering::Relaxed) - locks, 1);
+  assert!(!d.parked.is_set(0));
+  assert!((1..4).all(|seat| d.parked.is_set(seat)));
+  run(&shared, selected(&shared, 0).unwrap());
+  finish(job).unwrap();
+  check_distributed(&shared);
+}
+
+#[test]
 fn two_blocking_polls_start_before_deadline() {
   let (shared, root) = shared(config(2, 2));
   let d = engine(&shared);
@@ -152,6 +167,98 @@ fn two_blocking_polls_start_before_deadline() {
   join_worker(worker1);
   assert_eq!(results, (true, true), "concurrent poll start deadline");
   check_distributed(&shared);
+}
+
+#[test]
+fn external_spawns_start_all_blocking_polls_before_deadline() {
+  for workers in [2, 4] {
+    let runtime = runtime(workers, workers);
+    let d = engine(&runtime.shared);
+    wait(|| (0..workers).all(|seat| d.parked.is_set(seat)));
+    let handle = runtime.handle();
+    // This thread has no dispatcher seat. Wait for each poll to start so that
+    // every later insertion targets a busy lane with a lone ready entry.
+    let spawner = std::thread::spawn(move || {
+      let started = Arc::new(AtomicUsize::new(0));
+      let (tx, rx) = mpsc::channel();
+      let deadline = Instant::now() + Duration::from_secs(5);
+      let mut jobs = Vec::new();
+      for _ in 0..workers {
+        let started = Arc::clone(&started);
+        let tx = tx.clone();
+        jobs.push(
+          handle
+            .spawn(async move {
+              started.fetch_add(1, Ordering::SeqCst);
+              tx.send(()).unwrap();
+              while started.load(Ordering::SeqCst) < workers && Instant::now() < deadline {
+                std::thread::yield_now();
+              }
+              started.load(Ordering::SeqCst) == workers && Instant::now() < deadline
+            })
+            .unwrap(),
+        );
+        rx.recv_timeout(Duration::from_secs(10)).unwrap();
+      }
+      jobs
+    });
+    let jobs = join_worker(spawner);
+    let results: Vec<_> = jobs.into_iter().map(|job| finish(job).unwrap()).collect();
+    shutdown(runtime, AsyncShutdown::Drain);
+    assert!(
+      results.iter().all(|started| *started),
+      "{workers} poll start deadline: {results:?}"
+    );
+  }
+}
+
+#[test]
+fn external_idle_wake_behind_blocked_poll_runs_before_deadline() {
+  const WORKERS: usize = 4;
+  let runtime = runtime(WORKERS, 2);
+  let d = engine(&runtime.shared);
+  let ready = Arc::new(AtomicBool::new(false));
+  let blocker_returned = Arc::new(AtomicBool::new(false));
+  let (waker_tx, waker_rx) = mpsc::channel();
+  let (release_tx, release_rx) = mpsc::channel();
+  let task_ready = Arc::clone(&ready);
+  let returned = Arc::clone(&blocker_returned);
+  let job = runtime
+    .handle()
+    .spawn(std::future::poll_fn(move |cx| {
+      if task_ready.load(Ordering::Acquire) {
+        let ran_while_blocked = !returned.load(Ordering::Acquire);
+        let _ = release_tx.send(());
+        Poll::Ready(ran_while_blocked)
+      } else {
+        waker_tx.send(cx.waker().clone()).unwrap();
+        Poll::Pending
+      }
+    }))
+    .unwrap();
+  let waker = waker_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  // Observe the completed Pending transition, not just waker registration.
+  wait(|| (0..WORKERS).all(|seat| d.parked.is_set(seat)));
+  let (started_tx, started_rx) = mpsc::channel();
+  let blocker = runtime
+    .handle()
+    .spawn(async move {
+      started_tx.send(()).unwrap();
+      let released = release_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+      blocker_returned.store(true, Ordering::Release);
+      released
+    })
+    .unwrap();
+  started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  wait(|| (0..WORKERS).filter(|seat| d.parked.is_set(*seat)).count() == WORKERS - 1);
+  join_worker(std::thread::spawn(move || {
+    ready.store(true, Ordering::Release);
+    waker.wake();
+  }));
+  let ran_while_blocked = finish(job).unwrap();
+  let released = finish(blocker).unwrap();
+  shutdown(runtime, AsyncShutdown::Drain);
+  assert!(ran_while_blocked && released, "external idle wake deadline");
 }
 
 #[test]
@@ -690,6 +797,15 @@ fn self_yields_complete_even_when_under_subscribed() {
       .iter()
       .all(|t| t.parks > t.unparks)
   });
+  let d = engine(&runtime.shared);
+  let wakes_before = d.wake_searches.load(Ordering::Relaxed);
+  let parks_before: usize = runtime
+    .metrics()
+    .snapshot()
+    .threads
+    .iter()
+    .map(|t| t.parks)
+    .sum();
   let mut polls = 0;
   let job = runtime
     .handle()
@@ -704,8 +820,23 @@ fn self_yields_complete_even_when_under_subscribed() {
     }))
     .unwrap();
   assert_eq!(finish(job).unwrap(), 10_000);
-  // A lone requeued entry can migrate between workers, so idle workers may
-  // park again between polls. Completion must not depend on lane affinity.
+  // Poll-end requeues leave a dispatcher searching, without waking and
+  // parking an idle searcher for each poll. Count wake attempts as well as
+  // actual parks so notification churn cannot hide behind retained wakes.
+  wait(|| (0..4).all(|seat| d.parked.is_set(seat)));
+  let wakes = d.wake_searches.load(Ordering::Relaxed) - wakes_before;
+  let parks: usize = runtime
+    .metrics()
+    .snapshot()
+    .threads
+    .iter()
+    .map(|t| t.parks)
+    .sum();
+  assert!(wakes < 32, "{wakes} searcher wakes for 10,000 polls");
+  assert!(
+    parks - parks_before < 32,
+    "park cycles proportional to polls"
+  );
   shutdown(runtime, AsyncShutdown::Drain);
 }
 
@@ -833,9 +964,6 @@ fn distributed_control_charges_match_requested_and_actual_tables() {
     d.actual_control().unwrap(),
     Distributed::requested_control(cfg).unwrap()
   );
-  assert_eq!(shared.lock().tasks.capacity(), 0);
-  assert_eq!(shared.lock().round_robin.capacity(), 0);
-  assert_eq!(shared.poll_words.capacity(), 0);
   check_distributed(&shared);
 }
 
@@ -1262,7 +1390,6 @@ fn handoff_restores_onto_another_lane_while_other_workers_keep_polling() {
   let runtime = AsyncRuntime::new_with_options(
     config(2, 8),
     AsyncRuntimeOptions::new()
-      .dispatch(AsyncDispatch::Distributed)
       .handoffs(HandoffConfig { max_handoffs: 2 })
       .thread_options(options),
   )
@@ -1383,9 +1510,7 @@ fn handoff_root_limit_stays_binding_and_uses_two_scope_locks() {
   use super::super::super::HandoffConfig;
   let runtime = AsyncRuntime::new_with_options(
     config(2, 4),
-    AsyncRuntimeOptions::new()
-      .dispatch(AsyncDispatch::Distributed)
-      .handoffs(HandoffConfig { max_handoffs: 2 }),
+    AsyncRuntimeOptions::new().handoffs(HandoffConfig { max_handoffs: 2 }),
   )
   .unwrap();
   let d = engine(&runtime.shared);
@@ -1713,4 +1838,189 @@ fn handoff_helper_yield_hint_does_not_lock_worker_seats_per_poll() {
     "worker took seat locks between polls"
   );
   assert_eq!(shared.turn_counts(), (0, 0, 0, 0));
+}
+
+#[test]
+fn exhausted_task_generation_is_skipped_without_hiding_other_slots() {
+  let (shared, root) = shared(config(1, 2));
+  let d = engine(&shared);
+  shared
+    .lock()
+    .free_tasks
+    .retain(|Reverse(index)| *index != 0);
+  {
+    let mut slot = d.slot(0);
+    slot.protocol.admit(u64::MAX);
+    slot.protocol.finish_cancel();
+  }
+  let job = shared.spawn(root, async { 7 }).unwrap();
+  assert_eq!(d.slot(0).protocol.generation(), u64::MAX);
+  let work = selected(&shared, 0).unwrap();
+  assert!(matches!(&work, Selected::Poll(reference, ..) if reference.index == 1));
+  run(&shared, work);
+  assert_eq!(finish(job).unwrap(), 7);
+  check_distributed(&shared);
+  shared.close(false);
+}
+
+#[test]
+fn all_exhausted_task_generations_return_full_without_admission() {
+  let (shared, root) = shared(config(1, 2));
+  let d = engine(&shared);
+  shared.lock().free_tasks.clear();
+  for index in 0..2 {
+    let mut slot = d.slot(index);
+    slot.protocol.admit(u64::MAX);
+    slot.protocol.finish_cancel();
+  }
+  let error = shared
+    .spawn(root, std::future::pending::<()>())
+    .unwrap_err();
+  assert_eq!(error.kind, AsyncError::Full);
+  drop(error.into_future());
+  check_distributed(&shared);
+  shared.close(false);
+}
+
+#[test]
+fn free_task_heap_reuses_the_lowest_completed_slot() {
+  let (shared, root) = shared(config(1, 4));
+  let d = engine(&shared);
+  let jobs: Vec<_> = (0..4)
+    .map(|_| shared.spawn(root, std::future::pending::<()>()).unwrap())
+    .collect();
+  for _ in 0..4 {
+    run(&shared, selected(&shared, 0).unwrap());
+  }
+  for index in [2, 0, 3, 1] {
+    shared.abort(TaskRef {
+      index,
+      generation: 1,
+    });
+    run(&shared, selected(&shared, 0).unwrap());
+    check_distributed(&shared);
+  }
+  for job in jobs {
+    assert!(matches!(finish(job), Err(AsyncJoinError::Cancelled)));
+  }
+  let reused = shared.spawn(root, async {}).unwrap();
+  assert_eq!(d.slot(0).protocol.generation(), 2);
+  let work = selected(&shared, 0).unwrap();
+  assert!(matches!(&work, Selected::Poll(reference, ..) if reference.index == 0));
+  run(&shared, work);
+  finish(reused).unwrap();
+  check_distributed(&shared);
+  shared.close(false);
+}
+
+#[test]
+fn running_wakes_coalesce_and_stale_generations_do_not_wake_reused_slots() {
+  let (shared, root) = shared(config(1, 1));
+  let d = engine(&shared);
+  let old_job = shared.spawn(root, std::future::pending::<()>()).unwrap();
+  let old = TaskRef {
+    index: 0,
+    generation: 1,
+  };
+  run(&shared, selected(&shared, 0).unwrap());
+  shared.abort(old);
+  run(&shared, selected(&shared, 0).unwrap());
+  assert!(matches!(finish(old_job), Err(AsyncJoinError::Cancelled)));
+  let job = shared.spawn(root, std::future::pending::<()>()).unwrap();
+  let work = selected(&shared, 0).unwrap();
+  let current = match &work {
+    Selected::Poll(reference, ..) => *reference,
+    _ => panic!("expected a poll"),
+  };
+  assert_ne!(old.generation, current.generation);
+  shared.wake(old);
+  assert_eq!(d.slots[0].word.flags(), (true, false));
+  for _ in 0..3 {
+    shared.wake(current);
+  }
+  assert_eq!(d.slots[0].word.flags(), (true, true));
+  run(&shared, work);
+  assert_eq!(d.slots[0].word.flags(), (false, false));
+  check_distributed(&shared);
+  run(&shared, selected(&shared, 0).unwrap());
+  shared.wake(old);
+  assert!(selected(&shared, 0).is_none());
+  // A truncated-tag alias may cause one spurious poll, then becomes idle.
+  shared.wake(current);
+  let work = selected(&shared, 0).unwrap();
+  shared.wake(TaskRef {
+    generation: current.generation.wrapping_add(1 << 62),
+    ..current
+  });
+  assert_eq!(d.slots[0].word.flags(), (true, true));
+  run(&shared, work);
+  run(&shared, selected(&shared, 0).unwrap());
+  assert!(selected(&shared, 0).is_none());
+  shared.abort(current);
+  run(&shared, selected(&shared, 0).unwrap());
+  assert!(matches!(finish(job), Err(AsyncJoinError::Cancelled)));
+  check_distributed(&shared);
+  shared.close(false);
+}
+
+#[test]
+fn abort_during_pending_poll_releases_quota_before_cleanup() {
+  let runtime = runtime(1, 1);
+  let scope = runtime
+    .scope_with_config(AsyncScopeConfig {
+      max_active_polls: 1,
+    })
+    .unwrap();
+  let cell = Arc::clone(&scope.cell);
+  let (entered, arrival) = mpsc::channel();
+  let (release, resume) = mpsc::channel();
+  let polls = Arc::new(AtomicUsize::new(0));
+  struct Probe {
+    cell: Arc<ScopeCell>,
+    entered: mpsc::Sender<()>,
+    resume: mpsc::Receiver<()>,
+    polls: Arc<AtomicUsize>,
+  }
+  impl Future for Probe {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+      self.polls.fetch_add(1, Ordering::Relaxed);
+      self.entered.send(()).unwrap();
+      self.resume.recv_timeout(Duration::from_secs(30)).unwrap();
+      cx.waker().wake_by_ref();
+      Poll::Pending
+    }
+  }
+  impl Drop for Probe {
+    fn drop(&mut self) {
+      assert_eq!(scope_snapshot(&self.cell).active_polls, 0);
+    }
+  }
+  let job = scope
+    .spawn(Probe {
+      cell,
+      entered,
+      resume,
+      polls: Arc::clone(&polls),
+    })
+    .unwrap();
+  arrival.recv_timeout(Duration::from_secs(30)).unwrap();
+  job.abort();
+  let mut close = Box::pin(scope.close());
+  assert!(
+    close
+      .as_mut()
+      .poll(&mut Context::from_waker(Waker::noop()))
+      .is_pending()
+  );
+  release.send(()).unwrap();
+  assert!(matches!(finish(job), Err(AsyncJoinError::Cancelled)));
+  assert_eq!(polls.load(Ordering::Relaxed), 1);
+  wait(|| {
+    close
+      .as_mut()
+      .poll(&mut Context::from_waker(Waker::noop()))
+      .is_ready()
+  });
+  shutdown(runtime, AsyncShutdown::Drain);
 }

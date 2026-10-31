@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use allocatbelt::runtime::{
   Config, Resources, Runtime, ShutdownMode,
   asynchronous::{
-    AsyncConfig, AsyncDispatch, AsyncRuntime, AsyncRuntimeOptions, AsyncShutdown,
-    BlockInPlaceErrorKind, HandoffConfig, try_block_in_place,
+    AsyncConfig, AsyncRuntime, AsyncRuntimeOptions, AsyncShutdown, BlockInPlaceErrorKind,
+    HandoffConfig, try_block_in_place,
   },
 };
 
@@ -75,7 +75,6 @@ struct Options {
   workload: Workload,
   mode: Mode,
   executor: Option<ExecutorKind>,
-  dispatch: AsyncDispatch,
   count: usize,
   workers: usize,
   arrival_rate: u64,
@@ -92,8 +91,6 @@ impl Options {
     let mut workload_explicit = false;
     let mut mode = Mode::Latency;
     let mut executor = None;
-    let mut dispatch = AsyncDispatch::Strict;
-    let mut dispatch_explicit = false;
     let mut count = None;
     let mut workers = 4usize;
     let mut arrival_rate = 10_000u64;
@@ -156,18 +153,6 @@ impl Options {
             "tokio" => ExecutorKind::Tokio,
             other => return Err(format!("unknown executor {other:?} (bounded or tokio)")),
           })
-        }
-        "--dispatch" => {
-          dispatch_explicit = true;
-          dispatch = match value()?.as_str() {
-            "strict" => AsyncDispatch::Strict,
-            "distributed" => AsyncDispatch::Distributed,
-            other => {
-              return Err(format!(
-                "unknown dispatch {other:?} (strict or distributed)"
-              ));
-            }
-          }
         }
         "--ops" | "--jobs" => count = Some(parse_usize(&arg, &value()?)?),
         "--workers" => {
@@ -234,9 +219,6 @@ impl Options {
         return Err("--executor is required for --lane blocking or async".to_owned());
       }
       _ => {}
-    }
-    if dispatch_explicit && (lane != Lane::Async || executor != Some(ExecutorKind::Bounded)) {
-      return Err("--dispatch applies only to --lane async --executor bounded".to_owned());
     }
     if handoffs_explicit && (lane != Lane::Async || executor != Some(ExecutorKind::Bounded)) {
       return Err("--handoffs applies only to --lane async --executor bounded".to_owned());
@@ -316,7 +298,6 @@ impl Options {
       workload,
       mode,
       executor,
-      dispatch,
       count,
       workers,
       arrival_rate,
@@ -330,8 +311,8 @@ impl Options {
 
 fn usage() -> &'static str {
   "usage: bench-latency-* --lane allocator|blocking|async [--workload local|aligned|mixed|ready|yielding|head-of-line|handoff] \\
-   [--mode latency|throughput|capacity] [--executor bounded|tokio] [--dispatch strict|distributed] [--ops N|--jobs N] \\
-   [--workers N] [--arrival-rate JOBS_PER_SECOND] [--window N] [--bytes N] [--block-us N] [--handoffs N]"
+   [--mode latency|throughput|capacity] [--executor bounded|tokio] [--ops N|--jobs N] \\
+   [--workers N] [--arrival-rate JOBS_PER_SECOND] [--window N] [--bytes N] [--block-us N] [--handoffs N]\n\n   The bounded async executor uses distributed dispatch."
 }
 
 fn parse_u64(flag: &str, value: &str) -> Result<u64, String> {
@@ -870,7 +851,6 @@ impl AsyncExecutors {
     kind: ExecutorKind,
     workers: usize,
     window: usize,
-    dispatch: AsyncDispatch,
     handoffs: usize,
   ) -> Result<Self, String> {
     match kind {
@@ -883,7 +863,7 @@ impl AsyncExecutors {
               max_scopes: 1,
             },
             {
-              let options = AsyncRuntimeOptions::new().dispatch(dispatch);
+              let options = AsyncRuntimeOptions::new();
               if handoffs == 0 {
                 options
               } else {
@@ -1078,8 +1058,8 @@ fn warm_async_workers(
       kind,
       Box::pin(async move {
         let _ = arrived.send(());
-        // Warm tasks must not occupy every worker inside blocking polls:
-        // the final entry of another task's lane is intentionally not stolen.
+        // Yield so warm-up arrival does not depend on task placement
+        // or occupy every worker inside blocking polls.
         while !gate.load(Ordering::Acquire) {
           YieldOnce(false).await;
         }
@@ -1434,7 +1414,7 @@ fn run_async(allocator: &str, o: &Options, overhead: u64) -> Result<(), String> 
   }
   let kind = o.executor.ok_or("async lane requires an executor")?;
   let trace_span = Duration::from_nanos(intended_offset_ns(o.count, o.arrival_rate));
-  let executors = AsyncExecutors::new(kind, o.workers, o.window, o.dispatch, o.handoffs)?;
+  let executors = AsyncExecutors::new(kind, o.workers, o.window, o.handoffs)?;
   warm_async_workers(&executors, kind, o.workers.min(o.window))?;
   let mut samples = if o.mode == Mode::Latency {
     Vec::with_capacity(o.count)
@@ -2039,7 +2019,7 @@ fn run_blocking_capacity(allocator: &str, o: &Options) -> Result<(), String> {
 
 fn run_async_capacity(allocator: &str, o: &Options) -> Result<(), String> {
   let kind = o.executor.ok_or("async lane requires an executor")?;
-  let executors = AsyncExecutors::new(kind, o.workers, o.window, o.dispatch, o.handoffs)?;
+  let executors = AsyncExecutors::new(kind, o.workers, o.window, o.handoffs)?;
   warm_async_workers(&executors, kind, o.workers.min(o.window))?;
   let (workload, bytes, block_us) = (o.workload, o.bytes, o.block_us);
   let (outcome, mut executors) = run_capacity(
@@ -2182,77 +2162,48 @@ mod tests {
 
   #[test]
   fn distributed_head_of_line_and_under_subscribed_yields_run() {
-    for dispatch in ["strict", "distributed"] {
-      for (workload, window) in [("head-of-line", "16"), ("yielding", "1")] {
-        let options = args(&[
+    for (workload, window) in [("head-of-line", "16"), ("yielding", "1")] {
+      let options = args(&[
+        "--lane",
+        "async",
+        "--executor",
+        "bounded",
+        "--workload",
+        workload,
+        "--workers",
+        "4",
+        "--window",
+        window,
+        "--jobs",
+        "32",
+        "--arrival-rate",
+        "1000000",
+      ])
+      .unwrap();
+      assert_eq!(options.block_us, 2_000);
+      run_async("test", &options, 0).unwrap();
+    }
+  }
+
+  #[test]
+  fn removed_dispatch_flag_is_rejected() {
+    for value in ["strict", "distributed"] {
+      assert!(
+        args(&[
           "--lane",
           "async",
           "--executor",
           "bounded",
           "--dispatch",
-          dispatch,
-          "--workload",
-          workload,
-          "--workers",
-          "4",
-          "--window",
-          window,
-          "--jobs",
-          "32",
-          "--arrival-rate",
-          "1000000",
+          value
         ])
-        .unwrap();
-        assert_eq!(options.block_us, 2_000);
-        run_async("test", &options, 0).unwrap();
-      }
+        .is_err()
+      );
     }
-  }
-
-  #[test]
-  fn dispatch_flag_selects_the_bounded_async_constructor() {
-    let base = ["--lane", "async", "--executor", "bounded"];
-    assert_eq!(args(&base).unwrap().dispatch, AsyncDispatch::Strict);
-    for (value, dispatch) in [
-      ("strict", AsyncDispatch::Strict),
-      ("distributed", AsyncDispatch::Distributed),
-    ] {
-      let values = [base.as_slice(), &["--dispatch", value]].concat();
-      let options = args(&values).unwrap();
-      assert_eq!(options.dispatch, dispatch);
-      let result = AsyncExecutors::new(ExecutorKind::Bounded, 1, 1, options.dispatch, 0);
-      result.unwrap().shutdown().unwrap();
-    }
-    for values in [
-      vec![
-        "--lane",
-        "async",
-        "--executor",
-        "bounded",
-        "--dispatch",
-        "unknown",
-      ],
-      vec!["--lane", "async", "--executor", "bounded", "--dispatch"],
-      vec![
-        "--lane",
-        "async",
-        "--executor",
-        "tokio",
-        "--dispatch",
-        "strict",
-      ],
-      vec![
-        "--lane",
-        "blocking",
-        "--executor",
-        "bounded",
-        "--dispatch",
-        "strict",
-      ],
-      vec!["--lane", "allocator", "--dispatch", "strict"],
-    ] {
-      assert!(args(&values).is_err(), "{values:?} was accepted");
-    }
+    AsyncExecutors::new(ExecutorKind::Bounded, 1, 1, 0)
+      .unwrap()
+      .shutdown()
+      .unwrap();
   }
 
   #[test]
@@ -2320,8 +2271,7 @@ mod tests {
 
   #[test]
   fn async_worker_warmup_releases_submitted_tasks_after_partial_failure() {
-    let executors =
-      AsyncExecutors::new(ExecutorKind::Bounded, 2, 1, AsyncDispatch::Strict, 0).unwrap();
+    let executors = AsyncExecutors::new(ExecutorKind::Bounded, 2, 1, 0).unwrap();
     assert!(warm_async_workers(&executors, ExecutorKind::Bounded, 2).is_err());
     let mut executors = executors;
     executors.shutdown().unwrap();
@@ -2352,7 +2302,7 @@ mod tests {
     assert_eq!(empty_completed, 0);
 
     for kind in [ExecutorKind::Bounded, ExecutorKind::Tokio] {
-      let executors = AsyncExecutors::new(kind, 1, 1, AsyncDispatch::Strict, 0).unwrap();
+      let executors = AsyncExecutors::new(kind, 1, 1, 0).unwrap();
       let handle = executors
         .submit(
           kind,
@@ -2487,7 +2437,6 @@ mod tests {
       workload: Workload::Local,
       mode: Mode::Latency,
       executor: Some(ExecutorKind::Tokio),
-      dispatch: AsyncDispatch::Strict,
       count: 128,
       workers: 1,
       arrival_rate: 1_000_000_000,
@@ -2508,7 +2457,6 @@ mod tests {
           workload,
           mode: Mode::Latency,
           executor: Some(executor),
-          dispatch: AsyncDispatch::Strict,
           count: 8,
           workers: 2,
           arrival_rate: 1_000_000_000,
@@ -2855,8 +2803,7 @@ mod tests {
     let error = mismatched.err().unwrap();
     assert!(error.contains("capacity job 5 checksum"), "{error}");
 
-    let executors =
-      AsyncExecutors::new(ExecutorKind::Bounded, 1, 1, AsyncDispatch::Strict, 0).unwrap();
+    let executors = AsyncExecutors::new(ExecutorKind::Bounded, 1, 1, 0).unwrap();
     let panicked = run_capacity(
       executors,
       4,
@@ -2915,7 +2862,7 @@ mod tests {
     }
     for workload in [Workload::Ready, Workload::Yielding, Workload::Mixed] {
       for kind in [ExecutorKind::Bounded, ExecutorKind::Tokio] {
-        let executors = AsyncExecutors::new(kind, 2, 4, AsyncDispatch::Strict, 0).unwrap();
+        let executors = AsyncExecutors::new(kind, 2, 4, 0).unwrap();
         warm_async_workers(&executors, kind, 2).unwrap();
         let (outcome, mut executors) = run_capacity(
           executors,
@@ -2950,7 +2897,6 @@ mod tests {
         workload: Workload::Local,
         mode: Mode::Capacity,
         executor: Some(executor),
-        dispatch: AsyncDispatch::Strict,
         count: 64,
         workers: 2,
         arrival_rate: 10_000,
@@ -2977,7 +2923,6 @@ mod tests {
       workload: Workload::Mixed,
       mode: Mode::Capacity,
       executor: Some(ExecutorKind::Tokio),
-      dispatch: AsyncDispatch::Strict,
       count: 10,
       workers: 2,
       arrival_rate: 10_000,
@@ -3020,15 +2965,13 @@ mod tests {
 mod handoff_tests {
   use super::*;
 
-  fn options(dispatch: &str, workload: &str, handoffs: &str) -> Options {
+  fn options(workload: &str, handoffs: &str) -> Options {
     Options::parse(
       [
         "--lane",
         "async",
         "--executor",
         "bounded",
-        "--dispatch",
-        dispatch,
         "--workload",
         workload,
         "--handoffs",
@@ -3048,14 +2991,12 @@ mod handoff_tests {
   }
 
   #[test]
-  fn handoff_restore_latency_and_binding_root_scenarios_run_in_both_modes() {
-    for dispatch in ["strict", "distributed"] {
-      for (workload, handoffs) in [("handoff", "2"), ("yielding", "1")] {
-        let mut options = options(dispatch, workload, handoffs);
-        options.block_us = 100;
-        assert_eq!(options.workers, 4);
-        run_async("test", &options, 0).unwrap();
-      }
+  fn handoff_restore_latency_and_binding_root_scenarios_run() {
+    for (workload, handoffs) in [("handoff", "2"), ("yielding", "1")] {
+      let mut options = options(workload, handoffs);
+      options.block_us = 100;
+      assert_eq!(options.workers, 4);
+      run_async("test", &options, 0).unwrap();
     }
   }
 
@@ -3090,7 +3031,7 @@ mod handoff_tests {
     ] {
       assert!(Options::parse(args.into_iter().map(str::to_owned)).is_err());
     }
-    let options = options("distributed", "handoff", "2");
+    let options = options("handoff", "2");
     assert_eq!(CSV_HEADER.split(',').count(), 22);
     assert_eq!(
       expected_async_checksum(7, options.workload, options.bytes),

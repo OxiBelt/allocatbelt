@@ -623,7 +623,7 @@ impl Control {
     if !task.protocol.matches(task_ref.generation) {
       return PollFinish::Stale;
     }
-    let result = task.protocol.finish_poll(ready, false);
+    let result = task.protocol.finish_poll(ready);
     match result {
       PollFinish::Complete => {
         task.scope = None;

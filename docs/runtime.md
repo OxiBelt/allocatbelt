@@ -986,23 +986,26 @@ explicit application port; it does not claim Tokio macro compatibility.
 `runtime::asynchronous::AsyncRuntime` runs owned `Send + 'static` futures on a
 fixed worker pool. An outstanding bound covers queued, polling, sleeping and
 cancellation-cleanup tasks. A separate scope bound includes the implicit root
-scope. Rejection returns the original future. `AsyncDispatch::Strict` remains
-the default: each scope has FIFO ready order and dispatch rotates ready scopes
-with one poll per turn. `AsyncRuntimeOptions::dispatch(AsyncDispatch::Distributed)`
-opts into per-dispatcher FIFO lanes with bounded helper seat adoption. A future
-that never returns from `poll` cannot be preempted.
+scope. Rejection returns the original future. Ready work uses per-dispatcher
+FIFO lanes with bounded helper seat adoption. Ordering across tasks is not
+guaranteed. A future that never returns from `poll` cannot be preempted.
 
-Distributed appends every newly ready, self-woken, requeued, quota-released or
-cancelled task to a lane chosen only by a rotating counter and the parked mask.
+The executor appends newly ready, self-woken, requeued and quota-released
+tasks to a lane chosen by a round-robin counter and the parked mask.
 Dead seats are excluded; among live seats it skips parked dispatchers unless
-all are parked. A dispatcher takes its own
-front entry, then searches other lanes in a pseudo-random order, then takes one
+all are parked. A dispatcher takes its own front entry, then searches other
+lanes in a pseudo-random order, then takes one
 shared overflow entry. An idle dispatcher can take a busy lane's oldest
 entries, including a single remaining one. A steal moves that entry or the
 oldest bounded half (at most 32) of a larger lane to the receiving lane's tail,
-preserving order. A multi-entry victim keeps at least one entry. Publishing
-ready work wakes one parked dispatcher to search; after a steal, a dispatcher
-is woken only if entries remain.
+preserving order. A multi-entry victim keeps at least one entry. Inserting
+ready work onto a lane whose dispatcher is awake wakes one parked dispatcher,
+if available, even for a lone entry. An insertion that claims a parked lane
+wakes only that lane's dispatcher. This applies to spawns, idle task wakes and
+quota transfers or releases. A task's own end-of-poll requeue wakes nobody;
+the finishing dispatcher continues searching. Work remaining after a pop or
+steal wakes one parked dispatcher, if available. Taking a lane's last entry
+wakes nobody.
 There is no per-task lane affinity or global scope rotation. A larger ready
 scope can receive proportionally more polls, and scope readiness order can
 change across lanes. Each task still polls exclusively, and ready tasks make
@@ -1103,10 +1106,9 @@ never cover user polling, destructors or completion callbacks. Generation tags
 make retained stale wakers harmless without retaining completed futures.
 A wake of a task whose poll is running, including its own, sets a per-slot
 atomic flag tagged with the low 62 generation bits instead of taking the
-scheduler mutex; the poll's completion takes that flag under the task's dispatch lock as its
-one pending wake. Other wakes, abort and cancellation are taken under the
-scheduler mutex in Strict or the task slot lock in Distributed, and a tag
-alias can cause at most one spurious poll.
+task slot mutex; the poll's completion takes that flag under the same mutex
+as its one pending wake. Other wakes, abort and cancellation are taken under
+the task slot mutex, and a tag alias can cause at most one spurious poll.
 
 `AsyncJob::abort_handle` returns a clonable thread-safe control handle,
 including for local jobs whose outputs are `!Send`. It retains cancellation
@@ -1401,21 +1403,19 @@ construction uses the worker count. A configured limit above that count is
 accepted. At most `W` dispatcher seats run at once; up to `B` handed-off polls
 retain their scope slots while their closures run.
 `OwnedTaskScope::snapshot` reports unfinished tasks, reserved poll slots and
-the configured limit. Strict samples poll slots under the scheduler lock.
-Distributed uses the scope quota lock when the limit is below `W + B`
-(workers plus handoff helpers); otherwise it cannot bind and uses a relaxed
+the configured limit. The executor uses the scope quota lock when the limit
+is below `W + B` (workers plus handoff helpers); otherwise it cannot bind and
+uses a relaxed
 diagnostic count. The root limit does not bind without handoffs. Unfinished-task
 counts may change concurrently. A slot is reserved before dispatch and held
 through the future's poll return, so it can include work about to enter
 `Future::poll`.
 
-A saturated scope parks its ordinary ready queue without spinning. Strict
-continues equal round-robin scheduling across dispatchable scopes, one poll per
-turn, preserving ordinary FIFO order when capacity reopens. Distributed keeps
-blocked work in a per-scope FIFO, passing released slots in that order.
-Cancellation cleanup bypasses the quota and consumes no poll slot. In
-Distributed, entries made ready for cancellation cleanup go to the shared
-overflow queue and wake one parked dispatcher, if available, so a busy
+Per-scope poll limits are exact. A saturated scope keeps blocked work in a
+per-scope FIFO without spinning, passing released slots in that order.
+Cancellation cleanup bypasses the quota and consumes no poll slot. Entries
+made ready for cancellation cleanup go to the shared overflow queue and wake
+one parked dispatcher, if available, so a busy
 dispatcher's poll does not hold them on that dispatcher's lane. Overflow is
 still searched last, one entry at a time. Cancelling a task already polling
 still waits for that poll to return.
@@ -1426,34 +1426,20 @@ limit. Scope unfinished-task bookkeeping completes after publication.
 
 This bounds simultaneous polling, not CPU time. A future can block a worker
 inside a poll, and destructors can block during quota-free cleanup. There is
-no preemption or implicit managed-storage reservation. An idle distributed
-dispatcher can steal a single ready entry behind a busy dispatcher's poll.
+no preemption or implicit managed-storage reservation. An idle dispatcher can
+steal a single ready entry behind a busy dispatcher's poll.
 Blocking all available dispatchers can still prevent progress. Current-thread
-local execution already polls one future at a time. Native
-tests exercise saturation, cross-scope progress, FIFO resumption, cancellation,
-shutdown, slot reuse and
-cleanup; a same-source Loom model checks poll-slot acquire/release transitions.
+local execution already polls one future at a time. Native tests exercise
+saturation, cross-scope progress, FIFO quota transfer, cancellation, shutdown,
+slot reuse and cleanup; a same-source Loom model checks poll-slot acquire/release transitions.
 
-Distributed and Loom call the same park-advertise/rescan helper. The
+The executor and Loom call the same park-advertise/rescan helper. The
 same-source Loom models cover lane park/push, stealing versus
 owner pop and push, quota gating and transfer, abort and close versus spawn.
 They use tiny queues and do not model real condvar timing, OS threads, metrics,
 Control charges or task internals. Native tests cover those integration paths.
 `global_queue_depth` sums lane, blocked and overflow depths; samples are
 independent and can briefly omit an entry moving between queues.
-
-For unit-test coverage only, `ALLOCATBELT_ASYNC_DISPATCH=distributed` overrides
-`AsyncDispatch::default()`. Production never reads this variable. During this
-phase the second runtime suite skips `handoff_tests`, the two handoff metrics
-tests (`thread_name_callback_gets_physical_roles_and_copied_options` and
-`busy_duration_excludes_handoff_closure_and_attributes_helper_turns`), and
-Strict-pinned scheduler tests and order tests. Scope-close and cancel-pending
-quota-blocked cancellation tests run in both modes. Handoff wrappers outside
-`handoff_tests` are also skipped:
-`resource_handoff_thread_options_wrapper_keeps_the_root_binding` and the two
-`resource_domain_runtime_tests::handed_off_*` tests. The production default remains
-Strict. `scripts/check-async-distributed.sh` contains the exact skips and runs
-in release CI. The normal suite still runs every handoff and Strict-pinned test.
 
 ## Explicit cgroup controls
 
@@ -1546,10 +1532,8 @@ self-yields. `head-of-line` makes job zero block inside its poll for
 results. Its p50/p95/p99 columns exclude job zero and measure short-task
 intended-arrival-to-first-poll latency; other totals include it. CSV records
 the admission window and byte count.
-`--dispatch strict|distributed` selects the dispatch mode for
-`--lane async --executor bounded`; `strict` is the default, and `distributed`
-supports bounded handoffs via `--handoffs N`. This flag applies only to the
-bounded async executor; use `--workload yielding --handoffs 1` to measure the
+The bounded async executor uses distributed dispatch and supports bounded
+handoffs via `--handoffs N`. Use `--workload yielding --handoffs 1` to measure the
 binding root quota, keeping its default limit. `--workload handoff --workers 4
 --handoffs 2` runs blocking sections of `--block-us` microseconds on the
 original threads. Its p50/p95/p99 columns measure closure-end-to-restored-seat
@@ -1595,15 +1579,11 @@ borrowed or `!Send` closures and results. Disabled/full/local-executor rejection
 returns the uncalled closure. Outside owned dispatcher execution it runs inline;
 entering a local handle alone does not constitute local execution.
 
-`AsyncRuntimeOptions` combines dispatch, handoff and thread options for
-`AsyncRuntime::new_with_options`. `AsyncDispatch::Strict` remains the default.
-`AsyncDispatch::Distributed` supports the same bounded handoffs. Helpers adopt
-a vacant dispatcher seat and serve its lane using the same search: own lane,
-bounded stealing, then one overflow entry. Other holders may steal from a
-vacant seat's lane under the usual bounds, including its last entry.
-`AsyncRuntime::dispatch` and `RuntimeMetrics::dispatch` report the selected
-mode. `MultiThreadBuilder::dispatch` selects the mode for the owning facade;
-omitting it uses the default.
+`AsyncRuntimeOptions` combines handoff and thread options for
+`AsyncRuntime::new_with_options`. Helpers adopt a vacant dispatcher seat and
+serve its lane using the same search: own lane, bounded stealing, then one
+overflow entry. Other holders may steal from a vacant seat's lane under the
+usual bounds, including its last entry.
 
 With `W` workers and `B` helpers, at most `W` dispatcher turns and `B` handed-off
 closures are active. Reserving a loan precedes releasing the dispatcher permit.
@@ -1611,22 +1591,20 @@ The original task retains admission, its running state and its scope poll quota
 throughout the closure. A still-pending same-scope dependency cannot make
 progress if the scope quota is exhausted; use a separate scope or an explicit
 higher quota. The default root quota remains `W`. With handoffs enabled,
-`W < W + B`, so distributed root polls acquire the root scope mutex for quota
-acquisition and release (twice per ordinary poll). This cost is accepted. The
+`W < W + B`, so root polls acquire the root scope mutex for quota acquisition
+and release (twice per ordinary poll). This cost is accepted. The
 dispatcher bound covers owned dispatch, not CPU time, nested borrowed roots or
 external threads.
 
 Return or panic reacquires a dispatcher permit, retaining the loan until
-restoration. Strict gives restorers priority over every new turn.
-Distributed restorers take any vacant seat or a helper's seat at its next
+restoration. Restorers take any vacant seat or a helper's seat at its next
 poll boundary; other worker seats keep dispatching. If a helper-origin loan
 outlives the worker's loan and no helper holds a seat, a worker yields
 between polls and resumes after the restoration; helpers also yield to
-resuming workers. In distributed mode a waiting restorer is prioritised only
-at seat boundaries, so a helper blocked waiting on that restorer's task can
-deadlock; use Strict for such code. The restored thread then serves its new
-seat's lane. With one worker both modes give restorers priority over queued
-work; this also works after admission closes. Helpers can hand off under the
+resuming workers. A waiting restorer is prioritised only at seat boundaries,
+so a helper blocked waiting on that restorer's task can deadlock. The restored
+thread then serves its new seat's lane. With one worker restorers precede
+queued work; this also works after admission closes. Helpers can hand off under the
 same fixed bound, while nested handoff on the original already-loaned thread
 runs inline. Task identity, explicit resource binding, task-local values and
 runtime-worker shutdown identity remain intact. The closure may call a

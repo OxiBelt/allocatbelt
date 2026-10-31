@@ -320,7 +320,10 @@ fn dropping_http_transaction_aborts_server_and_releases_scope_slot() {
       Poll::Ready(transaction.as_mut().poll(cx))
     }))
     .expect("one manual transaction poll should complete");
-  assert!(matches!(first_poll, Poll::Pending));
+  assert!(
+    matches!(first_poll, Poll::Pending),
+    "expected a pending HTTP transaction, got {first_poll:?}"
+  );
   drop(transaction);
 
   // The scope has capacity for one task. The server initially owns it; a

@@ -101,10 +101,12 @@ impl<F> std::error::Error for BlockInPlaceError<F> {}
 /// threads dispatch at once and at most `max_handoffs` closures are handed
 /// off at once. After the closure returns or panics, the thread waits for a
 /// dispatcher permit and keeps its slot until it has one, even after
-/// admission closes. Strict prioritizes restoration over all new turns.
-/// Distributed takes a vacant seat or asks a helper to yield between polls;
+/// admission closes. Restoration takes a vacant seat or asks a helper to
+/// yield between polls;
 /// other worker seats keep dispatching. If only workers hold seats, one
 /// yields between polls to restore a helper-origin loan.
+/// A helper blocked waiting on a restoring thread's task can deadlock:
+/// restoration needs a vacant seat or a yield between polls.
 /// A panic in the closure resumes once the permit is held again.
 ///
 /// The calling task stays admitted and running throughout. In particular:

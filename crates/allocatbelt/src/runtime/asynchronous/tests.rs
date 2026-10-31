@@ -5,9 +5,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use super::{
-  AsyncConfig, AsyncJoinError, AsyncRuntime, AsyncScopeConfig, AsyncShutdown, strict_runtime,
-};
+use super::{AsyncConfig, AsyncJoinError, AsyncRuntime, AsyncScopeConfig, AsyncShutdown};
 use crate::runtime::managed::{ResourceLimits, ResourceScope};
 
 fn runtime(workers: usize, max_outstanding: usize, max_scopes: usize) -> AsyncRuntime {
@@ -37,43 +35,32 @@ impl AsyncRuntime {
 }
 
 #[test]
-fn dispatch_defaults_to_strict_and_is_retained_by_metrics() {
-  use super::{AsyncDispatch, AsyncRuntimeOptions};
-
+fn construction_defaults_and_options_run_tasks_and_retain_metrics() {
+  use super::AsyncRuntimeOptions;
   let config = AsyncConfig {
     workers: 1,
     max_outstanding: 2,
     max_scopes: 1,
   };
-  let default = AsyncDispatch::default();
-  let default_runtime = AsyncRuntime::new(config).unwrap();
-  assert_eq!(default_runtime.dispatch(), default);
-  assert_eq!(default_runtime.metrics().dispatch(), default);
-  default_runtime
-    .shutdown_before_deadline(AsyncShutdown::Drain)
-    .unwrap();
-  for options in [
-    AsyncRuntimeOptions::default(),
-    AsyncRuntimeOptions::new(),
-    AsyncRuntimeOptions::new().dispatch(AsyncDispatch::Strict),
+  for runtime in [
+    AsyncRuntime::new(config).unwrap(),
+    AsyncRuntime::new_with_options(config, AsyncRuntimeOptions::default()).unwrap(),
+    AsyncRuntime::new_with_options(config, AsyncRuntimeOptions::new()).unwrap(),
   ] {
-    let expected = options.dispatch;
-    let runtime = AsyncRuntime::new_with_options(config, options).unwrap();
     let metrics = runtime.metrics();
-    assert_eq!(runtime.dispatch(), expected);
-    assert_eq!(metrics.dispatch(), expected);
+    assert_eq!(metrics.num_workers(), 1);
     let job = runtime.handle().spawn(async { 7 }).unwrap();
     assert_eq!(runtime.block_on(job).unwrap().unwrap(), 7);
     runtime
       .shutdown_before_deadline(AsyncShutdown::Drain)
       .unwrap();
-    assert_eq!(metrics.dispatch(), expected);
+    assert_eq!(metrics.num_alive_tasks(), 0);
   }
 }
 
 #[test]
 fn distributed_handoffs_construct_with_thread_options_and_resources() {
-  use super::{AsyncDispatch, AsyncRuntimeOptions, AsyncThreadOptions, HandoffConfig};
+  use super::{AsyncRuntimeOptions, AsyncThreadOptions, HandoffConfig};
   let config = AsyncConfig {
     workers: 1,
     max_outstanding: 2,
@@ -82,7 +69,6 @@ fn distributed_handoffs_construct_with_thread_options_and_resources() {
   let name_calls = Arc::new(AtomicUsize::new(0));
   let calls = Arc::clone(&name_calls);
   let options = AsyncRuntimeOptions::new()
-    .dispatch(AsyncDispatch::Distributed)
     .handoffs(HandoffConfig { max_handoffs: 1 })
     .thread_options(AsyncThreadOptions::new().thread_name_fn(move |_| {
       calls.fetch_add(1, Ordering::Relaxed);
@@ -111,9 +97,7 @@ fn distributed_handoffs_construct_with_thread_options_and_resources() {
 
 #[test]
 fn construction_options_combine_handoffs_and_thread_options() {
-  use super::{
-    AsyncDispatch, AsyncRuntimeOptions, AsyncThreadOptions, HandoffConfig, try_block_in_place,
-  };
+  use super::{AsyncRuntimeOptions, AsyncThreadOptions, HandoffConfig, try_block_in_place};
 
   let (names_tx, names_rx) = std::sync::mpsc::channel();
   let runtime = AsyncRuntime::new_with_options(
@@ -123,7 +107,6 @@ fn construction_options_combine_handoffs_and_thread_options() {
       max_scopes: 1,
     },
     AsyncRuntimeOptions::new()
-      .dispatch(AsyncDispatch::Strict)
       .handoffs(HandoffConfig { max_handoffs: 1 })
       .thread_options(AsyncThreadOptions::new().thread_name_fn(move |context| {
         let name = format!("options-thread-{}", context.physical_index);
@@ -169,7 +152,7 @@ fn construction_options_reject_invalid_handoff_bounds() {
 
 #[test]
 fn resource_handoff_thread_options_wrapper_keeps_the_root_binding() {
-  use super::{AsyncDispatch, AsyncThreadOptions, HandoffConfig};
+  use super::{AsyncThreadOptions, HandoffConfig};
 
   let resources = ResourceScope::new(ResourceLimits {
     managed_memory: 32,
@@ -186,8 +169,6 @@ fn resource_handoff_thread_options_wrapper_keeps_the_root_binding() {
     AsyncThreadOptions::new(),
   )
   .unwrap();
-  assert_eq!(runtime.dispatch(), AsyncDispatch::default());
-  assert_eq!(runtime.metrics().dispatch(), runtime.dispatch());
   assert_eq!(runtime.metrics().thread_count(), 2);
   let buffer = runtime
     .block_on(async {
@@ -1577,76 +1558,8 @@ fn stale_waker_from_reused_slot_cannot_wake_the_new_generation() {
 }
 
 #[test]
-fn ready_queue_rotates_fairly_between_scopes() {
-  // Asserts strict rotation between ready scopes.
-  let runtime = strict_runtime(AsyncConfig {
-    workers: 1,
-    max_outstanding: 16,
-    max_scopes: 3,
-  })
-  .unwrap();
-  let first_scope = runtime
-    .scope()
-    .unwrap_or_else(|e| panic!("scope failed: {e}"));
-  let second_scope = runtime
-    .scope()
-    .unwrap_or_else(|e| panic!("scope failed: {e}"));
-  let gate = Arc::new((Mutex::new(false), Condvar::new()));
-  let started = Arc::new((Mutex::new(false), Condvar::new()));
-  let blocker = runtime
-    .handle()
-    .spawn(Gate {
-      gate: Arc::clone(&gate),
-      started: Arc::clone(&started),
-    })
-    .unwrap_or_else(|e| panic!("spawn failed: {e}"));
-  {
-    let (lock, cv) = &*started;
-    let mut value = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while !*value {
-      value = cv.wait(value).unwrap_or_else(|e| e.into_inner());
-    }
-  }
-  let order = Arc::new(Mutex::new(Vec::new()));
-  let mut jobs = Vec::new();
-  for index in 0..3 {
-    let order_a = Arc::clone(&order);
-    jobs.push(
-      first_scope
-        .spawn(async move {
-          order_a.lock().unwrap_or_else(|e| e.into_inner()).push('A');
-          index
-        })
-        .unwrap_or_else(|e| panic!("spawn failed: {e}")),
-    );
-    let order_b = Arc::clone(&order);
-    jobs.push(
-      second_scope
-        .spawn(async move {
-          order_b.lock().unwrap_or_else(|e| e.into_inner()).push('B');
-          index
-        })
-        .unwrap_or_else(|e| panic!("spawn failed: {e}")),
-    );
-  }
-  let (lock, cv) = &*gate;
-  *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
-  cv.notify_all();
-  assert!(matches!(block_on(blocker), Ok(())));
-  for job in jobs {
-    let _ = block_on(job);
-  }
-  let order = order.lock().unwrap_or_else(|e| e.into_inner()).clone();
-  assert_eq!(order, ['A', 'B', 'A', 'B', 'A', 'B']);
-  runtime
-    .shutdown_before_deadline(AsyncShutdown::Drain)
-    .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
-}
-
-#[test]
-fn saturated_scope_preserves_fifo_and_cancellation_leapfrogs_queued_work() {
-  // Asserts strict ready order within a saturated scope.
-  let runtime = strict_runtime(AsyncConfig {
+fn saturated_scope_allows_cancellation_and_independent_work() {
+  let runtime = AsyncRuntime::new(AsyncConfig {
     workers: 2,
     max_outstanding: 8,
     max_scopes: 4,
@@ -1738,7 +1651,9 @@ fn saturated_scope_preserves_fifo_and_cancellation_leapfrogs_queued_work() {
   assert!(matches!(block_on(head), Ok(())));
   assert!(matches!(block_on(tail), Ok(())));
   assert!(matches!(block_on(independent), Ok(())));
-  assert_eq!(*order.lock().unwrap_or_else(|e| e.into_inner()), [1, 2]);
+  let mut completed = order.lock().unwrap_or_else(|e| e.into_inner()).clone();
+  completed.sort_unstable();
+  assert_eq!(completed, [1, 2]);
   assert_eq!(limited.snapshot().active_polls, 0);
   runtime
     .shutdown_before_deadline(AsyncShutdown::Drain)
@@ -2232,7 +2147,7 @@ fn poll_quota_releases_before_a_panicking_future_destructor() {
   );
 
   assert_eq!(scope.snapshot().active_polls, 0);
-  if runtime.dispatch() == super::AsyncDispatch::Distributed {
+  {
     // A lone successor can wait behind this lane owner's destructor. Check
     // quota release directly before permitting that destructor to finish.
     let (lock, cv) = &*drop_gate;

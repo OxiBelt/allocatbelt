@@ -18,8 +18,17 @@
 //! runtime built with [`AsyncRuntime::new_with_handoffs`] keeps dispatching
 //! on a bounded set of prestarted helpers meanwhile.
 
-//! Strict dispatch preserves per-scope order; opt-in Distributed uses FIFO
-//! lanes with bounded stealing and seat adoption by prestarted handoff helpers.
+//! Ready tasks use per-dispatcher FIFO lanes. Placement uses a round-robin
+//! counter that skips parked dispatchers unless all are parked. Idle
+//! dispatchers take the oldest entries from busy lanes, including a single
+//! remaining entry. Cancellation cleanup and abandoned lanes use shared
+//! overflow. Ordering across tasks is not guaranteed.
+//!
+//! Per-scope poll limits are exact; cancellation cleanup needs no poll slot
+//! and can progress while a scope is saturated. Handoff helpers adopt vacant
+//! seats, and restorers take a vacant seat or a helper's seat between polls.
+//! A helper blocked waiting on a restorer's task can prevent restoration;
+//! blocking polls cannot be preempted.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
@@ -76,14 +85,6 @@ pub use scheduler::{OwnedTaskScope, ScopeClose};
 pub use task_set::{JoinNext, SetTaskId, TaskSet, TaskSetError};
 pub use thread_options::{AsyncThreadContext, AsyncThreadOptions, AsyncThreadRole};
 
-#[cfg(all(test, not(loom)))]
-fn strict_runtime(config: AsyncConfig) -> Result<AsyncRuntime, AsyncError> {
-  AsyncRuntime::new_with_options(
-    config,
-    AsyncRuntimeOptions::new().dispatch(AsyncDispatch::Strict),
-  )
-}
-
 fn thread_contexts(workers: usize, handoffs: usize) -> impl Iterator<Item = AsyncThreadContext> {
   (0..workers + handoffs).map(move |physical_index| {
     if physical_index < workers {
@@ -137,57 +138,18 @@ pub struct AsyncConfig {
   pub max_scopes: usize,
 }
 
-/// How an [`AsyncRuntime`] orders ready owned tasks.
-/// The default is currently [`AsyncDispatch::Strict`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(not(test), derive(Default))]
-#[non_exhaustive]
-pub enum AsyncDispatch {
-  /// FIFO lanes with bounded stealing. Handoff helpers adopt vacant seats;
-  /// restorers receive a vacant seat or a helper seat at its next poll boundary.
-  /// If only workers hold seats, one yields between polls to restore a
-  /// helper-origin loan. With handoffs, the unchanged root limit (`W`) binds
-  /// below `W + B`, so root quota acquisition and release use its scope mutex.
-  Distributed,
-  /// Ordinary ready work keeps per-scope FIFO order, with ready scopes
-  /// rotating one poll per turn. Cancellation cleanup can pass queued
-  /// ordinary work. Restoring threads precede every new turn.
-  // Keep the established ordering as the default during opt-in rollout.
-  #[cfg_attr(not(test), default)]
-  Strict,
-}
-
-#[cfg(test)]
-impl Default for AsyncDispatch {
-  fn default() -> Self {
-    if std::env::var("ALLOCATBELT_ASYNC_DISPATCH").as_deref() == Ok("distributed") {
-      return Self::Distributed;
-    }
-    Self::Strict
-  }
-}
-
 /// Additive construction options for [`AsyncRuntime::new_with_options`].
 #[derive(Clone, Debug, Default)]
 pub struct AsyncRuntimeOptions {
-  dispatch: AsyncDispatch,
   handoffs: Option<HandoffConfig>,
   thread_options: AsyncThreadOptions,
 }
 
 impl AsyncRuntimeOptions {
-  /// Starts with the default dispatch mode (currently [`AsyncDispatch::Strict`]),
-  /// no handoffs and default thread options.
+  /// Starts with no handoffs and default thread options.
   #[must_use]
   pub fn new() -> Self {
     Self::default()
-  }
-
-  /// Selects how ready owned tasks are ordered.
-  #[must_use]
-  pub const fn dispatch(mut self, dispatch: AsyncDispatch) -> Self {
-    self.dispatch = dispatch;
-    self
   }
 
   /// Prestarts bounded helper threads for [`try_block_in_place`].
@@ -221,8 +183,8 @@ pub struct AsyncScopeSnapshot {
   /// This count can change concurrently with a snapshot.
   pub active_tasks: usize,
   /// Poll slots reserved before dispatch and held through `Future::poll`
-  /// return. Strict samples under the scheduler lock. Distributed uses the
-  /// scope quota lock for binding limits, otherwise a relaxed diagnostic count.
+  /// return. Binding limits use the scope quota lock; other scopes use a
+  /// relaxed diagnostic count.
   /// A reserved task may be about to enter its poll call.
   pub active_polls: usize,
   /// The configured active-poll limit for this scope.
@@ -357,26 +319,24 @@ impl AsyncRuntime {
     Self::new_with_options(config, AsyncRuntimeOptions::new().thread_options(options))
   }
 
-  /// Creates a runtime with the selected dispatch, handoff and thread options.
+  /// Creates a runtime with handoff and thread options.
   ///
   /// # Errors
   ///
   /// Returns [`AsyncError::InvalidConfig`] for a zero required bound, a zero
-  /// handoff bound, worker/helper count overflow, invalid thread options or
-  /// an unavailable dispatch mode. Storage reservation or thread startup can
+  /// handoff bound, worker/helper count overflow or invalid thread options.
+  /// Storage reservation or thread startup can
   /// return [`AsyncError::OutOfMemory`].
   ///
   /// ```
   /// use allocatbelt::runtime::asynchronous::{
-  ///   AsyncConfig, AsyncDispatch, AsyncRuntime, AsyncRuntimeOptions, AsyncShutdown,
+  ///   AsyncConfig, AsyncRuntime, AsyncRuntimeOptions, AsyncShutdown,
   /// };
   ///
   /// let runtime = AsyncRuntime::new_with_options(
   ///   AsyncConfig { workers: 1, max_outstanding: 8, max_scopes: 2 },
-  ///   AsyncRuntimeOptions::new().dispatch(AsyncDispatch::Strict),
+  ///   AsyncRuntimeOptions::new(),
   /// )?;
-  /// assert_eq!(runtime.dispatch(), AsyncDispatch::Strict);
-  /// assert_eq!(runtime.metrics().dispatch(), AsyncDispatch::Strict);
   /// runtime.shutdown(AsyncShutdown::Drain)?;
   /// # Ok::<(), allocatbelt::runtime::asynchronous::AsyncError>(())
   /// ```
@@ -499,13 +459,7 @@ impl AsyncRuntime {
       Some(handoffs) => handoffs.max_handoffs,
       None => 0,
     };
-    Self::start(
-      config,
-      max_handoffs,
-      resources,
-      options.thread_options,
-      options.dispatch,
-    )
+    Self::start(config, max_handoffs, resources, options.thread_options)
   }
 
   fn start(
@@ -513,7 +467,6 @@ impl AsyncRuntime {
     max_handoffs: usize,
     resources: Option<ResourceScope>,
     options: AsyncThreadOptions,
-    dispatch: AsyncDispatch,
   ) -> Result<Self, AsyncError> {
     if config.workers == 0 || config.max_outstanding == 0 || config.max_scopes == 0 {
       return Err(AsyncError::InvalidConfig);
@@ -538,7 +491,6 @@ impl AsyncRuntime {
     };
     let tenant = resources.as_ref().and_then(ResourceScope::tenant_domain);
     let metrics = RuntimeMetrics::try_new(
-      dispatch,
       config.workers,
       thread_contexts(config.workers, max_handoffs),
       threads,
@@ -605,7 +557,7 @@ impl AsyncRuntime {
     } else {
       None
     };
-    let (shared, root) = Shared::new(config, dispatch, max_handoffs, resources, options, metrics)?;
+    let (shared, root) = Shared::new(config, max_handoffs, resources, options, metrics)?;
     let mut workers: Vec<DeferredJoin> = Vec::new();
     workers
       .try_reserve_exact(threads)
@@ -720,12 +672,6 @@ impl AsyncRuntime {
       resources: self.shared.root_resources(),
       _scope_owner: None,
     }
-  }
-
-  /// Returns the dispatch mode chosen at construction.
-  #[must_use]
-  pub fn dispatch(&self) -> AsyncDispatch {
-    self.shared.dispatch
   }
 
   /// Returns a cloneable diagnostic view that remains usable after shutdown.

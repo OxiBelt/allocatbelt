@@ -11,8 +11,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub(super) const NIL: usize = usize::MAX;
 pub(super) const STEAL_MAX: usize = 32;
-// Build-time comparison knob; ordinary placement skips parked lanes.
-pub(super) const ROUND_ROBIN_PLACEMENT: bool = false;
 
 #[derive(Debug)]
 pub(super) struct QueueLink {
@@ -289,28 +287,31 @@ impl ParkedMask {
   }
 }
 
-/// Skip parked lanes using only the rotating counter value and parked state. The caller advances the counter, independent of its identity.
-pub(super) fn choose_lane(next_lane: usize, parked: &ParkedMask) -> usize {
+/// Skip parked lanes using only the rotating counter value and parked state.
+/// The caller advances the counter, independent of its identity. Return the
+/// chosen seat and whether its parked bit was cleared by this selection.
+pub(super) fn choose_lane(next_lane: usize, parked: &ParkedMask) -> (usize, bool) {
   let start = next_lane % parked.lanes;
-  parked.first_clear_from(start).unwrap_or_else(|| {
-    let live = (0..parked.lanes)
-      .map(|offset| (start + offset) % parked.lanes)
-      .find(|&lane| !parked.is_dead(lane))
-      .unwrap_or(start);
-    let _ = parked.claim(live);
-    live
-  })
+  if let Some(seat) = parked.first_clear_from(start) {
+    return (seat, false);
+  }
+  let live = (0..parked.lanes)
+    .map(|offset| (start + offset) % parked.lanes)
+    .find(|&lane| !parked.is_dead(lane))
+    .unwrap_or(start);
+  (live, parked.claim(live))
 }
 
-/// Round-robin selection, retained for comparison by the upcoming engine.
-pub(super) fn choose_lane_round_robin(next_lane: usize, parked: &ParkedMask) -> usize {
+/// Test-only comparison policy that selects the next live lane without
+/// skipping parked dispatchers. Return whether selection cleared its bit.
+#[cfg(test)]
+pub(super) fn choose_lane_round_robin(next_lane: usize, parked: &ParkedMask) -> (usize, bool) {
   let start = next_lane % parked.lanes;
   let live = (0..parked.lanes)
     .map(|offset| (start + offset) % parked.lanes)
     .find(|&lane| !parked.is_dead(lane))
     .unwrap_or(start);
-  let _ = parked.claim(live);
-  live
+  (live, parked.claim(live))
 }
 
 /// A random start followed by a complete cyclic traversal. Filtering out the
@@ -451,43 +452,39 @@ mod tests {
   }
 
   #[test]
-  fn both_lane_choices_use_only_counter_and_parked_state() {
+  fn lane_choice_uses_only_counter_and_parked_state() {
     let mask = ParkedMask::new(3);
     for counter in 0..12 {
-      assert_eq!(choose_lane(counter, &mask), counter % 3);
-      assert_eq!(choose_lane_round_robin(counter, &mask), counter % 3);
+      assert_eq!(choose_lane(counter, &mask), (counter % 3, false));
     }
     mask.advertise(1);
-    assert_eq!(choose_lane(1, &mask), 2);
+    assert_eq!(choose_lane(1, &mask), (2, false));
     assert!(mask.is_set(1));
-    assert_eq!(choose_lane_round_robin(1, &mask), 1);
-    assert!(!mask.is_set(1));
-    for variant in [choose_lane, choose_lane_round_robin] {
-      for lane in 0..3 {
-        mask.advertise(lane);
-      }
-      assert_eq!(variant(4, &mask), 1);
-      assert!(!mask.is_set(1));
+    assert_eq!(choose_lane_round_robin(1, &mask), (1, true));
+    assert_eq!(choose_lane_round_robin(1, &mask), (1, false));
+    for lane in 0..3 {
+      mask.advertise(lane);
     }
+    assert_eq!(choose_lane(4, &mask), (1, true));
+    assert!(!mask.is_set(1));
+    assert_eq!(choose_lane(4, &mask), (1, false));
   }
 
   #[test]
   fn lane_choice_is_independent_of_calling_thread() {
-    for variant in [choose_lane, choose_lane_round_robin] {
-      let sequence = move || {
-        let mask = ParkedMask::new(4);
-        mask.advertise(1);
-        mask.advertise(3);
-        (0..32)
-          .map(|counter| variant(counter, &mask))
-          .collect::<Vec<_>>()
-      };
-      let expected = sequence();
-      let first = std::thread::spawn(sequence);
-      let second = std::thread::spawn(sequence);
-      assert_eq!(first.join().unwrap(), expected);
-      assert_eq!(second.join().unwrap(), expected);
-    }
+    let sequence = || {
+      let mask = ParkedMask::new(4);
+      mask.advertise(1);
+      mask.advertise(3);
+      (0..32)
+        .map(|counter| choose_lane(counter, &mask))
+        .collect::<Vec<_>>()
+    };
+    let expected = sequence();
+    let first = std::thread::spawn(sequence);
+    let second = std::thread::spawn(sequence);
+    assert_eq!(first.join().unwrap(), expected);
+    assert_eq!(second.join().unwrap(), expected);
   }
 
   #[test]
@@ -875,8 +872,12 @@ mod loom_tests {
     bounded_model(|| {
       let parked = ParkedMask::new(3);
       parked.advertise(1);
-      assert_eq!(choose_lane(1, &parked), 2);
-      assert_eq!(choose_lane_round_robin(1, &parked), 1);
+      assert_eq!(choose_lane(1, &parked), (2, false));
+      parked.advertise(0);
+      parked.advertise(2);
+      assert_eq!(choose_lane(1, &parked), (1, true));
+      parked.advertise(1);
+      assert_eq!(choose_lane_round_robin(1, &parked), (1, true));
       let mut state = 7;
       let order = VictimOrder::new(&mut state, 3);
       for own in 0..3 {
