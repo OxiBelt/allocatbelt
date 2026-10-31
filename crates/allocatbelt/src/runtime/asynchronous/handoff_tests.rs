@@ -16,10 +16,10 @@ use std::time::{Duration, Instant};
 
 use super::entry::{block_on_active, budget_remaining, cooperative_poll_active};
 use super::{
-  AsyncConfig, AsyncError, AsyncHandle, AsyncJob, AsyncJoinError, AsyncRuntime, AsyncScopeConfig,
-  AsyncShutdown, BlockInPlaceErrorKind, HandoffConfig, LocalConfig, LocalRuntime, OwnedTaskScope,
-  consume_budget, current_resource_scope, try_block_in_place, try_current_resource_scope,
-  try_task_id, yield_now,
+  AsyncConfig, AsyncDispatch, AsyncError, AsyncHandle, AsyncJob, AsyncJoinError, AsyncRuntime,
+  AsyncRuntimeOptions, AsyncScopeConfig, AsyncShutdown, BlockInPlaceErrorKind, HandoffConfig,
+  LocalConfig, LocalRuntime, OwnedTaskScope, consume_budget, current_resource_scope,
+  try_block_in_place, try_current_resource_scope, try_task_id, yield_now,
 };
 use crate::runtime::cache;
 use crate::runtime::managed::{ResourceLimits, ResourceScope};
@@ -44,6 +44,21 @@ fn handoff_runtime(
   AsyncRuntime::new_with_handoffs(
     config(workers, max_outstanding, max_scopes),
     HandoffConfig { max_handoffs },
+  )
+  .unwrap_or_else(|error| panic!("runtime construction failed: {error}"))
+}
+
+fn strict_handoff_runtime(
+  workers: usize,
+  max_handoffs: usize,
+  max_outstanding: usize,
+  max_scopes: usize,
+) -> AsyncRuntime {
+  AsyncRuntime::new_with_options(
+    config(workers, max_outstanding, max_scopes),
+    AsyncRuntimeOptions::new()
+      .dispatch(AsyncDispatch::Strict)
+      .handoffs(HandoffConfig { max_handoffs }),
   )
   .unwrap_or_else(|error| panic!("runtime construction failed: {error}"))
 }
@@ -773,7 +788,8 @@ fn drain_shutdown_allows_admitted_continuations_to_hand_off() {
 
 #[test]
 fn a_restoring_thread_reenters_before_queued_work() {
-  let runtime = handoff_runtime(1, 1, 8, 3);
+  // Asserts strict priority for restoring threads over new turns.
+  let runtime = strict_handoff_runtime(1, 1, 8, 3);
   let shared = Arc::clone(&runtime.shared);
   let handle = runtime.handle();
   let (restored_scope, busy_scope) = (own_scope(&runtime), own_scope(&runtime));
@@ -1213,7 +1229,8 @@ impl<F: Future> Future for Counted<F> {
 fn concurrent_handoffs_never_exceed_the_dispatcher_or_handoff_bounds() {
   const WORKERS: usize = 2;
   const HANDOFFS: usize = 2;
-  let runtime = handoff_runtime(WORKERS, HANDOFFS, 32, 4);
+  // Samples the strict turn coordinator directly.
+  let runtime = strict_handoff_runtime(WORKERS, HANDOFFS, 32, 4);
   let shared = Arc::clone(&runtime.shared);
   let scopes: Vec<_> = (0..3)
     .map(|_| {

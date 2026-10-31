@@ -1479,6 +1479,9 @@ Choose `--workers`, `--window`, `--bytes`, `--jobs` and `--arrival-rate`
 explicitly. The window must cover every worker and cannot exceed the requested
 job count; construction warms all workers before timing and cleans up partial
 warm-up failures. CSV records the admission window and byte count.
+`--dispatch strict|distributed` selects the dispatch mode for
+`--lane async --executor bounded`; `strict` is the default, and `distributed`
+is reserved and currently rejected with `InvalidConfig` at construction.
 
 An independent producer uses intended arrival deadlines and a separate observer
 polls each public join to ready. One common external admission window remains
@@ -1518,6 +1521,14 @@ handoff. `try_block_in_place` runs its closure on the calling thread, accepting
 borrowed or `!Send` closures and results. Disabled/full/local-executor rejection
 returns the uncalled closure. Outside owned dispatcher execution it runs inline;
 entering a local handle alone does not constitute local execution.
+
+`AsyncRuntimeOptions` combines dispatch, handoff and thread options for
+`AsyncRuntime::new_with_options`. Only `AsyncDispatch::Strict` is available,
+and it is the default. `AsyncDispatch::Distributed` is reserved and currently
+rejected with `AsyncError::InvalidConfig` at construction.
+`AsyncRuntime::dispatch` and `RuntimeMetrics::dispatch` report the selected
+mode. `MultiThreadBuilder::dispatch` selects the mode for the owning facade;
+omitting it uses the default.
 
 With `W` workers and `B` helpers, at most `W` dispatcher turns and `B` handed-off
 closures are active. Reserving a loan precedes releasing the dispatcher permit.

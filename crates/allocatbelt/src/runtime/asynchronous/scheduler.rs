@@ -22,7 +22,7 @@ use super::task::{DomainCpuAdmission, ErasedTask, PollResult, Task};
 use super::thread_options::AsyncThreadContext;
 #[cfg(test)]
 use super::thread_options::AsyncThreadOptions;
-use super::{AsyncConfig, AsyncError, AsyncSpawnError};
+use super::{AsyncConfig, AsyncDispatch, AsyncError, AsyncSpawnError};
 use crate::runtime::cache;
 use crate::runtime::managed::ResourceScope;
 use crate::runtime::resource_domain::{
@@ -125,6 +125,7 @@ struct State {
 
 pub(super) struct Shared {
   id: u64,
+  pub(super) dispatch: AsyncDispatch,
   max_handoffs: usize,
   workers: usize,
   pub(super) metrics: RuntimeMetrics,
@@ -213,6 +214,7 @@ impl ScopeCell {
 impl Shared {
   pub(super) fn new(
     config: AsyncConfig,
+    dispatch: AsyncDispatch,
     max_handoffs: usize,
     resources: Option<ResourceScope>,
     thread_options: super::ControlledThreadOptions,
@@ -317,6 +319,7 @@ impl Shared {
     Ok((
       Arc::new(Self {
         id,
+        dispatch,
         max_handoffs,
         workers: config.workers,
         metrics,
@@ -1981,7 +1984,9 @@ pub(super) fn is_worker(shared: &Shared) -> bool {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
-  use super::super::{AsyncJoinError, AsyncRuntime, AsyncShutdown, yield_now};
+  use super::super::{
+    AsyncJoinError, AsyncRuntime, AsyncRuntimeOptions, AsyncShutdown, strict_runtime, yield_now,
+  };
   use super::*;
   use crate::runtime::managed::{ResourceLimits, ResourceScope};
   use crate::runtime::resource_domain::{DomainResource, DomainResources, ResourceDomain};
@@ -2074,13 +2079,15 @@ mod tests {
           unparks.fetch_add(1, Ordering::Relaxed);
         }
       });
-    let runtime = AsyncRuntime::new_with_thread_options(
+    let runtime = AsyncRuntime::new_with_options(
       AsyncConfig {
         workers: 1,
         max_outstanding: 1,
         max_scopes: 1,
       },
-      options,
+      AsyncRuntimeOptions::new()
+        .dispatch(AsyncDispatch::Strict)
+        .thread_options(options),
     )
     .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
     wait_for_parked_workers(&runtime.shared);
@@ -2113,7 +2120,7 @@ mod tests {
   fn many_ready_tasks_and_external_wakes_make_progress() {
     const TASKS: usize = 2048;
     const EXTERNAL_TASKS: usize = 32;
-    let runtime = AsyncRuntime::new(AsyncConfig {
+    let runtime = strict_runtime(AsyncConfig {
       workers: 4,
       max_outstanding: TASKS + EXTERNAL_TASKS,
       max_scopes: 1,
@@ -2192,7 +2199,7 @@ mod tests {
   #[test]
   fn parked_workers_finish_cancellation_and_graceful_shutdown() {
     for mode in [AsyncShutdown::CancelPending, AsyncShutdown::Drain] {
-      let runtime = AsyncRuntime::new(AsyncConfig {
+      let runtime = strict_runtime(AsyncConfig {
         workers: 4,
         max_outstanding: 16,
         max_scopes: 1,
@@ -2376,9 +2383,10 @@ mod tests {
   }
 
   /// Builds scheduler state without starting executor threads, so tests
-  /// drive `dequeue` and the poll/cancel completions directly.
+  /// drive strict `dequeue` and the poll/cancel completions directly.
   fn shared_with_config(config: AsyncConfig) -> (Arc<Shared>, ScopeRef) {
     let metrics = RuntimeMetrics::try_new(
+      AsyncDispatch::Strict,
       1,
       [AsyncThreadContext {
         role: super::super::thread_options::AsyncThreadRole::Worker,
@@ -2391,6 +2399,7 @@ mod tests {
     .unwrap_or_else(|error| panic!("metrics allocation failed: {error:?}"));
     Shared::new(
       config,
+      AsyncDispatch::Strict,
       0,
       None,
       super::super::ControlledThreadOptions::unbounded(AsyncThreadOptions::default()),
@@ -2464,10 +2473,12 @@ mod tests {
         max_outstanding: 1,
         max_scopes: 2,
       },
+      AsyncDispatch::Strict,
       0,
       None,
       super::super::ControlledThreadOptions::unbounded(AsyncThreadOptions::default()),
       RuntimeMetrics::try_new(
+        AsyncDispatch::Strict,
         1,
         [AsyncThreadContext {
           role: super::super::thread_options::AsyncThreadRole::Worker,
@@ -2526,6 +2537,7 @@ mod tests {
     let global_base = domain.snapshot().used.get(DomainResource::Control);
     let tenant_base = tenant.snapshot().unwrap().used.get(DomainResource::Control);
     let metrics = RuntimeMetrics::try_new(
+      AsyncDispatch::Strict,
       1,
       [AsyncThreadContext {
         role: super::super::thread_options::AsyncThreadRole::Worker,
@@ -2542,6 +2554,7 @@ mod tests {
         max_outstanding: 2,
         max_scopes: 2,
       },
+      AsyncDispatch::Strict,
       0,
       Some(resources),
       super::super::ControlledThreadOptions::unbounded(
@@ -2710,7 +2723,7 @@ mod tests {
 
   #[test]
   fn pending_self_yields_take_one_scheduler_lock_per_poll() {
-    let runtime = AsyncRuntime::new(AsyncConfig {
+    let runtime = strict_runtime(AsyncConfig {
       workers: 1,
       max_outstanding: 1,
       max_scopes: 1,
@@ -2829,7 +2842,7 @@ mod tests {
 
   #[test]
   fn abort_during_pending_poll_cleans_up_in_the_same_turn() {
-    let runtime = AsyncRuntime::new(AsyncConfig {
+    let runtime = strict_runtime(AsyncConfig {
       workers: 1,
       max_outstanding: 1,
       max_scopes: 2,
@@ -2917,7 +2930,7 @@ mod tests {
   #[test]
   fn closed_runtime_finishes_pending_self_yields_with_a_deadline() {
     for mode in [AsyncShutdown::Drain, AsyncShutdown::CancelPending] {
-      let runtime = AsyncRuntime::new(AsyncConfig {
+      let runtime = strict_runtime(AsyncConfig {
         workers: 4,
         max_outstanding: 8,
         max_scopes: 1,

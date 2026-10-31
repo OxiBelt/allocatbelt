@@ -72,6 +72,14 @@ pub use scheduler::{OwnedTaskScope, ScopeClose};
 pub use task_set::{JoinNext, SetTaskId, TaskSet, TaskSetError};
 pub use thread_options::{AsyncThreadContext, AsyncThreadOptions, AsyncThreadRole};
 
+#[cfg(all(test, not(loom)))]
+fn strict_runtime(config: AsyncConfig) -> Result<AsyncRuntime, AsyncError> {
+  AsyncRuntime::new_with_options(
+    config,
+    AsyncRuntimeOptions::new().dispatch(AsyncDispatch::Strict),
+  )
+}
+
 fn thread_contexts(workers: usize, handoffs: usize) -> impl Iterator<Item = AsyncThreadContext> {
   (0..workers + handoffs).map(move |physical_index| {
     if physical_index < workers {
@@ -123,6 +131,71 @@ pub struct AsyncConfig {
   /// Maximum number of simultaneously live owned scopes. The runtime's
   /// implicit scope used by [`AsyncHandle::spawn`] counts toward this bound.
   pub max_scopes: usize,
+}
+
+/// How an [`AsyncRuntime`] orders ready owned tasks.
+/// The default is currently [`AsyncDispatch::Strict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(not(test), derive(Default))]
+#[non_exhaustive]
+pub enum AsyncDispatch {
+  /// Reserved and not yet available. Selecting this mode currently returns
+  /// [`AsyncError::InvalidConfig`] at construction.
+  Distributed,
+  /// Ordinary ready work keeps per-scope FIFO order, with ready scopes
+  /// rotating one poll per turn. Cancellation cleanup can pass queued
+  /// ordinary work. Restoring threads precede every new turn.
+  // The default changes when the distributed engine lands.
+  #[cfg_attr(not(test), default)]
+  Strict,
+}
+
+#[cfg(test)]
+impl Default for AsyncDispatch {
+  fn default() -> Self {
+    if std::env::var("ALLOCATBELT_ASYNC_DISPATCH").as_deref() == Ok("strict") {
+      return Self::Strict;
+    }
+    Self::Strict
+  }
+}
+
+/// Additive construction options for [`AsyncRuntime::new_with_options`].
+#[derive(Clone, Debug, Default)]
+pub struct AsyncRuntimeOptions {
+  dispatch: AsyncDispatch,
+  handoffs: Option<HandoffConfig>,
+  thread_options: AsyncThreadOptions,
+}
+
+impl AsyncRuntimeOptions {
+  /// Starts with the default dispatch mode (currently [`AsyncDispatch::Strict`]),
+  /// no handoffs and default thread options.
+  #[must_use]
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  /// Selects how ready owned tasks are ordered.
+  #[must_use]
+  pub const fn dispatch(mut self, dispatch: AsyncDispatch) -> Self {
+    self.dispatch = dispatch;
+    self
+  }
+
+  /// Prestarts bounded helper threads for [`try_block_in_place`].
+  #[must_use]
+  pub const fn handoffs(mut self, handoffs: HandoffConfig) -> Self {
+    self.handoffs = Some(handoffs);
+    self
+  }
+
+  /// Applies names, stack sizes and lifecycle hooks to executor threads.
+  #[must_use]
+  pub fn thread_options(mut self, options: AsyncThreadOptions) -> Self {
+    self.thread_options = options;
+    self
+  }
 }
 
 /// Polling limits for one owned scope.
@@ -265,7 +338,7 @@ impl AsyncRuntime {
   /// [`try_block_in_place`] on one of its turns returns
   /// [`BlockInPlaceErrorKind::Disabled`].
   pub fn new(config: AsyncConfig) -> Result<Self, AsyncError> {
-    Self::start(config, 0, None, AsyncThreadOptions::default())
+    Self::new_with_options(config, AsyncRuntimeOptions::new())
   }
 
   /// Creates a runtime with additive per-thread naming, stack and lifecycle options.
@@ -273,29 +346,64 @@ impl AsyncRuntime {
     config: AsyncConfig,
     options: AsyncThreadOptions,
   ) -> Result<Self, AsyncError> {
-    Self::start(config, 0, None, options)
+    Self::new_with_options(config, AsyncRuntimeOptions::new().thread_options(options))
+  }
+
+  /// Creates a runtime with the selected dispatch, handoff and thread options.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`AsyncError::InvalidConfig`] for a zero required bound, a zero
+  /// handoff bound, worker/helper count overflow, invalid thread options or
+  /// an unavailable dispatch mode. Storage reservation or thread startup can
+  /// return [`AsyncError::OutOfMemory`].
+  ///
+  /// ```
+  /// use allocatbelt::runtime::asynchronous::{
+  ///   AsyncConfig, AsyncDispatch, AsyncRuntime, AsyncRuntimeOptions, AsyncShutdown,
+  /// };
+  ///
+  /// let runtime = AsyncRuntime::new_with_options(
+  ///   AsyncConfig { workers: 1, max_outstanding: 8, max_scopes: 2 },
+  ///   AsyncRuntimeOptions::new().dispatch(AsyncDispatch::Strict),
+  /// )?;
+  /// assert_eq!(runtime.dispatch(), AsyncDispatch::Strict);
+  /// assert_eq!(runtime.metrics().dispatch(), AsyncDispatch::Strict);
+  /// runtime.shutdown(AsyncShutdown::Drain)?;
+  /// # Ok::<(), allocatbelt::runtime::asynchronous::AsyncError>(())
+  /// ```
+  pub fn new_with_options(
+    config: AsyncConfig,
+    options: AsyncRuntimeOptions,
+  ) -> Result<Self, AsyncError> {
+    Self::start_with_options(config, None, options)
   }
 
   /// Creates a runtime whose implicit root scope uses `resources` for every
   /// root handle, worker context and task admitted through that root.
   ///
-  /// This constructor is reserved for the owning runtime facade, which owns
-  /// the ledger alongside the executor. It binds the existing root scope and
-  /// therefore does not consume an additional scope slot.
+  /// Test helper that binds the existing root scope without consuming an
+  /// additional scope slot.
+  #[cfg(test)]
   pub(super) fn with_resources(
     config: AsyncConfig,
     resources: ResourceScope,
   ) -> Result<Self, AsyncError> {
-    Self::start(config, 0, Some(resources), AsyncThreadOptions::default())
+    Self::with_resources_and_options(config, resources, AsyncRuntimeOptions::new())
   }
 
-  /// Resource-bound counterpart used by the owning runtime facade.
+  /// Resource-bound thread-options constructor for tests.
+  #[cfg(test)]
   pub(super) fn with_resources_and_thread_options(
     config: AsyncConfig,
     resources: ResourceScope,
     options: AsyncThreadOptions,
   ) -> Result<Self, AsyncError> {
-    Self::start(config, 0, Some(resources), options)
+    Self::with_resources_and_options(
+      config,
+      resources,
+      AsyncRuntimeOptions::new().thread_options(options),
+    )
   }
 
   /// Like [`AsyncRuntime::new`], and also prestarts
@@ -315,15 +423,7 @@ impl AsyncRuntime {
     config: AsyncConfig,
     handoffs: HandoffConfig,
   ) -> Result<Self, AsyncError> {
-    if handoffs.max_handoffs == 0 {
-      return Err(AsyncError::InvalidConfig);
-    }
-    Self::start(
-      config,
-      handoffs.max_handoffs,
-      None,
-      AsyncThreadOptions::default(),
-    )
+    Self::new_with_options(config, AsyncRuntimeOptions::new().handoffs(handoffs))
   }
 
   /// Like [`AsyncRuntime::new_with_thread_options`], with prestarted helpers
@@ -333,40 +433,71 @@ impl AsyncRuntime {
     handoffs: HandoffConfig,
     options: AsyncThreadOptions,
   ) -> Result<Self, AsyncError> {
-    if handoffs.max_handoffs == 0 {
-      return Err(AsyncError::InvalidConfig);
-    }
-    Self::start(config, handoffs.max_handoffs, None, options)
+    Self::new_with_options(
+      config,
+      AsyncRuntimeOptions::new()
+        .handoffs(handoffs)
+        .thread_options(options),
+    )
   }
 
-  /// Resource-bound counterpart used by the owning facade.
+  /// Resource-bound handoff constructor for tests.
+  #[cfg(test)]
   pub(super) fn with_resources_and_handoffs(
     config: AsyncConfig,
     handoffs: HandoffConfig,
     resources: ResourceScope,
   ) -> Result<Self, AsyncError> {
-    if handoffs.max_handoffs == 0 {
-      return Err(AsyncError::InvalidConfig);
-    }
-    Self::start(
+    Self::with_resources_and_options(
       config,
-      handoffs.max_handoffs,
-      Some(resources),
-      AsyncThreadOptions::default(),
+      resources,
+      AsyncRuntimeOptions::new().handoffs(handoffs),
     )
   }
 
-  /// Resource-bound counterpart used by the owning runtime facade.
+  /// Resource-bound handoff and thread-options constructor for tests.
+  #[cfg(test)]
   pub(super) fn with_resources_handoffs_and_thread_options(
     config: AsyncConfig,
     handoffs: HandoffConfig,
     resources: ResourceScope,
     options: AsyncThreadOptions,
   ) -> Result<Self, AsyncError> {
-    if handoffs.max_handoffs == 0 {
-      return Err(AsyncError::InvalidConfig);
-    }
-    Self::start(config, handoffs.max_handoffs, Some(resources), options)
+    Self::with_resources_and_options(
+      config,
+      resources,
+      AsyncRuntimeOptions::new()
+        .handoffs(handoffs)
+        .thread_options(options),
+    )
+  }
+
+  /// Resource-bound counterpart used by the owning runtime facade.
+  pub(super) fn with_resources_and_options(
+    config: AsyncConfig,
+    resources: ResourceScope,
+    options: AsyncRuntimeOptions,
+  ) -> Result<Self, AsyncError> {
+    Self::start_with_options(config, Some(resources), options)
+  }
+
+  fn start_with_options(
+    config: AsyncConfig,
+    resources: Option<ResourceScope>,
+    options: AsyncRuntimeOptions,
+  ) -> Result<Self, AsyncError> {
+    let max_handoffs = match options.handoffs {
+      Some(HandoffConfig { max_handoffs: 0 }) => return Err(AsyncError::InvalidConfig),
+      Some(handoffs) => handoffs.max_handoffs,
+      None => 0,
+    };
+    Self::start(
+      config,
+      max_handoffs,
+      resources,
+      options.thread_options,
+      options.dispatch,
+    )
   }
 
   fn start(
@@ -374,7 +505,11 @@ impl AsyncRuntime {
     max_handoffs: usize,
     resources: Option<ResourceScope>,
     options: AsyncThreadOptions,
+    dispatch: AsyncDispatch,
   ) -> Result<Self, AsyncError> {
+    if dispatch == AsyncDispatch::Distributed {
+      return Err(AsyncError::InvalidConfig);
+    }
     if config.workers == 0 || config.max_outstanding == 0 || config.max_scopes == 0 {
       return Err(AsyncError::InvalidConfig);
     }
@@ -398,6 +533,7 @@ impl AsyncRuntime {
     };
     let tenant = resources.as_ref().and_then(ResourceScope::tenant_domain);
     let metrics = RuntimeMetrics::try_new(
+      dispatch,
       config.workers,
       thread_contexts(config.workers, max_handoffs),
       threads,
@@ -464,7 +600,7 @@ impl AsyncRuntime {
     } else {
       None
     };
-    let (shared, root) = Shared::new(config, max_handoffs, resources, options, metrics)?;
+    let (shared, root) = Shared::new(config, dispatch, max_handoffs, resources, options, metrics)?;
     let mut workers: Vec<DeferredJoin> = Vec::new();
     workers
       .try_reserve_exact(threads)
@@ -579,6 +715,12 @@ impl AsyncRuntime {
       resources: self.shared.root_resources(),
       _scope_owner: None,
     }
+  }
+
+  /// Returns the dispatch mode chosen at construction.
+  #[must_use]
+  pub fn dispatch(&self) -> AsyncDispatch {
+    self.shared.dispatch
   }
 
   /// Returns a cloneable diagnostic view that remains usable after shutdown.

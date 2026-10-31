@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use super::AsyncDispatch;
 use super::thread_options::AsyncThreadContext;
 use crate::runtime::resource_domain::{ControlCharge, DomainError, TenantDomain, payload_bytes};
 
@@ -13,6 +14,7 @@ pub(super) enum MetricsBuildError {
 }
 
 pub(super) struct RuntimeMetricsInner {
+  dispatch: AsyncDispatch,
   pub(super) workers: usize,
   pub(super) alive_tasks: AtomicUsize,
   pub(super) queue_depth: AtomicUsize,
@@ -67,6 +69,7 @@ pub struct RuntimeMetrics(Arc<RuntimeMetricsInner>);
 
 impl RuntimeMetrics {
   pub(super) fn try_new(
+    dispatch: AsyncDispatch,
     workers: usize,
     contexts: impl IntoIterator<Item = AsyncThreadContext>,
     capacity: usize,
@@ -94,6 +97,7 @@ impl RuntimeMetrics {
       .try_resize(actual)
       .map_err(MetricsBuildError::ResourceDomain)?;
     Ok(Self(Arc::new(RuntimeMetricsInner {
+      dispatch,
       workers,
       alive_tasks: AtomicUsize::new(0),
       queue_depth: AtomicUsize::new(0),
@@ -105,6 +109,12 @@ impl RuntimeMetrics {
 
   pub(super) fn inner(&self) -> &Arc<RuntimeMetricsInner> {
     &self.0
+  }
+
+  /// Returns the dispatch mode chosen at construction.
+  #[must_use]
+  pub fn dispatch(&self) -> AsyncDispatch {
+    self.0.dispatch
   }
 
   /// Returns the configured primary worker count.

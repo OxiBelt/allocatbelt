@@ -48,9 +48,9 @@ use std::sync::Arc;
 
 use super::ShutdownMode;
 use super::asynchronous::{
-  AsyncConfig, AsyncError, AsyncHandle, AsyncRuntime, AsyncShutdown, AsyncThreadOptions,
-  HandoffConfig, LocalConfig, LocalError, LocalHandle, LocalRuntime, LocalSendHandle,
-  LocalTaskScope, OwnedTaskScope, RuntimeMetrics,
+  AsyncConfig, AsyncDispatch, AsyncError, AsyncHandle, AsyncRuntime, AsyncRuntimeOptions,
+  AsyncShutdown, AsyncThreadOptions, HandoffConfig, LocalConfig, LocalError, LocalHandle,
+  LocalRuntime, LocalSendHandle, LocalTaskScope, OwnedTaskScope, RuntimeMetrics,
 };
 use super::byte_rate::{ByteRateConfig, ByteRateError, ByteRateLimit};
 use super::fs::FsHandle;
@@ -1052,6 +1052,7 @@ service_builder_methods!(CurrentThreadBuilder);
 #[derive(Clone, Debug)]
 pub struct MultiThreadBuilder {
   config: AsyncConfig,
+  dispatch: Option<AsyncDispatch>,
   handoffs: Option<HandoffConfig>,
   thread_options: Option<AsyncThreadOptions>,
   resources: ResourceLimits,
@@ -1065,6 +1066,7 @@ impl MultiThreadBuilder {
   pub const fn new(config: AsyncConfig) -> Self {
     Self {
       config,
+      dispatch: None,
       handoffs: None,
       tenant: None,
       thread_options: None,
@@ -1089,6 +1091,13 @@ impl MultiThreadBuilder {
         feedback: None,
       },
     }
+  }
+
+  /// Selects how the executor orders ready owned tasks.
+  #[must_use]
+  pub const fn dispatch(mut self, dispatch: AsyncDispatch) -> Self {
+    self.dispatch = Some(dispatch);
+    self
   }
 
   /// Prestarts bounded helper threads for [`super::asynchronous::try_block_in_place`].
@@ -1172,22 +1181,15 @@ impl MultiThreadBuilder {
       .transpose()
       .map_err(DriverBuildError::ResourceDomain)?;
     let mut startup = StartupGuard::default();
-    let asynchronous = match (self.handoffs, self.thread_options) {
-      (Some(handoffs), Some(options)) => AsyncRuntime::with_resources_handoffs_and_thread_options(
-        self.config,
-        handoffs,
-        resources.clone(),
-        options,
-      ),
-      (Some(handoffs), None) => {
-        AsyncRuntime::with_resources_and_handoffs(self.config, handoffs, resources.clone())
-      }
-      (None, Some(options)) => {
-        AsyncRuntime::with_resources_and_thread_options(self.config, resources.clone(), options)
-      }
-      (None, None) => AsyncRuntime::with_resources(self.config, resources.clone()),
+    let mut options = AsyncRuntimeOptions::new()
+      .dispatch(self.dispatch.unwrap_or_default())
+      .thread_options(self.thread_options.unwrap_or_default());
+    if let Some(handoffs) = self.handoffs {
+      options = options.handoffs(handoffs);
     }
-    .map_err(DriverBuildError::Async)?;
+    let asynchronous =
+      AsyncRuntime::with_resources_and_options(self.config, resources.clone(), options)
+        .map_err(DriverBuildError::Async)?;
     startup.asynchronous = Some(asynchronous);
     let filesystem = self.services.build_services(
       &resources,
@@ -3191,6 +3193,27 @@ mod tests {
   }
 
   #[test]
+  fn multithread_builder_threads_dispatch_to_the_executor() {
+    const STRICT_BUILDER: MultiThreadBuilder = MultiThreadBuilder::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 2,
+      max_scopes: 1,
+    })
+    .dispatch(AsyncDispatch::Strict);
+    for builder in [MultiThreadBuilder::new(async_config()), STRICT_BUILDER] {
+      let driver = builder.build().unwrap();
+      assert_eq!(driver.metrics().dispatch(), AsyncDispatch::Strict);
+      drop(driver);
+    }
+    assert!(matches!(
+      MultiThreadBuilder::new(async_config())
+        .dispatch(AsyncDispatch::Distributed)
+        .build(),
+      Err(DriverBuildError::Async(AsyncError::InvalidConfig))
+    ));
+  }
+
+  #[test]
   fn multithread_facade_applies_thread_options_and_exposes_metrics() {
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let options = AsyncThreadOptions::new()
@@ -3205,6 +3228,7 @@ mod tests {
         let _ = started_tx.send(context);
       });
     let driver = MultiThreadBuilder::new(async_config())
+      .dispatch(AsyncDispatch::Strict)
       .thread_options(options)
       .build()
       .unwrap_or_else(|error| panic!("multithread build failed: {error}"));
@@ -3219,6 +3243,7 @@ mod tests {
     assert_eq!(started.physical_index, 0);
 
     let metrics = driver.metrics();
+    assert_eq!(metrics.dispatch(), AsyncDispatch::Strict);
     let snapshot = metrics.snapshot();
     assert_eq!(snapshot.num_workers, 1);
     assert_eq!(snapshot.threads.len(), 1);

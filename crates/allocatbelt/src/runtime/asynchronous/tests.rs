@@ -5,7 +5,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use super::{AsyncConfig, AsyncJoinError, AsyncRuntime, AsyncScopeConfig, AsyncShutdown};
+use super::{
+  AsyncConfig, AsyncJoinError, AsyncRuntime, AsyncScopeConfig, AsyncShutdown, strict_runtime,
+};
 use crate::runtime::managed::{ResourceLimits, ResourceScope};
 
 fn runtime(workers: usize, max_outstanding: usize, max_scopes: usize) -> AsyncRuntime {
@@ -15,6 +17,159 @@ fn runtime(workers: usize, max_outstanding: usize, max_scopes: usize) -> AsyncRu
     max_scopes,
   })
   .unwrap_or_else(|error| panic!("runtime construction failed: {error}"))
+}
+
+#[test]
+fn dispatch_defaults_to_strict_and_is_retained_by_metrics() {
+  use super::{AsyncDispatch, AsyncRuntimeOptions};
+
+  let config = AsyncConfig {
+    workers: 1,
+    max_outstanding: 2,
+    max_scopes: 1,
+  };
+  assert_eq!(AsyncDispatch::default(), AsyncDispatch::Strict);
+  let default_runtime = AsyncRuntime::new(config).unwrap();
+  assert_eq!(default_runtime.dispatch(), AsyncDispatch::Strict);
+  assert_eq!(default_runtime.metrics().dispatch(), AsyncDispatch::Strict);
+  default_runtime.shutdown(AsyncShutdown::Drain).unwrap();
+  for options in [
+    AsyncRuntimeOptions::default(),
+    AsyncRuntimeOptions::new(),
+    AsyncRuntimeOptions::new().dispatch(AsyncDispatch::Strict),
+  ] {
+    let runtime = AsyncRuntime::new_with_options(config, options).unwrap();
+    let metrics = runtime.metrics();
+    assert_eq!(runtime.dispatch(), AsyncDispatch::Strict);
+    assert_eq!(metrics.dispatch(), AsyncDispatch::Strict);
+    let job = runtime.handle().spawn(async { 7 }).unwrap();
+    assert_eq!(runtime.block_on(job).unwrap().unwrap(), 7);
+    runtime.shutdown(AsyncShutdown::Drain).unwrap();
+    assert_eq!(metrics.dispatch(), AsyncDispatch::Strict);
+  }
+}
+
+#[test]
+fn unavailable_dispatch_is_rejected_before_thread_callbacks() {
+  use super::{AsyncDispatch, AsyncError, AsyncRuntimeOptions, AsyncThreadOptions};
+
+  let config = AsyncConfig {
+    workers: 1,
+    max_outstanding: 2,
+    max_scopes: 1,
+  };
+  let name_calls = Arc::new(AtomicUsize::new(0));
+  let calls = Arc::clone(&name_calls);
+  let options = AsyncRuntimeOptions::new()
+    .dispatch(AsyncDispatch::Distributed)
+    .thread_options(AsyncThreadOptions::new().thread_name_fn(move |_| {
+      calls.fetch_add(1, Ordering::Relaxed);
+      String::from("unavailable-dispatch")
+    }));
+  assert!(matches!(
+    AsyncRuntime::new_with_options(config, options.clone()),
+    Err(AsyncError::InvalidConfig)
+  ));
+  assert!(matches!(
+    AsyncRuntime::with_resources_and_options(
+      config,
+      ResourceScope::new(ResourceLimits::default()),
+      options,
+    ),
+    Err(AsyncError::InvalidConfig)
+  ));
+  assert_eq!(name_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn construction_options_combine_handoffs_and_thread_options() {
+  use super::{
+    AsyncDispatch, AsyncRuntimeOptions, AsyncThreadOptions, HandoffConfig, try_block_in_place,
+  };
+
+  let (names_tx, names_rx) = std::sync::mpsc::channel();
+  let runtime = AsyncRuntime::new_with_options(
+    AsyncConfig {
+      workers: 1,
+      max_outstanding: 2,
+      max_scopes: 1,
+    },
+    AsyncRuntimeOptions::new()
+      .dispatch(AsyncDispatch::Strict)
+      .handoffs(HandoffConfig { max_handoffs: 1 })
+      .thread_options(AsyncThreadOptions::new().thread_name_fn(move |context| {
+        let name = format!("options-thread-{}", context.physical_index);
+        names_tx.send(name.clone()).unwrap();
+        name
+      })),
+  )
+  .unwrap();
+  assert_eq!(runtime.metrics().thread_count(), 2);
+  assert_eq!(
+    names_rx.try_iter().collect::<Vec<_>>(),
+    ["options-thread-0", "options-thread-1"]
+  );
+  let job = runtime
+    .handle()
+    .spawn(async { try_block_in_place(|| 9).unwrap() })
+    .unwrap();
+  assert_eq!(runtime.block_on(job).unwrap().unwrap(), 9);
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+}
+
+#[test]
+fn construction_options_reject_invalid_handoff_bounds() {
+  use super::{AsyncError, AsyncRuntimeOptions, HandoffConfig};
+
+  let config = AsyncConfig {
+    workers: 1,
+    max_outstanding: 2,
+    max_scopes: 1,
+  };
+  for max_handoffs in [0, usize::MAX] {
+    assert!(matches!(
+      AsyncRuntime::new_with_options(
+        config,
+        AsyncRuntimeOptions::new().handoffs(HandoffConfig { max_handoffs }),
+      ),
+      Err(AsyncError::InvalidConfig)
+    ));
+  }
+}
+
+#[test]
+fn resource_handoff_thread_options_wrapper_keeps_the_root_binding() {
+  use super::{AsyncDispatch, AsyncThreadOptions, HandoffConfig};
+
+  let resources = ResourceScope::new(ResourceLimits {
+    managed_memory: 32,
+    ..ResourceLimits::default()
+  });
+  let runtime = AsyncRuntime::with_resources_handoffs_and_thread_options(
+    AsyncConfig {
+      workers: 1,
+      max_outstanding: 2,
+      max_scopes: 1,
+    },
+    HandoffConfig { max_handoffs: 1 },
+    resources.clone(),
+    AsyncThreadOptions::new(),
+  )
+  .unwrap();
+  assert_eq!(runtime.dispatch(), AsyncDispatch::default());
+  assert_eq!(runtime.metrics().dispatch(), runtime.dispatch());
+  assert_eq!(runtime.metrics().thread_count(), 2);
+  let buffer = runtime
+    .block_on(async {
+      super::current_resource_scope()
+        .try_alloc_zeroed(16)
+        .unwrap()
+    })
+    .unwrap();
+  assert_eq!(resources.snapshot().managed_memory, buffer.charged_bytes());
+  drop(buffer);
+  assert_eq!(resources.snapshot().managed_memory, 0);
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
 }
 
 fn wait_until(predicate: impl Fn() -> bool, message: &str) {
@@ -1391,7 +1546,13 @@ fn stale_waker_from_reused_slot_cannot_wake_the_new_generation() {
 
 #[test]
 fn ready_queue_rotates_fairly_between_scopes() {
-  let runtime = runtime(1, 16, 3);
+  // Asserts strict rotation between ready scopes.
+  let runtime = strict_runtime(AsyncConfig {
+    workers: 1,
+    max_outstanding: 16,
+    max_scopes: 3,
+  })
+  .unwrap();
   let first_scope = runtime
     .scope()
     .unwrap_or_else(|e| panic!("scope failed: {e}"));
@@ -1452,7 +1613,13 @@ fn ready_queue_rotates_fairly_between_scopes() {
 
 #[test]
 fn saturated_scope_preserves_fifo_and_cancellation_leapfrogs_queued_work() {
-  let runtime = runtime(2, 8, 4);
+  // Asserts strict ready order within a saturated scope.
+  let runtime = strict_runtime(AsyncConfig {
+    workers: 2,
+    max_outstanding: 8,
+    max_scopes: 4,
+  })
+  .unwrap();
   let limited = runtime
     .scope_with_config(AsyncScopeConfig {
       max_active_polls: 1,
