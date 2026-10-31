@@ -13,11 +13,17 @@ pub(super) enum MetricsBuildError {
   ResourceDomain(DomainError),
 }
 
+#[repr(align(64))]
+pub(super) struct PaddedCounter(pub(super) AtomicUsize);
+
 pub(super) struct RuntimeMetricsInner {
   dispatch: AsyncDispatch,
   pub(super) workers: usize,
   pub(super) alive_tasks: AtomicUsize,
   pub(super) queue_depth: AtomicUsize,
+  pub(super) lane_depth: Vec<PaddedCounter>,
+  pub(super) blocked_depth: AtomicUsize,
+  pub(super) overflow_depth: AtomicUsize,
   pub(super) hook_panics: AtomicUsize,
   pub(super) threads: Vec<ThreadMetrics>,
   _control: ControlCharge,
@@ -75,10 +81,16 @@ impl RuntimeMetrics {
     capacity: usize,
     tenant: Option<&TenantDomain>,
   ) -> Result<Self, MetricsBuildError> {
+    let lanes = if dispatch == AsyncDispatch::Distributed {
+      workers
+    } else {
+      0
+    };
     let requested = std::mem::size_of::<RuntimeMetricsInner>()
       .checked_add(
         payload_bytes::<ThreadMetrics>(capacity).map_err(MetricsBuildError::ResourceDomain)?,
       )
+      .and_then(|bytes| bytes.checked_add(payload_bytes::<PaddedCounter>(lanes).ok()?))
       .ok_or(MetricsBuildError::ResourceDomain(DomainError::Invalid))?;
     let mut control =
       ControlCharge::try_new(tenant, requested).map_err(MetricsBuildError::ResourceDomain)?;
@@ -87,11 +99,19 @@ impl RuntimeMetrics {
       .try_reserve_exact(capacity)
       .map_err(|_| MetricsBuildError::OutOfMemory)?;
     threads.extend(contexts.into_iter().map(ThreadMetrics::new));
+    let mut lane_depth = Vec::new();
+    lane_depth
+      .try_reserve_exact(lanes)
+      .map_err(|_| MetricsBuildError::OutOfMemory)?;
+    lane_depth.resize_with(lanes, || PaddedCounter(AtomicUsize::new(0)));
     let actual = std::mem::size_of::<RuntimeMetricsInner>()
       .checked_add(
         payload_bytes::<ThreadMetrics>(threads.capacity())
           .map_err(MetricsBuildError::ResourceDomain)?,
       )
+      .and_then(|bytes| {
+        bytes.checked_add(payload_bytes::<PaddedCounter>(lane_depth.capacity()).ok()?)
+      })
       .ok_or(MetricsBuildError::ResourceDomain(DomainError::Invalid))?;
     control
       .try_resize(actual)
@@ -101,6 +121,9 @@ impl RuntimeMetrics {
       workers,
       alive_tasks: AtomicUsize::new(0),
       queue_depth: AtomicUsize::new(0),
+      lane_depth,
+      blocked_depth: AtomicUsize::new(0),
+      overflow_depth: AtomicUsize::new(0),
       hook_panics: AtomicUsize::new(0),
       threads,
       _control: control,
@@ -135,10 +158,18 @@ impl RuntimeMetrics {
     self.0.alive_tasks.load(Ordering::Relaxed)
   }
 
-  /// Returns the current number of tasks queued across all scope ready lists.
+  /// Returns the current number of tasks queued in lanes or ready lists, including scope poll waiters.
   #[must_use]
   pub fn global_queue_depth(&self) -> usize {
-    self.0.queue_depth.load(Ordering::Relaxed)
+    self.0.lane_depth.iter().fold(
+      self
+        .0
+        .queue_depth
+        .load(Ordering::Relaxed)
+        .saturating_add(self.0.blocked_depth.load(Ordering::Relaxed))
+        .saturating_add(self.0.overflow_depth.load(Ordering::Relaxed)),
+      |sum, depth| sum.saturating_add(depth.0.load(Ordering::Relaxed)),
+    )
   }
 
   /// Returns the number of contained lifecycle hook panics.
@@ -188,7 +219,7 @@ impl RuntimeMetrics {
       num_workers: self.0.workers,
       dispatch_ceiling: self.0.workers,
       num_alive_tasks: self.0.alive_tasks.load(Ordering::Relaxed),
-      global_queue_depth: self.0.queue_depth.load(Ordering::Relaxed),
+      global_queue_depth: self.global_queue_depth(),
       hook_panics: self.0.hook_panics.load(Ordering::Relaxed),
       threads: self
         .0
@@ -229,7 +260,7 @@ pub struct RuntimeMetricsSnapshot {
   pub dispatch_ceiling: usize,
   /// Admitted task slots still owned by the executor, including cleanup.
   pub num_alive_tasks: usize,
-  /// Current tasks queued across all scope ready lists.
+  /// Current tasks queued in lanes or ready lists, including scope poll waiters.
   pub global_queue_depth: usize,
   /// Number of contained lifecycle hook panics. A naming callback panic
   /// rejects construction before a metrics handle is returned.

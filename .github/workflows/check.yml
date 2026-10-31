@@ -128,6 +128,9 @@ jobs:
       - name: Cargo release correctness tests
         run: cargo test --release --all-features --locked
 
+      - name: Distributed runtime correctness tests without handoffs
+        run: scripts/check-async-distributed.sh
+
   scalar-isa-arm64:
     name: ARM64 scalar instruction probes
     runs-on: ubuntu-26.04-arm

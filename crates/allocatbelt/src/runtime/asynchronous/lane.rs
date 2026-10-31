@@ -3,10 +3,6 @@
 //! receiving lock. Lane locks are leaves: cut, unlock, then append.
 
 #![forbid(unsafe_code)]
-#![cfg_attr(
-  not(test),
-  expect(dead_code, reason = "used by the upcoming distributed engine")
-)]
 
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -15,6 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub(super) const NIL: usize = usize::MAX;
 pub(super) const STEAL_MAX: usize = 32;
+// Build-time comparison knob; ordinary placement skips parked lanes.
+pub(super) const ROUND_ROBIN_PLACEMENT: bool = false;
 
 #[derive(Debug)]
 pub(super) struct QueueLink {
@@ -22,6 +20,7 @@ pub(super) struct QueueLink {
   // Only the scope blocked list uses back-links, for constant-time unlink.
   pub(super) prev: AtomicUsize,
   pub(super) blocked: AtomicBool,
+  pub(super) cleanup: AtomicBool,
 }
 
 impl QueueLink {
@@ -30,6 +29,7 @@ impl QueueLink {
       next: AtomicUsize::new(NIL),
       prev: AtomicUsize::new(NIL),
       blocked: AtomicBool::new(false),
+      cleanup: AtomicBool::new(false),
     }
   }
 }
@@ -87,6 +87,53 @@ impl LaneQueue {
     }
     links[index].next.store(NIL, Ordering::Relaxed);
     Some(index)
+  }
+
+  /// Remove an entry without acquiring it for polling. Used only to relocate
+  /// cancellation cleanup; ordinary dispatch still pops one FIFO entry.
+  pub(super) fn remove(&mut self, links: &[QueueLink], target: usize) -> bool {
+    let mut previous = NIL;
+    let mut index = self.head;
+    while index != NIL {
+      let next = links[index].next.load(Ordering::Relaxed);
+      if index == target {
+        if previous == NIL {
+          self.head = next;
+        } else {
+          links[previous].next.store(next, Ordering::Relaxed);
+        }
+        if self.tail == index {
+          self.tail = previous;
+        }
+        self.len -= 1;
+        links[index].next.store(NIL, Ordering::Relaxed);
+        return true;
+      }
+      previous = index;
+      index = next;
+    }
+    false
+  }
+
+  /// Filter a stolen chain while its receiving lane is locked. An abort may
+  /// have scanned that lane while the chain was detached from both queues.
+  pub(super) fn extract_cleanup(&mut self, links: &[QueueLink]) -> Option<Chain> {
+    let mut cleanup = Self::new();
+    let mut index = self.head;
+    while index != NIL {
+      let next = links[index].next.load(Ordering::Relaxed);
+      if links[index].cleanup.load(Ordering::SeqCst) {
+        let removed = self.remove(links, index);
+        debug_assert!(removed);
+        cleanup.push(links, index);
+      }
+      index = next;
+    }
+    (cleanup.len != 0).then_some(Chain {
+      first: cleanup.head,
+      last: cleanup.tail,
+      len: cleanup.len,
+    })
   }
 
   /// Takes the oldest bounded half, always leaving the victim an entry.
@@ -163,16 +210,33 @@ impl LaneQueue {
 #[derive(Debug)]
 pub(super) struct ParkedMask {
   words: Vec<AtomicU64>,
+  dead: Vec<AtomicU64>,
   lanes: usize,
 }
 
 impl ParkedMask {
+  #[cfg(test)]
   pub(super) fn new(lanes: usize) -> Self {
     assert!(lanes > 0);
     Self {
       words: (0..lanes.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+      dead: (0..lanes.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
       lanes,
     }
+  }
+
+  pub(super) fn try_new(lanes: usize) -> Result<Self, std::collections::TryReserveError> {
+    let mut words = Vec::new();
+    words.try_reserve_exact(lanes.div_ceil(64))?;
+    words.resize_with(lanes.div_ceil(64), || AtomicU64::new(0));
+    let mut dead = Vec::new();
+    dead.try_reserve_exact(lanes.div_ceil(64))?;
+    dead.resize_with(lanes.div_ceil(64), || AtomicU64::new(0));
+    Ok(Self { words, dead, lanes })
+  }
+
+  pub(super) fn capacity(&self) -> usize {
+    self.words.capacity() + self.dead.capacity()
   }
 
   pub(super) fn advertise(&self, lane: usize) {
@@ -183,8 +247,16 @@ impl ParkedMask {
     loom::sync::atomic::fence(Ordering::SeqCst);
   }
 
+  pub(super) fn mark_dead(&self, lane: usize) {
+    self.dead[lane / 64].fetch_or(1 << (lane % 64), Ordering::SeqCst);
+  }
+
+  pub(super) fn is_dead(&self, lane: usize) -> bool {
+    self.dead[lane / 64].load(Ordering::SeqCst) & (1 << (lane % 64)) != 0
+  }
+
   pub(super) fn is_set(&self, lane: usize) -> bool {
-    self.words[lane / 64].load(Ordering::SeqCst) & (1 << (lane % 64)) != 0
+    self.is_dead(lane) || self.words[lane / 64].load(Ordering::SeqCst) & (1 << (lane % 64)) != 0
   }
 
   pub(super) fn claim(&self, lane: usize) -> bool {
@@ -199,7 +271,7 @@ impl ParkedMask {
     loom::sync::atomic::fence(Ordering::SeqCst);
     (0..self.lanes)
       .map(|offset| (start % self.lanes + offset) % self.lanes)
-      .find(|&lane| self.is_set(lane) && self.claim(lane))
+      .find(|&lane| !self.is_dead(lane) && self.is_set(lane) && self.claim(lane))
   }
 
   pub(super) fn first_clear_from(&self, start: usize) -> Option<usize> {
@@ -213,16 +285,24 @@ impl ParkedMask {
 pub(super) fn choose_lane(next_lane: usize, parked: &ParkedMask) -> usize {
   let start = next_lane % parked.lanes;
   parked.first_clear_from(start).unwrap_or_else(|| {
-    let _ = parked.claim(start);
-    start
+    let live = (0..parked.lanes)
+      .map(|offset| (start + offset) % parked.lanes)
+      .find(|&lane| !parked.is_dead(lane))
+      .unwrap_or(start);
+    let _ = parked.claim(live);
+    live
   })
 }
 
 /// Round-robin selection, retained for comparison by the upcoming engine.
 pub(super) fn choose_lane_round_robin(next_lane: usize, parked: &ParkedMask) -> usize {
   let start = next_lane % parked.lanes;
-  let _ = parked.claim(start);
-  start
+  let live = (0..parked.lanes)
+    .map(|offset| (start + offset) % parked.lanes)
+    .find(|&lane| !parked.is_dead(lane))
+    .unwrap_or(start);
+  let _ = parked.claim(live);
+  live
 }
 
 /// A random start followed by a complete cyclic traversal. Filtering out the
@@ -254,24 +334,23 @@ impl VictimOrder {
   }
 }
 
-/// The final, model-level park handshake after own/steal/overflow searches
+/// The final park handshake after own/steal/overflow searches
 /// failed. A true result permits the caller to test `prepare_sleep` under its
 /// lane lock and wait there. A false result requires a fresh full search.
-/// Producers publish a SeqCst length before claiming and kicking a sleeper.
+/// The iterator must load SeqCst lengths lazily, after advertisement, and the
+/// closure must load overflow the same way. Producers publish a SeqCst length
+/// before claiming and kicking a sleeper.
 pub(super) fn search_or_park(
   seat: usize,
   parked: &ParkedMask,
-  lane_len: &[AtomicUsize],
-  overflow_hint: &AtomicUsize,
-  closed_hint: &AtomicBool,
+  lane_len: impl IntoIterator<Item = (usize, usize)>,
+  overflow_hint: impl FnOnce() -> usize,
 ) -> bool {
   parked.advertise(seat);
   let work = lane_len
-    .iter()
-    .enumerate()
-    .any(|(lane, len)| lane != seat && len.load(Ordering::SeqCst) >= 2)
-    || overflow_hint.load(Ordering::SeqCst) != 0
-    || closed_hint.load(Ordering::SeqCst);
+    .into_iter()
+    .any(|(lane, len)| lane != seat && len >= 2)
+    || overflow_hint() != 0;
   if work {
     let _ = parked.claim(seat);
   }
@@ -432,22 +511,42 @@ mod tests {
   }
 
   #[test]
-  fn park_rescans_stealable_lanes_overflow_and_close() {
+  fn park_rescans_stealable_lanes_and_overflow() {
     let mask = ParkedMask::new(2);
     let lengths = [AtomicUsize::new(0), AtomicUsize::new(1)];
     let overflow = AtomicUsize::new(0);
-    let closed = AtomicBool::new(false);
-    assert!(search_or_park(0, &mask, &lengths, &overflow, &closed));
+    assert!(search_or_park(
+      0,
+      &mask,
+      lengths
+        .iter()
+        .enumerate()
+        .map(|(lane, len)| (lane, len.load(Ordering::SeqCst))),
+      || overflow.load(Ordering::SeqCst),
+    ));
     assert!(mask.claim(0));
     lengths[1].store(2, Ordering::SeqCst);
-    assert!(!search_or_park(0, &mask, &lengths, &overflow, &closed));
+    assert!(!search_or_park(
+      0,
+      &mask,
+      lengths
+        .iter()
+        .enumerate()
+        .map(|(lane, len)| (lane, len.load(Ordering::SeqCst))),
+      || overflow.load(Ordering::SeqCst),
+    ));
     assert!(!mask.is_set(0));
     lengths[1].store(1, Ordering::SeqCst);
     overflow.store(1, Ordering::SeqCst);
-    assert!(!search_or_park(0, &mask, &lengths, &overflow, &closed));
-    overflow.store(0, Ordering::SeqCst);
-    closed.store(true, Ordering::SeqCst);
-    assert!(!search_or_park(0, &mask, &lengths, &overflow, &closed));
+    assert!(!search_or_park(
+      0,
+      &mask,
+      lengths
+        .iter()
+        .enumerate()
+        .map(|(lane, len)| (lane, len.load(Ordering::SeqCst))),
+      || overflow.load(Ordering::SeqCst),
+    ));
   }
 }
 
@@ -661,9 +760,11 @@ mod loom_tests {
         if search_or_park(
           0,
           &parked,
-          &lengths[..],
-          &AtomicUsize::new(0),
-          &AtomicBool::new(false),
+          lengths
+            .iter()
+            .enumerate()
+            .map(|(lane, len)| (lane, len.load(Ordering::SeqCst))),
+          || 0,
         ) {
           sleeper.lock().unwrap().prepare_sleep()
         } else {

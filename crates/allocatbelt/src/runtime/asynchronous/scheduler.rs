@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Wake, Waker};
 
+#[path = "distributed.rs"]
+mod distributed;
+
 use super::handoff;
 use super::handoff_protocol::{DispatchTurn, HandoffLoan, HelperLease, TurnCoordinator};
 use super::identity;
@@ -20,7 +23,7 @@ use super::metrics::RuntimeMetrics;
 use super::protocol::{PollFinish, PollProtocol, PollQuota, PollWord, ScopeProtocol};
 use super::task::{DomainCpuAdmission, ErasedTask, PollResult, Task};
 use super::thread_options::AsyncThreadContext;
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 use super::thread_options::AsyncThreadOptions;
 use super::{AsyncConfig, AsyncDispatch, AsyncError, AsyncSpawnError};
 use crate::runtime::cache;
@@ -29,6 +32,7 @@ use crate::runtime::resource_domain::{
   ControlCharge, DomainError, DomainIdentity, DomainReservation, DomainResource, DomainResources,
   DomainWaitPool, DomainWaiter, TenantDomain, payload_bytes,
 };
+use distributed::Distributed;
 
 thread_local! {
   static WORKER_RUNTIME: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -114,6 +118,7 @@ impl TaskSlot {
 
 struct State {
   closed: bool,
+  admitted: usize,
   cancel_all: bool,
   tasks: Vec<TaskSlot>,
   free_tasks: BinaryHeap<Reverse<usize>>,
@@ -134,6 +139,7 @@ pub(super) struct Shared {
   /// without the scheduler mutex.
   poll_words: Vec<PollWord>,
   state: Mutex<State>,
+  distributed: Option<Distributed>,
   work: Condvar,
   /// Inactive helpers and restoring threads wait here; `work` waiters are
   /// dispatchers.
@@ -150,6 +156,9 @@ pub(super) struct ScopeCell {
   reference: Option<ScopeRef>,
   shared: Option<Weak<Shared>>,
   max_active_polls: usize,
+  binding: bool,
+  dispatch: Mutex<super::protocol::ScopeDispatch>,
+  active_stat: AtomicUsize,
   resources: Option<ResourceScope>,
   tenant: Option<TenantDomain>,
   task_waiters: Option<DomainWaitPool>,
@@ -163,12 +172,13 @@ impl ScopeCell {
   fn new(
     reference: Option<ScopeRef>,
     shared: Option<Weak<Shared>>,
-    max_active_polls: usize,
+    poll_limits: (usize, usize),
     resources: Option<ResourceScope>,
     task_waiters: Option<DomainWaitPool>,
     root_waiters: Option<DomainWaitPool>,
     control: Option<ControlCharge>,
   ) -> Self {
+    let (max_active_polls, dispatch_ceiling) = poll_limits;
     let tenant = resources
       .as_ref()
       .and_then(ResourceScope::tenant_domain)
@@ -177,6 +187,9 @@ impl ScopeCell {
       reference,
       shared,
       max_active_polls,
+      binding: max_active_polls < dispatch_ceiling,
+      dispatch: Mutex::new(super::protocol::ScopeDispatch::new(max_active_polls)),
+      active_stat: AtomicUsize::new(0),
       resources,
       tenant,
       task_waiters,
@@ -220,19 +233,35 @@ impl Shared {
     thread_options: super::ControlledThreadOptions,
     metrics: RuntimeMetrics,
   ) -> Result<(Arc<Self>, ScopeRef), AsyncError> {
+    let distributed_mode = dispatch == AsyncDispatch::Distributed;
+    let strict_tasks = if distributed_mode {
+      0
+    } else {
+      config.max_outstanding
+    };
+    let strict_scopes = if distributed_mode {
+      0
+    } else {
+      config.max_scopes
+    };
     let tenant = resources.as_ref().and_then(ResourceScope::tenant_domain);
     let mut requested_control = std::mem::size_of::<Shared>();
     for bytes in [
-      payload_bytes::<TaskSlot>(config.max_outstanding).map_err(AsyncError::ResourceDomain)?,
+      payload_bytes::<TaskSlot>(strict_tasks).map_err(AsyncError::ResourceDomain)?,
       payload_bytes::<Reverse<usize>>(config.max_outstanding)
         .map_err(AsyncError::ResourceDomain)?,
-      payload_bytes::<PollWord>(config.max_outstanding).map_err(AsyncError::ResourceDomain)?,
+      payload_bytes::<PollWord>(strict_tasks).map_err(AsyncError::ResourceDomain)?,
       payload_bytes::<ScopeSlot>(config.max_scopes).map_err(AsyncError::ResourceDomain)?,
-      payload_bytes::<ScopeRef>(config.max_scopes).map_err(AsyncError::ResourceDomain)?,
+      payload_bytes::<ScopeRef>(strict_scopes).map_err(AsyncError::ResourceDomain)?,
       std::mem::size_of::<ScopeCell>(),
     ] {
       requested_control = requested_control
         .checked_add(bytes)
+        .ok_or(AsyncError::ResourceDomain(DomainError::Invalid))?;
+    }
+    if distributed_mode {
+      requested_control = requested_control
+        .checked_add(Distributed::requested_control(config)?)
         .ok_or(AsyncError::ResourceDomain(DomainError::Invalid))?;
     }
     let mut control =
@@ -240,9 +269,9 @@ impl Shared {
 
     let mut tasks = Vec::new();
     tasks
-      .try_reserve_exact(config.max_outstanding)
+      .try_reserve_exact(strict_tasks)
       .map_err(|_| AsyncError::OutOfMemory)?;
-    tasks.resize_with(config.max_outstanding, TaskSlot::new);
+    tasks.resize_with(strict_tasks, TaskSlot::new);
     let mut free_tasks = BinaryHeap::new();
     free_tasks
       .try_reserve_exact(config.max_outstanding)
@@ -252,9 +281,9 @@ impl Shared {
     }
     let mut poll_words = Vec::new();
     poll_words
-      .try_reserve_exact(config.max_outstanding)
+      .try_reserve_exact(strict_tasks)
       .map_err(|_| AsyncError::OutOfMemory)?;
-    poll_words.resize_with(config.max_outstanding, PollWord::new);
+    poll_words.resize_with(strict_tasks, PollWord::new);
     let mut scopes = Vec::new();
     scopes
       .try_reserve_exact(config.max_scopes)
@@ -264,7 +293,7 @@ impl Shared {
     });
     let mut round_robin = VecDeque::new();
     round_robin
-      .try_reserve_exact(config.max_scopes)
+      .try_reserve_exact(strict_scopes)
       .map_err(|_| AsyncError::OutOfMemory)?;
     let Some(id) = NEXT_RUNTIME
       .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -289,7 +318,7 @@ impl Shared {
     let root_scope = Arc::new(ScopeCell::new(
       None,
       None,
-      config.workers,
+      (config.workers, config.workers + max_handoffs),
       resources,
       task_waiters,
       root_waiters,
@@ -299,6 +328,11 @@ impl Shared {
     let root = ScopeRef {
       index: 0,
       generation: 1,
+    };
+    let distributed = if distributed_mode {
+      Some(Distributed::new(config)?)
+    } else {
+      None
     };
     let mut actual_control = std::mem::size_of::<Shared>();
     for bytes in [
@@ -313,6 +347,11 @@ impl Shared {
         .checked_add(bytes)
         .ok_or(AsyncError::ResourceDomain(DomainError::Invalid))?;
     }
+    if let Some(d) = &distributed {
+      actual_control = actual_control
+        .checked_add(d.actual_control()?)
+        .ok_or(AsyncError::ResourceDomain(DomainError::Invalid))?;
+    }
     control
       .try_resize(actual_control)
       .map_err(AsyncError::ResourceDomain)?;
@@ -325,8 +364,10 @@ impl Shared {
         metrics,
         thread_options,
         poll_words,
+        distributed,
         state: Mutex::new(State {
           closed: false,
+          admitted: 0,
           cancel_all: false,
           tasks,
           free_tasks,
@@ -348,6 +389,7 @@ impl Shared {
   }
 
   fn lock(&self) -> MutexGuard<'_, State> {
+    distributed::assert_admission_order();
     #[cfg(all(test, not(loom)))]
     self.lock_acquisitions.fetch_add(1, Ordering::Relaxed);
     self.state.lock().unwrap_or_else(PoisonError::into_inner)
@@ -478,7 +520,15 @@ impl Shared {
       else {
         return Err(AsyncError::Closed);
       };
-      (index, generation, root_cell, state.tasks.len())
+      (
+        index,
+        generation,
+        root_cell,
+        self
+          .distributed
+          .as_ref()
+          .map_or(state.tasks.len(), Distributed::slots_len),
+      )
     };
     let root_resources = root_cell.resources.clone();
     let root_tenant = root_cell.tenant.clone();
@@ -531,7 +581,7 @@ impl Shared {
     let cell = Arc::new(ScopeCell::new(
       Some(scope_ref),
       Some(Arc::downgrade(self)),
-      max_active_polls,
+      (max_active_polls, self.workers + self.max_handoffs),
       resources,
       task_waiters,
       root_waiters,
@@ -662,6 +712,11 @@ impl Shared {
       return None;
     }
     let cell = slot.scope.as_ref()?;
+    if self.distributed.is_some() {
+      let cell = Arc::clone(cell);
+      drop(state);
+      return Some(distributed::scope_snapshot(&cell));
+    }
     Some(super::AsyncScopeSnapshot {
       active_tasks: cell.protocol.active(),
       active_polls: slot.quota.active(),
@@ -689,6 +744,9 @@ impl Shared {
     F: Future + Send + 'static,
     F::Output: Send + 'static,
   {
+    if let Some(d) = &self.distributed {
+      return d.spawn(self, scope, future);
+    }
     let scope_cell = {
       let state = self.lock();
       if state.closed {
@@ -815,6 +873,9 @@ impl Shared {
   }
 
   pub(super) fn close(&self, cancel: bool) {
+    if let Some(d) = &self.distributed {
+      return d.close(self, cancel);
+    }
     let mut state = self.lock();
     state.closed = true;
     state.cancel_all |= cancel;
@@ -845,6 +906,9 @@ impl Shared {
   }
 
   fn request_scope_close(&self, scope: ScopeRef) {
+    if let Some(d) = &self.distributed {
+      return d.request_scope_close(self, scope);
+    }
     let mut state = self.lock();
     if let Some(cell) = get_scope(&state, scope) {
       cell.protocol.close();
@@ -887,6 +951,9 @@ impl Shared {
   }
 
   fn wake(&self, task_ref: TaskRef) {
+    if let Some(d) = &self.distributed {
+      return d.wake(self, task_ref);
+    }
     // A wake of the running poll, often the task's own, only records
     // `NOTIFIED`; `finish_poll` hands it to `PollProtocol` under the mutex.
     if self
@@ -916,6 +983,9 @@ impl Shared {
   }
 
   pub(super) fn abort(&self, task_ref: TaskRef) {
+    if let Some(d) = &self.distributed {
+      return d.abort(self, task_ref);
+    }
     let mut state = self.lock();
     let Some(slot) = state.tasks.get_mut(task_ref.index) else {
       return;
@@ -1004,6 +1074,9 @@ impl Shared {
 
   /// Releases the permit of a thread that unwound out of a turn.
   pub(super) fn abandon_turn(&self, turn: DispatchTurn) {
+    if let Some(d) = &self.distributed {
+      return d.abandon_turn(self, turn);
+    }
     let mut state = self.lock();
     end_turn(self, &mut state, turn);
   }
@@ -1074,8 +1147,9 @@ impl OwnedTaskScope {
   }
 
   /// Returns task and active-poll counts for this scope. The task count may
-  /// change concurrently; the active-poll count and configured maximum are
-  /// sampled together under the scheduler lock.
+  /// change concurrently. Strict samples poll counts under the scheduler
+  /// lock; Distributed uses the scope quota lock for binding limits and a
+  /// relaxed diagnostic count otherwise.
   #[must_use]
   pub fn snapshot(&self) -> super::AsyncScopeSnapshot {
     self
@@ -1359,9 +1433,24 @@ impl Selected {
 /// polls return it for locked completion; terminal polls drop it before any
 /// future/output cleanup can run.
 pub(super) struct PollPermit {
-  shared: Weak<Shared>,
-  scope: ScopeRef,
+  release: PermitRelease,
   cpu_ticket: Option<DomainReservation>,
+}
+
+enum PermitRelease {
+  Strict {
+    shared: Weak<Shared>,
+    scope: ScopeRef,
+  },
+  Scope {
+    shared: Weak<Shared>,
+    cell: Arc<ScopeCell>,
+  },
+  Counted {
+    cell: Arc<ScopeCell>,
+  },
+  Free,
+  Disarmed,
 }
 
 impl PollPermit {
@@ -1377,8 +1466,11 @@ impl PollPermit {
   /// The CPU ticket must already be gone: its drop may run wakers.
   fn release_locked(mut self, state: &mut State) -> bool {
     debug_assert!(self.cpu_ticket.is_none());
-    self.shared = Weak::new();
-    release_poll_locked(state, self.scope)
+    let release = std::mem::replace(&mut self.release, PermitRelease::Disarmed);
+    match release {
+      PermitRelease::Strict { scope, .. } => release_poll_locked(state, scope),
+      _ => unreachable!("distributed permit on strict path"),
+    }
   }
 
   /// Returns the CPU ticket so it can be dropped as soon as the poll ends.
@@ -1400,8 +1492,23 @@ pub(super) struct RootAdmission {
 
 impl Drop for PollPermit {
   fn drop(&mut self) {
-    if let Some(shared) = self.shared.upgrade() {
-      shared.release_poll(self.scope);
+    match std::mem::replace(&mut self.release, PermitRelease::Disarmed) {
+      PermitRelease::Strict { shared, scope } => {
+        if let Some(shared) = shared.upgrade() {
+          shared.release_poll(scope);
+        }
+      }
+      PermitRelease::Scope { shared, cell } => {
+        if let Some(shared) = shared.upgrade()
+          && let Some(d) = &shared.distributed
+        {
+          d.release_permit(&shared, &cell);
+        }
+      }
+      PermitRelease::Counted { cell } => {
+        cell.active_stat.fetch_sub(1, Ordering::Relaxed);
+      }
+      PermitRelease::Free | PermitRelease::Disarmed => {}
     }
   }
 }
@@ -1463,8 +1570,10 @@ fn dequeue(shared: &Arc<Shared>, state: &mut State) -> Option<Selected> {
         } else {
           debug_assert!(acquired);
           Some(PollPermit {
-            shared: Arc::downgrade(shared),
-            scope: scope_ref,
+            release: PermitRelease::Strict {
+              shared: Arc::downgrade(shared),
+              scope: scope_ref,
+            },
             cpu_ticket: None,
           })
         };
@@ -1801,7 +1910,11 @@ pub(super) fn worker(
   context_control: ControlCharge,
 ) {
   executor_thread(&shared, context, context_control, || {
-    let _ = run_turns(&shared, context.physical_index, context, &mut None);
+    if let Some(d) = &shared.distributed {
+      d.run_seat(&shared, context);
+    } else {
+      let _ = run_turns(&shared, context.physical_index, context, &mut None);
+    }
     cache::flush();
   });
 }
@@ -2273,10 +2386,12 @@ mod tests {
       .unwrap_or_else(|error| panic!("waker creation failed: {error}"));
     assert_eq!(Arc::strong_count(&probe), 3);
     let permit = PollPermit {
-      shared: Weak::new(),
-      scope: ScopeRef {
-        index: 0,
-        generation: 1,
+      release: PermitRelease::Strict {
+        shared: Weak::new(),
+        scope: ScopeRef {
+          index: 0,
+          generation: 1,
+        },
       },
       cpu_ticket: None,
     };
@@ -2331,10 +2446,12 @@ mod tests {
 
   fn unscheduled_permit() -> PollPermit {
     PollPermit {
-      shared: Weak::new(),
-      scope: ScopeRef {
-        index: 0,
-        generation: 1,
+      release: PermitRelease::Strict {
+        shared: Weak::new(),
+        scope: ScopeRef {
+          index: 0,
+          generation: 1,
+        },
       },
       cpu_ticket: None,
     }

@@ -18,6 +18,9 @@
 //! runtime built with [`AsyncRuntime::new_with_handoffs`] keeps dispatching
 //! on a bounded set of prestarted helpers meanwhile.
 
+//! Strict dispatch preserves per-scope order; opt-in Distributed uses FIFO
+//! lanes with bounded stealing and currently requires handoffs to be disabled.
+
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
@@ -140,13 +143,13 @@ pub struct AsyncConfig {
 #[cfg_attr(not(test), derive(Default))]
 #[non_exhaustive]
 pub enum AsyncDispatch {
-  /// Reserved and not yet available. Selecting this mode currently returns
-  /// [`AsyncError::InvalidConfig`] at construction.
+  /// FIFO lanes with bounded stealing. Available without handoffs; combining
+  /// this mode with handoffs returns [`AsyncError::InvalidConfig`].
   Distributed,
   /// Ordinary ready work keeps per-scope FIFO order, with ready scopes
   /// rotating one poll per turn. Cancellation cleanup can pass queued
   /// ordinary work. Restoring threads precede every new turn.
-  // The default changes when the distributed engine lands.
+  // Keep the established ordering as the default during opt-in rollout.
   #[cfg_attr(not(test), default)]
   Strict,
 }
@@ -154,8 +157,8 @@ pub enum AsyncDispatch {
 #[cfg(test)]
 impl Default for AsyncDispatch {
   fn default() -> Self {
-    if std::env::var("ALLOCATBELT_ASYNC_DISPATCH").as_deref() == Ok("strict") {
-      return Self::Strict;
+    if std::env::var("ALLOCATBELT_ASYNC_DISPATCH").as_deref() == Ok("distributed") {
+      return Self::Distributed;
     }
     Self::Strict
   }
@@ -215,7 +218,8 @@ pub struct AsyncScopeSnapshot {
   /// This count can change concurrently with a snapshot.
   pub active_tasks: usize,
   /// Poll slots reserved before dispatch and held through `Future::poll`
-  /// return, sampled under the scheduler lock with `max_active_polls`.
+  /// return. Strict samples under the scheduler lock. Distributed uses the
+  /// scope quota lock for binding limits, otherwise a relaxed diagnostic count.
   /// A reserved task may be about to enter its poll call.
   pub active_polls: usize,
   /// The configured active-poll limit for this scope.
@@ -508,7 +512,7 @@ impl AsyncRuntime {
     options: AsyncThreadOptions,
     dispatch: AsyncDispatch,
   ) -> Result<Self, AsyncError> {
-    if dispatch == AsyncDispatch::Distributed {
+    if dispatch == AsyncDispatch::Distributed && max_handoffs != 0 {
       return Err(AsyncError::InvalidConfig);
     }
     if config.workers == 0 || config.max_outstanding == 0 || config.max_scopes == 0 {

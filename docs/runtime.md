@@ -986,9 +986,31 @@ explicit application port; it does not claim Tokio macro compatibility.
 `runtime::asynchronous::AsyncRuntime` runs owned `Send + 'static` futures on a
 fixed worker pool. An outstanding bound covers queued, polling, sleeping and
 cancellation-cleanup tasks. A separate scope bound includes the implicit root
-scope. Rejection returns the original future. Each scope has FIFO ready order;
-dispatch rotates ready scopes with one poll per turn. A future that never
+scope. Rejection returns the original future. `AsyncDispatch::Strict` remains
+the default: each scope has FIFO ready order and dispatch rotates ready scopes
+with one poll per turn. `AsyncRuntimeOptions::dispatch(AsyncDispatch::Distributed)`
+opts into per-dispatcher FIFO lanes without handoffs. A future that never
 returns from `poll` cannot be preempted.
+
+Distributed appends every newly ready, self-woken, requeued, quota-released or
+cancelled task to a lane chosen only by a rotating counter and the parked mask.
+It skips parked dispatchers unless all are parked. A dispatcher takes its own
+front entry, then searches other lanes in a pseudo-random order, then takes one
+shared overflow entry. A steal moves the oldest bounded half (at most 32) to
+the receiving lane's tail, preserving order and always leaving the victim at
+least one entry. A lane with two or more entries wakes one parked dispatcher
+to search. The last entry behind a long poll waits for that lane's dispatcher.
+There is no per-task lane affinity or global scope rotation. A larger ready
+scope can receive proportionally more polls, and scope readiness order can
+change across lanes. Each task still polls exclusively, and ready tasks make
+progress if every poll returns; there is no time bound.
+
+A binding scope keeps quota-blocked entries in FIFO order. Each release passes
+its permit directly to the oldest blocked entry, which reenters a lane without
+reacquiring the permit. At most `max_outstanding - 1` other scope tasks receive
+a permit before it. Cancellation cleanup consumes no poll permit and joins a
+lane like ordinary work. Scheduler locks never cover polling, user destruction
+or waker calls. Timer and reactor work stays on its existing service threads.
 
 `AsyncRuntime::block_on` and `AsyncHandle::block_on` poll one root future on
 the caller's thread; that future may borrow local data and need not be `Send`.
@@ -1076,9 +1098,10 @@ never cover user polling, destructors or completion callbacks. Generation tags
 make retained stale wakers harmless without retaining completed futures.
 A wake of a task whose poll is running, including its own, sets a per-slot
 atomic flag tagged with the low 62 generation bits instead of taking the
-scheduler mutex; the poll's completion takes that flag under the mutex as its
+scheduler mutex; the poll's completion takes that flag under the task's dispatch lock as its
 one pending wake. Other wakes, abort and cancellation are taken under the
-scheduler mutex, and a tag alias can cause at most one spurious poll.
+scheduler mutex in Strict or the task slot lock in Distributed, and a tag
+alias can cause at most one spurious poll.
 
 `AsyncJob::abort_handle` returns a clonable thread-safe control handle,
 including for local jobs whose outputs are `!Send`. It retains cancellation
@@ -1372,15 +1395,24 @@ adds a nonzero simultaneous-poll limit to an owned Send scope. Existing scope
 construction uses the worker count. A configured limit above that count is
 accepted; the fixed worker pool remains the overall concurrency ceiling.
 `OwnedTaskScope::snapshot` reports unfinished tasks, reserved poll slots and
-the configured limit. Poll slots are sampled under the scheduler lock;
-unfinished-task counts may change concurrently. A slot is reserved before
+the configured limit. Strict samples poll slots under the scheduler lock.
+Distributed uses the scope quota lock when the limit is below the fixed worker
+count; otherwise it cannot bind and uses a relaxed diagnostic count. The root
+limit does not bind without handoffs. Unfinished-task counts may change
+concurrently. A slot is reserved before
 dispatch and held through the future's poll return, so it can include work
 about to enter `Future::poll`.
 
-A saturated scope parks its ordinary ready queue without spinning. Other
-dispatchable scopes continue equal round-robin scheduling, one poll per turn.
-Ordinary ready work retains FIFO order when capacity reopens. Cancellation
-cleanup can pass ordinary work in a saturated scope and consumes no poll slot.
+A saturated scope parks its ordinary ready queue without spinning. Strict
+continues equal round-robin scheduling across dispatchable scopes, one poll per
+turn, preserving ordinary FIFO order when capacity reopens. Distributed keeps
+blocked work in a per-scope FIFO, passing released slots in that order.
+Cancellation cleanup bypasses the quota and consumes no poll slot. In
+Distributed, entries made ready for cancellation cleanup go to the shared
+overflow queue and wake one parked dispatcher, if available, so a busy
+dispatcher's poll does not hold them on that dispatcher's lane. Overflow is
+still searched last, one entry at a time. Cancelling a task already polling
+still waits for that poll to return.
 The slot is released before future destruction or completion publication,
 including panic cleanup. Outstanding-task admission remains charged through
 future cleanup and is released before join publication; it is a separate
@@ -1388,10 +1420,35 @@ limit. Scope unfinished-task bookkeeping completes after publication.
 
 This bounds simultaneous polling, not CPU time. A future can block a worker
 inside a poll, and destructors can block during quota-free cleanup. There is
-no preemption or implicit managed-storage reservation. Current-thread local
-execution already polls one future at a time. Native tests exercise saturation,
-cross-scope progress, FIFO resumption, cancellation, shutdown, slot reuse and
+no preemption or implicit managed-storage reservation. In Distributed, an
+ordinary lone ready entry on a busy dispatcher's lane waits for that poll to
+return. A future that blocks a dispatcher while waiting synchronously on
+another task of the same runtime can therefore deadlock; use Strict for such
+code. Current-thread local execution already polls one future at a time. Native
+tests exercise saturation, cross-scope progress, FIFO resumption, cancellation,
+shutdown, slot reuse and
 cleanup; a same-source Loom model checks poll-slot acquire/release transitions.
+
+Distributed and Loom call the same park-advertise/rescan helper. The
+same-source Loom models cover lane park/push, stealing versus
+owner pop and push, quota gating and transfer, abort and close versus spawn.
+They use tiny queues and do not model real condvar timing, OS threads, metrics,
+Control charges or task internals. Native tests cover those integration paths.
+`global_queue_depth` sums lane, blocked and overflow depths; samples are
+independent and can briefly omit an entry moving between queues.
+
+For unit-test coverage only, `ALLOCATBELT_ASYNC_DISPATCH=distributed` overrides
+`AsyncDispatch::default()`. Production never reads this variable. During this
+phase the second runtime suite skips `handoff_tests`, the two handoff metrics
+tests (`thread_name_callback_gets_physical_roles_and_copied_options` and
+`busy_duration_excludes_handoff_closure_and_attributes_helper_turns`), and
+Strict-pinned scheduler tests and order tests. Scope-close and cancel-pending
+quota-blocked cancellation tests run in both modes. Handoff wrappers outside
+`handoff_tests` are also skipped:
+`resource_handoff_thread_options_wrapper_keeps_the_root_binding` and the two
+`resource_domain_runtime_tests::handed_off_*` tests. The production default remains
+Strict. `scripts/check-async-distributed.sh` contains the exact skips and runs
+in release CI. The normal suite still runs every handoff and Strict-pinned test.
 
 ## Explicit cgroup controls
 
@@ -1476,12 +1533,16 @@ future body: immediate deterministic results, eight self-waking yield turns,
 or eight yields with fully touched ordinary vector chunks. Mixed storage uses
 each binary's global allocator, with no implicit managed-buffer reservation.
 Choose `--workers`, `--window`, `--bytes`, `--jobs` and `--arrival-rate`
-explicitly. The window must cover every worker and cannot exceed the requested
-job count; construction warms all workers before timing and cleans up partial
-warm-up failures. CSV records the admission window and byte count.
+explicitly. The window cannot exceed the requested job count. Warm-up admits
+at most the smaller of the window and worker counts and cleans up partial
+failures. `yielding` with `--window` below `--workers` exercises under-subscribed
+self-yields. `head-of-line` makes job zero block inside its poll for
+`--block-us` microseconds (default 2000), while subsequent jobs return short
+results. Its p50/p95/p99 columns exclude job zero and measure short-task
+intended-arrival-to-first-poll latency; other totals include it. CSV records the admission window and byte count.
 `--dispatch strict|distributed` selects the dispatch mode for
 `--lane async --executor bounded`; `strict` is the default, and `distributed`
-is reserved and currently rejected with `InvalidConfig` at construction.
+is available without handoffs.
 
 An independent producer uses intended arrival deadlines and a separate observer
 polls each public join to ready. One common external admission window remains
@@ -1497,8 +1558,7 @@ gates; functional tests and output smokes establish no speedup.
 `--mode capacity` is available only for the blocking and async lanes. It
 keeps the configured outstanding window full without an arrival schedule,
 refilling only after the observer sees a public join ready and releases its
-handle. A full window waits on a condition variable. Both executors warm all
-workers and run the same job body; any rejection, panic, checksum mismatch or
+handle. A full window waits on a condition variable. Both executors run cooperative warm-up tasks and the same job body; any rejection, panic, checksum mismatch or
 completion loss fails the run. Blocking capacity accepts `--window`; paced
 blocking retains its existing admission bound. Capacity rejects an explicit
 arrival rate and reports `NA` for arrival rate, lateness, timer overhead and
@@ -1523,9 +1583,10 @@ returns the uncalled closure. Outside owned dispatcher execution it runs inline;
 entering a local handle alone does not constitute local execution.
 
 `AsyncRuntimeOptions` combines dispatch, handoff and thread options for
-`AsyncRuntime::new_with_options`. Only `AsyncDispatch::Strict` is available,
-and it is the default. `AsyncDispatch::Distributed` is reserved and currently
-rejected with `AsyncError::InvalidConfig` at construction.
+`AsyncRuntime::new_with_options`. `AsyncDispatch::Strict` remains the default.
+`AsyncDispatch::Distributed` is available when handoffs are disabled. Combining
+Distributed with a nonzero handoff bound temporarily returns
+`AsyncError::InvalidConfig` before thread callbacks or startup.
 `AsyncRuntime::dispatch` and `RuntimeMetrics::dispatch` report the selected
 mode. `MultiThreadBuilder::dispatch` selects the mode for the owning facade;
 omitting it uses the default.

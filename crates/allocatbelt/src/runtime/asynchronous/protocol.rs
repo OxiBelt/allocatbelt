@@ -64,10 +64,6 @@ impl PollQuota {
 /// require exclusive access under the scope mutex. A transferred permit stays
 /// counted until its selected task dispatches or returns it on cancellation.
 #[derive(Debug)]
-#[cfg_attr(
-  not(test),
-  expect(dead_code, reason = "used by the upcoming distributed engine")
-)]
 pub(super) struct ScopeDispatch {
   quota: PollQuota,
   blocked_head: usize,
@@ -75,10 +71,6 @@ pub(super) struct ScopeDispatch {
   blocked_len: usize,
 }
 
-#[cfg_attr(
-  not(test),
-  expect(dead_code, reason = "used by the upcoming distributed engine")
-)]
 impl ScopeDispatch {
   pub(super) const fn new(maximum: usize) -> Self {
     Self {
@@ -159,7 +151,7 @@ impl ScopeDispatch {
   }
 
   #[cfg(test)]
-  fn check(&self, links: &[super::lane::QueueLink]) -> Vec<usize> {
+  pub(super) fn check(&self, links: &[super::lane::QueueLink]) -> Vec<usize> {
     assert!(self.active() <= self.maximum());
     let mut indices = Vec::new();
     let mut prev = super::lane::NIL;
@@ -233,9 +225,14 @@ impl PollProtocol {
     self.admitted && self.queued && self.abort && !self.running
   }
 
-  #[cfg(all(test, loom))]
+  #[cfg(test)]
   pub(super) fn is_running(&self) -> bool {
     self.running
+  }
+
+  #[cfg(all(test, not(loom)))]
+  pub(super) fn is_queued(&self) -> bool {
+    self.queued
   }
 
   /// Queues an idle admitted task, at most once.

@@ -19,6 +19,23 @@ fn runtime(workers: usize, max_outstanding: usize, max_scopes: usize) -> AsyncRu
   .unwrap_or_else(|error| panic!("runtime construction failed: {error}"))
 }
 
+impl AsyncRuntime {
+  fn shutdown_before_deadline(self, mode: AsyncShutdown) -> Result<(), super::AsyncError> {
+    if super::scheduler::is_worker(&self.shared) {
+      return self.shutdown(mode);
+    }
+    let (done, completion) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+      let _ = done.send(self.shutdown(mode));
+    });
+    let result = completion
+      .recv_timeout(Duration::from_secs(30))
+      .expect("async shutdown deadline");
+    thread.join().unwrap();
+    result
+  }
+}
+
 #[test]
 fn dispatch_defaults_to_strict_and_is_retained_by_metrics() {
   use super::{AsyncDispatch, AsyncRuntimeOptions};
@@ -28,29 +45,34 @@ fn dispatch_defaults_to_strict_and_is_retained_by_metrics() {
     max_outstanding: 2,
     max_scopes: 1,
   };
-  assert_eq!(AsyncDispatch::default(), AsyncDispatch::Strict);
+  let default = AsyncDispatch::default();
   let default_runtime = AsyncRuntime::new(config).unwrap();
-  assert_eq!(default_runtime.dispatch(), AsyncDispatch::Strict);
-  assert_eq!(default_runtime.metrics().dispatch(), AsyncDispatch::Strict);
-  default_runtime.shutdown(AsyncShutdown::Drain).unwrap();
+  assert_eq!(default_runtime.dispatch(), default);
+  assert_eq!(default_runtime.metrics().dispatch(), default);
+  default_runtime
+    .shutdown_before_deadline(AsyncShutdown::Drain)
+    .unwrap();
   for options in [
     AsyncRuntimeOptions::default(),
     AsyncRuntimeOptions::new(),
     AsyncRuntimeOptions::new().dispatch(AsyncDispatch::Strict),
   ] {
+    let expected = options.dispatch;
     let runtime = AsyncRuntime::new_with_options(config, options).unwrap();
     let metrics = runtime.metrics();
-    assert_eq!(runtime.dispatch(), AsyncDispatch::Strict);
-    assert_eq!(metrics.dispatch(), AsyncDispatch::Strict);
+    assert_eq!(runtime.dispatch(), expected);
+    assert_eq!(metrics.dispatch(), expected);
     let job = runtime.handle().spawn(async { 7 }).unwrap();
     assert_eq!(runtime.block_on(job).unwrap().unwrap(), 7);
-    runtime.shutdown(AsyncShutdown::Drain).unwrap();
-    assert_eq!(metrics.dispatch(), AsyncDispatch::Strict);
+    runtime
+      .shutdown_before_deadline(AsyncShutdown::Drain)
+      .unwrap();
+    assert_eq!(metrics.dispatch(), expected);
   }
 }
 
 #[test]
-fn unavailable_dispatch_is_rejected_before_thread_callbacks() {
+fn distributed_handoffs_are_rejected_before_thread_callbacks() {
   use super::{AsyncDispatch, AsyncError, AsyncRuntimeOptions, AsyncThreadOptions};
 
   let config = AsyncConfig {
@@ -62,6 +84,7 @@ fn unavailable_dispatch_is_rejected_before_thread_callbacks() {
   let calls = Arc::clone(&name_calls);
   let options = AsyncRuntimeOptions::new()
     .dispatch(AsyncDispatch::Distributed)
+    .handoffs(super::HandoffConfig { max_handoffs: 1 })
     .thread_options(AsyncThreadOptions::new().thread_name_fn(move |_| {
       calls.fetch_add(1, Ordering::Relaxed);
       String::from("unavailable-dispatch")
@@ -114,7 +137,9 @@ fn construction_options_combine_handoffs_and_thread_options() {
     .spawn(async { try_block_in_place(|| 9).unwrap() })
     .unwrap();
   assert_eq!(runtime.block_on(job).unwrap().unwrap(), 9);
-  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+  runtime
+    .shutdown_before_deadline(AsyncShutdown::Drain)
+    .unwrap();
 }
 
 #[test]
@@ -169,7 +194,9 @@ fn resource_handoff_thread_options_wrapper_keeps_the_root_binding() {
   assert_eq!(resources.snapshot().managed_memory, buffer.charged_bytes());
   drop(buffer);
   assert_eq!(resources.snapshot().managed_memory, 0);
-  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+  runtime
+    .shutdown_before_deadline(AsyncShutdown::Drain)
+    .unwrap();
 }
 
 fn wait_until(predicate: impl Fn() -> bool, message: &str) {
@@ -344,7 +371,7 @@ fn concurrent_spawns_select_distinct_slots_after_the_shared_snapshot() {
   let second = second.unwrap_or_else(|error| panic!("second spawn rejected: {}", error.kind));
 
   runtime
-    .shutdown(AsyncShutdown::CancelPending)
+    .shutdown_before_deadline(AsyncShutdown::CancelPending)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
   assert!(matches!(block_on(first), Err(AsyncJoinError::Cancelled)));
   assert!(matches!(block_on(second), Err(AsyncJoinError::Cancelled)));
@@ -402,7 +429,7 @@ fn concurrent_spawn_with_one_slot_returns_full_and_preserves_the_rejected_future
   assert_eq!(rejected, 1);
 
   runtime
-    .shutdown(AsyncShutdown::CancelPending)
+    .shutdown_before_deadline(AsyncShutdown::CancelPending)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
   for (job, drops) in admitted {
     assert!(matches!(block_on(job), Err(AsyncJoinError::Cancelled)));
@@ -441,7 +468,7 @@ fn scope_close_after_domain_reservation_rolls_back_and_returns_the_future() {
     }
     block_on(scope.close());
     runtime
-      .shutdown(AsyncShutdown::CancelPending)
+      .shutdown_before_deadline(AsyncShutdown::CancelPending)
       .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
     panic!("scope-close spawn did not reach final admission");
   }
@@ -464,7 +491,7 @@ fn scope_close_after_domain_reservation_rolls_back_and_returns_the_future() {
   assert_eq!(drops.load(Ordering::SeqCst), 1);
   assert_eq!(domain.snapshot().used, before_scope);
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
 }
 
@@ -484,12 +511,12 @@ fn runtime_close_after_spawn_reservation_returns_the_unpolled_future() {
       Err(error) => drop(error.into_future()),
     }
     runtime
-      .shutdown(AsyncShutdown::CancelPending)
+      .shutdown_before_deadline(AsyncShutdown::CancelPending)
       .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
     panic!("runtime-close spawn did not reach final admission");
   }
   runtime
-    .shutdown(AsyncShutdown::CancelPending)
+    .shutdown_before_deadline(AsyncShutdown::CancelPending)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
   release_admission_hook(&release);
 
@@ -534,7 +561,7 @@ fn ready_async_job_waits_at_zero_budget_and_keeps_its_output() {
     ));
   }
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
 }
 
@@ -650,7 +677,7 @@ fn wakes_during_poll_are_coalesced_without_losing_progress() {
   assert!(matches!(block_on(job), Ok(2)));
   assert_eq!(polls.load(Ordering::SeqCst), 2);
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -708,7 +735,7 @@ fn automatic_channel_budget_runs_sibling_and_cancel_pending_shutdown_completes()
 
   let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel(1);
   let shutdown_thread = std::thread::spawn(move || {
-    let _ = shutdown_tx.send(runtime.shutdown(AsyncShutdown::CancelPending));
+    let _ = shutdown_tx.send(runtime.shutdown_before_deadline(AsyncShutdown::CancelPending));
   });
   shutdown_rx
     .recv_timeout(Duration::from_secs(3))
@@ -745,7 +772,7 @@ fn automatic_channel_budget_allows_abort_of_perpetually_ready_loop() {
   wait_until(|| hot.is_finished(), "hot task abort publication");
   assert!(matches!(block_on(hot), Err(AsyncJoinError::Cancelled)));
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
 }
 
@@ -776,7 +803,7 @@ fn ready_channel_and_mutex_chains_each_charge_one_shared_unit() {
 
   assert_eq!(remaining, (63, 62));
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
 }
 
@@ -812,7 +839,7 @@ fn semaphore_pending_refunds_and_terminal_ready_error_charges() {
 
   assert_eq!(remaining, (64, 63, 62));
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
 }
 
@@ -868,7 +895,7 @@ fn a_task_is_never_polled_concurrently() {
   assert!(matches!(block_on(job), Ok(())));
   assert_eq!(polls.load(Ordering::SeqCst), 21);
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -942,7 +969,7 @@ fn abort_before_start_drops_future_on_a_worker_and_publishes_cancelled() {
   assert!(dropped.load(Ordering::SeqCst));
   assert!(matches!(block_on(first), Ok(())));
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -993,7 +1020,7 @@ fn full_admission_returns_the_original_future() {
   cv.notify_all();
   assert!(matches!(block_on(first), Ok(())));
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -1059,7 +1086,7 @@ fn scheduler_slot_is_released_before_join_waker_runs() {
     Poll::Ready(Ok(()))
   ));
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -1122,7 +1149,7 @@ fn panicking_join_waker_does_not_kill_worker() {
     .unwrap_or_else(|e| panic!("worker died after waker panic: {e}"));
   assert!(matches!(block_on(next), Ok(19)));
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -1190,7 +1217,7 @@ fn detached_panicking_outputs_and_panic_payloads_do_not_kill_worker() {
     .unwrap_or_else(|e| panic!("worker died after destructor panic: {e}"));
   assert!(matches!(block_on(next), Ok(23)));
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -1260,7 +1287,7 @@ fn abort_during_poll_is_cleaned_after_that_poll_returns() {
   assert!(matches!(block_on(job), Err(AsyncJoinError::Cancelled)));
   assert!(dropped.load(Ordering::SeqCst));
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -1300,7 +1327,7 @@ fn retained_waker_does_not_keep_completed_future_alive() {
   assert!(dropped.load(Ordering::SeqCst));
   assert!(retained.lock().unwrap_or_else(|e| e.into_inner()).is_some());
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -1355,7 +1382,7 @@ fn tasks_that_wake_themselves_many_times_complete_with_one_poll_per_round() {
     assert!(matches!(block_on(job), Ok(polls) if polls == ROUNDS + 1));
   }
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -1434,7 +1461,7 @@ fn external_wakes_racing_poll_completion_are_never_lost() {
     assert!(matches!(block_on(job), Ok(())));
   }
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -1478,7 +1505,7 @@ fn task_reuses_waker_across_polls() {
   assert!(wakers.windows(2).all(|pair| pair[0].will_wake(&pair[1])));
   drop(wakers);
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -1540,7 +1567,7 @@ fn stale_waker_from_reused_slot_cannot_wake_the_new_generation() {
     .wake();
   assert!(matches!(block_on(second), Ok(2)));
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -1607,7 +1634,7 @@ fn ready_queue_rotates_fairly_between_scopes() {
   let order = order.lock().unwrap_or_else(|e| e.into_inner()).clone();
   assert_eq!(order, ['A', 'B', 'A', 'B', 'A', 'B']);
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -1709,7 +1736,7 @@ fn saturated_scope_preserves_fifo_and_cancellation_leapfrogs_queued_work() {
   assert_eq!(*order.lock().unwrap_or_else(|e| e.into_inner()), [1, 2]);
   assert_eq!(limited.snapshot().active_polls, 0);
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -1748,7 +1775,7 @@ fn idle_pending_abort_gets_a_queue_token_and_invalid_poll_limits_reject() {
   job.abort_handle().abort();
   assert!(matches!(block_on(job), Err(AsyncJoinError::Cancelled)));
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -1804,7 +1831,7 @@ fn closing_a_quota_blocked_scope_reactivates_queued_cancellation() {
   assert!(matches!(block_on(blocker), Ok(())));
   assert_eq!(block_on(close), ());
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -1861,7 +1888,7 @@ fn cancel_pending_shutdown_reactivates_quota_blocked_work() {
     cv.notify_all();
   });
   runtime
-    .shutdown(AsyncShutdown::CancelPending)
+    .shutdown_before_deadline(AsyncShutdown::CancelPending)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
   releaser
     .join()
@@ -2070,7 +2097,7 @@ fn resource_bound_scope_rejection_returns_the_original_unpolled_future() {
   cv.notify_all();
   assert!(matches!(runtime.block_on(blocker).unwrap(), Ok(())));
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -2199,6 +2226,15 @@ fn poll_quota_releases_before_a_panicking_future_destructor() {
     "panicking future destructor",
   );
 
+  assert_eq!(scope.snapshot().active_polls, 0);
+  if runtime.dispatch() == super::AsyncDispatch::Distributed {
+    // A lone successor can wait behind this lane owner's destructor. Check
+    // quota release directly before permitting that destructor to finish.
+    let (lock, cv) = &*drop_gate;
+    *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    cv.notify_all();
+  }
+
   let successor_ran = Arc::new(AtomicBool::new(false));
   let flag = Arc::clone(&successor_ran);
   let successor = scope
@@ -2220,7 +2256,7 @@ fn poll_quota_releases_before_a_panicking_future_destructor() {
   ));
   assert!(matches!(block_on(successor), Ok(())));
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -2251,7 +2287,7 @@ fn panic_is_published_and_dropping_join_detaches() {
   }
   assert!(ran.load(Ordering::SeqCst));
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -2297,7 +2333,7 @@ fn scope_drop_cancels_and_shutdown_from_worker_is_rejected() {
         .unwrap_or_else(|e| e.into_inner())
         .take()
         .unwrap_or_else(|| panic!("runtime missing"));
-      runtime.shutdown(AsyncShutdown::Drain)
+      runtime.shutdown_before_deadline(AsyncShutdown::Drain)
     })
     .unwrap_or_else(|e| panic!("spawn failed: {e}"));
   assert!(matches!(
@@ -2361,7 +2397,7 @@ fn concurrent_last_scope_children_release_scope_capacity() {
     .unwrap_or_else(|e| panic!("scope slot leaked after concurrent cleanup: {e}"));
   drop(replacement);
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|e| panic!("shutdown failed: {e}"));
 }
 
@@ -2380,7 +2416,7 @@ fn block_on_accepts_borrowed_non_send_root_future() {
   assert_eq!(result, (42, true));
   assert!(AsyncHandle::try_current().is_none());
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
 }
 
@@ -2399,7 +2435,7 @@ fn block_on_parks_while_workers_progress_and_wake_it() {
     .unwrap_or_else(|error| panic!("block_on failed: {error}"));
   assert!(matches!(joined, Ok(42)));
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
 }
 
@@ -2446,10 +2482,10 @@ fn nested_block_on_returns_error_and_entered_context_restores_after_unwind() {
     .unwrap_or_else(|error| panic!("outer block_on failed: {error}"));
   assert!(matches!(nested, Err(super::AsyncError::NestedBlockOn)));
   first
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
   second
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
 }
 
@@ -2468,10 +2504,10 @@ fn entered_context_guards_restore_when_dropped_out_of_order() {
   drop(second_guard);
   assert!(AsyncHandle::try_current().is_none());
   first_runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
   second_runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
 }
 
@@ -2491,7 +2527,7 @@ fn block_on_can_return_an_enter_guard_without_resurrecting_the_root_context() {
   drop(guard);
   assert!(AsyncHandle::try_current().is_none());
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
 }
 
@@ -2521,10 +2557,10 @@ fn worker_context_is_entered_and_block_on_is_rejected_there() {
     Err(super::AsyncError::BlockOnFromWorker)
   ));
   primary_runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
   other_runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
 }
 
@@ -2533,7 +2569,7 @@ fn a_handle_retained_after_shutdown_rejects_spawn_and_returns_future() {
   let runtime = runtime(1, 2, 1);
   let handle = runtime.handle();
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
   let error = handle
     .spawn(async { 19 })
@@ -2592,6 +2628,6 @@ fn cpu_limited_self_yielding_tasks_progress_and_return_cpu() {
   }
   assert_eq!(domain.snapshot().used.get(DomainResource::Cpu), 0);
   runtime
-    .shutdown(AsyncShutdown::Drain)
+    .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
 }

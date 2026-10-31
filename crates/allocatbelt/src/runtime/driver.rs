@@ -3200,17 +3200,23 @@ mod tests {
       max_scopes: 1,
     })
     .dispatch(AsyncDispatch::Strict);
-    for builder in [MultiThreadBuilder::new(async_config()), STRICT_BUILDER] {
+    for (builder, expected) in [
+      (
+        MultiThreadBuilder::new(async_config()),
+        AsyncDispatch::default(),
+      ),
+      (STRICT_BUILDER, AsyncDispatch::Strict),
+    ] {
       let driver = builder.build().unwrap();
-      assert_eq!(driver.metrics().dispatch(), AsyncDispatch::Strict);
+      assert_eq!(driver.metrics().dispatch(), expected);
       drop(driver);
     }
-    assert!(matches!(
-      MultiThreadBuilder::new(async_config())
-        .dispatch(AsyncDispatch::Distributed)
-        .build(),
-      Err(DriverBuildError::Async(AsyncError::InvalidConfig))
-    ));
+    let driver = MultiThreadBuilder::new(async_config())
+      .dispatch(AsyncDispatch::Distributed)
+      .build()
+      .unwrap();
+    assert_eq!(driver.metrics().dispatch(), AsyncDispatch::Distributed);
+    drop(driver);
   }
 
   #[test]

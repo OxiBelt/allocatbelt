@@ -18,7 +18,7 @@ use std::future::Future;
 use std::hint::black_box;
 use std::pin::Pin;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
@@ -49,6 +49,7 @@ enum Workload {
   Mixed,
   Ready,
   Yielding,
+  HeadOfLine,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +77,7 @@ struct Options {
   arrival_rate: u64,
   bytes: usize,
   window: usize,
+  block_us: u64,
 }
 
 impl Options {
@@ -92,6 +94,8 @@ impl Options {
     let mut arrival_rate = 10_000u64;
     let mut bytes = 256usize;
     let mut window = None;
+    let mut block_us = 2_000;
+    let mut block_explicit = false;
     let mut workers_explicit = false;
     let mut arrival_rate_explicit = false;
     let mut args = args.into_iter();
@@ -118,9 +122,10 @@ impl Options {
             "mixed" => Workload::Mixed,
             "ready" => Workload::Ready,
             "yielding" => Workload::Yielding,
+            "head-of-line" => Workload::HeadOfLine,
             other => {
               return Err(format!(
-                "unknown workload {other:?} (local, aligned, mixed, ready or yielding)"
+                "unknown workload {other:?} (local, aligned, mixed, ready, yielding or head-of-line)"
               ));
             }
           }
@@ -167,6 +172,12 @@ impl Options {
         }
         "--bytes" => bytes = parse_usize(&arg, &value()?)?,
         "--window" => window = Some(parse_usize(&arg, &value()?)?),
+        "--block-us" => {
+          block_explicit = true;
+          block_us = value()?
+            .parse()
+            .map_err(|_| "invalid --block-us".to_owned())?;
+        }
         "-h" | "--help" => return Err(usage().to_owned()),
         _ => return Err(format!("unknown argument {arg:?}\n{}", usage())),
       }
@@ -238,8 +249,14 @@ impl Options {
     if requested_window.is_some() && lane != Lane::Async && !blocking_capacity {
       return Err("--window applies only to --lane async or blocking --mode capacity".to_owned());
     }
-    if lane == Lane::Async && window < workers {
-      return Err("async --window must be at least --workers to warm every worker".to_owned());
+    if block_explicit && (lane != Lane::Async || workload != Workload::HeadOfLine) {
+      return Err("--block-us applies only to async --workload head-of-line".to_owned());
+    }
+    if block_us == 0 || block_us > 10_000_000 {
+      return Err("--block-us must be from 1 to 10000000".to_owned());
+    }
+    if workload == Workload::HeadOfLine && count < 2 {
+      return Err("head-of-line requires at least two jobs".to_owned());
     }
     if blocking_capacity && window < workers {
       return Err("capacity --window must be at least --workers to warm every worker".to_owned());
@@ -247,7 +264,12 @@ impl Options {
     if lane == Lane::Blocking && workload != Workload::Local {
       return Err("blocking jobs currently support only --workload local".to_owned());
     }
-    if lane == Lane::Allocator && matches!(workload, Workload::Ready | Workload::Yielding) {
+    if lane == Lane::Allocator
+      && matches!(
+        workload,
+        Workload::Ready | Workload::Yielding | Workload::HeadOfLine
+      )
+    {
       return Err("allocator lane workload must be local, aligned or mixed".to_owned());
     }
     if lane == Lane::Async && matches!(workload, Workload::Local | Workload::Aligned) {
@@ -275,14 +297,15 @@ impl Options {
       arrival_rate,
       bytes,
       window,
+      block_us,
     })
   }
 }
 
 fn usage() -> &'static str {
-  "usage: bench-latency-* --lane allocator|blocking|async [--workload local|aligned|mixed|ready|yielding] \\
+  "usage: bench-latency-* --lane allocator|blocking|async [--workload local|aligned|mixed|ready|yielding|head-of-line] \\
    [--mode latency|throughput|capacity] [--executor bounded|tokio] [--dispatch strict|distributed] [--ops N|--jobs N] \\
-   [--workers N] [--arrival-rate JOBS_PER_SECOND] [--window N] [--bytes N]"
+   [--workers N] [--arrival-rate JOBS_PER_SECOND] [--window N] [--bytes N] [--block-us N]"
 }
 
 fn parse_u64(flag: &str, value: &str) -> Result<u64, String> {
@@ -347,7 +370,9 @@ fn allocation_work(workload: Workload, id: usize, bytes: usize) -> u64 {
       6 => 262_144,
       _ => bytes,
     },
-    Workload::Ready | Workload::Yielding => unreachable!("async-only workload in allocator lane"),
+    Workload::Ready | Workload::Yielding | Workload::HeadOfLine => {
+      unreachable!("async-only workload in allocator lane")
+    }
   };
   match workload {
     Workload::Aligned => {
@@ -407,7 +432,9 @@ fn run_allocator(allocator: &str, o: &Options, overhead: u64) {
         6 => 262_144,
         _ => o.bytes,
       },
-      Workload::Ready | Workload::Yielding => unreachable!("async-only workload in allocator lane"),
+      Workload::Ready | Workload::Yielding | Workload::HeadOfLine => {
+        unreachable!("async-only workload in allocator lane")
+      }
     };
     let value = match o.workload {
       Workload::Aligned => u64::from(i as u8) + u64::from(i.wrapping_add(1) as u8),
@@ -449,6 +476,7 @@ fn workload_name(w: Workload) -> &'static str {
     Workload::Mixed => "mixed",
     Workload::Ready => "ready",
     Workload::Yielding => "yielding",
+    Workload::HeadOfLine => "head-of-line",
   }
 }
 
@@ -915,9 +943,15 @@ impl Future for YieldOnce {
   }
 }
 
-async fn async_work(id: usize, workload: Workload, bytes: usize) -> u64 {
+async fn async_work(id: usize, workload: Workload, bytes: usize, block_us: u64) -> u64 {
   let mut checksum = id as u64;
   match workload {
+    Workload::HeadOfLine => {
+      if id == 0 {
+        std::thread::sleep(Duration::from_micros(block_us));
+      }
+      checksum = checksum.wrapping_add(1);
+    }
     Workload::Ready => checksum = checksum.wrapping_add(1),
     Workload::Yielding => {
       for turn in 1..=ASYNC_YIELD_ROUNDS {
@@ -947,7 +981,7 @@ async fn async_work(id: usize, workload: Workload, bytes: usize) -> u64 {
 
 fn expected_async_checksum(id: usize, workload: Workload, bytes: usize) -> u64 {
   match workload {
-    Workload::Ready => (id as u64).wrapping_add(1),
+    Workload::Ready | Workload::HeadOfLine => (id as u64).wrapping_add(1),
     Workload::Yielding => (id as u64).wrapping_add((1..=ASYNC_YIELD_ROUNDS).sum::<usize>() as u64),
     Workload::Mixed => (0..ASYNC_YIELD_ROUNDS).fold(id as u64, |sum, chunk| {
       sum.wrapping_add((id.wrapping_add(chunk) as u8 as u64).wrapping_mul(bytes as u64))
@@ -961,15 +995,14 @@ fn warm_async_workers(
   kind: ExecutorKind,
   workers: usize,
 ) -> Result<(), String> {
-  type WarmGate = Arc<(Mutex<bool>, Condvar)>;
+  type WarmGate = Arc<AtomicBool>;
   struct WarmRelease(WarmGate);
   impl Drop for WarmRelease {
     fn drop(&mut self) {
-      *self.0.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
-      self.0.1.notify_all();
+      self.0.store(true, Ordering::Release);
     }
   }
-  let gate = Arc::new((Mutex::new(false), Condvar::new()));
+  let gate = Arc::new(AtomicBool::new(false));
   let release = WarmRelease(Arc::clone(&gate));
   let (arrived_tx, arrived_rx) = mpsc::sync_channel(workers);
   let mut handles = Vec::with_capacity(workers);
@@ -981,11 +1014,11 @@ fn warm_async_workers(
       kind,
       Box::pin(async move {
         let _ = arrived.send(());
-        let mut open = gate.0.lock().unwrap_or_else(PoisonError::into_inner);
-        while !*open {
-          open = gate.1.wait(open).unwrap_or_else(PoisonError::into_inner);
+        // Warm tasks must not occupy every worker inside blocking polls:
+        // the final entry of another task's lane is intentionally not stolen.
+        while !gate.load(Ordering::Acquire) {
+          YieldOnce(false).await;
         }
-        drop(open);
         0xa5
       }),
     ) {
@@ -1061,6 +1094,7 @@ fn poll_observed(
 }
 
 struct AsyncObserver<'a> {
+  short_latencies: Option<&'a [AtomicU64]>,
   slots: &'a mut [Option<(Handle, Instant)>],
   wakers: &'a [Waker],
   samples: &'a mut Vec<u64>,
@@ -1092,13 +1126,18 @@ impl AsyncObserver<'_> {
           "async job {id} checksum {sum} did not match {expected}"
         ));
       }
-      if let Some(observed_at) = observed_at {
-        self.samples.push(
-          observed_at
-            .saturating_duration_since(intended_at)
-            .as_nanos()
-            .min(u64::MAX as u128) as u64,
-        );
+      if let Some(observed_at) = observed_at
+        && !(self.workload == Workload::HeadOfLine && id == 0)
+      {
+        self.samples.push(self.short_latencies.map_or_else(
+          || {
+            observed_at
+              .saturating_duration_since(intended_at)
+              .as_nanos()
+              .min(u64::MAX as u128) as u64
+          },
+          |latencies| latencies[id].load(Ordering::Relaxed),
+        ));
       }
       *self.checksum = self.checksum.wrapping_add(sum);
       *self.completed += 1;
@@ -1332,7 +1371,7 @@ fn run_async(allocator: &str, o: &Options, overhead: u64) -> Result<(), String> 
   let kind = o.executor.ok_or("async lane requires an executor")?;
   let trace_span = Duration::from_nanos(intended_offset_ns(o.count, o.arrival_rate));
   let executors = AsyncExecutors::new(kind, o.workers, o.window, o.dispatch)?;
-  warm_async_workers(&executors, kind, o.workers)?;
+  warm_async_workers(&executors, kind, o.workers.min(o.window))?;
   let mut samples = if o.mode == Mode::Latency {
     Vec::with_capacity(o.count)
   } else {
@@ -1355,12 +1394,23 @@ fn run_async(allocator: &str, o: &Options, overhead: u64) -> Result<(), String> 
   });
   let producer_gate = Arc::clone(&start_gate);
   let producer_events = Arc::clone(&events);
+  let short_latencies: Arc<Vec<_>> = Arc::new(
+    (0..if o.workload == Workload::HeadOfLine {
+      o.count
+    } else {
+      0
+    })
+      .map(|_| AtomicU64::new(0))
+      .collect(),
+  );
+  let producer_latencies = Arc::clone(&short_latencies);
   let in_flight = Arc::new(AtomicUsize::new(0));
   let producer_in_flight = Arc::clone(&in_flight);
   let (ready_tx, ready_rx) = mpsc::sync_channel::<()>(1);
   let count = o.count;
   let arrival_rate = o.arrival_rate;
   let workload = o.workload;
+  let block_us = o.block_us;
   let bytes = o.bytes;
   let window = o.window;
   let producer = std::thread::spawn(move || {
@@ -1386,7 +1436,21 @@ fn run_async(allocator: &str, o: &Options, overhead: u64) -> Result<(), String> 
         dropped += 1;
         continue;
       }
-      let future: AsyncWork = Box::pin(async_work(id, workload, bytes));
+      let future: AsyncWork = if workload == Workload::HeadOfLine && id != 0 {
+        let latencies = Arc::clone(&producer_latencies);
+        Box::pin(async move {
+          latencies[id].store(
+            Instant::now()
+              .saturating_duration_since(target)
+              .as_nanos()
+              .min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+          );
+          async_work(id, workload, bytes, block_us).await
+        })
+      } else {
+        Box::pin(async_work(id, workload, bytes, block_us))
+      };
       match executors.submit(kind, future) {
         Ok(handle) => {
           if producer_events
@@ -1424,6 +1488,7 @@ fn run_async(allocator: &str, o: &Options, overhead: u64) -> Result<(), String> 
   let mut accepted = 0usize;
   let mut submission_stats = None;
   let mut observer = AsyncObserver {
+    short_latencies: (workload == Workload::HeadOfLine).then_some(short_latencies.as_slice()),
     slots: &mut slots,
     wakers: &wakers,
     samples: &mut samples,
@@ -1903,15 +1968,15 @@ fn run_blocking_capacity(allocator: &str, o: &Options) -> Result<(), String> {
 fn run_async_capacity(allocator: &str, o: &Options) -> Result<(), String> {
   let kind = o.executor.ok_or("async lane requires an executor")?;
   let executors = AsyncExecutors::new(kind, o.workers, o.window, o.dispatch)?;
-  warm_async_workers(&executors, kind, o.workers)?;
-  let (workload, bytes) = (o.workload, o.bytes);
+  warm_async_workers(&executors, kind, o.workers.min(o.window))?;
+  let (workload, bytes, block_us) = (o.workload, o.bytes, o.block_us);
   let (outcome, mut executors) = run_capacity(
     executors,
     o.count,
     o.window,
     COMPLETION_TIMEOUT,
     move |executors: &AsyncExecutors, id| {
-      executors.submit(kind, Box::pin(async_work(id, workload, bytes)))
+      executors.submit(kind, Box::pin(async_work(id, workload, bytes, block_us)))
     },
     |id| expected_async_checksum(id, workload, bytes),
   )?;
@@ -2044,6 +2109,35 @@ mod tests {
   }
 
   #[test]
+  fn distributed_head_of_line_and_under_subscribed_yields_run() {
+    for dispatch in ["strict", "distributed"] {
+      for (workload, window) in [("head-of-line", "16"), ("yielding", "1")] {
+        let options = args(&[
+          "--lane",
+          "async",
+          "--executor",
+          "bounded",
+          "--dispatch",
+          dispatch,
+          "--workload",
+          workload,
+          "--workers",
+          "4",
+          "--window",
+          window,
+          "--jobs",
+          "32",
+          "--arrival-rate",
+          "1000000",
+        ])
+        .unwrap();
+        assert_eq!(options.block_us, 2_000);
+        run_async("test", &options, 0).unwrap();
+      }
+    }
+  }
+
+  #[test]
   fn dispatch_flag_selects_the_bounded_async_constructor() {
     let base = ["--lane", "async", "--executor", "bounded"];
     assert_eq!(args(&base).unwrap().dispatch, AsyncDispatch::Strict);
@@ -2055,16 +2149,7 @@ mod tests {
       let options = args(&values).unwrap();
       assert_eq!(options.dispatch, dispatch);
       let result = AsyncExecutors::new(ExecutorKind::Bounded, 1, 1, options.dispatch);
-      if dispatch == AsyncDispatch::Strict {
-        result.unwrap().shutdown().unwrap();
-      } else {
-        assert_eq!(
-          result.err().unwrap(),
-          "bounded async runtime: invalid async runtime configuration"
-        );
-        assert!(run_async("test", &options, 0).is_err());
-        assert!(run_async_capacity("test", &options).is_err());
-      }
+      result.unwrap().shutdown().unwrap();
     }
     for values in [
       vec![
@@ -2139,16 +2224,6 @@ mod tests {
         "async",
         "--executor",
         "tokio",
-        "--jobs",
-        "2",
-        "--window",
-        "1",
-      ],
-      vec![
-        "--lane",
-        "async",
-        "--executor",
-        "tokio",
         "--workload",
         "local",
       ],
@@ -2189,6 +2264,7 @@ mod tests {
     let mut empty_checksum = 0;
     let mut empty_completed = 0;
     AsyncObserver {
+      short_latencies: None,
       slots: &mut empty_slots,
       wakers: &empty_wakers,
       samples: &mut empty_samples,
@@ -2225,6 +2301,7 @@ mod tests {
       let mut checksum = 0;
       let mut completed = 0;
       let result = AsyncObserver {
+        short_latencies: None,
         slots: &mut slots,
         wakers: &wakers,
         samples: &mut samples,
@@ -2344,6 +2421,7 @@ mod tests {
       arrival_rate: 1_000_000_000,
       bytes: 1_048_576,
       window: 128,
+      block_us: 2_000,
     };
     run_blocking("test", &options, 0).unwrap();
   }
@@ -2363,6 +2441,7 @@ mod tests {
           arrival_rate: 1_000_000_000,
           bytes: 64,
           window: 8,
+          block_us: 2_000,
         };
         run_async("test", &options, 0).unwrap();
       }
@@ -2770,7 +2849,7 @@ mod tests {
           4,
           COMPLETION_TIMEOUT,
           move |executors: &AsyncExecutors, id| {
-            executors.submit(kind, Box::pin(async_work(id, workload, 64)))
+            executors.submit(kind, Box::pin(async_work(id, workload, 64, 2_000)))
           },
           move |id| expected_async_checksum(id, workload, 64),
         )
@@ -2803,6 +2882,7 @@ mod tests {
         arrival_rate: 10_000,
         bytes: 4096,
         window: 2,
+        block_us: 2_000,
       };
       run_blocking("test", &blocking, 0).unwrap();
       let asynchronous = Options {
@@ -2828,6 +2908,7 @@ mod tests {
       arrival_rate: 10_000,
       bytes: 64,
       window: 4,
+      block_us: 2_000,
     };
     let outcome = CapacityOutcome {
       attempted: 10,

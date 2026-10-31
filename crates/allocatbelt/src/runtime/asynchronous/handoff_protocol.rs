@@ -204,12 +204,8 @@ impl TurnCoordinator {
 }
 
 /// Seat identity around the existing turn counters. This table is only
-/// used by the upcoming distributed engine; strict keeps using the counters.
+/// used by distributed dispatch; strict keeps using the counters.
 #[derive(Debug)]
-#[cfg_attr(
-  not(test),
-  expect(dead_code, reason = "used by the upcoming distributed engine")
-)]
 pub(super) struct SeatTable {
   turns: TurnCoordinator,
   vacant: Vec<usize>,
@@ -218,15 +214,40 @@ pub(super) struct SeatTable {
 
 #[cfg_attr(
   not(test),
-  expect(dead_code, reason = "used by the upcoming distributed engine")
+  expect(
+    dead_code,
+    reason = "handoff operations reserved for distributed handoffs"
+  )
 )]
 impl SeatTable {
+  #[cfg(test)]
   pub(super) fn new(workers: usize, max_handoffs: usize) -> Self {
     Self {
       turns: TurnCoordinator::new(workers, max_handoffs),
       vacant: (0..workers).rev().collect(),
       helper_held: vec![false; workers],
     }
+  }
+
+  pub(super) fn try_new(
+    workers: usize,
+    max_handoffs: usize,
+  ) -> Result<Self, std::collections::TryReserveError> {
+    let mut vacant = Vec::new();
+    vacant.try_reserve_exact(workers)?;
+    vacant.extend((0..workers).rev());
+    let mut helper_held = Vec::new();
+    helper_held.try_reserve_exact(workers)?;
+    helper_held.resize(workers, false);
+    Ok(Self {
+      turns: TurnCoordinator::new(workers, max_handoffs),
+      vacant,
+      helper_held,
+    })
+  }
+
+  pub(super) fn capacities(&self) -> (usize, usize) {
+    (self.vacant.capacity(), self.helper_held.capacity())
   }
 
   pub(super) fn claim(&mut self, seat: usize) -> DispatchTurn {
