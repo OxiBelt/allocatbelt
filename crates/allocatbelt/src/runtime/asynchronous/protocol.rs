@@ -1,6 +1,7 @@
 //! Per-task dispatch, wake, abort, and generation transitions. Production
-//! holds this state under the scheduler mutex; Loom tests use the same helper
-//! under Loom's mutex to explore operation orderings. `PollWord` is the one
+//! holds this state under the lock that owns the task: the scheduler mutex
+//! in strict mode, or a slot mutex in distributed mode. Loom uses the same
+//! helpers under its mutexes to explore operation orderings. `PollWord` is the one
 //! per-task word a wake may change without that mutex.
 
 #[cfg(loom)]
@@ -56,6 +57,127 @@ impl PollQuota {
 
   pub(super) const fn maximum(&self) -> usize {
     self.maximum
+  }
+}
+
+/// A binding scope's quota and FIFO waiters. Both acquisition and release
+/// require exclusive access under the scope mutex. A transferred permit stays
+/// counted until its selected task dispatches or returns it on cancellation.
+#[derive(Debug)]
+#[cfg_attr(
+  not(test),
+  expect(dead_code, reason = "used by the upcoming distributed engine")
+)]
+pub(super) struct ScopeDispatch {
+  quota: PollQuota,
+  blocked_head: usize,
+  blocked_tail: usize,
+  blocked_len: usize,
+}
+
+#[cfg_attr(
+  not(test),
+  expect(dead_code, reason = "used by the upcoming distributed engine")
+)]
+impl ScopeDispatch {
+  pub(super) const fn new(maximum: usize) -> Self {
+    Self {
+      quota: PollQuota::new(maximum),
+      blocked_head: super::lane::NIL,
+      blocked_tail: super::lane::NIL,
+      blocked_len: 0,
+    }
+  }
+
+  pub(super) fn try_acquire(&mut self) -> bool {
+    self.quota.try_acquire()
+  }
+
+  pub(super) fn block(&mut self, links: &[super::lane::QueueLink], index: usize) {
+    debug_assert!(!links[index].blocked.load(Ordering::Relaxed));
+    let nil = super::lane::NIL;
+    links[index]
+      .prev
+      .store(self.blocked_tail, Ordering::Relaxed);
+    links[index].next.store(nil, Ordering::Relaxed);
+    if self.blocked_tail == nil {
+      self.blocked_head = index;
+    } else {
+      links[self.blocked_tail]
+        .next
+        .store(index, Ordering::Relaxed);
+    }
+    self.blocked_tail = index;
+    self.blocked_len += 1;
+    links[index].blocked.store(true, Ordering::Relaxed);
+  }
+
+  pub(super) fn unlink_blocked(&mut self, links: &[super::lane::QueueLink], index: usize) -> bool {
+    if !links[index].blocked.load(Ordering::Relaxed) {
+      return false;
+    }
+    let nil = super::lane::NIL;
+    let prev = links[index].prev.load(Ordering::Relaxed);
+    let next = links[index].next.load(Ordering::Relaxed);
+    if prev == nil {
+      self.blocked_head = next;
+    } else {
+      links[prev].next.store(next, Ordering::Relaxed);
+    }
+    if next == nil {
+      self.blocked_tail = prev;
+    } else {
+      links[next].prev.store(prev, Ordering::Relaxed);
+    }
+    self.blocked_len -= 1;
+    links[index].prev.store(nil, Ordering::Relaxed);
+    links[index].next.store(nil, Ordering::Relaxed);
+    links[index].blocked.store(false, Ordering::Relaxed);
+    true
+  }
+
+  pub(super) fn release_or_transfer(&mut self, links: &[super::lane::QueueLink]) -> Option<usize> {
+    debug_assert!(self.quota.active() > 0);
+    if self.blocked_len != 0 {
+      let index = self.blocked_head;
+      let removed = self.unlink_blocked(links, index);
+      debug_assert!(removed);
+      return Some(index);
+    }
+    self.quota.release();
+    None
+  }
+
+  pub(super) const fn active(&self) -> usize {
+    self.quota.active()
+  }
+  pub(super) const fn maximum(&self) -> usize {
+    self.quota.maximum()
+  }
+  pub(super) const fn blocked_len(&self) -> usize {
+    self.blocked_len
+  }
+
+  #[cfg(test)]
+  fn check(&self, links: &[super::lane::QueueLink]) -> Vec<usize> {
+    assert!(self.active() <= self.maximum());
+    let mut indices = Vec::new();
+    let mut prev = super::lane::NIL;
+    let mut index = self.blocked_head;
+    while index != super::lane::NIL {
+      assert!(
+        indices.len() < self.blocked_len,
+        "cycle or incorrect blocked length"
+      );
+      assert_eq!(links[index].prev.load(Ordering::Relaxed), prev);
+      assert!(links[index].blocked.load(Ordering::Relaxed));
+      indices.push(index);
+      prev = index;
+      index = links[index].next.load(Ordering::Relaxed);
+    }
+    assert_eq!(indices.len(), self.blocked_len);
+    assert_eq!(prev, self.blocked_tail);
+    indices
   }
 }
 
@@ -616,6 +738,8 @@ mod loom_tests {
     });
   }
 
+  /// A task slot in either dispatch mode. Strict uses the global
+  /// mutex; distributed uses this per-slot mutex.
   /// One task slot as the scheduler holds it: `PollProtocol` and a count of
   /// ready-list insertions under the mutex, and the unlocked wake word.
   struct WordSlot {
@@ -905,5 +1029,368 @@ mod loom_tests {
       assert_eq!(lock(&slot).generation, 2);
       assert!(lock(&slot).occupied);
     });
+  }
+
+  struct DispatchSlot {
+    protocol: PollProtocol,
+    ready: bool,
+    reserved: bool,
+    permit: bool,
+    polls: usize,
+    cleanups: usize,
+    finished: usize,
+  }
+
+  struct ScopeModel {
+    scope: Mutex<super::ScopeDispatch>,
+    slots: [Mutex<DispatchSlot>; 2],
+    links: [super::super::lane::QueueLink; 3],
+  }
+
+  impl ScopeModel {
+    fn new() -> Self {
+      Self {
+        scope: Mutex::new(super::ScopeDispatch::new(1)),
+        slots: std::array::from_fn(|_| {
+          Mutex::new(DispatchSlot {
+            protocol: admitted(),
+            ready: true,
+            reserved: false,
+            permit: false,
+            polls: 0,
+            cleanups: 0,
+            finished: 0,
+          })
+        }),
+        links: std::array::from_fn(|_| super::super::lane::QueueLink::new()),
+      }
+    }
+
+    fn dispatch(&self, index: usize) {
+      let mut slot = lock(&self.slots[index]);
+      if !std::mem::take(&mut slot.ready) {
+        return;
+      }
+      assert!(slot.protocol.admitted() && !slot.protocol.is_running());
+      let reserved = std::mem::take(&mut slot.reserved);
+      if slot.protocol.abort {
+        assert_eq!(slot.protocol.begin_poll(), Some(true));
+        slot.protocol.finish_cancel();
+        slot.cleanups += 1;
+        slot.finished += 1;
+        drop(slot);
+        if reserved {
+          self.release();
+        }
+        return;
+      }
+      if !reserved {
+        let mut scope = lock(&self.scope);
+        if !scope.try_acquire() {
+          scope.block(&self.links, index);
+          scope.check(&self.links);
+          return;
+        }
+        assert_eq!(scope.active(), 1);
+      }
+      assert_eq!(slot.protocol.begin_poll(), Some(false));
+      slot.permit = true;
+      slot.polls += 1;
+    }
+
+    fn abort(&self, index: usize) {
+      let mut slot = lock(&self.slots[index]);
+      if slot.protocol.abort() {
+        slot.ready = true;
+      }
+      if lock(&self.scope).unlink_blocked(&self.links, index) {
+        slot.ready = true;
+      }
+    }
+
+    fn release(&self) {
+      let transferred = {
+        let mut scope = lock(&self.scope);
+        let index = scope.release_or_transfer(&self.links);
+        // A transfer keeps the permit counted, including in release builds.
+        assert_eq!(scope.active(), usize::from(index.is_some()));
+        scope.check(&self.links);
+        index
+      };
+      // No scope lock while taking the selected slot lock.
+      if let Some(index) = transferred {
+        let mut slot = lock(&self.slots[index]);
+        assert!(!slot.reserved && !slot.ready);
+        slot.reserved = true;
+        slot.ready = true;
+      }
+    }
+
+    fn complete(&self, index: usize) {
+      let mut slot = lock(&self.slots[index]);
+      if !std::mem::take(&mut slot.permit) {
+        return;
+      }
+      assert_eq!(slot.protocol.finish_poll(true, false), PollFinish::Complete);
+      slot.finished += 1;
+      drop(slot);
+      self.release();
+    }
+
+    fn drain_and_check(&self) {
+      for _ in 0..3 {
+        for index in 0..2 {
+          self.dispatch(index);
+          self.complete(index);
+        }
+      }
+      let scope = lock(&self.scope);
+      assert_eq!(scope.active(), 0);
+      assert_eq!(scope.blocked_len(), 0);
+      assert!(scope.check(&self.links).is_empty());
+      drop(scope);
+      for (index, slot) in self.slots.iter().enumerate() {
+        let slot = lock(slot);
+        assert!(!slot.protocol.admitted());
+        assert!(!slot.reserved && !slot.permit && !slot.ready);
+        assert!(!self.links[index].blocked.load(super::Ordering::Relaxed));
+        assert_eq!(slot.finished, 1);
+        assert_eq!(slot.polls + slot.cleanups, 1);
+      }
+    }
+  }
+
+  #[test]
+  fn loom_dispatch_abort_and_release_return_reserved_permits() {
+    bounded_model(|| {
+      let model = Arc::new(ScopeModel::new());
+      model.dispatch(0);
+      let popper = {
+        let model = Arc::clone(&model);
+        thread::spawn(move || model.dispatch(1))
+      };
+      let aborter = {
+        let model = Arc::clone(&model);
+        thread::spawn(move || model.abort(1))
+      };
+      let releaser = {
+        let model = Arc::clone(&model);
+        thread::spawn(move || model.complete(0))
+      };
+      popper.join().unwrap();
+      aborter.join().unwrap();
+      releaser.join().unwrap();
+      model.drain_and_check();
+    });
+  }
+
+  #[test]
+  fn loom_scope_transfer_is_fifo_and_cannot_reblock() {
+    bounded_model(|| {
+      let links = Arc::new([
+        super::super::lane::QueueLink::new(),
+        super::super::lane::QueueLink::new(),
+      ]);
+      let mut initial = super::ScopeDispatch::new(1);
+      assert!(initial.try_acquire());
+      initial.block(&links[..], 0);
+      initial.block(&links[..], 1);
+      let scope = Arc::new(Mutex::new(initial));
+      let releaser = {
+        let links = Arc::clone(&links);
+        let scope = Arc::clone(&scope);
+        thread::spawn(move || {
+          for index in 0..2 {
+            let mut scope = lock(&scope);
+            assert_eq!(scope.release_or_transfer(&links[..]), Some(index));
+            assert_eq!(scope.active(), 1);
+            // The permit is reserved, so no reacquire or blocking is needed.
+            assert!(!scope.try_acquire());
+            assert!(!links[index].blocked.load(super::Ordering::Relaxed));
+            scope.check(&links[..]);
+          }
+          assert_eq!(lock(&scope).release_or_transfer(&links[..]), None);
+        })
+      };
+      let newcomer = {
+        let links = Arc::clone(&links);
+        let scope = Arc::clone(&scope);
+        thread::spawn(move || {
+          let mut scope = lock(&scope);
+          if scope.try_acquire() {
+            assert_eq!(scope.blocked_len(), 0);
+            assert_eq!(scope.release_or_transfer(&links[..]), None);
+          }
+          scope.check(&links[..]);
+        })
+      };
+      releaser.join().unwrap();
+      newcomer.join().unwrap();
+      assert_eq!(lock(&scope).active(), 0);
+    });
+  }
+
+  #[test]
+  fn loom_close_races_spawn_and_aborts_every_admitted_slot() {
+    bounded_model(|| {
+      let admission = Arc::new(Mutex::new(false));
+      let slot = Arc::new(Mutex::new(PollProtocol::new()));
+      let spawner = {
+        let admission = Arc::clone(&admission);
+        let slot = Arc::clone(&slot);
+        thread::spawn(move || {
+          let closed = lock(&admission);
+          if *closed {
+            return false;
+          }
+          let mut slot = lock(&slot);
+          slot.admit(1);
+          assert!(slot.queue());
+          true
+        })
+      };
+      let closer = {
+        let admission = Arc::clone(&admission);
+        let slot = Arc::clone(&slot);
+        thread::spawn(move || {
+          *lock(&admission) = true;
+          let mut slot = lock(&slot);
+          if slot.admitted() {
+            let _ = slot.abort();
+          }
+        })
+      };
+      let spawned = spawner.join().unwrap();
+      closer.join().unwrap();
+      assert!(*lock(&admission));
+      let mut slot = lock(&slot);
+      assert_eq!(slot.admitted(), spawned);
+      if spawned {
+        assert_eq!(slot.begin_poll(), Some(true));
+        slot.finish_cancel();
+      }
+      assert!(!slot.admitted());
+    });
+  }
+
+  #[test]
+  fn loom_stolen_dispatch_races_release_and_owner_pop() {
+    use super::super::lane::LaneQueue;
+
+    bounded_model(|| {
+      let model = Arc::new(ScopeModel::new());
+      model.dispatch(0);
+      assert_eq!(lock(&model.scope).active(), 1);
+      // The second same-scope task competes with the owner's pop. The
+      // sentinel keeps the victim stealable until either search takes it.
+      let mut victim = LaneQueue::new();
+      victim.push(&model.links, 1);
+      victim.push(&model.links, 2);
+      let victim = Arc::new(Mutex::new(victim));
+      let owner = {
+        let model = Arc::clone(&model);
+        let victim = Arc::clone(&victim);
+        thread::spawn(move || {
+          let index = lock(&victim).pop(&model.links).unwrap();
+          if index == 1 {
+            model.dispatch(index);
+          }
+          index
+        })
+      };
+      let thief = {
+        let model = Arc::clone(&model);
+        let victim = Arc::clone(&victim);
+        thread::spawn(move || {
+          let chain = lock(&victim).steal_front(&model.links);
+          chain.map(|chain| {
+            // Release the victim before acquiring the receiving lane.
+            let own = Mutex::new(LaneQueue::new());
+            let index = {
+              let mut own = lock(&own);
+              own.append_chain(&model.links, chain);
+              let index = own.pop(&model.links).unwrap();
+              assert!(own.check(&model.links).is_empty());
+              index
+            };
+            assert_eq!(index, 1);
+            model.dispatch(index);
+            index
+          })
+        })
+      };
+      let releaser = {
+        let model = Arc::clone(&model);
+        // Release can precede dispatch, or transfer to its blocked task.
+        thread::spawn(move || model.complete(0))
+      };
+      let mut popped = vec![owner.join().unwrap()];
+      popped.extend(thief.join().unwrap());
+      releaser.join().unwrap();
+      model.drain_and_check();
+      let mut victim = lock(&victim);
+      popped.extend(victim.pop(&model.links));
+      popped.sort_unstable();
+      assert_eq!(popped, [1, 2]);
+      assert!(victim.check(&model.links).is_empty());
+    });
+  }
+}
+
+#[cfg(all(test, not(loom)))]
+mod scope_dispatch_tests {
+  use super::super::lane::{NIL, QueueLink};
+  use super::{Ordering, ScopeDispatch};
+
+  #[test]
+  fn scope_dispatch_transfers_permits_in_fifo_order() {
+    let links: Vec<_> = (0..4).map(|_| QueueLink::new()).collect();
+    let mut scope = ScopeDispatch::new(1);
+    assert_eq!(scope.maximum(), 1);
+    assert!(scope.try_acquire());
+    for index in 0..4 {
+      assert!(!scope.try_acquire());
+      scope.block(&links, index);
+      assert_eq!(scope.blocked_len(), index + 1);
+    }
+    assert_eq!(scope.check(&links), [0, 1, 2, 3]);
+    for index in 0..4 {
+      assert_eq!(scope.release_or_transfer(&links), Some(index));
+      assert_eq!(scope.active(), 1);
+      assert!(!scope.try_acquire());
+      assert!(!links[index].blocked.load(Ordering::Relaxed));
+      assert_eq!(links[index].next.load(Ordering::Relaxed), NIL);
+      assert_eq!(links[index].prev.load(Ordering::Relaxed), NIL);
+      scope.check(&links);
+    }
+    assert_eq!(scope.release_or_transfer(&links), None);
+    assert_eq!(scope.active(), 0);
+    assert!(scope.try_acquire());
+  }
+
+  #[test]
+  fn scope_dispatch_unlinks_head_middle_tail_and_singleton() {
+    for order in [[0, 1, 2, 3], [1, 3, 0, 2], [3, 2, 1, 0]] {
+      let links: Vec<_> = (0..4).map(|_| QueueLink::new()).collect();
+      let mut scope = ScopeDispatch::new(2);
+      assert!(scope.try_acquire());
+      assert!(scope.try_acquire());
+      assert!(!scope.try_acquire());
+      for index in 0..4 {
+        scope.block(&links, index);
+      }
+      let mut expected = vec![0, 1, 2, 3];
+      for index in order {
+        assert!(scope.unlink_blocked(&links, index));
+        assert!(!scope.unlink_blocked(&links, index));
+        expected.retain(|&entry| entry != index);
+        assert_eq!(scope.check(&links), expected);
+        assert_eq!(scope.blocked_len(), expected.len());
+      }
+      assert_eq!(scope.release_or_transfer(&links), None);
+      assert_eq!(scope.active(), 1);
+      assert_eq!(scope.release_or_transfer(&links), None);
+      assert_eq!(scope.active(), 0);
+    }
   }
 }

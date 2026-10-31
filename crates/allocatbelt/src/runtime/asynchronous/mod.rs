@@ -26,6 +26,7 @@ mod handoff;
 mod handoff_protocol;
 mod identity;
 mod join;
+mod lane;
 mod local;
 mod metrics;
 mod protocol;

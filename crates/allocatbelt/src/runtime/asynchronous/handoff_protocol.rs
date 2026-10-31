@@ -10,23 +10,36 @@
 //! loans exist at once, so at most `W + B` outer poll stacks. Permits, loans,
 //! restoration tickets and helper leases are linear values: none is `Clone`
 //! and every release consumes the value it releases, so one acquisition
-//! cannot be released twice.
+//! cannot be released twice. Only this module can construct dispatcher turns;
+//! callers can read their seat identity without creating or changing a token.
 
 /// One held dispatcher permit.
 #[derive(Debug)]
 #[must_use]
-pub(super) struct DispatchTurn(());
+pub(super) struct DispatchTurn {
+  seat: usize,
+}
+
+impl DispatchTurn {
+  pub(super) const fn seat(&self) -> usize {
+    self.seat
+  }
+}
 
 /// One held handoff slot whose dispatcher permit has been released.
 #[derive(Debug)]
 #[must_use]
-pub(super) struct HandoffLoan(());
+pub(super) struct HandoffLoan {
+  helper: bool,
+}
 
 /// A loan whose original thread is waiting to reacquire a permit. While any
 /// ticket is outstanding, no new turn starts.
 #[derive(Debug)]
 #[must_use]
-pub(super) struct RestoreTicket(());
+pub(super) struct RestoreTicket {
+  helper: bool,
+}
 
 /// One activated helper thread.
 #[derive(Debug)]
@@ -81,11 +94,11 @@ impl TurnCoordinator {
       return None;
     }
     self.turns += 1;
-    Some(DispatchTurn(()))
+    Some(DispatchTurn { seat: 0 })
   }
 
   pub(super) fn end_turn(&mut self, turn: DispatchTurn) -> TurnEnd {
-    let DispatchTurn(()) = turn;
+    let DispatchTurn { seat: _ } = turn;
     debug_assert!(self.turns > 0);
     self.turns = self.turns.saturating_sub(1);
     TurnEnd {
@@ -100,19 +113,19 @@ impl TurnCoordinator {
     if self.handoffs >= self.max_handoffs {
       return Err(turn);
     }
-    let DispatchTurn(()) = turn;
+    let DispatchTurn { seat: _ } = turn;
     self.handoffs += 1;
     debug_assert!(self.turns > 0);
     self.turns = self.turns.saturating_sub(1);
-    Ok(HandoffLoan(()))
+    Ok(HandoffLoan { helper: false })
   }
 
   /// Registers the loan's thread as waiting to reacquire a permit. The loan
   /// stays counted until [`Self::try_restore`] succeeds.
   pub(super) fn begin_restore(&mut self, loan: HandoffLoan) -> RestoreTicket {
-    let HandoffLoan(()) = loan;
+    let HandoffLoan { helper } = loan;
     self.restoring += 1;
-    RestoreTicket(())
+    RestoreTicket { helper }
   }
 
   /// Converts a waiting restoration back into a turn when a permit is free.
@@ -124,12 +137,12 @@ impl TurnCoordinator {
     if self.turns >= self.dispatchers {
       return Err(ticket);
     }
-    let RestoreTicket(()) = ticket;
+    let RestoreTicket { helper: _ } = ticket;
     debug_assert!(self.restoring > 0 && self.handoffs > 0);
     self.restoring = self.restoring.saturating_sub(1);
     self.handoffs = self.handoffs.saturating_sub(1);
     self.turns += 1;
-    Ok(DispatchTurn(()))
+    Ok(DispatchTurn { seat: 0 })
   }
 
   /// Activates one helper while fewer helpers than loans are active.
@@ -187,6 +200,121 @@ impl TurnCoordinator {
       self.turns + self.handoffs <= self.dispatchers + self.max_handoffs,
       "outer poll stack bound exceeded"
     );
+  }
+}
+
+/// Seat identity around the existing turn counters. This table is only
+/// used by the upcoming distributed engine; strict keeps using the counters.
+#[derive(Debug)]
+#[cfg_attr(
+  not(test),
+  expect(dead_code, reason = "used by the upcoming distributed engine")
+)]
+pub(super) struct SeatTable {
+  turns: TurnCoordinator,
+  vacant: Vec<usize>,
+  helper_held: Vec<bool>,
+}
+
+#[cfg_attr(
+  not(test),
+  expect(dead_code, reason = "used by the upcoming distributed engine")
+)]
+impl SeatTable {
+  pub(super) fn new(workers: usize, max_handoffs: usize) -> Self {
+    Self {
+      turns: TurnCoordinator::new(workers, max_handoffs),
+      vacant: (0..workers).rev().collect(),
+      helper_held: vec![false; workers],
+    }
+  }
+
+  pub(super) fn claim(&mut self, seat: usize) -> DispatchTurn {
+    let Some(position) = self.vacant.iter().position(|&vacant| vacant == seat) else {
+      panic!("seat is already held");
+    };
+    let Some(mut turn) = self.turns.try_begin_turn() else {
+      panic!("worker startup cannot acquire a turn");
+    };
+    self.vacant.swap_remove(position);
+    turn.seat = seat;
+    turn
+  }
+
+  fn assign(&mut self, mut turn: DispatchTurn, helper: bool) -> DispatchTurn {
+    let Some(seat) = self.vacant.pop() else {
+      panic!("turn without a vacant seat");
+    };
+    turn.seat = seat;
+    self.helper_held[seat] = helper;
+    turn
+  }
+
+  pub(super) fn try_begin_helper_turn(&mut self) -> Option<DispatchTurn> {
+    let turn = self.turns.try_begin_turn()?;
+    Some(self.assign(turn, true))
+  }
+
+  pub(super) fn end_turn(&mut self, turn: DispatchTurn) -> TurnEnd {
+    self.vacant.push(turn.seat());
+    self.helper_held[turn.seat()] = false;
+    self.turns.end_turn(turn)
+  }
+
+  pub(super) fn try_hand_off(&mut self, turn: DispatchTurn) -> Result<HandoffLoan, DispatchTurn> {
+    let seat = turn.seat();
+    let mut loan = self.turns.try_hand_off(turn)?;
+    // Preserve helper identity even if an activated helper hands off and
+    // later restores onto a different seat.
+    loan.helper = self.helper_held[seat];
+    self.helper_held[seat] = false;
+    self.vacant.push(seat);
+    Ok(loan)
+  }
+
+  pub(super) fn begin_restore(&mut self, loan: HandoffLoan) -> RestoreTicket {
+    self.turns.begin_restore(loan)
+  }
+
+  pub(super) fn try_restore(
+    &mut self,
+    ticket: RestoreTicket,
+  ) -> Result<DispatchTurn, RestoreTicket> {
+    let helper = ticket.helper;
+    let turn = self.turns.try_restore(ticket)?;
+    Ok(self.assign(turn, helper))
+  }
+
+  pub(super) fn try_activate_helper(&mut self) -> Option<HelperLease> {
+    self.turns.try_activate_helper()
+  }
+
+  pub(super) fn retire_helper(&mut self, lease: HelperLease) -> Result<(), HelperLease> {
+    self.turns.retire_helper(lease)
+  }
+
+  pub(super) const fn helper_is_excess(&self) -> bool {
+    self.turns.helper_is_excess()
+  }
+
+  pub(super) const fn may_exit(&self, admission_empty: bool) -> bool {
+    admission_empty && self.turns.handoffs == 0 && self.turns.restoring == 0
+  }
+
+  #[cfg(test)]
+  pub(super) fn check(&self) {
+    self.turns.check();
+    assert_eq!(self.turns.turns + self.vacant.len(), self.turns.dispatchers);
+    assert_eq!(self.helper_held.len(), self.turns.dispatchers);
+    for (position, &seat) in self.vacant.iter().enumerate() {
+      assert!(seat < self.turns.dispatchers);
+      assert!(
+        !self.vacant[..position].contains(&seat),
+        "duplicate vacant seat"
+      );
+      assert!(!self.helper_held[seat]);
+    }
+    assert!(self.helper_held.iter().filter(|&&held| held).count() <= self.turns.helpers);
   }
 }
 
@@ -497,5 +625,180 @@ mod loom_tests {
       closer.join().unwrap();
       assert!(lock(&state).turns.may_exit(true));
     });
+  }
+
+  #[test]
+  fn loom_seat_handoff_restore_and_helper_retirement_conserve_identity() {
+    use super::SeatTable;
+
+    bounded_model(|| {
+      let mut seats = SeatTable::new(2, 1);
+      let original = seats.claim(0);
+      let second = seats.claim(1);
+      let state = Arc::new(Mutex::new((seats, false)));
+      let worker = {
+        let state = Arc::clone(&state);
+        thread::spawn(move || {
+          let loan = {
+            let mut state = lock(&state);
+            let loan = state.0.try_hand_off(original).unwrap();
+            state.0.check();
+            assert!(!state.0.may_exit(true));
+            loan
+          };
+          thread::yield_now();
+          let mut ticket = lock(&state).0.begin_restore(loan);
+          let turn = loop {
+            {
+              let mut state = lock(&state);
+              match state.0.try_restore(ticket) {
+                Ok(turn) => {
+                  state.1 = true;
+                  state.0.check();
+                  break turn;
+                }
+                Err(waiting) => ticket = waiting,
+              }
+            }
+            thread::yield_now();
+          };
+          let mut state = lock(&state);
+          let _ = state.0.end_turn(turn);
+          state.0.check();
+        })
+      };
+      let helper = {
+        let state = Arc::clone(&state);
+        thread::spawn(move || {
+          let mut lease = None;
+          let mut turn = None;
+          loop {
+            {
+              let mut state = lock(&state);
+              if let Some(held) = turn.take() {
+                let _ = state.0.end_turn(held);
+              }
+              if let Some(held) = lease.take() {
+                match state.0.retire_helper(held) {
+                  Ok(()) => {}
+                  Err(held) => lease = Some(held),
+                }
+              }
+              if lease.is_none() {
+                lease = state.0.try_activate_helper();
+              }
+              if lease.is_some() {
+                turn = state.0.try_begin_helper_turn();
+              }
+              state.0.check();
+              // Admission stays occupied until the original worker restores.
+              if state.0.may_exit(state.1) {
+                assert!(state.1, "exit before restoration");
+                if let Some(held) = turn.take() {
+                  let _ = state.0.end_turn(held);
+                }
+                if let Some(held) = lease.take() {
+                  assert!(state.0.helper_is_excess());
+                  state.0.retire_helper(held).unwrap();
+                }
+                state.0.check();
+                break;
+              }
+            }
+            thread::yield_now();
+          }
+        })
+      };
+      let other = {
+        let state = Arc::clone(&state);
+        thread::spawn(move || {
+          thread::yield_now();
+          let mut state = lock(&state);
+          assert_eq!(second.seat(), 1);
+          assert!(!state.0.vacant.contains(&second.seat()));
+          let _ = state.0.end_turn(second);
+          state.0.check();
+        })
+      };
+      worker.join().unwrap();
+      helper.join().unwrap();
+      other.join().unwrap();
+      let state = lock(&state);
+      state.0.check();
+      assert!(state.1);
+      assert_eq!(state.0.turns.counts(), (0, 0, 0, 0));
+      assert_eq!(state.0.vacant.len(), 2);
+    });
+  }
+}
+
+#[cfg(all(test, not(loom)))]
+mod seat_tests {
+  use super::SeatTable;
+
+  #[test]
+  fn seats_are_distinct_and_restore_has_priority() {
+    let mut seats = SeatTable::new(2, 1);
+    let first = seats.claim(0);
+    let second = seats.claim(1);
+    assert_ne!(first.seat(), second.seat());
+    assert!(seats.try_begin_helper_turn().is_none());
+    let loan = seats.try_hand_off(first).unwrap();
+    assert!(!seats.may_exit(true));
+    let lease = seats.try_activate_helper().unwrap();
+    let helper = seats.try_begin_helper_turn().unwrap();
+    assert_eq!(helper.seat(), 0);
+    assert!(seats.helper_held[helper.seat()]);
+    seats.check();
+    let ticket = seats.begin_restore(loan);
+    let ticket = seats.try_restore(ticket).unwrap_err();
+    assert!(seats.end_turn(helper).wake_restorer);
+    assert!(seats.try_begin_helper_turn().is_none());
+    let first = seats.try_restore(ticket).unwrap();
+    assert_eq!(first.seat(), 0);
+    assert!(!seats.helper_held[first.seat()]);
+    assert!(seats.helper_is_excess());
+    seats.retire_helper(lease).unwrap();
+    seats.check();
+    assert!(seats.may_exit(true));
+    assert!(!seats.may_exit(false));
+    let _ = seats.end_turn(first);
+    let _ = seats.end_turn(second);
+    seats.check();
+    assert_eq!(seats.vacant.len(), 2);
+  }
+
+  #[test]
+  fn full_handoff_preserves_seat_and_helper_restore_preserves_kind() {
+    let mut seats = SeatTable::new(2, 2);
+    let first = seats.claim(0);
+    let second = seats.claim(1);
+    let loan = seats.try_hand_off(first).unwrap();
+    let lease = seats.try_activate_helper().unwrap();
+    let helper = seats.try_begin_helper_turn().unwrap();
+    let helper_loan = seats.try_hand_off(helper).unwrap();
+    let second = seats.try_hand_off(second).unwrap_err();
+    assert_eq!(second.seat(), 1);
+    let ticket = seats.begin_restore(helper_loan);
+    let helper = seats.try_restore(ticket).unwrap();
+    assert!(seats.helper_held[helper.seat()]);
+    seats.check();
+    let ticket = seats.begin_restore(loan);
+    let ticket = seats.try_restore(ticket).unwrap_err();
+    let _ = seats.end_turn(helper);
+    let first = seats.try_restore(ticket).unwrap();
+    seats.retire_helper(lease).unwrap();
+    let _ = seats.end_turn(first);
+    let _ = seats.end_turn(second);
+    seats.check();
+    assert!(seats.may_exit(true));
+  }
+
+  #[test]
+  #[should_panic(expected = "seat is already held")]
+  fn an_occupied_seat_cannot_be_claimed_twice() {
+    let mut seats = SeatTable::new(1, 0);
+    let _turn = seats.claim(0);
+    let _duplicate = seats.claim(0);
   }
 }
