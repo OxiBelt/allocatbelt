@@ -1279,7 +1279,7 @@ mod loom_tests {
       model.dispatch(0);
       assert_eq!(lock(&model.scope).active(), 1);
       // The second same-scope task competes with the owner's pop. The
-      // sentinel keeps the victim stealable until either search takes it.
+      // sentinel exercises both a multi-entry steal and a final-entry steal.
       let mut victim = LaneQueue::new();
       victim.push(&model.links, 1);
       victim.push(&model.links, 2);
@@ -1310,8 +1310,10 @@ mod loom_tests {
               assert!(own.check(&model.links).is_empty());
               index
             };
-            assert_eq!(index, 1);
-            model.dispatch(index);
+            assert!(index == 1 || index == 2);
+            if index == 1 {
+              model.dispatch(index);
+            }
             index
           })
         })

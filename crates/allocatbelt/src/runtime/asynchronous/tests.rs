@@ -2370,8 +2370,7 @@ impl Future for ManyGate {
 
 #[test]
 fn concurrent_last_scope_children_release_scope_capacity() {
-  // Distributed can leave a lone ready entry behind a blocking poll.
-  let runtime = strict_runtime(AsyncConfig {
+  let runtime = AsyncRuntime::new(AsyncConfig {
     workers: 2,
     max_outstanding: 8,
     max_scopes: 2,

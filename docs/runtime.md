@@ -997,10 +997,12 @@ cancelled task to a lane chosen only by a rotating counter and the parked mask.
 Dead seats are excluded; among live seats it skips parked dispatchers unless
 all are parked. A dispatcher takes its own
 front entry, then searches other lanes in a pseudo-random order, then takes one
-shared overflow entry. A steal moves the oldest bounded half (at most 32) to
-the receiving lane's tail, preserving order and always leaving the victim at
-least one entry. A lane with two or more entries wakes one parked dispatcher
-to search. The last entry behind a long poll waits for that lane's dispatcher.
+shared overflow entry. An idle dispatcher can take a busy lane's oldest
+entries, including a single remaining one. A steal moves that entry or the
+oldest bounded half (at most 32) of a larger lane to the receiving lane's tail,
+preserving order. A multi-entry victim keeps at least one entry. Publishing
+ready work wakes one parked dispatcher to search; after a steal, a dispatcher
+is woken only if entries remain.
 There is no per-task lane affinity or global scope rotation. A larger ready
 scope can receive proportionally more polls, and scope readiness order can
 change across lanes. Each task still polls exclusively, and ready tasks make
@@ -1424,11 +1426,10 @@ limit. Scope unfinished-task bookkeeping completes after publication.
 
 This bounds simultaneous polling, not CPU time. A future can block a worker
 inside a poll, and destructors can block during quota-free cleanup. There is
-no preemption or implicit managed-storage reservation. In Distributed, an
-ordinary lone ready entry on a busy dispatcher's lane waits for that poll to
-return. A future that blocks a dispatcher while waiting synchronously on
-another task of the same runtime can therefore deadlock; use Strict for such
-code. Current-thread local execution already polls one future at a time. Native
+no preemption or implicit managed-storage reservation. An idle distributed
+dispatcher can steal a single ready entry behind a busy dispatcher's poll.
+Blocking all available dispatchers can still prevent progress. Current-thread
+local execution already polls one future at a time. Native
 tests exercise saturation, cross-scope progress, FIFO resumption, cancellation,
 shutdown, slot reuse and
 cleanup; a same-source Loom model checks poll-slot acquire/release transitions.
@@ -1599,7 +1600,7 @@ entering a local handle alone does not constitute local execution.
 `AsyncDispatch::Distributed` supports the same bounded handoffs. Helpers adopt
 a vacant dispatcher seat and serve its lane using the same search: own lane,
 bounded stealing, then one overflow entry. Other holders may steal from a
-vacant seat's lane under the usual bounds; its last entry waits for adoption.
+vacant seat's lane under the usual bounds, including its last entry.
 `AsyncRuntime::dispatch` and `RuntimeMetrics::dispatch` report the selected
 mode. `MultiThreadBuilder::dispatch` selects the mode for the owning facade;
 omitting it uses the default.

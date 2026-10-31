@@ -322,7 +322,9 @@ impl Distributed {
       }
       let notify = queue.push(&self.links, index);
       self.publish_depth(shared, seat, &queue);
-      (notify, queue.len() >= 2)
+      // A single entry on a busy lane is stealable too. A sleeping owner
+      // already receives the notification; otherwise kick a parked searcher.
+      (notify, queue.len() >= 2 || !notify)
     };
     if notify {
       self.lanes[seat].cv.notify_one();
@@ -787,7 +789,7 @@ impl Distributed {
       if shared.metrics.inner().lane_depth[victim]
         .0
         .load(Ordering::SeqCst)
-        < 2
+        == 0
       {
         continue;
       }
@@ -797,11 +799,11 @@ impl Distributed {
         let Some(chain) = queue.steal_front(&self.links) else {
           continue;
         };
-        debug_assert!(queue.len() >= 1);
-        debug_assert!(before - queue.len() <= before / 2);
+        debug_assert!(before == 1 || queue.len() >= 1);
+        debug_assert!(before - queue.len() <= (before / 2).max(1));
         debug_assert!(before - queue.len() <= super::super::lane::STEAL_MAX);
         self.publish_depth(shared, victim, &queue);
-        (chain, queue.len() >= 2)
+        (chain, queue.len() != 0)
       };
       if remains {
         self.wake_one_parked();
@@ -812,7 +814,7 @@ impl Distributed {
         let cleanup = queue.extract_cleanup(&self.links);
         let first = queue.pop(&self.links);
         self.publish_depth(shared, seat, &queue);
-        (first, queue.len() >= 2, cleanup)
+        (first, queue.len() != 0, cleanup)
       };
       if let Some(cleanup) = cleanup {
         let count = {
@@ -846,7 +848,7 @@ impl Distributed {
       let first = queue.pop(&self.links);
       let recheck = first.is_none() && queue.take_recheck();
       self.publish_depth(shared, seat, &queue);
-      (first, recheck, queue.len() >= 2)
+      (first, recheck, queue.len() != 0)
     };
     if let Some(index) = first {
       if remains {

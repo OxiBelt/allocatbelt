@@ -118,6 +118,109 @@ fn run(shared: &Arc<Shared>, work: Selected) {
   }
 }
 
+#[test]
+fn two_blocking_polls_start_before_deadline() {
+  let (shared, root) = shared(config(2, 2));
+  let d = engine(&shared);
+  let started = Arc::new(AtomicUsize::new(0));
+  let spawn = || {
+    d.next_lane.store(0, Ordering::Relaxed);
+    let started = Arc::clone(&started);
+    shared
+      .spawn(
+        root,
+        std::future::poll_fn(move |_| {
+          started.fetch_add(1, Ordering::SeqCst);
+          let deadline = Instant::now() + Duration::from_secs(5);
+          while started.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            std::thread::yield_now();
+          }
+          Poll::Ready(started.load(Ordering::SeqCst) == 2)
+        }),
+      )
+      .unwrap()
+  };
+  let first = spawn();
+  let worker0 = start_worker(&shared, 0);
+  wait(|| started.load(Ordering::SeqCst) == 1);
+  let worker1 = start_worker(&shared, 1);
+  wait(|| d.parked.is_set(1));
+  let second = spawn();
+  let results = (finish(first).unwrap(), finish(second).unwrap());
+  shared.close(false);
+  join_worker(worker0);
+  join_worker(worker1);
+  assert_eq!(results, (true, true), "concurrent poll start deadline");
+  check_distributed(&shared);
+}
+
+#[test]
+fn lone_entry_behind_blocked_poll_runs_on_idle_worker() {
+  let (shared, root) = shared(config(2, 2));
+  let d = engine(&shared);
+  let (started_tx, started_rx) = mpsc::channel();
+  let (release_tx, release_rx) = mpsc::channel();
+  let returned = Arc::new(AtomicBool::new(false));
+  let done = Arc::clone(&returned);
+  let blocker = shared
+    .spawn(root, async move {
+      started_tx.send(()).unwrap();
+      let released = release_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+      done.store(true, Ordering::SeqCst);
+      released
+    })
+    .unwrap();
+  let worker0 = start_worker(&shared, 0);
+  started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+  let worker1 = start_worker(&shared, 1);
+  wait(|| d.parked.is_set(1));
+  d.next_lane.store(0, Ordering::Relaxed);
+  let job = shared
+    .spawn(root, async move { !returned.load(Ordering::SeqCst) })
+    .unwrap();
+  let ran_while_blocked = finish(job).unwrap();
+  let _ = release_tx.send(());
+  let released = finish(blocker).unwrap();
+  shared.close(false);
+  join_worker(worker0);
+  join_worker(worker1);
+  assert!(ran_while_blocked && released, "idle worker steal deadline");
+  check_distributed(&shared);
+}
+
+#[test]
+fn stealing_last_entry_does_not_wake_or_lock_a_parked_dispatcher() {
+  for count in [1, 2, 3] {
+    let (shared, root) = shared(config(3, 3));
+    let d = engine(&shared);
+    let jobs: Vec<_> = (0..count)
+      .map(|_| {
+        d.next_lane.store(1, Ordering::Relaxed);
+        shared.spawn(root, async {}).unwrap()
+      })
+      .collect();
+    d.next_lane.store(2, Ordering::Relaxed);
+    d.parked.advertise(2);
+    assert!(d.lane(2).prepare_sleep());
+    let before = d.lane_locks.load(Ordering::Relaxed);
+    let index = d.try_steal(&shared, 0, &mut 1).unwrap();
+    let locks = d.lane_locks.load(Ordering::Relaxed) - before;
+    assert_eq!(locks, if count == 1 { 2 } else { 3 });
+    assert_eq!(d.parked.is_set(2), count == 1);
+    assert_eq!(d.lane(2).take_recheck(), count != 1);
+    assert_eq!(d.lane(1).check(&d.links).len(), count - 1);
+    run(&shared, d.dispatch_decision(&shared, index).unwrap());
+    for _ in 1..count {
+      run(&shared, selected(&shared, 1).unwrap());
+    }
+    for job in jobs {
+      finish(job).unwrap();
+    }
+    d.lane(2).finish_sleep();
+    check_distributed(&shared);
+  }
+}
+
 /// Checks only quiescent points, when no entries or permits are in transit.
 fn check_distributed(shared: &Shared) {
   let d = engine(shared);
@@ -472,7 +575,7 @@ fn stolen_tasks_obey_exact_scope_limits_under_contention() {
 }
 
 #[test]
-fn idle_worker_steals_behind_a_long_poll_without_emptying_the_victim() {
+fn idle_workers_drain_ready_entries_behind_a_long_poll() {
   let (shared, root) = shared(config(4, 17));
   let (entered, arrival) = mpsc::channel();
   let (release, resume) = mpsc::channel();
@@ -532,7 +635,7 @@ fn idle_worker_steals_behind_a_long_poll_without_emptying_the_victim() {
       .all(|(index, id)| !threads[..index].contains(id))
   );
   release_short.store(true, Ordering::Release);
-  for _ in 0..15 {
+  for _ in 0..16 {
     completions.recv_timeout(Duration::from_secs(30)).unwrap();
   }
   assert!(d.steals.load(Ordering::Relaxed) > 0);
@@ -540,7 +643,7 @@ fn idle_worker_steals_behind_a_long_poll_without_emptying_the_victim() {
     shared.metrics.inner().lane_depth[0]
       .0
       .load(Ordering::SeqCst),
-    1
+    0
   );
   release.send(()).unwrap();
   for job in jobs {
@@ -555,7 +658,7 @@ fn idle_worker_steals_behind_a_long_poll_without_emptying_the_victim() {
 }
 
 #[test]
-fn self_yields_complete_and_under_subscribed_yields_do_not_park_per_poll() {
+fn self_yields_complete_even_when_under_subscribed() {
   let runtime = runtime(4, 4);
   let jobs: Vec<_> = (0..4)
     .map(|_| {
@@ -593,24 +696,16 @@ fn self_yields_complete_and_under_subscribed_yields_do_not_park_per_poll() {
     .spawn(std::future::poll_fn(move |cx| {
       polls += 1;
       if polls == 10_000 {
-        Poll::Ready(())
+        Poll::Ready(polls)
       } else {
         cx.waker().wake_by_ref();
         Poll::Pending
       }
     }))
     .unwrap();
-  finish(job).unwrap();
-  assert!(
-    runtime
-      .metrics()
-      .snapshot()
-      .threads
-      .iter()
-      .map(|t| t.parks)
-      .sum::<usize>()
-      < 50
-  );
+  assert_eq!(finish(job).unwrap(), 10_000);
+  // A lone requeued entry can migrate between workers, so idle workers may
+  // park again between polls. Completion must not depend on lane affinity.
   shutdown(runtime, AsyncShutdown::Drain);
 }
 
@@ -1003,7 +1098,7 @@ fn abort_of_stolen_blocked_task_cleans_up_during_another_poll() {
   park_attempt.recv_timeout(Duration::from_secs(30)).unwrap();
   assert_eq!(
     shared.metrics.inner().blocked_depth.load(Ordering::Relaxed),
-    1
+    2
   );
   assert!(d.steals.load(Ordering::Relaxed) > 0);
   assert!(!d.parked.is_set(1));
@@ -1059,8 +1154,8 @@ fn cancellation_cleanup_releases_a_sibling_blocked_inside_poll() {
   let second = start_worker(&shared, 1);
   first_poll.recv_timeout(Duration::from_secs(30)).unwrap();
   wait(|| engine(&shared).parked.is_set(1));
-  // Ordinary placement here would select the busy dispatcher's lane, whose
-  // last entry cannot be stolen. Cleanup must instead wake the parked seat.
+  // Cancellation cleanup uses overflow and wakes the parked seat, even
+  // though ordinary placement would select the busy dispatcher's lane.
   engine(&shared).next_lane.store(0, Ordering::Relaxed);
   sibling.abort_handle().abort();
   finish(holder).expect("blocked poll must observe cleanup before its deadline");
@@ -1073,7 +1168,7 @@ fn cancellation_cleanup_releases_a_sibling_blocked_inside_poll() {
 
 #[test]
 fn park_rescan_finds_work_published_before_park_advertisement() {
-  let (mut shared, root) = shared(config(2, 3));
+  let (mut shared, root) = shared(config(2, 2));
   let (attempt, attempted) = mpsc::channel();
   let (resume, resumed) = mpsc::channel();
   let resumed = Mutex::new(Some(resumed));
@@ -1109,9 +1204,7 @@ fn park_rescan_finds_work_published_before_park_advertisement() {
       done.send(()).unwrap();
     })
     .unwrap();
-  d.next_lane.store(0, Ordering::Relaxed);
-  let tail = shared.spawn(root, async {}).unwrap();
-  assert_eq!(d.lane(0).len(), 2);
+  assert_eq!(d.lane(0).len(), 1);
   resume.send(()).unwrap();
   let progress = completion.recv_timeout(Duration::from_secs(5));
   // Release the blocked poll even on a failed assertion.
@@ -1121,7 +1214,6 @@ fn park_rescan_finds_work_published_before_park_advertisement() {
     "park rescan deadline: stealable work left asleep"
   );
   finish(short).unwrap();
-  finish(tail).unwrap();
   finish(holder).unwrap();
   shared.close(false);
   join_worker(first);
@@ -1151,17 +1243,35 @@ impl Drop for ReleaseHandoffs {
 #[test]
 fn handoff_restores_onto_another_lane_while_other_workers_keep_polling() {
   use super::super::super::{HandoffConfig, try_block_in_place};
+  // Keep worker one at its first park boundary until the helper has adopted
+  // seat zero. A single entry no longer forces its assigned owner to run it.
+  let bootstrap = HandoffGate::default();
+  let _release_bootstrap = ReleaseHandoffs(vec![bootstrap.clone()]);
+  let hold = bootstrap.clone();
+  let once = AtomicBool::new(true);
+  let (parked, park_attempt) = mpsc::channel();
+  let options = AsyncThreadOptions::new().on_thread_park(move |context| {
+    if context.role == AsyncThreadRole::Worker
+      && context.index == 1
+      && once.swap(false, Ordering::Relaxed)
+    {
+      parked.send(()).unwrap();
+      hold.wait();
+    }
+  });
   let runtime = AsyncRuntime::new_with_options(
     config(2, 8),
     AsyncRuntimeOptions::new()
       .dispatch(AsyncDispatch::Distributed)
-      .handoffs(HandoffConfig { max_handoffs: 2 }),
+      .handoffs(HandoffConfig { max_handoffs: 2 })
+      .thread_options(options),
   )
   .unwrap();
   let shared = Arc::clone(&runtime.shared);
   let d = engine(&shared);
   d.round_robin.store(true, Ordering::Relaxed);
   wait(|| shared.turn_counts() == (2, 0, 0, 0));
+  park_attempt.recv_timeout(Duration::from_secs(30)).unwrap();
   let scopes: Vec<_> = (0..3)
     .map(|_| {
       runtime
@@ -1191,7 +1301,7 @@ fn handoff_restores_onto_another_lane_while_other_workers_keep_polling() {
       .unwrap()
   };
   arrival.recv_timeout(Duration::from_secs(30)).unwrap();
-  // A helper must adopt seat zero to run its last (unstealable) entry.
+  // With worker one held, only the helper can run the entry on seat zero.
   let (entered, arrival) = mpsc::channel();
   let helper = {
     let gate = gates[2].clone();
@@ -1204,6 +1314,7 @@ fn handoff_restores_onto_another_lane_while_other_workers_keep_polling() {
       .unwrap()
   };
   arrival.recv_timeout(Duration::from_secs(30)).unwrap();
+  bootstrap.open();
   let (entered, arrival) = mpsc::channel();
   let (advanced, progress) = mpsc::channel();
   let other = {

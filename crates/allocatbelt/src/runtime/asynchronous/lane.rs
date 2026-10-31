@@ -136,12 +136,12 @@ impl LaneQueue {
     })
   }
 
-  /// Takes the oldest bounded half, always leaving the victim an entry.
+  /// Takes a single remaining entry or the oldest bounded half of a larger lane.
   pub(super) fn steal_front(&mut self, links: &[QueueLink]) -> Option<Chain> {
-    if self.len < 2 {
+    if self.len == 0 {
       return None;
     }
-    let len = (self.len / 2).min(STEAL_MAX);
+    let len = (self.len / 2).clamp(1, STEAL_MAX);
     let first = self.head;
     let mut last = first;
     for _ in 1..len {
@@ -150,6 +150,9 @@ impl LaneQueue {
     self.head = links[last].next.load(Ordering::Relaxed);
     links[last].next.store(NIL, Ordering::Relaxed);
     self.len -= len;
+    if self.len == 0 {
+      self.tail = NIL;
+    }
     Some(Chain { first, last, len })
   }
 
@@ -354,7 +357,7 @@ pub(super) fn search_or_park(
   parked.advertise(seat);
   let work = lane_len
     .into_iter()
-    .any(|(lane, len)| lane != seat && len >= 2)
+    .any(|(lane, len)| lane != seat && len != 0)
     || overflow_hint() != 0;
   if work {
     let _ = parked.claim(seat);
@@ -376,19 +379,19 @@ mod tests {
       }
       let mut thief = LaneQueue::new();
       let chain = victim.steal_front(&links);
-      if len < 2 {
+      if len == 0 {
         assert!(chain.is_none());
         assert_eq!(victim.len(), len);
         victim.check(&links);
         continue;
       }
       let chain = chain.unwrap();
-      let taken = (len / 2).min(STEAL_MAX);
+      let taken = (len / 2).clamp(1, STEAL_MAX);
       assert_eq!(chain.len, taken);
       assert_eq!(chain.first, 0);
       assert_eq!(chain.last, taken - 1);
       assert_eq!(victim.len(), len - taken);
-      assert!(victim.len() >= 1);
+      assert!(len == 1 || victim.len() >= 1);
       assert_eq!(victim.check(&links), (taken..len).collect::<Vec<_>>());
       // A push during the move stays ahead of the detached chain.
       thief.push(&links, len);
@@ -518,7 +521,7 @@ mod tests {
   #[test]
   fn park_rescans_stealable_lanes_and_overflow() {
     let mask = ParkedMask::new(2);
-    let lengths = [AtomicUsize::new(0), AtomicUsize::new(1)];
+    let lengths = [AtomicUsize::new(0), AtomicUsize::new(0)];
     let overflow = AtomicUsize::new(0);
     assert!(search_or_park(
       0,
@@ -530,7 +533,7 @@ mod tests {
       || overflow.load(Ordering::SeqCst),
     ));
     assert!(mask.claim(0));
-    lengths[1].store(2, Ordering::SeqCst);
+    lengths[1].store(1, Ordering::SeqCst);
     assert!(!search_or_park(
       0,
       &mask,
@@ -541,7 +544,7 @@ mod tests {
       || overflow.load(Ordering::SeqCst),
     ));
     assert!(!mask.is_set(0));
-    lengths[1].store(1, Ordering::SeqCst);
+    lengths[1].store(0, Ordering::SeqCst);
     overflow.store(1, Ordering::SeqCst);
     assert!(!search_or_park(
       0,
@@ -653,8 +656,8 @@ mod loom_tests {
 
   #[test]
   fn loom_steal_races_owner_pop() {
-    bounded_model(|| {
-      for count in [3, 4] {
+    for count in [1, 2, 3, 4] {
+      loom::model(move || {
         let links = Arc::new((0..=count).map(|_| QueueLink::new()).collect::<Vec<_>>());
         let mut initial = LaneQueue::new();
         for index in 0..count {
@@ -684,8 +687,8 @@ mod loom_tests {
               let mut queue = victim.lock().unwrap();
               let before = queue.check(&links);
               queue.steal_front(&links).map(|chain| {
-                assert!(queue.len() >= 1, "steal emptied victim");
-                assert_eq!(chain.len, (before.len() / 2).min(STEAL_MAX));
+                assert!(before.len() == 1 || queue.len() >= 1);
+                assert_eq!(chain.len, (before.len() / 2).clamp(1, STEAL_MAX));
                 assert_eq!(chain.first, before[0]);
                 assert_eq!(chain.last, before[chain.len - 1]);
                 queue.check(&links);
@@ -717,16 +720,18 @@ mod loom_tests {
         popped.sort_unstable();
         assert_eq!(popped, (0..=count).collect::<Vec<_>>());
         assert!(victim.lock().unwrap().check(&links).is_empty());
-      }
-    });
+      });
+    }
   }
 
   /// Keep the final sleep decision observable rather than actually waiting:
   /// an invalid decision fails an assertion instead of hanging the model.
-  fn steal_push_park(other_parked: bool) {
+  fn steal_push_park(other_parked: bool, initial_entry: bool) {
     let links = Arc::new([QueueLink::new(), QueueLink::new()]);
     let mut initial = LaneQueue::new();
-    initial.push(&links[..], 0);
+    if initial_entry {
+      initial.push(&links[..], 0);
+    }
     let victim = Arc::new(Mutex::new(initial));
     let sleeper = Arc::new(Mutex::new(LaneQueue::new()));
     let other = Arc::new(Mutex::new(LaneQueue::new()));
@@ -737,27 +742,46 @@ mod loom_tests {
     }
     let lengths = Arc::new([
       AtomicUsize::new(0),
-      AtomicUsize::new(1),
+      AtomicUsize::new(usize::from(initial_entry)),
       AtomicUsize::new(0),
     ]);
     let kick = Arc::new(Mutex::new(None));
     let searcher = {
-      let (links, victim, sleeper, parked, lengths) = (
+      let (links, victim, sleeper, parked, lengths, other) = (
         Arc::clone(&links),
         Arc::clone(&victim),
         Arc::clone(&sleeper),
         Arc::clone(&parked),
         Arc::clone(&lengths),
+        Arc::clone(&other),
       );
       thread::spawn(move || {
-        let chain = {
+        let (chain, remains, before) = {
           let mut queue = victim.lock().unwrap();
+          let before = queue.len();
           let chain = queue.steal_front(&links[..]);
+          if let Some(chain) = &chain {
+            assert!(before == 1 || queue.len() >= 1);
+            assert_eq!(chain.len, (before / 2).clamp(1, STEAL_MAX));
+          }
           lengths[1].store(queue.len(), Ordering::SeqCst);
           queue.check(&links[..]);
-          chain
+          (chain, queue.len() != 0, before)
         };
         if let Some(chain) = chain {
+          let kicked = if remains {
+            parked.claim_any(2).map(|seat| {
+              assert_eq!(seat, 2);
+              assert!(other.lock().unwrap().request_recheck());
+              seat
+            })
+          } else {
+            None
+          };
+          assert!(
+            before != 1 || kicked.is_none(),
+            "last-entry steal woke a holder"
+          );
           let mut own = sleeper.lock().unwrap();
           own.append_chain(&links[..], chain);
           return false;
@@ -793,7 +817,7 @@ mod loom_tests {
           queue.push(&links[..], 1);
           lengths[1].store(queue.len(), Ordering::SeqCst);
           queue.check(&links[..]);
-          queue.len() >= 2
+          queue.len() != 0
         };
         if remains && let Some(seat) = parked.claim_any(if other_parked { 2 } else { 0 }) {
           assert!(seat == 0 || (other_parked && seat == 2));
@@ -808,7 +832,7 @@ mod loom_tests {
     pusher.join().unwrap();
     let kick = *kick.lock().unwrap();
     assert!(
-      !asleep || lengths[1].load(Ordering::SeqCst) < 2 || kick.is_some(),
+      !asleep || lengths[1].load(Ordering::SeqCst) == 0 || kick.is_some(),
       "parked with stealable work and no kick"
     );
     if let Some((seat, saw_sleeping)) = kick {
@@ -829,17 +853,21 @@ mod loom_tests {
       queue.check(&links[..]);
     }
     popped.sort_unstable();
-    assert_eq!(popped, [0, 1]);
+    assert_eq!(popped, if initial_entry { vec![0, 1] } else { vec![1] });
   }
 
   #[test]
   fn loom_steal_push_park_has_a_searcher_or_kick() {
-    bounded_model(|| steal_push_park(false));
+    for initial_entry in [false, true] {
+      loom::model(move || steal_push_park(false, initial_entry));
+    }
   }
 
   #[test]
   fn loom_work_remains_may_wake_another_parked_holder() {
-    bounded_model(|| steal_push_park(true));
+    for initial_entry in [false, true] {
+      loom::model(move || steal_push_park(true, initial_entry));
+    }
   }
 
   #[test]
