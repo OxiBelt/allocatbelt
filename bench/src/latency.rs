@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use allocatbelt::runtime::{
   Config, Resources, Runtime, ShutdownMode,
   asynchronous::{
-    AsyncConfig, AsyncRuntime, AsyncRuntimeOptions, AsyncShutdown, BlockInPlaceErrorKind,
-    HandoffConfig, try_block_in_place,
+    AsyncConfig, AsyncHandle, AsyncRuntime, AsyncRuntimeOptions, AsyncShutdown,
+    BlockInPlaceErrorKind, HandoffConfig, try_block_in_place,
   },
 };
 
@@ -835,6 +835,7 @@ type AsyncWork = Pin<Box<dyn Future<Output = u64> + Send + 'static>>;
 
 struct AsyncExecutors {
   bounded: Option<AsyncRuntime>,
+  bounded_handle: Option<AsyncHandle>,
   tokio: Option<tokio::runtime::Runtime>,
 }
 
@@ -854,31 +855,34 @@ impl AsyncExecutors {
     handoffs: usize,
   ) -> Result<Self, String> {
     match kind {
-      ExecutorKind::Bounded => Ok(Self {
-        bounded: Some(
-          AsyncRuntime::new_with_options(
-            AsyncConfig {
-              workers,
-              max_outstanding: window,
-              max_scopes: 1,
-            },
-            {
-              let options = AsyncRuntimeOptions::new();
-              if handoffs == 0 {
-                options
-              } else {
-                options.handoffs(HandoffConfig {
-                  max_handoffs: handoffs,
-                })
-              }
-            },
-          )
-          .map_err(|e| format!("bounded async runtime: {e}"))?,
-        ),
-        tokio: None,
-      }),
+      ExecutorKind::Bounded => {
+        let runtime = AsyncRuntime::new_with_options(
+          AsyncConfig {
+            workers,
+            max_outstanding: window,
+            max_scopes: 1,
+          },
+          {
+            let options = AsyncRuntimeOptions::new();
+            if handoffs == 0 {
+              options
+            } else {
+              options.handoffs(HandoffConfig {
+                max_handoffs: handoffs,
+              })
+            }
+          },
+        )
+        .map_err(|e| format!("bounded async runtime: {e}"))?;
+        Ok(Self {
+          bounded_handle: Some(runtime.handle()),
+          bounded: Some(runtime),
+          tokio: None,
+        })
+      }
       ExecutorKind::Tokio => Ok(Self {
         bounded: None,
+        bounded_handle: None,
         tokio: Some(
           tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
@@ -893,10 +897,9 @@ impl AsyncExecutors {
   fn submit(&self, kind: ExecutorKind, future: AsyncWork) -> Result<Handle, String> {
     match kind {
       ExecutorKind::Bounded => self
-        .bounded
+        .bounded_handle
         .as_ref()
         .ok_or("bounded async executor missing")?
-        .handle()
         .spawn(future)
         .map(Handle::BoundedAsync)
         .map_err(|error| format!("bounded async submit: {}", error.kind)),
