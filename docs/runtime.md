@@ -1579,11 +1579,26 @@ borrowed or `!Send` closures and results. Disabled/full/local-executor rejection
 returns the uncalled closure. Outside owned dispatcher execution it runs inline;
 entering a local handle alone does not constitute local execution.
 
-`AsyncRuntimeOptions` combines handoff and thread options for
+`AsyncRuntimeOptions` combines handoff, park-spin and thread options for
 `AsyncRuntime::new_with_options`. Helpers adopt a vacant dispatcher seat and
 serve its lane using the same search: own lane, bounded stealing, then one
 overflow entry. Other holders may steal from a vacant seat's lane under the
 usual bounds, including its last entry.
+
+`AsyncRuntimeOptions::park_spin(ParkSpin::fixed(rounds))` controls the
+lock-free ready-hint checks before a distributed dispatcher attempts to park.
+The round limit is fixed at construction and defaults to 128; zero disables
+spinning. `AsyncRuntimeOptions::max_spinning_dispatchers(K)` fixes the cap on
+simultaneously spinning dispatchers, defaulting to the worker count; a cap at or above the
+worker count does not limit spinning. Zero skips spinning. A dispatcher that cannot acquire a spinner slot proceeds directly to
+the existing park handshake. A guard releases its slot on every spin exit,
+including work, closing, handoff yield, exhaustion and unwinding. Releasing a
+slot sends no wake. Closing and handoff yield hints stop the spin early. The
+condvar park remains untimed. Loom builds omit spinning and the slot counter.
+
+For `--lane async --executor bounded`, the latency benchmark accepts
+`--park-spin fixed:N` and `--max-spinners K`. CSV columns are unchanged; record
+the selected flags alongside benchmark results.
 
 With `W` workers and `B` helpers, at most `W` dispatcher turns and `B` handed-off
 closures are active. Reserving a loan precedes releasing the dispatcher permit.

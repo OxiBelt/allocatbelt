@@ -6,6 +6,8 @@
 
 use super::super::handoff_protocol::SeatTable;
 use super::super::lane::{LaneQueue, ParkedMask, QueueLink, VictimOrder, choose_lane};
+#[cfg(not(loom))]
+use super::super::park_spin::SpinnerSlots;
 use super::*;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicBool;
@@ -140,6 +142,16 @@ impl SeatGuard<'_> {
 }
 
 pub(super) struct Distributed {
+  #[cfg(not(loom))]
+  spin_limit: u32,
+  #[cfg(not(loom))]
+  spinners: SpinnerSlots,
+  #[cfg(not(loom))]
+  limit_spinners: bool,
+  #[cfg(all(test, not(loom)))]
+  max_concurrent_spinners: AtomicUsize,
+  #[cfg(all(test, not(loom)))]
+  spin_rounds: AtomicUsize,
   slots: Vec<SlotCell>,
   links: Vec<QueueLink>,
   lanes: Vec<Lane>,
@@ -229,8 +241,27 @@ impl Distributed {
     )
   }
 
-  pub(super) fn new(config: AsyncConfig, max_handoffs: usize) -> Result<Self, AsyncError> {
+  pub(super) fn new(
+    config: AsyncConfig,
+    max_handoffs: usize,
+    park_spin: super::super::park_spin::Policy,
+  ) -> Result<Self, AsyncError> {
+    #[cfg(loom)]
+    let _ = park_spin;
     Ok(Self {
+      #[cfg(not(loom))]
+      spin_limit: park_spin.rounds,
+      #[cfg(not(loom))]
+      spinners: SpinnerSlots::new(park_spin.max_spinners.unwrap_or(config.workers)),
+      #[cfg(not(loom))]
+      // Every spinner holds one of the `workers` seats, so a cap of at least
+      // the worker count cannot bind and needs no counter.
+      limit_spinners: park_spin.rounds != 0
+        && park_spin.max_spinners.is_some_and(|max| max < config.workers),
+      #[cfg(all(test, not(loom)))]
+      max_concurrent_spinners: AtomicUsize::new(0),
+      #[cfg(all(test, not(loom)))]
+      spin_rounds: AtomicUsize::new(0),
       slots: table(config.max_outstanding, || SlotCell {
         word: PollWord::new(),
         state: Mutex::new(SlotState {
@@ -930,9 +961,20 @@ impl Distributed {
         found => return found,
       }
       #[cfg(not(loom))]
-      {
+      let spinner = if self.spin_limit != 0 && self.limit_spinners {
+        self.spinners.try_acquire()
+      } else {
+        None
+      };
+      #[cfg(not(loom))]
+      if self.spin_limit != 0 && (!self.limit_spinners || spinner.is_some()) {
+        #[cfg(test)]
+        self
+          .max_concurrent_spinners
+          .fetch_max(self.spinners.current(), Ordering::Relaxed);
         let mut work = false;
-        for _ in 0..super::super::lane::PARK_SPIN_ROUNDS {
+        debug_assert_eq!(lock_level(), 0, "spin under a dispatch lock");
+        for _ in 0..self.spin_limit {
           // Stop on the raw worker-yield hint without locking seats: while a
           // handoff keeps it set, no worker spins, intentionally.
           if self.closing.load(Ordering::Acquire)
@@ -942,6 +984,8 @@ impl Distributed {
             break;
           }
           std::hint::spin_loop();
+          #[cfg(all(test, not(loom)))]
+          self.spin_rounds.fetch_add(1, Ordering::Relaxed);
           #[cfg(all(test, not(loom)))]
           SPIN_HOOK.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
@@ -963,6 +1007,8 @@ impl Distributed {
           continue;
         }
       }
+      #[cfg(not(loom))]
+      drop(spinner);
       cache::flush();
       shared.thread_park_attempted(context);
       if !super::super::lane::search_or_park(

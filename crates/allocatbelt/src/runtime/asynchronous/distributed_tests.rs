@@ -8,6 +8,30 @@ use std::sync::mpsc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
+use super::super::super::park_spin::Policy;
+
+thread_local! {
+  static TEST_SPIN_POLICY: std::cell::Cell<Policy> = std::cell::Cell::new(Policy::default());
+}
+
+fn spin_options() -> AsyncRuntimeOptions {
+  AsyncRuntimeOptions {
+    park_spin: TEST_SPIN_POLICY.get(),
+    ..AsyncRuntimeOptions::new()
+  }
+}
+
+fn each_spin_configuration(mut test: impl FnMut()) {
+  for rounds in [0, 128, 4096] {
+    TEST_SPIN_POLICY.set(Policy {
+      rounds,
+      max_spinners: Some(1),
+    });
+    test();
+  }
+  TEST_SPIN_POLICY.set(Policy::default());
+}
+
 fn config(workers: usize, tasks: usize) -> AsyncConfig {
   AsyncConfig {
     workers,
@@ -16,7 +40,7 @@ fn config(workers: usize, tasks: usize) -> AsyncConfig {
   }
 }
 fn runtime(workers: usize, tasks: usize) -> AsyncRuntime {
-  AsyncRuntime::new_with_options(config(workers, tasks), AsyncRuntimeOptions::new()).unwrap()
+  AsyncRuntime::new_with_options(config(workers, tasks), spin_options()).unwrap()
 }
 fn shared(config: AsyncConfig) -> (Arc<Shared>, ScopeRef) {
   shared_with_handoffs(config, 0)
@@ -35,6 +59,7 @@ fn shared_with_handoffs(config: AsyncConfig, handoffs: usize) -> (Arc<Shared>, S
     None,
     super::super::super::ControlledThreadOptions::unbounded(AsyncThreadOptions::new()),
     metrics,
+    TEST_SPIN_POLICY.get(),
   )
   .unwrap()
 }
@@ -119,6 +144,10 @@ fn run(shared: &Arc<Shared>, work: Selected) {
 
 #[test]
 fn pushes_and_kicks_notify_a_sleeping_lane_once() {
+  each_spin_configuration(pushes_and_kicks_notify_a_sleeping_lane_once_case);
+}
+
+fn pushes_and_kicks_notify_a_sleeping_lane_once_case() {
   for kick_first in [false, true] {
     let (shared, root) = shared(config(1, 8));
     let d = engine(&shared);
@@ -155,6 +184,12 @@ fn pushes_and_kicks_notify_a_sleeping_lane_once() {
 
 #[test]
 fn dispatcher_rechecks_without_exit_hints_take_no_admission_or_seat_locks() {
+  each_spin_configuration(
+    dispatcher_rechecks_without_exit_hints_take_no_admission_or_seat_locks_case,
+  );
+}
+
+fn dispatcher_rechecks_without_exit_hints_take_no_admission_or_seat_locks_case() {
   let (shared, _) = shared(config(1, 1));
   let d = engine(&shared);
   let worker = start_worker(&shared, 0);
@@ -190,6 +225,10 @@ fn dispatcher_rechecks_without_exit_hints_take_no_admission_or_seat_locks() {
 
 #[test]
 fn closing_rechecks_finish_drain_and_cancel_pending_before_deadline() {
+  each_spin_configuration(closing_rechecks_finish_drain_and_cancel_pending_before_deadline_case);
+}
+
+fn closing_rechecks_finish_drain_and_cancel_pending_before_deadline_case() {
   for mode in [AsyncShutdown::Drain, AsyncShutdown::CancelPending] {
     for empty in [false, true] {
       let (shared, root) = shared(config(1, 1));
@@ -239,6 +278,12 @@ fn closing_rechecks_finish_drain_and_cancel_pending_before_deadline() {
 
 #[test]
 fn parked_worker_yields_to_helper_restoration_and_helper_retires_before_deadline() {
+  each_spin_configuration(
+    parked_worker_yields_to_helper_restoration_and_helper_retires_before_deadline_case,
+  );
+}
+
+fn parked_worker_yields_to_helper_restoration_and_helper_retires_before_deadline_case() {
   let (shared, _) = shared_with_handoffs(config(1, 1), 2);
   let d = engine(&shared);
   let (turn, helper_loan, lease) = {
@@ -295,6 +340,17 @@ fn parked_worker_yields_to_helper_restoration_and_helper_retires_before_deadline
 
 #[test]
 fn work_arriving_during_spin_runs_without_a_park() {
+  for rounds in [128, 4096] {
+    TEST_SPIN_POLICY.set(Policy {
+      rounds,
+      max_spinners: Some(1),
+    });
+    work_arriving_during_spin_runs_without_a_park_case();
+  }
+  TEST_SPIN_POLICY.set(Policy::default());
+}
+
+fn work_arriving_during_spin_runs_without_a_park_case() {
   let (mut shared, root) = shared(config(2, 1));
   let park_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
   let attempts = Arc::clone(&park_attempts);
@@ -338,6 +394,7 @@ fn work_arriving_during_spin_runs_without_a_park() {
     })
   };
   join_worker(thread);
+  assert_eq!(engine(&shared).spinners.current(), 0);
   assert!(completed.load(Ordering::SeqCst));
   assert_eq!(shared.metrics.snapshot().threads[0].parks, 0);
   assert_eq!(park_attempts.load(Ordering::SeqCst), 0);
@@ -347,6 +404,10 @@ fn work_arriving_during_spin_runs_without_a_park() {
 
 #[test]
 fn idle_dispatchers_park_after_spinning() {
+  each_spin_configuration(idle_dispatchers_park_after_spinning_case);
+}
+
+fn idle_dispatchers_park_after_spinning_case() {
   let runtime = runtime(2, 1);
   wait(|| {
     runtime
@@ -375,6 +436,10 @@ fn idle_dispatchers_park_after_spinning() {
 
 #[test]
 fn one_spawn_into_four_parked_lanes_wakes_only_its_dispatcher() {
+  each_spin_configuration(one_spawn_into_four_parked_lanes_wakes_only_its_dispatcher_case);
+}
+
+fn one_spawn_into_four_parked_lanes_wakes_only_its_dispatcher_case() {
   let (shared, root) = shared(config(4, 1));
   let d = engine(&shared);
   // Model all four parked dispatchers without racing their next search.
@@ -396,6 +461,10 @@ fn one_spawn_into_four_parked_lanes_wakes_only_its_dispatcher() {
 
 #[test]
 fn two_blocking_polls_start_before_deadline() {
+  each_spin_configuration(two_blocking_polls_start_before_deadline_case);
+}
+
+fn two_blocking_polls_start_before_deadline_case() {
   let (shared, root) = shared(config(2, 2));
   let d = engine(&shared);
   let started = Arc::new(AtomicUsize::new(0));
@@ -432,6 +501,10 @@ fn two_blocking_polls_start_before_deadline() {
 
 #[test]
 fn external_spawns_start_all_blocking_polls_before_deadline() {
+  each_spin_configuration(external_spawns_start_all_blocking_polls_before_deadline_case);
+}
+
+fn external_spawns_start_all_blocking_polls_before_deadline_case() {
   for workers in [2, 4] {
     let runtime = runtime(workers, workers);
     let d = engine(&runtime.shared);
@@ -475,6 +548,10 @@ fn external_spawns_start_all_blocking_polls_before_deadline() {
 
 #[test]
 fn external_idle_wake_behind_blocked_poll_runs_before_deadline() {
+  each_spin_configuration(external_idle_wake_behind_blocked_poll_runs_before_deadline_case);
+}
+
+fn external_idle_wake_behind_blocked_poll_runs_before_deadline_case() {
   const WORKERS: usize = 4;
   let runtime = runtime(WORKERS, 2);
   let d = engine(&runtime.shared);
@@ -524,6 +601,10 @@ fn external_idle_wake_behind_blocked_poll_runs_before_deadline() {
 
 #[test]
 fn lone_entry_behind_blocked_poll_runs_on_idle_worker() {
+  each_spin_configuration(lone_entry_behind_blocked_poll_runs_on_idle_worker_case);
+}
+
+fn lone_entry_behind_blocked_poll_runs_on_idle_worker_case() {
   let (shared, root) = shared(config(2, 2));
   let d = engine(&shared);
   let (started_tx, started_rx) = mpsc::channel();
@@ -558,6 +639,10 @@ fn lone_entry_behind_blocked_poll_runs_on_idle_worker() {
 
 #[test]
 fn stealing_last_entry_does_not_wake_or_lock_a_parked_dispatcher() {
+  each_spin_configuration(stealing_last_entry_does_not_wake_or_lock_a_parked_dispatcher_case);
+}
+
+fn stealing_last_entry_does_not_wake_or_lock_a_parked_dispatcher_case() {
   for count in [1, 2, 3] {
     let (shared, root) = shared(config(3, 3));
     let d = engine(&shared);
@@ -673,6 +758,10 @@ fn check_distributed(shared: &Shared) {
 
 #[test]
 fn pending_self_yields_take_zero_global_two_slot_and_two_lane_locks() {
+  each_spin_configuration(pending_self_yields_take_zero_global_two_slot_and_two_lane_locks_case);
+}
+
+fn pending_self_yields_take_zero_global_two_slot_and_two_lane_locks_case() {
   let runtime = runtime(1, 1);
   let shared = Arc::clone(&runtime.shared);
   let mut previous = None;
@@ -705,6 +794,10 @@ fn pending_self_yields_take_zero_global_two_slot_and_two_lane_locks() {
 
 #[test]
 fn spawn_wake_completion_and_steal_lock_counts() {
+  each_spin_configuration(spawn_wake_completion_and_steal_lock_counts_case);
+}
+
+fn spawn_wake_completion_and_steal_lock_counts_case() {
   let (shared, root) = shared(config(2, 8));
   let d = engine(&shared);
   let before = (
@@ -796,6 +889,10 @@ fn spawn_wake_completion_and_steal_lock_counts() {
 
 #[test]
 fn blocked_fifo_transfers_without_reblocking_and_abort_bypasses_quota() {
+  each_spin_configuration(blocked_fifo_transfers_without_reblocking_and_abort_bypasses_quota_case);
+}
+
+fn blocked_fifo_transfers_without_reblocking_and_abort_bypasses_quota_case() {
   let (shared, _) = shared(config(2, 8));
   let scope = shared.new_scope(1, None).unwrap();
   let jobs: Vec<_> = (0..6).map(|_| scope.spawn(async {}).unwrap()).collect();
@@ -848,6 +945,10 @@ fn blocked_fifo_transfers_without_reblocking_and_abort_bypasses_quota() {
 
 #[test]
 fn abort_racing_a_reserved_transfer_returns_every_permit() {
+  each_spin_configuration(abort_racing_a_reserved_transfer_returns_every_permit_case);
+}
+
+fn abort_racing_a_reserved_transfer_returns_every_permit_case() {
   for _ in 0..200 {
     let (shared, _) = shared(config(2, 2));
     let scope = shared.new_scope(1, None).unwrap();
@@ -879,6 +980,10 @@ fn abort_racing_a_reserved_transfer_returns_every_permit() {
 
 #[test]
 fn nonbinding_boundary_uses_no_quota_lock() {
+  each_spin_configuration(nonbinding_boundary_uses_no_quota_lock_case);
+}
+
+fn nonbinding_boundary_uses_no_quota_lock_case() {
   for limit in [3, 4, 5] {
     let (shared, _) = shared(config(4, 1));
     let scope = shared.new_scope(limit, None).unwrap();
@@ -898,6 +1003,10 @@ fn nonbinding_boundary_uses_no_quota_lock() {
 
 #[test]
 fn stolen_tasks_obey_exact_scope_limits_under_contention() {
+  each_spin_configuration(stolen_tasks_obey_exact_scope_limits_under_contention_case);
+}
+
+fn stolen_tasks_obey_exact_scope_limits_under_contention_case() {
   let runtime = runtime(8, 32);
   for limit in [1, 3] {
     let scope = runtime
@@ -944,6 +1053,10 @@ fn stolen_tasks_obey_exact_scope_limits_under_contention() {
 
 #[test]
 fn idle_workers_drain_ready_entries_behind_a_long_poll() {
+  each_spin_configuration(idle_workers_drain_ready_entries_behind_a_long_poll_case);
+}
+
+fn idle_workers_drain_ready_entries_behind_a_long_poll_case() {
   let (shared, root) = shared(config(4, 17));
   let (entered, arrival) = mpsc::channel();
   let (release, resume) = mpsc::channel();
@@ -1027,6 +1140,10 @@ fn idle_workers_drain_ready_entries_behind_a_long_poll() {
 
 #[test]
 fn self_yields_complete_even_when_under_subscribed() {
+  each_spin_configuration(self_yields_complete_even_when_under_subscribed_case);
+}
+
+fn self_yields_complete_even_when_under_subscribed_case() {
   let runtime = runtime(4, 4);
   let jobs: Vec<_> = (0..4)
     .map(|_| {
@@ -1103,6 +1220,10 @@ fn self_yields_complete_even_when_under_subscribed() {
 
 #[test]
 fn external_wakes_against_parked_lanes_are_not_lost() {
+  each_spin_configuration(external_wakes_against_parked_lanes_are_not_lost_case);
+}
+
+fn external_wakes_against_parked_lanes_are_not_lost_case() {
   let runtime = runtime(4, 1);
   let (tx, rx) = mpsc::channel();
   let mut polls = 0;
@@ -1127,6 +1248,10 @@ fn external_wakes_against_parked_lanes_are_not_lost() {
 
 #[test]
 fn shutdown_and_scope_close_reclaim_pending_and_quota_blocked_tasks() {
+  each_spin_configuration(shutdown_and_scope_close_reclaim_pending_and_quota_blocked_tasks_case);
+}
+
+fn shutdown_and_scope_close_reclaim_pending_and_quota_blocked_tasks_case() {
   for mode in [AsyncShutdown::Drain, AsyncShutdown::CancelPending] {
     let runtime = runtime(4, 16);
     let scope = runtime
@@ -1169,6 +1294,10 @@ fn shutdown_and_scope_close_reclaim_pending_and_quota_blocked_tasks() {
 
 #[test]
 fn search_takes_stealable_work_before_one_overflow_entry() {
+  each_spin_configuration(search_takes_stealable_work_before_one_overflow_entry_case);
+}
+
+fn search_takes_stealable_work_before_one_overflow_entry_case() {
   let (shared, root) = shared(config(2, 4));
   let d = engine(&shared);
   d.parked.advertise(0);
@@ -1212,6 +1341,10 @@ fn search_takes_stealable_work_before_one_overflow_entry() {
 
 #[test]
 fn distributed_control_charges_match_requested_and_actual_tables() {
+  each_spin_configuration(distributed_control_charges_match_requested_and_actual_tables_case);
+}
+
+fn distributed_control_charges_match_requested_and_actual_tables_case() {
   let cfg = config(65, 129);
   let (shared, _) = shared(cfg);
   let d = engine(&shared);
@@ -1230,6 +1363,10 @@ fn distributed_control_charges_match_requested_and_actual_tables() {
 
 #[test]
 fn cleanup_is_quota_free_and_slot_reuse_ignores_stale_wakes() {
+  each_spin_configuration(cleanup_is_quota_free_and_slot_reuse_ignores_stale_wakes_case);
+}
+
+fn cleanup_is_quota_free_and_slot_reuse_ignores_stale_wakes_case() {
   struct Probe {
     cell: Arc<ScopeCell>,
     dropped: Arc<AtomicUsize>,
@@ -1304,6 +1441,10 @@ fn cleanup_is_quota_free_and_slot_reuse_ignores_stale_wakes() {
 
 #[test]
 fn unwind_outside_a_poll_moves_orphaned_entries_to_overflow() {
+  each_spin_configuration(unwind_outside_a_poll_moves_orphaned_entries_to_overflow_case);
+}
+
+fn unwind_outside_a_poll_moves_orphaned_entries_to_overflow_case() {
   for handoffs in [0, 2] {
     let (shared, root) = shared_with_handoffs(config(2, 4), handoffs);
     let d = engine(&shared);
@@ -1343,6 +1484,10 @@ fn unwind_outside_a_poll_moves_orphaned_entries_to_overflow() {
 
 #[test]
 fn round_robin_alternative_runs_the_same_wake_and_finish_paths() {
+  each_spin_configuration(round_robin_alternative_runs_the_same_wake_and_finish_paths_case);
+}
+
+fn round_robin_alternative_runs_the_same_wake_and_finish_paths_case() {
   let runtime = runtime(4, 8);
   engine(&runtime.shared)
     .round_robin
@@ -1372,6 +1517,10 @@ fn round_robin_alternative_runs_the_same_wake_and_finish_paths() {
 
 #[test]
 fn repeated_bursts_and_long_polls_leave_no_stealable_work_asleep() {
+  each_spin_configuration(repeated_bursts_and_long_polls_leave_no_stealable_work_asleep_case);
+}
+
+fn repeated_bursts_and_long_polls_leave_no_stealable_work_asleep_case() {
   let runtime = runtime(4, 32);
   let mut random = 17u64;
   for _ in 0..8 {
@@ -1417,6 +1566,10 @@ fn repeated_bursts_and_long_polls_leave_no_stealable_work_asleep() {
 
 #[test]
 fn abort_of_stolen_blocked_task_cleans_up_during_another_poll() {
+  each_spin_configuration(abort_of_stolen_blocked_task_cleans_up_during_another_poll_case);
+}
+
+fn abort_of_stolen_blocked_task_cleans_up_during_another_poll_case() {
   let (mut shared, _) = shared(config(2, 3));
   let (parked, park_attempt) = mpsc::channel();
   let (unpark, continue_park) = mpsc::channel();
@@ -1510,6 +1663,10 @@ fn abort_of_stolen_blocked_task_cleans_up_during_another_poll() {
 
 #[test]
 fn cancellation_cleanup_releases_a_sibling_blocked_inside_poll() {
+  each_spin_configuration(cancellation_cleanup_releases_a_sibling_blocked_inside_poll_case);
+}
+
+fn cancellation_cleanup_releases_a_sibling_blocked_inside_poll_case() {
   let (shared, root) = shared(config(2, 2));
   let (dropped, cleanup) = mpsc::channel();
   let (entered, arrival) = mpsc::channel();
@@ -1557,6 +1714,10 @@ fn cancellation_cleanup_releases_a_sibling_blocked_inside_poll() {
 
 #[test]
 fn park_rescan_finds_work_published_before_park_advertisement() {
+  each_spin_configuration(park_rescan_finds_work_published_before_park_advertisement_case);
+}
+
+fn park_rescan_finds_work_published_before_park_advertisement_case() {
   let (mut shared, root) = shared(config(2, 2));
   let (attempt, attempted) = mpsc::channel();
   let (resume, resumed) = mpsc::channel();
@@ -1631,6 +1792,10 @@ impl Drop for ReleaseHandoffs {
 
 #[test]
 fn handoff_restores_onto_another_lane_while_other_workers_keep_polling() {
+  each_spin_configuration(handoff_restores_onto_another_lane_while_other_workers_keep_polling_case);
+}
+
+fn handoff_restores_onto_another_lane_while_other_workers_keep_polling_case() {
   use super::super::super::{HandoffConfig, try_block_in_place};
   // Keep worker one at its first park boundary until the helper has adopted
   // seat zero. A single entry no longer forces its assigned owner to run it.
@@ -1650,7 +1815,7 @@ fn handoff_restores_onto_another_lane_while_other_workers_keep_polling() {
   });
   let runtime = AsyncRuntime::new_with_options(
     config(2, 8),
-    AsyncRuntimeOptions::new()
+    spin_options()
       .handoffs(HandoffConfig { max_handoffs: 2 })
       .thread_options(options),
   )
@@ -1768,10 +1933,14 @@ fn handoff_restores_onto_another_lane_while_other_workers_keep_polling() {
 
 #[test]
 fn handoff_root_limit_stays_binding_and_uses_two_scope_locks() {
+  each_spin_configuration(handoff_root_limit_stays_binding_and_uses_two_scope_locks_case);
+}
+
+fn handoff_root_limit_stays_binding_and_uses_two_scope_locks_case() {
   use super::super::super::HandoffConfig;
   let runtime = AsyncRuntime::new_with_options(
     config(2, 4),
-    AsyncRuntimeOptions::new().handoffs(HandoffConfig { max_handoffs: 2 }),
+    spin_options().handoffs(HandoffConfig { max_handoffs: 2 }),
   )
   .unwrap();
   let d = engine(&runtime.shared);
@@ -1801,6 +1970,10 @@ fn handoff_root_limit_stays_binding_and_uses_two_scope_locks() {
 
 #[test]
 fn uncontended_handoff_and_restore_take_only_seat_and_kick_locks() {
+  each_spin_configuration(uncontended_handoff_and_restore_take_only_seat_and_kick_locks_case);
+}
+
+fn uncontended_handoff_and_restore_take_only_seat_and_kick_locks_case() {
   let (shared, _) = shared_with_handoffs(config(2, 4), 2);
   let d = engine(&shared);
   let first = d.seats().claim(0);
@@ -1841,6 +2014,10 @@ fn uncontended_handoff_and_restore_take_only_seat_and_kick_locks() {
 
 #[test]
 fn restoration_can_adopt_an_abandoned_seat_after_its_lane_has_drained() {
+  each_spin_configuration(restoration_can_adopt_an_abandoned_seat_after_its_lane_has_drained_case);
+}
+
+fn restoration_can_adopt_an_abandoned_seat_after_its_lane_has_drained_case() {
   let (shared, root) = shared_with_handoffs(config(2, 2), 1);
   let d = engine(&shared);
   let failed = d.seats().claim(0);
@@ -1934,6 +2111,10 @@ fn helper_restored_a_yielded_worker_seat(
 
 #[test]
 fn handoff_helper_parks_instead_of_reacquiring_a_resuming_workers_seat() {
+  each_spin_configuration(handoff_helper_parks_instead_of_reacquiring_a_resuming_workers_seat_case);
+}
+
+fn handoff_helper_parks_instead_of_reacquiring_a_resuming_workers_seat_case() {
   let (shared, root) = shared_with_handoffs(config(2, 4), 2);
   let d = engine(&shared);
   let (other, helper, lease) = helper_restored_a_yielded_worker_seat(d);
@@ -1985,6 +2166,12 @@ fn handoff_helper_parks_instead_of_reacquiring_a_resuming_workers_seat() {
 
 #[test]
 fn handoff_serving_helper_yields_to_a_resuming_worker_without_other_yield_reasons() {
+  each_spin_configuration(
+    handoff_serving_helper_yields_to_a_resuming_worker_without_other_yield_reasons_case,
+  );
+}
+
+fn handoff_serving_helper_yields_to_a_resuming_worker_without_other_yield_reasons_case() {
   let (shared, root) = shared_with_handoffs(config(2, 4), 2);
   let d = engine(&shared);
   let (other, helper_turn, lease) = helper_restored_a_yielded_worker_seat(d);
@@ -2035,6 +2222,10 @@ fn handoff_serving_helper_yields_to_a_resuming_worker_without_other_yield_reason
 
 #[test]
 fn handoff_helper_yield_hint_does_not_lock_worker_seats_per_poll() {
+  each_spin_configuration(handoff_helper_yield_hint_does_not_lock_worker_seats_per_poll_case);
+}
+
+fn handoff_helper_yield_hint_does_not_lock_worker_seats_per_poll_case() {
   let (shared, root) = shared_with_handoffs(config(2, 4), 2);
   let d = engine(&shared);
   let (worker, helper, ticket, lease) = {
@@ -2103,6 +2294,10 @@ fn handoff_helper_yield_hint_does_not_lock_worker_seats_per_poll() {
 
 #[test]
 fn exhausted_task_generation_is_skipped_without_hiding_other_slots() {
+  each_spin_configuration(exhausted_task_generation_is_skipped_without_hiding_other_slots_case);
+}
+
+fn exhausted_task_generation_is_skipped_without_hiding_other_slots_case() {
   let (shared, root) = shared(config(1, 2));
   let d = engine(&shared);
   shared
@@ -2126,6 +2321,10 @@ fn exhausted_task_generation_is_skipped_without_hiding_other_slots() {
 
 #[test]
 fn all_exhausted_task_generations_return_full_without_admission() {
+  each_spin_configuration(all_exhausted_task_generations_return_full_without_admission_case);
+}
+
+fn all_exhausted_task_generations_return_full_without_admission_case() {
   let (shared, root) = shared(config(1, 2));
   let d = engine(&shared);
   shared.lock().free_tasks.clear();
@@ -2145,6 +2344,10 @@ fn all_exhausted_task_generations_return_full_without_admission() {
 
 #[test]
 fn free_task_heap_reuses_the_lowest_completed_slot() {
+  each_spin_configuration(free_task_heap_reuses_the_lowest_completed_slot_case);
+}
+
+fn free_task_heap_reuses_the_lowest_completed_slot_case() {
   let (shared, root) = shared(config(1, 4));
   let d = engine(&shared);
   let jobs: Vec<_> = (0..4)
@@ -2176,6 +2379,12 @@ fn free_task_heap_reuses_the_lowest_completed_slot() {
 
 #[test]
 fn running_wakes_coalesce_and_stale_generations_do_not_wake_reused_slots() {
+  each_spin_configuration(
+    running_wakes_coalesce_and_stale_generations_do_not_wake_reused_slots_case,
+  );
+}
+
+fn running_wakes_coalesce_and_stale_generations_do_not_wake_reused_slots_case() {
   let (shared, root) = shared(config(1, 1));
   let d = engine(&shared);
   let old_job = shared.spawn(root, std::future::pending::<()>()).unwrap();
@@ -2226,6 +2435,10 @@ fn running_wakes_coalesce_and_stale_generations_do_not_wake_reused_slots() {
 
 #[test]
 fn abort_during_pending_poll_releases_quota_before_cleanup() {
+  each_spin_configuration(abort_during_pending_poll_releases_quota_before_cleanup_case);
+}
+
+fn abort_during_pending_poll_releases_quota_before_cleanup_case() {
   let runtime = runtime(1, 1);
   let scope = runtime
     .scope_with_config(AsyncScopeConfig {
@@ -2284,4 +2497,210 @@ fn abort_during_pending_poll_releases_quota_before_cleanup() {
       .is_ready()
   });
   shutdown(runtime, AsyncShutdown::Drain);
+}
+
+#[test]
+fn fixed_rounds_are_unchanged_by_repeated_idle_parks() {
+  for rounds in [0, 128, 4096] {
+    TEST_SPIN_POLICY.set(Policy {
+      rounds,
+      max_spinners: Some(1),
+    });
+    let (shared, root) = shared(config(1, 1));
+    let d = engine(&shared);
+    let job = shared.spawn(root, async {}).unwrap();
+    let worker = start_worker(&shared, 0);
+    finish(job).unwrap();
+    wait(|| lane_sleeping(&shared, 0));
+    assert_eq!(d.spin_rounds.load(Ordering::Relaxed), rounds as usize);
+    assert_eq!(d.spinners.current(), 0);
+    for _ in 0..12 {
+      let before = d.spin_rounds.load(Ordering::Relaxed);
+      let parks = shared.metrics.snapshot().threads[0].parks;
+      d.kick(0);
+      wait(|| shared.metrics.snapshot().threads[0].parks > parks && lane_sleeping(&shared, 0));
+      assert_eq!(
+        d.spin_rounds.load(Ordering::Relaxed) - before,
+        rounds as usize
+      );
+      assert_eq!(d.spinners.current(), 0);
+    }
+    shared.close(false);
+    join_worker(worker);
+    assert_eq!(d.spinners.current(), 0);
+  }
+  TEST_SPIN_POLICY.set(Policy::default());
+}
+
+#[test]
+fn public_fixed_spin_and_spinner_cap_options() {
+  use super::super::super::ParkSpin;
+  for rounds in [0, 128, 4096] {
+    for cap in [None, Some(0), Some(1), Some(usize::MAX)] {
+      let mut options = AsyncRuntimeOptions::new();
+      if let Some(cap) = cap {
+        options = options.max_spinning_dispatchers(cap);
+      }
+      // Setting rounds must preserve the previously selected cap.
+      options = options.park_spin(ParkSpin::fixed(rounds));
+      let runtime = AsyncRuntime::new_with_options(config(1, 1), options).unwrap();
+      let shared = Arc::clone(&runtime.shared);
+      wait(|| lane_sleeping(&shared, 0));
+      assert_eq!(
+        engine(&shared).spin_rounds.load(Ordering::Relaxed),
+        if cap == Some(0) { 0 } else { rounds as usize }
+      );
+      assert_eq!(engine(&shared).spinners.current(), 0);
+      shutdown(runtime, AsyncShutdown::Drain);
+      assert_eq!(engine(&shared).spinners.current(), 0);
+    }
+  }
+}
+
+#[test]
+fn spinner_limit_binds_only_below_the_worker_seat_count() {
+  for (rounds, cap, handoffs, limited) in [
+    (128, None, 0, false),
+    (128, None, 1, false),
+    (128, Some(5), 1, false),
+    (128, Some(4), 1, false),
+    (128, Some(3), 1, true),
+    (128, Some(3), 0, true),
+    (0, Some(0), 1, false),
+  ] {
+    let d = Distributed::new(
+      config(4, 4),
+      handoffs,
+      Policy {
+        rounds,
+        max_spinners: cap,
+      },
+    )
+    .unwrap();
+    assert_eq!(d.limit_spinners, limited);
+  }
+}
+
+#[test]
+fn default_spin_does_not_acquire_spinner_slots() {
+  let runtime = AsyncRuntime::new_with_options(config(4, 4), AsyncRuntimeOptions::new()).unwrap();
+  let shared = Arc::clone(&runtime.shared);
+  wait(|| (0..4).all(|seat| lane_sleeping(&shared, seat)));
+  let d = engine(&shared);
+  assert!(d.spin_rounds.load(Ordering::Relaxed) > 0);
+  assert_eq!(d.spinners.acquisitions(), 0);
+  shutdown(runtime, AsyncShutdown::Drain);
+  assert_eq!(d.spinners.acquisitions(), 0);
+}
+
+#[test]
+fn burst_respects_spinner_cap_and_denied_dispatchers_park_immediately() {
+  for cap in [1, 2] {
+    TEST_SPIN_POLICY.set(Policy {
+      rounds: 4096,
+      max_spinners: Some(cap),
+    });
+    let (shared, root) = shared(config(4, 64));
+    let d = engine(&shared);
+    let (entered, entering) = mpsc::channel();
+    let mut releases = Vec::new();
+    let mut workers = Vec::new();
+    // Hold exactly K actual dispatchers inside their first spin round.
+    // The remaining dispatchers encounter a full cap during the same burst.
+    for index in 0..cap {
+      let (release, resume) = mpsc::channel();
+      releases.push(release);
+      let entered = entered.clone();
+      let shared = Arc::clone(&shared);
+      workers.push(std::thread::spawn(move || {
+        SPIN_HOOK.with(|hook| {
+          *hook.borrow_mut() = Some(Box::new(move || {
+            entered.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(30)).unwrap();
+          }));
+        });
+        worker(
+          shared,
+          AsyncThreadContext {
+            role: AsyncThreadRole::Worker,
+            index,
+            physical_index: index,
+          },
+          super::super::super::entry::PreparedContextNodes::new(None, 1)
+            .unwrap()
+            .pop()
+            .unwrap(),
+        );
+      }));
+    }
+    for _ in 0..cap {
+      entering.recv_timeout(Duration::from_secs(30)).unwrap();
+    }
+    assert_eq!(d.spinners.current(), cap);
+    let before = d.spin_rounds.load(Ordering::Relaxed);
+    for index in cap..4 {
+      workers.push(start_worker(&shared, index));
+    }
+    wait(|| (cap..4).all(|seat| lane_sleeping(&shared, seat)));
+    // No spin round ran on any dispatcher denied a slot.
+    assert_eq!(d.spin_rounds.load(Ordering::Relaxed), before);
+    assert_eq!(d.max_concurrent_spinners.load(Ordering::Relaxed), cap);
+    for release in releases {
+      release.send(()).unwrap();
+    }
+    wait(|| (0..4).all(|seat| lane_sleeping(&shared, seat)));
+    assert_eq!(d.spinners.current(), 0);
+    let jobs: Vec<_> = (0..64)
+      .map(|_| {
+        shared
+          .spawn(root, async {
+            for _ in 0..8 {
+              super::super::super::yield_now().await;
+            }
+          })
+          .unwrap()
+      })
+      .collect();
+    for job in jobs {
+      finish(job).unwrap();
+    }
+    wait(|| (0..4).all(|seat| lane_sleeping(&shared, seat)));
+    assert_eq!(d.spinners.current(), 0);
+    shared.close(false);
+    for worker in workers {
+      join_worker(worker);
+    }
+    assert_eq!(d.spinners.current(), 0);
+    assert!(d.max_concurrent_spinners.load(Ordering::Relaxed) <= cap);
+  }
+  TEST_SPIN_POLICY.set(Policy::default());
+}
+
+#[test]
+fn dispatcher_unwind_inside_spin_releases_its_slot() {
+  TEST_SPIN_POLICY.set(Policy {
+    rounds: 128,
+    max_spinners: Some(1),
+  });
+  let (shared, _) = shared(config(2, 1));
+  SPIN_HOOK.with(|hook| {
+    *hook.borrow_mut() = Some(Box::new(|| panic!("injected spin unwind")));
+  });
+  let d = engine(&shared);
+  let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    d.run_seat(
+      &shared,
+      AsyncThreadContext {
+        role: AsyncThreadRole::Worker,
+        index: 0,
+        physical_index: 0,
+      },
+    );
+  }));
+  assert!(result.is_err());
+  assert_eq!(d.spinners.current(), 0);
+  assert_eq!(shared.turn_counts(), (0, 0, 0, 0));
+  assert_eq!(d.spinners.acquisitions(), 1);
+  shared.close(false);
+  TEST_SPIN_POLICY.set(Policy::default());
 }

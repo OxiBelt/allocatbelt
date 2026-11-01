@@ -43,6 +43,7 @@ mod join;
 mod lane;
 mod local;
 mod metrics;
+mod park_spin;
 mod protocol;
 mod scheduler;
 mod task;
@@ -83,6 +84,7 @@ pub use local::{
 };
 use metrics::MetricsBuildError;
 pub use metrics::{AsyncThreadMetrics, RuntimeMetrics, RuntimeMetricsSnapshot};
+pub use park_spin::ParkSpin;
 pub use scheduler::{OwnedTaskScope, ScopeClose};
 pub use task_set::{JoinNext, SetTaskId, TaskSet, TaskSetError};
 pub use thread_options::{AsyncThreadContext, AsyncThreadOptions, AsyncThreadRole};
@@ -144,6 +146,7 @@ pub struct AsyncConfig {
 #[derive(Clone, Debug, Default)]
 pub struct AsyncRuntimeOptions {
   handoffs: Option<HandoffConfig>,
+  park_spin: park_spin::Policy,
   thread_options: AsyncThreadOptions,
 }
 
@@ -152,6 +155,26 @@ impl AsyncRuntimeOptions {
   #[must_use]
   pub fn new() -> Self {
     Self::default()
+  }
+
+  /// Sets the fixed lock-free spin rounds before parking. Defaults to 128.
+  #[must_use]
+  pub const fn park_spin(mut self, policy: ParkSpin) -> Self {
+    let ParkSpin::Fixed { rounds } = policy;
+    self.park_spin.rounds = rounds;
+    self
+  }
+
+  /// Caps dispatchers simultaneously in the pre-park spin. Defaults to the
+  /// worker count. Zero skips spinning; a dispatcher denied a slot proceeds
+  /// directly to the existing park handshake. Slots are released before
+  /// parking, dispatching work, or yielding, including during unwinding.
+  /// Values at or above the worker count do not limit spinning. The cap is
+  /// fixed at construction and is ignored under Loom.
+  #[must_use]
+  pub const fn max_spinning_dispatchers(mut self, max: usize) -> Self {
+    self.park_spin.max_spinners = Some(max);
+    self
   }
 
   /// Prestarts bounded helper threads for [`try_block_in_place`].
@@ -461,7 +484,13 @@ impl AsyncRuntime {
       Some(handoffs) => handoffs.max_handoffs,
       None => 0,
     };
-    Self::start(config, max_handoffs, resources, options.thread_options)
+    Self::start(
+      config,
+      max_handoffs,
+      resources,
+      options.thread_options,
+      options.park_spin,
+    )
   }
 
   fn start(
@@ -469,6 +498,7 @@ impl AsyncRuntime {
     max_handoffs: usize,
     resources: Option<ResourceScope>,
     options: AsyncThreadOptions,
+    park_spin: park_spin::Policy,
   ) -> Result<Self, AsyncError> {
     if config.workers == 0 || config.max_outstanding == 0 || config.max_scopes == 0 {
       return Err(AsyncError::InvalidConfig);
@@ -559,7 +589,7 @@ impl AsyncRuntime {
     } else {
       None
     };
-    let (shared, root) = Shared::new(config, max_handoffs, resources, options, metrics)?;
+    let (shared, root) = Shared::new(config, max_handoffs, resources, options, metrics, park_spin)?;
     let mut workers: Vec<DeferredJoin> = Vec::new();
     workers
       .try_reserve_exact(threads)

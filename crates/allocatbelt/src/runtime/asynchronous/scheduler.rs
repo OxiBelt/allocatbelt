@@ -176,6 +176,7 @@ impl Shared {
     resources: Option<ResourceScope>,
     thread_options: super::ControlledThreadOptions,
     metrics: RuntimeMetrics,
+    park_spin: super::park_spin::Policy,
   ) -> Result<(Arc<Self>, ScopeRef), AsyncError> {
     let tenant = resources.as_ref().and_then(ResourceScope::tenant_domain);
     let mut requested_control = std::mem::size_of::<Shared>();
@@ -241,7 +242,7 @@ impl Shared {
       index: 0,
       generation: 1,
     };
-    let distributed = Distributed::new(config, max_handoffs)?;
+    let distributed = Distributed::new(config, max_handoffs, park_spin)?;
     let mut actual_control = std::mem::size_of::<Shared>();
     for bytes in [
       payload_bytes::<Reverse<usize>>(free_tasks.capacity()).map_err(AsyncError::ResourceDomain)?,
@@ -1370,6 +1371,7 @@ mod tests {
         None,
       )
       .unwrap_or_else(|error| panic!("metrics allocation failed: {error:?}")),
+      super::super::park_spin::Policy::default(),
     )
     .unwrap_or_else(|error| panic!("shared construction failed: {error}"));
     let scope = shared
@@ -1440,6 +1442,7 @@ mod tests {
         super::super::thread_options::AsyncThreadOptions::default(),
       ),
       metrics,
+      super::super::park_spin::Policy::default(),
     )
     .unwrap();
     let scope = shared.new_scope(1, None).unwrap();

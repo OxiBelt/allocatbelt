@@ -28,7 +28,7 @@ use allocatbelt::runtime::{
   Config, Resources, Runtime, ShutdownMode,
   asynchronous::{
     AsyncConfig, AsyncHandle, AsyncRuntime, AsyncRuntimeOptions, AsyncShutdown,
-    BlockInPlaceErrorKind, HandoffConfig, try_block_in_place,
+    BlockInPlaceErrorKind, HandoffConfig, ParkSpin, try_block_in_place,
   },
 };
 
@@ -69,6 +69,36 @@ enum ExecutorKind {
   Tokio,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpinPolicy {
+  Fixed(u32),
+}
+
+impl Default for SpinPolicy {
+  fn default() -> Self {
+    Self::Fixed(128)
+  }
+}
+
+impl SpinPolicy {
+  fn parse(value: &str) -> Result<Self, String> {
+    let parts: Vec<_> = value.split(':').collect();
+    let rounds = |value: &str| {
+      u32::try_from(parse_u64("--park-spin", value)?)
+        .map_err(|_| "--park-spin rounds exceed u32".to_owned())
+    };
+    match parts.as_slice() {
+      ["fixed", n] => Ok(Self::Fixed(rounds(n)?)),
+      _ => Err("--park-spin needs fixed:N".to_owned()),
+    }
+  }
+
+  fn apply(self, options: AsyncRuntimeOptions) -> AsyncRuntimeOptions {
+    let Self::Fixed(rounds) = self;
+    options.park_spin(ParkSpin::fixed(rounds))
+  }
+}
+
 #[derive(Clone, Debug)]
 struct Options {
   lane: Lane,
@@ -82,6 +112,8 @@ struct Options {
   window: usize,
   block_us: u64,
   handoffs: usize,
+  park_spin: SpinPolicy,
+  max_spinners: Option<usize>,
 }
 
 impl Options {
@@ -98,6 +130,8 @@ impl Options {
     let mut window = None;
     let mut block_us = 2_000;
     let mut handoffs = 0;
+    let mut park_spin = None;
+    let mut max_spinners = None;
     let mut handoffs_explicit = false;
     let mut block_explicit = false;
     let mut workers_explicit = false;
@@ -165,6 +199,8 @@ impl Options {
         }
         "--bytes" => bytes = parse_usize(&arg, &value()?)?,
         "--window" => window = Some(parse_usize(&arg, &value()?)?),
+        "--max-spinners" => max_spinners = Some(parse_usize("--max-spinners", &value()?)?),
+        "--park-spin" => park_spin = Some(SpinPolicy::parse(&value()?)?),
         "--handoffs" => {
           handoffs_explicit = true;
           handoffs = parse_usize(&arg, &value()?)?;
@@ -293,7 +329,16 @@ impl Options {
         "--window times --bytes times 8 must fit within 512 MiB for mixed async work".to_owned(),
       );
     }
+    if (park_spin.is_some() || max_spinners.is_some())
+      && !(lane == Lane::Async && executor == Some(ExecutorKind::Bounded))
+    {
+      return Err(
+        "--park-spin and --max-spinners apply only to --lane async --executor bounded".to_owned(),
+      );
+    }
     Ok(Self {
+      park_spin: park_spin.unwrap_or_default(),
+      max_spinners,
       lane,
       workload,
       mode,
@@ -312,7 +357,7 @@ impl Options {
 fn usage() -> &'static str {
   "usage: bench-latency-* --lane allocator|blocking|async [--workload local|aligned|mixed|ready|yielding|head-of-line|handoff] \\
    [--mode latency|throughput|capacity] [--executor bounded|tokio] [--ops N|--jobs N] \\
-   [--workers N] [--arrival-rate JOBS_PER_SECOND] [--window N] [--bytes N] [--block-us N] [--handoffs N]\n\n   The bounded async executor uses distributed dispatch."
+   [--workers N] [--arrival-rate JOBS_PER_SECOND] [--window N] [--bytes N] [--block-us N] [--handoffs N] [--park-spin fixed:N] [--max-spinners K]\n\n   The bounded async executor uses distributed dispatch."
 }
 
 fn parse_u64(flag: &str, value: &str) -> Result<u64, String> {
@@ -853,6 +898,8 @@ impl AsyncExecutors {
     workers: usize,
     window: usize,
     handoffs: usize,
+    park_spin: SpinPolicy,
+    max_spinners: Option<usize>,
   ) -> Result<Self, String> {
     match kind {
       ExecutorKind::Bounded => {
@@ -863,7 +910,10 @@ impl AsyncExecutors {
             max_scopes: 1,
           },
           {
-            let options = AsyncRuntimeOptions::new();
+            let mut options = park_spin.apply(AsyncRuntimeOptions::new());
+            if let Some(cap) = max_spinners {
+              options = options.max_spinning_dispatchers(cap);
+            }
             if handoffs == 0 {
               options
             } else {
@@ -1417,7 +1467,14 @@ fn run_async(allocator: &str, o: &Options, overhead: u64) -> Result<(), String> 
   }
   let kind = o.executor.ok_or("async lane requires an executor")?;
   let trace_span = Duration::from_nanos(intended_offset_ns(o.count, o.arrival_rate));
-  let executors = AsyncExecutors::new(kind, o.workers, o.window, o.handoffs)?;
+  let executors = AsyncExecutors::new(
+    kind,
+    o.workers,
+    o.window,
+    o.handoffs,
+    o.park_spin,
+    o.max_spinners,
+  )?;
   warm_async_workers(&executors, kind, o.workers.min(o.window))?;
   let mut samples = if o.mode == Mode::Latency {
     Vec::with_capacity(o.count)
@@ -2022,7 +2079,14 @@ fn run_blocking_capacity(allocator: &str, o: &Options) -> Result<(), String> {
 
 fn run_async_capacity(allocator: &str, o: &Options) -> Result<(), String> {
   let kind = o.executor.ok_or("async lane requires an executor")?;
-  let executors = AsyncExecutors::new(kind, o.workers, o.window, o.handoffs)?;
+  let executors = AsyncExecutors::new(
+    kind,
+    o.workers,
+    o.window,
+    o.handoffs,
+    o.park_spin,
+    o.max_spinners,
+  )?;
   warm_async_workers(&executors, kind, o.workers.min(o.window))?;
   let (workload, bytes, block_us) = (o.workload, o.bytes, o.block_us);
   let (outcome, mut executors) = run_capacity(
@@ -2203,7 +2267,7 @@ mod tests {
         .is_err()
       );
     }
-    AsyncExecutors::new(ExecutorKind::Bounded, 1, 1, 0)
+    AsyncExecutors::new(ExecutorKind::Bounded, 1, 1, 0, SpinPolicy::default(), None)
       .unwrap()
       .shutdown()
       .unwrap();
@@ -2274,7 +2338,8 @@ mod tests {
 
   #[test]
   fn async_worker_warmup_releases_submitted_tasks_after_partial_failure() {
-    let executors = AsyncExecutors::new(ExecutorKind::Bounded, 2, 1, 0).unwrap();
+    let executors =
+      AsyncExecutors::new(ExecutorKind::Bounded, 2, 1, 0, SpinPolicy::default(), None).unwrap();
     assert!(warm_async_workers(&executors, ExecutorKind::Bounded, 2).is_err());
     let mut executors = executors;
     executors.shutdown().unwrap();
@@ -2305,7 +2370,7 @@ mod tests {
     assert_eq!(empty_completed, 0);
 
     for kind in [ExecutorKind::Bounded, ExecutorKind::Tokio] {
-      let executors = AsyncExecutors::new(kind, 1, 1, 0).unwrap();
+      let executors = AsyncExecutors::new(kind, 1, 1, 0, SpinPolicy::default(), None).unwrap();
       let handle = executors
         .submit(
           kind,
@@ -2447,6 +2512,8 @@ mod tests {
       window: 128,
       block_us: 2_000,
       handoffs: 0,
+      park_spin: SpinPolicy::default(),
+      max_spinners: None,
     };
     run_blocking("test", &options, 0).unwrap();
   }
@@ -2467,6 +2534,8 @@ mod tests {
           window: 8,
           block_us: 2_000,
           handoffs: 0,
+          park_spin: SpinPolicy::default(),
+          max_spinners: None,
         };
         run_async("test", &options, 0).unwrap();
       }
@@ -2806,7 +2875,8 @@ mod tests {
     let error = mismatched.err().unwrap();
     assert!(error.contains("capacity job 5 checksum"), "{error}");
 
-    let executors = AsyncExecutors::new(ExecutorKind::Bounded, 1, 1, 0).unwrap();
+    let executors =
+      AsyncExecutors::new(ExecutorKind::Bounded, 1, 1, 0, SpinPolicy::default(), None).unwrap();
     let panicked = run_capacity(
       executors,
       4,
@@ -2865,7 +2935,7 @@ mod tests {
     }
     for workload in [Workload::Ready, Workload::Yielding, Workload::Mixed] {
       for kind in [ExecutorKind::Bounded, ExecutorKind::Tokio] {
-        let executors = AsyncExecutors::new(kind, 2, 4, 0).unwrap();
+        let executors = AsyncExecutors::new(kind, 2, 4, 0, SpinPolicy::default(), None).unwrap();
         warm_async_workers(&executors, kind, 2).unwrap();
         let (outcome, mut executors) = run_capacity(
           executors,
@@ -2907,6 +2977,8 @@ mod tests {
         window: 2,
         block_us: 2_000,
         handoffs: 0,
+        park_spin: SpinPolicy::default(),
+        max_spinners: None,
       };
       run_blocking("test", &blocking, 0).unwrap();
       let asynchronous = Options {
@@ -2933,6 +3005,8 @@ mod tests {
       window: 4,
       block_us: 2_000,
       handoffs: 0,
+      park_spin: SpinPolicy::default(),
+      max_spinners: None,
     };
     let outcome = CapacityOutcome {
       attempted: 10,
@@ -3040,5 +3114,116 @@ mod handoff_tests {
       expected_async_checksum(7, options.workload, options.bytes),
       8
     );
+  }
+}
+
+#[cfg(test)]
+mod park_spin_tests {
+  use super::*;
+
+  #[test]
+  fn parser_validates_spin_policy_and_executor() {
+    assert_eq!(SpinPolicy::default(), SpinPolicy::Fixed(128));
+    for (value, expected) in [
+      ("fixed:0", SpinPolicy::Fixed(0)),
+      ("fixed:4096", SpinPolicy::Fixed(4096)),
+    ] {
+      let options = Options::parse(
+        [
+          "--lane",
+          "async",
+          "--executor",
+          "bounded",
+          "--park-spin",
+          value,
+        ]
+        .map(str::to_owned),
+      )
+      .unwrap();
+      assert_eq!(options.park_spin, expected);
+    }
+    for value in [
+      "fixed",
+      "fixed:-1",
+      "fixed:4294967296",
+      "fixed:1:2",
+      "other:1:2",
+      "fixed:",
+    ] {
+      assert!(SpinPolicy::parse(value).is_err(), "{value}");
+    }
+    for flag in ["--park-spin", "--max-spinners"] {
+      let flag_value = if flag == "--park-spin" {
+        "fixed:128"
+      } else {
+        "1"
+      };
+      for lane_args in [
+        &["--lane", "allocator"][..],
+        &["--lane", "blocking", "--executor", "bounded"],
+        &["--lane", "async", "--executor", "tokio"],
+      ] {
+        let flag_args = [flag, flag_value];
+        let args = lane_args
+          .iter()
+          .chain(&flag_args)
+          .map(|arg| (*arg).to_owned());
+        assert_eq!(
+          Options::parse(args).unwrap_err(),
+          "--park-spin and --max-spinners apply only to --lane async --executor bounded",
+          "{lane_args:?} {flag}"
+        );
+      }
+    }
+    for value in ["", "-1", "1:2", "18446744073709551616"] {
+      assert!(
+        Options::parse(
+          [
+            "--lane",
+            "async",
+            "--executor",
+            "bounded",
+            "--max-spinners",
+            value,
+          ]
+          .map(str::to_owned)
+        )
+        .is_err()
+      );
+    }
+  }
+
+  #[test]
+  fn bounded_async_benchmark_runs_fixed_rounds_and_caps() {
+    for value in ["fixed:0", "fixed:128", "fixed:4096"] {
+      for cap in ["0", "1", "2"] {
+        let options = Options::parse(
+          [
+            "--lane",
+            "async",
+            "--executor",
+            "bounded",
+            "--mode",
+            "capacity",
+            "--workload",
+            "yielding",
+            "--jobs",
+            "16",
+            "--workers",
+            "2",
+            "--window",
+            "4",
+            "--park-spin",
+            value,
+            "--max-spinners",
+            cap,
+          ]
+          .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(options.max_spinners, Some(cap.parse().unwrap()));
+        run_async_capacity("test", &options).unwrap();
+      }
+    }
   }
 }
