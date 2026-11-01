@@ -49,6 +49,7 @@ pub(super) struct LaneQueue {
   tail: usize,
   len: usize,
   sleeping: bool,
+  notified: bool,
   recheck: bool,
 }
 
@@ -59,6 +60,7 @@ impl LaneQueue {
       tail: NIL,
       len: 0,
       sleeping: false,
+      notified: false,
       recheck: false,
     }
   }
@@ -164,12 +166,20 @@ impl LaneQueue {
     }
     self.tail = chain.last;
     self.len += chain.len;
-    self.sleeping
+    self.take_notify()
+  }
+
+  // The lane mutex serializes producers and the sole dispatcher. Once a
+  // notification is owed, later pushes/kicks are covered by its next search.
+  fn take_notify(&mut self) -> bool {
+    let notify = self.sleeping && !self.notified;
+    self.notified |= notify;
+    notify
   }
 
   pub(super) fn request_recheck(&mut self) -> bool {
     self.recheck = true;
-    self.sleeping
+    self.take_notify()
   }
 
   pub(super) fn take_recheck(&mut self) -> bool {
@@ -182,11 +192,15 @@ impl LaneQueue {
       return false;
     }
     self.sleeping = true;
+    // Each new wait must be eligible for a notification, including a re-wait
+    // under the lane lock after a wake whose work was stolen.
+    self.notified = false;
     true
   }
 
   pub(super) fn finish_sleep(&mut self) {
     self.sleeping = false;
+    self.notified = false;
   }
 
   pub(super) const fn len(&self) -> usize {
@@ -433,6 +447,30 @@ mod tests {
   }
 
   #[test]
+  fn empty_rewait_and_search_allow_a_fresh_notification() {
+    let links = [QueueLink::new()];
+    let mut queue = LaneQueue::new();
+    assert!(queue.prepare_sleep());
+    assert!(queue.push(&links, 0));
+    assert!(!queue.request_recheck());
+    // A thief can consume all work before the dispatcher reacquires its lock.
+    assert!(queue.steal_front(&links).is_some());
+    assert!(queue.take_recheck());
+    // Rearm under the lock, as in a condvar predicate loop with no intervening
+    // search. The old notification must not suppress the next producer.
+    assert!(queue.prepare_sleep());
+    assert!(queue.push(&links, 0));
+    assert!(!queue.request_recheck());
+    queue.finish_sleep();
+    assert!(!queue.notified);
+    assert_eq!(queue.pop(&links), Some(0));
+    assert!(queue.take_recheck());
+    assert!(queue.prepare_sleep());
+    assert!(queue.request_recheck());
+    queue.finish_sleep();
+  }
+
+  #[test]
   fn parked_mask_spans_words_claims_once_and_wraps() {
     let mask = ParkedMask::new(130);
     assert_eq!(mask.claim_any(usize::MAX), None);
@@ -654,6 +692,50 @@ mod loom_tests {
   }
 
   #[test]
+  fn loom_lane_empty_rewait_does_not_lose_push_notification() {
+    loom::model(|| {
+      let links = Arc::new([QueueLink::new()]);
+      let mut queue = LaneQueue::new();
+      assert!(queue.prepare_sleep());
+      assert!(queue.push(&links[..], 0));
+      // The dispatcher has consumed its notification, but a thief removed
+      // the entry. Re-wait while retaining the lane lock and sleeping state.
+      assert!(queue.steal_front(&links[..]).is_some());
+      let lane = Arc::new((Mutex::new(queue), Condvar::new()));
+      let owner = {
+        let lane = Arc::clone(&lane);
+        let links = Arc::clone(&links);
+        thread::spawn(move || {
+          let mut queue = lane.0.lock().unwrap();
+          while queue.len() == 0 {
+            assert!(queue.prepare_sleep());
+            queue = lane.1.wait(queue).unwrap();
+          }
+          queue.finish_sleep();
+          assert!(!queue.notified);
+          assert_eq!(queue.pop(&links[..]), Some(0));
+        })
+      };
+      let producer = {
+        let lane = Arc::clone(&lane);
+        thread::spawn(move || {
+          let mut queue = lane.0.lock().unwrap();
+          let notify = queue.push(&links[..], 0);
+          // A kick and a push share the same outstanding notification.
+          assert!(!queue.request_recheck());
+          drop(queue);
+          if notify {
+            lane.1.notify_one();
+          }
+        })
+      };
+      producer.join().unwrap();
+      owner.join().unwrap();
+      assert!(lane.0.lock().unwrap().take_recheck());
+    });
+  }
+
+  #[test]
   fn loom_steal_races_owner_pop() {
     for count in [1, 2, 3, 4] {
       loom::model(move || {
@@ -771,7 +853,9 @@ mod loom_tests {
           let kicked = if remains {
             parked.claim_any(2).map(|seat| {
               assert_eq!(seat, 2);
-              assert!(other.lock().unwrap().request_recheck());
+              let mut queue = other.lock().unwrap();
+              let notify = queue.request_recheck();
+              assert!(notify || queue.notified);
               seat
             })
           } else {
@@ -822,8 +906,11 @@ mod loom_tests {
           assert!(seat == 0 || (other_parked && seat == 2));
           // A claimed holder gets a recheck even before it enters wait.
           let holder = if seat == 0 { &sleeper } else { &other };
-          let saw_sleeping = holder.lock().unwrap().request_recheck();
-          *kick.lock().unwrap() = Some((seat, saw_sleeping));
+          let mut queue = holder.lock().unwrap();
+          let notify = queue.request_recheck();
+          // A prior kick may already cover this sleeping holder.
+          let covered = notify || queue.notified;
+          *kick.lock().unwrap() = Some((seat, covered));
         }
       })
     };
@@ -834,12 +921,12 @@ mod loom_tests {
       !asleep || lengths[1].load(Ordering::SeqCst) == 0 || kick.is_some(),
       "parked with stealable work and no kick"
     );
-    if let Some((seat, saw_sleeping)) = kick {
+    if let Some((seat, covered)) = kick {
       // A kick before the final lane check must prevent sleep; a later
-      // kick must observe sleeping so that its caller sends a notification.
+      // kick must have sent a notification or be covered by an earlier one.
       assert!(
-        (seat == 0 && !asleep) || saw_sleeping,
-        "holder slept but its kick did not observe sleeping"
+        (seat == 0 && !asleep) || covered,
+        "holder slept without a covering notification"
       );
     }
     let mut popped = Vec::new();

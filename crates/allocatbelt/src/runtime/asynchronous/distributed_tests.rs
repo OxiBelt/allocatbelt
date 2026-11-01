@@ -65,6 +65,11 @@ fn join_worker<T>(thread: std::thread::JoinHandle<T>) -> T {
   wait(|| thread.is_finished());
   thread.join().unwrap()
 }
+fn lane_sleeping(shared: &Shared, seat: usize) -> bool {
+  let _queue = engine(shared).lane(seat);
+  let thread = shared.metrics.inner().thread(seat).unwrap();
+  thread.parks.load(Ordering::Relaxed) > thread.unparks.load(Ordering::Relaxed)
+}
 fn start_worker(shared: &Arc<Shared>, index: usize) -> std::thread::JoinHandle<()> {
   let shared = Arc::clone(shared);
   std::thread::spawn(move || {
@@ -110,6 +115,182 @@ fn run(shared: &Arc<Shared>, work: Selected) {
       d.finish_poll(shared, reference, matches!(result, PollResult::Ready));
     }
   }
+}
+
+#[test]
+fn pushes_and_kicks_notify_a_sleeping_lane_once() {
+  for kick_first in [false, true] {
+    let (shared, root) = shared(config(1, 8));
+    let d = engine(&shared);
+    d.parked.advertise(0);
+    assert!(d.lane(0).prepare_sleep());
+    if kick_first {
+      d.kick(0);
+    }
+    let jobs: Vec<_> = (0..8)
+      .map(|_| {
+        let job = shared.spawn(root, async {}).unwrap();
+        d.kick(0);
+        job
+      })
+      .collect();
+    assert_eq!(d.lane_notifies.load(Ordering::Relaxed), 1);
+    d.lane(0).finish_sleep();
+    for job in jobs {
+      run(&shared, selected(&shared, 0).unwrap());
+      finish(job).unwrap();
+    }
+    assert!(d.lane(0).take_recheck());
+    assert!(d.lane(0).prepare_sleep());
+    // A new sleep needs a fresh notify, even after an empty recheck.
+    let job = shared.spawn(root, async {}).unwrap();
+    assert_eq!(d.lane_notifies.load(Ordering::Relaxed), 2);
+    d.lane(0).finish_sleep();
+    run(&shared, selected(&shared, 0).unwrap());
+    finish(job).unwrap();
+    shared.close(false);
+    check_distributed(&shared);
+  }
+}
+
+#[test]
+fn dispatcher_rechecks_without_exit_hints_take_no_admission_or_seat_locks() {
+  let (shared, _) = shared(config(1, 1));
+  let d = engine(&shared);
+  let worker = start_worker(&shared, 0);
+  wait(|| lane_sleeping(&shared, 0));
+  let admission = shared.lock_acquisitions.load(Ordering::Relaxed);
+  let seats = d.seat_locks.load(Ordering::Relaxed);
+  for _ in 0..32 {
+    let parks = shared
+      .metrics
+      .inner()
+      .thread(0)
+      .unwrap()
+      .parks
+      .load(Ordering::Relaxed);
+    d.kick(0);
+    wait(|| {
+      shared
+        .metrics
+        .inner()
+        .thread(0)
+        .unwrap()
+        .parks
+        .load(Ordering::Relaxed)
+        > parks
+        && lane_sleeping(&shared, 0)
+    });
+  }
+  assert_eq!(shared.lock_acquisitions.load(Ordering::Relaxed), admission);
+  assert_eq!(d.seat_locks.load(Ordering::Relaxed), seats);
+  shared.close(false);
+  join_worker(worker);
+}
+
+#[test]
+fn closing_rechecks_finish_drain_and_cancel_pending_before_deadline() {
+  for mode in [AsyncShutdown::Drain, AsyncShutdown::CancelPending] {
+    for empty in [false, true] {
+      let (shared, root) = shared(config(1, 1));
+      let ready = Arc::new(AtomicBool::new(false));
+      let (tx, rx) = mpsc::channel();
+      let job = (!empty).then(|| {
+        let ready = Arc::clone(&ready);
+        shared
+          .spawn(
+            root,
+            std::future::poll_fn(move |cx| {
+              if ready.load(Ordering::Acquire) {
+                Poll::Ready(())
+              } else {
+                tx.send(cx.waker().clone()).unwrap();
+                Poll::Pending
+              }
+            }),
+          )
+          .unwrap()
+      });
+      let worker = start_worker(&shared, 0);
+      let waker = (!empty).then(|| rx.recv_timeout(Duration::from_secs(5)).unwrap());
+      wait(|| lane_sleeping(&shared, 0));
+      shared.close(mode == AsyncShutdown::CancelPending);
+      if mode == AsyncShutdown::Drain
+        && let Some(waker) = waker
+      {
+        ready.store(true, Ordering::Release);
+        waker.wake();
+      }
+      if let Some(job) = job {
+        let result = finish(job);
+        match mode {
+          AsyncShutdown::Drain => result.unwrap(),
+          AsyncShutdown::CancelPending => {
+            assert!(matches!(result, Err(AsyncJoinError::Cancelled)))
+          }
+        }
+      }
+      join_worker(worker);
+      assert_eq!(shared.turn_counts(), (0, 0, 0, 0));
+      check_distributed(&shared);
+    }
+  }
+}
+
+#[test]
+fn parked_worker_yields_to_helper_restoration_and_helper_retires_before_deadline() {
+  let (shared, _) = shared_with_handoffs(config(1, 1), 2);
+  let d = engine(&shared);
+  let (turn, helper_loan, lease) = {
+    let mut seats = d.seats();
+    let worker = seats.claim(0);
+    let worker_loan = seats.try_hand_off(worker).unwrap();
+    let lease = seats.try_activate_helper().unwrap();
+    let helper = seats.try_begin_helper_turn().unwrap();
+    let helper_loan = seats.try_hand_off(helper).unwrap();
+    let ticket = seats.begin_restore(worker_loan);
+    let turn = seats.try_restore(ticket).unwrap();
+    d.update_yield(&seats);
+    (turn, helper_loan, lease)
+  };
+  let worker = {
+    let shared = Arc::clone(&shared);
+    std::thread::spawn(move || {
+      let context = worker_context(0);
+      run_dispatcher(&shared, context, || {
+        engine(&shared).serve(&shared, context, turn, false);
+      });
+    })
+  };
+  wait(|| lane_sleeping(&shared, 0));
+  let helper = {
+    let shared = Arc::clone(&shared);
+    std::thread::spawn(move || {
+      let d = engine(&shared);
+      let context = AsyncThreadContext {
+        role: AsyncThreadRole::HandoffHelper,
+        index: 0,
+        physical_index: 1,
+      };
+      run_dispatcher(&shared, context, || {
+        // All seats are held by workers: this restoration requires a kick
+        // and a worker yield before the helper can acquire its turn.
+        let turn = d.restore(&shared, helper_loan, context);
+        assert!(d.helper_yield.load(Ordering::Acquire));
+        // With no loans left, serve must relinquish the helper's turn.
+        d.serve(&shared, context, turn, true);
+        let mut seats = d.seats();
+        seats.retire_helper(lease).unwrap();
+        d.update_yield(&seats);
+        d.seat_cv.notify_all();
+      });
+    })
+  };
+  join_worker(helper);
+  wait(|| shared.turn_counts() == (1, 0, 0, 0) && lane_sleeping(&shared, 0));
+  shared.close(false);
+  join_worker(worker);
+  assert_eq!(shared.turn_counts(), (0, 0, 0, 0));
 }
 
 #[test]

@@ -165,6 +165,8 @@ pub(super) struct Distributed {
   #[cfg(all(test, not(loom)))]
   wake_searches: AtomicUsize,
   #[cfg(all(test, not(loom)))]
+  lane_notifies: AtomicUsize,
+  #[cfg(all(test, not(loom)))]
   round_robin: AtomicBool,
   #[cfg(all(test, not(loom)))]
   unwind_seat: AtomicUsize,
@@ -267,6 +269,8 @@ impl Distributed {
       #[cfg(all(test, not(loom)))]
       wake_searches: AtomicUsize::new(0),
       #[cfg(all(test, not(loom)))]
+      lane_notifies: AtomicUsize::new(0),
+      #[cfg(all(test, not(loom)))]
       round_robin: AtomicBool::new(false),
       #[cfg(all(test, not(loom)))]
       unwind_seat: AtomicUsize::new(usize::MAX),
@@ -347,6 +351,8 @@ impl Distributed {
       (notify, search)
     };
     if notify {
+      #[cfg(all(test, not(loom)))]
+      self.lane_notifies.fetch_add(1, Ordering::Relaxed);
       self.lanes[seat].cv.notify_one();
     }
     if search {
@@ -370,6 +376,8 @@ impl Distributed {
   fn kick(&self, seat: usize) {
     let notify = self.lane(seat).request_recheck();
     if notify {
+      #[cfg(all(test, not(loom)))]
+      self.lane_notifies.fetch_add(1, Ordering::Relaxed);
       self.lanes[seat].cv.notify_one();
     }
   }
@@ -1277,6 +1285,11 @@ impl Distributed {
       let index = match self.search_or_park(shared, seat.seat(), &mut random, context) {
         Search::Got(index) => index,
         Search::Recheck => {
+          // Close publishes before its kick; seat transitions publish the
+          // worker-yield hint. Helper retirement is handled above each search.
+          if !self.closing.load(Ordering::Acquire) && !self.worker_yield.load(Ordering::Acquire) {
+            continue;
+          }
           let empty = {
             let state = self.admission(shared);
             state.closed && state.admitted == 0
