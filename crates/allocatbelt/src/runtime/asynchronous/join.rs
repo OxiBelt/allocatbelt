@@ -167,6 +167,10 @@ struct PendingWakers {
 
 enum Slot<T> {
   Pending(PendingWakers),
+  Staged {
+    outcome: Result<T, AsyncJoinError>,
+    wakers: Option<PendingWakers>,
+  },
   Ready(Option<Result<T, AsyncJoinError>>),
   Taken,
 }
@@ -174,7 +178,8 @@ enum Slot<T> {
 pub(super) struct JoinState<T> {
   slot: Mutex<Slot<T>>,
   // Output-independent metadata also works for non-Send local outputs.
-  finished: Arc<dyn AbortMetadata>,
+  finished: Option<Arc<dyn AbortMetadata>>,
+  completed: AtomicBool,
   id: TaskId,
   _control: ControlCharge,
 }
@@ -187,15 +192,24 @@ impl<T> JoinState<T> {
   ) -> Arc<Self> {
     #[cfg(all(test, not(loom)))]
     super::allocation_tests::record();
-    Arc::new(Self {
+    Arc::new(Self::embedded(id, control, Some(finished)))
+  }
+
+  pub(super) fn embedded(
+    id: TaskId,
+    control: ControlCharge,
+    finished: Option<Arc<dyn AbortMetadata>>,
+  ) -> Self {
+    Self {
       slot: Mutex::new(Slot::Pending(PendingWakers {
         join: None,
         finished: None,
       })),
       finished,
+      completed: AtomicBool::new(false),
       id,
       _control: control,
-    })
+    }
   }
 
   #[cfg(test)]
@@ -213,8 +227,62 @@ impl<T> JoinState<T> {
     )
   }
 
+  pub(super) fn id(&self) -> TaskId {
+    self.id
+  }
+
+  pub(super) fn is_finished(&self) -> bool {
+    self.finished.as_ref().map_or_else(
+      || self.completed.load(Ordering::Acquire),
+      |metadata| metadata.is_finished(),
+    )
+  }
+
+  pub(super) fn set_finished(&self) {
+    if let Some(metadata) = &self.finished {
+      metadata.set_finished();
+    } else {
+      self.completed.store(true, Ordering::Release);
+    }
+  }
+
   fn lock(&self) -> MutexGuard<'_, Slot<T>> {
     self.slot.lock().unwrap_or_else(PoisonError::into_inner)
+  }
+
+  /// Stores the driver's outcome without making it visible to observers.
+  /// A detached join leaves producer-side cleanup to the publishing worker.
+  pub(super) fn stage(&self, outcome: Result<T, AsyncJoinError>) {
+    let old = {
+      let mut slot = self.lock();
+      let (wakers, old) = match std::mem::replace(&mut *slot, Slot::Taken) {
+        Slot::Pending(wakers) => (Some(wakers), None),
+        Slot::Staged { outcome, wakers } => (wakers, Some(outcome)),
+        Slot::Taken => (None, None),
+        Slot::Ready(_) => unreachable!("cannot stage after publication"),
+      };
+      *slot = Slot::Staged { outcome, wakers };
+      old
+    };
+    drop_contained(old);
+  }
+
+  pub(super) fn has_staged(&self) -> bool {
+    matches!(*self.lock(), Slot::Staged { .. })
+  }
+
+  pub(super) fn take_staged(&self) -> Option<Result<T, AsyncJoinError>> {
+    let mut slot = self.lock();
+    match std::mem::replace(&mut *slot, Slot::Taken) {
+      Slot::Staged { outcome, wakers } => {
+        *slot = wakers.map_or(Slot::Taken, Slot::Pending);
+        Some(outcome)
+      }
+      other => {
+        *slot = other;
+        None
+      }
+    }
   }
 
   /// Publishes once. Returns an unobserved output for destruction by the
@@ -227,7 +295,7 @@ impl<T> JoinState<T> {
     match std::mem::replace(&mut *slot, Slot::Taken) {
       Slot::Pending(wakers) => {
         *slot = Slot::Ready(Some(result));
-        self.finished.set_finished();
+        self.set_finished();
         drop(slot);
         if let Some(waker) = wakers.finished
           && let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| waker.wake()))
@@ -241,6 +309,11 @@ impl<T> JoinState<T> {
         }
         None
       }
+      staged @ Slot::Staged { .. } => {
+        *slot = staged;
+        drop(slot);
+        Some(result)
+      }
       Slot::Ready(ready) => {
         *slot = Slot::Ready(ready);
         drop(slot);
@@ -248,7 +321,7 @@ impl<T> JoinState<T> {
       }
       Slot::Taken => {
         *slot = Slot::Taken;
-        self.finished.set_finished();
+        self.set_finished();
         drop(slot);
         Some(result)
       }
@@ -264,10 +337,26 @@ fn drop_contained<T>(value: T) {
   }
 }
 
+enum JobState<T> {
+  Separate(Arc<JoinState<T>>),
+  Merged(Arc<super::task::Task<T>>),
+}
+
+impl<T> std::ops::Deref for JobState<T> {
+  type Target = JoinState<T>;
+
+  fn deref(&self) -> &Self::Target {
+    match self {
+      Self::Separate(state) => state,
+      Self::Merged(task) => &task.join,
+    }
+  }
+}
+
 /// The awaitable result of a submitted future. Dropping it detaches the
 /// task; call [`AsyncJob::abort`] to request cancellation.
 pub struct AsyncJob<T> {
-  state: Arc<JoinState<T>>,
+  state: JobState<T>,
   abort: Arc<dyn AbortMetadata>,
   finished: bool,
 }
@@ -275,7 +364,15 @@ pub struct AsyncJob<T> {
 impl<T> AsyncJob<T> {
   pub(super) fn new_with_metadata(state: Arc<JoinState<T>>, abort: Arc<dyn AbortMetadata>) -> Self {
     Self {
-      state,
+      state: JobState::Separate(state),
+      abort,
+      finished: false,
+    }
+  }
+
+  pub(super) fn merged(state: Arc<super::task::Task<T>>, abort: Arc<dyn AbortMetadata>) -> Self {
+    Self {
+      state: JobState::Merged(state),
       abort,
       finished: false,
     }
@@ -285,7 +382,7 @@ impl<T> AsyncJob<T> {
   pub(super) fn new(state: Arc<JoinState<T>>, abort: Arc<dyn Fn() + Send + Sync>) -> Self {
     let metadata = Arc::new(CallbackAbort {
       callback: abort,
-      completion: Arc::clone(&state.finished),
+      completion: Arc::clone(state.finished.as_ref().unwrap()),
     });
     Self::new_with_metadata(state, metadata)
   }
@@ -303,7 +400,9 @@ impl<T> AsyncJob<T> {
   }
 
   /// Returns a clonable cancellation handle independent of the output type.
-  /// The handle does not retain the task's future or result.
+  /// Native task handles retain the shared bookkeeping allocation and its
+  /// Control charge. Completion drops the future; consuming or dropping the
+  /// join releases its result even if an abort handle remains alive.
   #[must_use]
   pub fn abort_handle(&self) -> AbortHandle {
     AbortHandle {
@@ -315,7 +414,7 @@ impl<T> AsyncJob<T> {
   /// Whether the terminal join outcome has been published after task cleanup.
   #[must_use]
   pub fn is_finished(&self) -> bool {
-    self.state.finished.is_finished()
+    self.state.is_finished()
   }
 
   /// Polls for terminal completion without taking the task's result.
@@ -324,19 +423,24 @@ impl<T> AsyncJob<T> {
   /// notification before they consume this join handle.
   pub fn poll_finished(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
     let this = self.get_mut();
-    if this.state.finished.is_finished() {
+    if this.state.is_finished() {
       return Poll::Ready(());
     }
 
     let replacement = cx.waker().clone();
     let old = {
       let mut slot = this.state.lock();
-      let Slot::Pending(wakers) = &mut *slot else {
+      let (Slot::Pending(wakers)
+      | Slot::Staged {
+        wakers: Some(wakers),
+        ..
+      }) = &mut *slot
+      else {
         drop(slot);
         drop(replacement);
         return Poll::Ready(());
       };
-      if this.state.finished.is_finished() {
+      if this.state.is_finished() {
         drop(slot);
         drop(replacement);
         return Poll::Ready(());
@@ -350,7 +454,7 @@ impl<T> AsyncJob<T> {
   /// Takes an outcome already announced by `poll_finished`, without cloning a
   /// caller waker while consuming a completion notification.
   pub(super) fn take_finished(&mut self) -> Option<Result<T, AsyncJoinError>> {
-    if !self.state.finished.is_finished() {
+    if !self.state.is_finished() {
       return None;
     }
     let outcome = {
@@ -358,8 +462,8 @@ impl<T> AsyncJob<T> {
       match std::mem::replace(&mut *slot, Slot::Taken) {
         Slot::Ready(outcome) => outcome.unwrap_or(Err(AsyncJoinError::Cancelled)),
         Slot::Taken => Err(AsyncJoinError::Cancelled),
-        Slot::Pending(wakers) => {
-          *slot = Slot::Pending(wakers);
+        pending @ (Slot::Pending(_) | Slot::Staged { .. }) => {
+          *slot = pending;
           return None;
         }
       }
@@ -417,7 +521,11 @@ impl<T> Future for AsyncJob<T> {
       let replacement = cx.waker().clone();
       let mut slot = self.state.lock();
       match &mut *slot {
-        Slot::Pending(wakers) => {
+        Slot::Pending(wakers)
+        | Slot::Staged {
+          wakers: Some(wakers),
+          ..
+        } => {
           let old = wakers.join.replace(replacement);
           drop(slot);
           drop(old);
@@ -430,7 +538,7 @@ impl<T> Future for AsyncJob<T> {
           self.finished = true;
           Poll::Ready(result.unwrap_or(Err(AsyncJoinError::Cancelled)))
         }
-        Slot::Taken => {
+        Slot::Taken | Slot::Staged { wakers: None, .. } => {
           drop(slot);
           self.finished = true;
           Poll::Ready(Err(AsyncJoinError::Cancelled))
@@ -445,7 +553,16 @@ impl<T> Drop for AsyncJob<T> {
     if !self.finished {
       let outcome = {
         let mut slot = self.state.lock();
-        std::mem::replace(&mut *slot, Slot::Taken)
+        match std::mem::replace(&mut *slot, Slot::Taken) {
+          Slot::Staged { outcome, wakers } => {
+            *slot = Slot::Staged {
+              outcome,
+              wakers: None,
+            };
+            wakers.map(Slot::Pending)
+          }
+          other => Some(other),
+        }
       };
       // Results and wakers may run user code from Drop; do so without the
       // join mutex held.
@@ -757,6 +874,34 @@ mod model {
     fn wake(self: StdArc<Self>) {
       self.0.store(true, Ordering::Release);
     }
+  }
+
+  #[test]
+  fn staging_and_publication_racing_detach_drop_output_once() {
+    loom::model(|| {
+      struct Output(Arc<loom::sync::atomic::AtomicUsize>);
+      impl Drop for Output {
+        fn drop(&mut self) {
+          self.0.fetch_add(1, Ordering::SeqCst);
+        }
+      }
+      let drops = Arc::new(loom::sync::atomic::AtomicUsize::new(0));
+      let state = JoinState::new();
+      let job = AsyncJob::new(StdArc::clone(&state), StdArc::new(|| {}));
+      let output = Output(Arc::clone(&drops));
+      let producer = thread::spawn(move || {
+        state.stage(Ok(output));
+        assert!(state.has_staged());
+        assert!(!state.is_finished());
+        let outcome = state.take_staged().unwrap();
+        drop(state.publish(outcome));
+        assert!(state.is_finished());
+      });
+      let consumer = thread::spawn(move || drop(job));
+      producer.join().unwrap();
+      consumer.join().unwrap();
+      assert_eq!(drops.load(Ordering::SeqCst), 1);
+    });
   }
 
   #[test]

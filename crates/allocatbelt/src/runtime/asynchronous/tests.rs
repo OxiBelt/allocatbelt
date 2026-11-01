@@ -2556,3 +2556,188 @@ fn cpu_limited_self_yielding_tasks_progress_and_return_cpu() {
     .shutdown_before_deadline(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
 }
+
+#[test]
+fn driver_preserves_inline_and_caller_boxed_future_pins_and_drop_order() {
+  struct PinnedFuture {
+    address: Arc<AtomicUsize>,
+    polls: AtomicUsize,
+    dropped: Arc<AtomicBool>,
+    _pin: std::marker::PhantomPinned,
+  }
+  impl Future for PinnedFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+      let this = self.as_ref().get_ref();
+      let address = std::ptr::from_ref(this).addr();
+      let previous = this.address.swap(address, Ordering::SeqCst);
+      assert!(previous == 0 || previous == address);
+      if this.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+        cx.waker().wake_by_ref();
+        Poll::Pending
+      } else {
+        Poll::Ready(())
+      }
+    }
+  }
+  impl Drop for PinnedFuture {
+    fn drop(&mut self) {
+      assert_eq!(
+        self.address.load(Ordering::SeqCst),
+        std::ptr::from_ref(self).addr()
+      );
+      self.dropped.store(true, Ordering::SeqCst);
+    }
+  }
+
+  let runtime = runtime(1, 2, 1);
+  for boxed in [false, true] {
+    let address = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let future = PinnedFuture {
+      address: Arc::clone(&address),
+      polls: AtomicUsize::new(0),
+      dropped: Arc::clone(&dropped),
+      _pin: std::marker::PhantomPinned,
+    };
+    let job = if boxed {
+      let future = Box::pin(future);
+      address.store(
+        std::ptr::from_ref(future.as_ref().get_ref()).addr(),
+        Ordering::SeqCst,
+      );
+      let erased: Pin<Box<dyn Future<Output = ()> + Send>> = future;
+      runtime.handle().spawn(erased).unwrap()
+    } else {
+      runtime.handle().spawn(future).unwrap()
+    };
+    block_on(job).unwrap();
+    assert!(dropped.load(Ordering::SeqCst));
+  }
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+}
+
+#[test]
+fn driver_preserves_poll_panic_when_future_drop_also_panics() {
+  struct PanicOnPollAndDrop;
+  impl Future for PanicOnPollAndDrop {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+      std::panic::panic_any("original poll panic");
+    }
+  }
+  impl Drop for PanicOnPollAndDrop {
+    fn drop(&mut self) {
+      std::panic::panic_any("secondary cleanup panic");
+    }
+  }
+
+  let runtime = runtime(1, 1, 1);
+  let job = runtime.handle().spawn(PanicOnPollAndDrop).unwrap();
+  let Err(AsyncJoinError::Panicked(payload)) = block_on(job) else {
+    panic!("expected the original poll panic");
+  };
+  assert_eq!(payload.downcast_ref::<&str>(), Some(&"original poll panic"));
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+}
+
+#[test]
+fn successful_join_is_pending_until_future_destructor_finishes() {
+  struct ReadyDrop {
+    gate: Arc<(Mutex<bool>, Condvar)>,
+    started: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+  }
+  impl Future for ReadyDrop {
+    type Output = usize;
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<usize> {
+      Poll::Ready(17)
+    }
+  }
+  impl Drop for ReadyDrop {
+    fn drop(&mut self) {
+      self.started.store(true, Ordering::SeqCst);
+      let (lock, cv) = &*self.gate;
+      let mut released = lock.lock().unwrap_or_else(|e| e.into_inner());
+      while !*released {
+        released = cv.wait(released).unwrap_or_else(|e| e.into_inner());
+      }
+      self.finished.store(true, Ordering::SeqCst);
+    }
+  }
+  let runtime = runtime(1, 1, 1);
+  let gate = Arc::new((Mutex::new(false), Condvar::new()));
+  // Release before runtime destruction even if a publication assertion fails.
+  let release = ReleaseGate(Arc::clone(&gate));
+  let started = Arc::new(AtomicBool::new(false));
+  let finished = Arc::new(AtomicBool::new(false));
+  let mut job = runtime
+    .handle()
+    .spawn(ReadyDrop {
+      gate,
+      started: Arc::clone(&started),
+      finished: Arc::clone(&finished),
+    })
+    .unwrap();
+  wait_until(
+    || started.load(Ordering::SeqCst),
+    "successful future destructor",
+  );
+  assert!(!job.is_finished());
+  assert!(
+    Pin::new(&mut job)
+      .poll(&mut Context::from_waker(Waker::noop()))
+      .is_pending()
+  );
+  drop(release);
+  let outcome = block_on(std::future::poll_fn(|cx| {
+    let result = Pin::new(&mut job).poll(cx);
+    if result.is_ready() {
+      assert!(finished.load(Ordering::SeqCst));
+    }
+    result
+  }));
+  assert_eq!(outcome.unwrap(), 17);
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+}
+
+#[test]
+fn retained_abort_and_waker_release_consumed_or_discarded_output() {
+  struct Output(Arc<AtomicBool>, [u8; 4096]);
+  impl Drop for Output {
+    fn drop(&mut self) {
+      assert_eq!(self.1[0], 37);
+      self.0.store(true, Ordering::SeqCst);
+    }
+  }
+  let runtime = runtime(1, 2, 1);
+  for consume in [false, true] {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let saved = Arc::new(Mutex::new(None));
+    let capture = Arc::clone(&saved);
+    let flag = Arc::clone(&dropped);
+    let job = runtime
+      .handle()
+      .spawn(std::future::poll_fn(move |cx| {
+        *capture.lock().unwrap() = Some(cx.waker().clone());
+        Poll::Ready(Output(Arc::clone(&flag), [37; 4096]))
+      }))
+      .unwrap();
+    let abort = job.abort_handle();
+    wait_until(|| job.is_finished(), "output publication");
+    assert!(!dropped.load(Ordering::SeqCst));
+    if consume {
+      let output = block_on(job).unwrap();
+      assert!(!dropped.load(Ordering::SeqCst));
+      drop(output);
+    } else {
+      drop(job);
+    }
+    assert!(dropped.load(Ordering::SeqCst));
+    assert!(abort.is_finished());
+    saved.lock().unwrap().as_ref().unwrap().wake_by_ref();
+  }
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+}

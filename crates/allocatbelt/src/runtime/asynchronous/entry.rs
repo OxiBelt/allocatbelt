@@ -216,8 +216,14 @@ impl TaskContextGuard {
     task_id: Option<TaskId>,
     resources: Option<ResourceScope>,
   ) -> Self {
-    let previous = CURRENT_TASK_ID.with(|current| current.replace(task_id));
-    let previous_resources = CURRENT_RESOURCE_SCOPE.with(|current| current.replace(resources));
+    // Final runtime cleanup can run during thread-local destruction, after
+    // these slots are gone; the task then runs without an ambient context.
+    let previous = CURRENT_TASK_ID
+      .try_with(|current| current.replace(task_id))
+      .unwrap_or(None);
+    let previous_resources = CURRENT_RESOURCE_SCOPE
+      .try_with(|current| current.replace(resources))
+      .unwrap_or(None);
     Self {
       previous,
       previous_resources,

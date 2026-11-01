@@ -2704,3 +2704,36 @@ fn dispatcher_unwind_inside_spin_releases_its_slot() {
   shared.close(false);
   TEST_SPIN_POLICY.set(Policy::default());
 }
+
+#[test]
+fn final_shared_drop_cleans_admitted_future_with_retained_handles() {
+  struct PendingDrop(Arc<AtomicBool>);
+  impl Future for PendingDrop {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+      Poll::Pending
+    }
+  }
+  impl Drop for PendingDrop {
+    fn drop(&mut self) {
+      self.0.store(true, Ordering::SeqCst);
+    }
+  }
+  let (shared, root) = shared(config(1, 1));
+  let dropped = Arc::new(AtomicBool::new(false));
+  let mut job = shared
+    .spawn(root, PendingDrop(Arc::clone(&dropped)))
+    .unwrap();
+  let abort = job.abort_handle();
+  let task = engine(&shared).slot(0).task.as_ref().unwrap().clone();
+  let waker = task.task_waker();
+  assert!(!dropped.load(Ordering::SeqCst));
+  drop(shared);
+  assert!(dropped.load(Ordering::SeqCst));
+  assert!(abort.is_finished());
+  waker.wake_by_ref();
+  assert!(matches!(
+    Pin::new(&mut job).poll(&mut Context::from_waker(Waker::noop())),
+    Poll::Ready(Err(AsyncJoinError::Cancelled))
+  ));
+}

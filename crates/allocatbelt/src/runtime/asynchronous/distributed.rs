@@ -308,6 +308,22 @@ impl Distributed {
     })
   }
 
+  pub(super) fn cancel_remaining(&mut self) {
+    for cell in &mut self.slots {
+      let task = cell
+        .state
+        .get_mut()
+        .unwrap_or_else(PoisonError::into_inner)
+        .task
+        .take();
+      if let Some(task) = task {
+        // Final-owner cleanup runs without any scheduler mutex held.
+        task.cancel();
+        task.publish();
+      }
+    }
+  }
+
   pub(super) fn slots_len(&self) -> usize {
     self.slots.len()
   }
@@ -464,7 +480,7 @@ impl Distributed {
         future,
       ));
     }
-    let mut domain = match Task::<F>::reserve_domain_admission(tenant) {
+    let mut domain = match Task::<F::Output>::reserve_domain_admission::<F>(tenant) {
       Ok(domain) => domain,
       Err(error) => {
         return Err(AsyncSpawnError::new(
@@ -1362,33 +1378,25 @@ impl Distributed {
         }
         Selected::Poll(task_ref, task, permit) => {
           super::super::entry::reset_budget();
-          match task.task_waker(&mut || task_waker(shared, task_ref, task.tenant_domain())) {
-            Err(error) => {
+          let waker = Arc::clone(&task).task_waker();
+          let mut context = Context::from_waker(&waker);
+          let (result, mut permit) = match task.acquire_cpu(&waker) {
+            DomainCpuAdmission::Unbounded => task.poll(&mut context, permit),
+            DomainCpuAdmission::Acquired(ticket) => {
+              let mut permit = permit;
+              permit.set_cpu_ticket(ticket);
+              task.poll(&mut context, permit)
+            }
+            DomainCpuAdmission::Waiting => (PollResult::Pending, Some(permit)),
+            DomainCpuAdmission::Rejected(error) => {
               drop(permit);
               task.fail_resource(error);
-              self.finish_poll(shared, task_ref, true);
+              (PollResult::Ready, None)
             }
-            Ok(waker) => {
-              let mut context = Context::from_waker(&waker);
-              let (result, mut permit) = match task.acquire_cpu(&waker) {
-                DomainCpuAdmission::Unbounded => task.poll(&mut context, permit),
-                DomainCpuAdmission::Acquired(ticket) => {
-                  let mut permit = permit;
-                  permit.set_cpu_ticket(ticket);
-                  task.poll(&mut context, permit)
-                }
-                DomainCpuAdmission::Waiting => (PollResult::Pending, Some(permit)),
-                DomainCpuAdmission::Rejected(error) => {
-                  drop(permit);
-                  task.fail_resource(error);
-                  (PollResult::Ready, None)
-                }
-              };
-              drop(permit.as_mut().and_then(PollPermit::take_cpu_ticket));
-              drop(permit);
-              self.finish_poll(shared, task_ref, matches!(result, PollResult::Ready));
-            }
-          }
+          };
+          drop(permit.as_mut().and_then(PollPermit::take_cpu_ticket));
+          drop(permit);
+          self.finish_poll(shared, task_ref, matches!(result, PollResult::Ready));
         }
       }
       seat.turn = Some(match handoff::leave_turn() {

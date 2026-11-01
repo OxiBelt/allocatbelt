@@ -4,14 +4,11 @@ use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::task::{Context, Waker};
+use std::task::{Context, Poll, Wake, Waker};
 
 use super::entry::TaskContextGuard;
 use super::identity::TaskId;
-use super::join::{
-  AbortAction, AbortMetadata, AsyncJob, AsyncJoinError, JoinState, abort_metadata_bytes,
-  finished_flag_bytes, new_abort_metadata,
-};
+use super::join::{AbortMetadata, AsyncJob, AsyncJoinError, JoinState};
 use super::scheduler::{PollPermit, Shared, TaskRef};
 use crate::runtime::cpu_execution::CpuExecutionGuard;
 use crate::runtime::managed::ResourceScope;
@@ -32,10 +29,6 @@ pub(super) struct TaskDomainAdmission {
   pub(super) waiter: Option<DomainWaiter>,
   pub(super) task: Option<DomainReservation>,
   pub(super) task_control: ControlCharge,
-  pub(super) join_control: ControlCharge,
-  pub(super) abort_control: ControlCharge,
-  pub(super) finished_control: ControlCharge,
-  waiter_control: ControlCharge,
 }
 
 pub(super) enum PollResult {
@@ -44,8 +37,8 @@ pub(super) enum PollResult {
 }
 
 pub(super) trait ErasedTask: Send + Sync {
-  /// Polls once without a scheduler lock. The future mutex prevents a
-  /// cancellation cleanup from taking the future concurrently with poll.
+  /// Polls once without a scheduler lock. The scheduler protocol serializes
+  /// polling and cancellation cleanup; the mutex transfers driver ownership.
   /// Pending returns the quota permit for the caller's locked completion.
   fn poll(&self, cx: &mut Context<'_>, permit: PollPermit) -> (PollResult, Option<PollPermit>);
 
@@ -60,41 +53,47 @@ pub(super) trait ErasedTask: Send + Sync {
   /// Attempts to take one CPU ticket or enrolls the task's scheduler waker.
   fn acquire_cpu(&self, waker: &std::task::Waker) -> DomainCpuAdmission;
 
-  /// Returns the cached waker, creating it on first use.
-  fn task_waker(
-    &self,
-    create: &mut dyn FnMut() -> Result<Waker, DomainError>,
-  ) -> Result<Waker, DomainError>;
-
-  /// The tenant whose Control ledger charges the cached task waker for this
-  /// task generation, including any clones retained after completion.
-  fn tenant_domain(&self) -> Option<&TenantDomain>;
+  /// Returns a waker backed by the typed task Arc, without another allocation.
+  fn task_waker(self: Arc<Self>) -> Waker;
 
   /// Stages a typed resource failure without polling user code.
   fn fail_resource(&self, error: DomainError);
 }
 
-struct ChargedDomainWaiter {
-  waiter: DomainWaiter,
-  _control: ControlCharge,
+type Driver = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+#[derive(Clone, Copy)]
+enum DriverCommand {
+  Idle,
+  Poll,
 }
 
-pub(super) struct Task<F: Future + Send + 'static> {
-  future: Mutex<Option<Pin<Box<F>>>>,
-  staged: Mutex<Option<Result<F::Output, AsyncJoinError>>>,
-  join: Arc<JoinState<F::Output>>,
-  id: TaskId,
+// Taking a waiter for domain admission must not undo concurrent cleanup.
+// Domain waker operations run outside this mutex.
+enum WaiterState {
+  Available(DomainWaiter),
+  InUse,
+  Released,
+}
+
+/// One allocation shared by the scheduler, join, abort handles and wakers.
+/// Only the boxed driver contains the user future. Terminal paths take and
+/// drop it before publishing, even when stale handles retain this allocation.
+pub(super) struct Task<T> {
+  future: Mutex<Option<Driver>>,
+  command: Mutex<DriverCommand>,
+  pub(super) join: JoinState<T>,
   resources: Option<ResourceScope>,
   tenant: Option<TenantDomain>,
-  waiter: Mutex<Option<Arc<ChargedDomainWaiter>>>,
-  waker: Mutex<Option<Waker>>,
+  waiter: Mutex<WaiterState>,
   task_admission: Mutex<Option<DomainReservation>>,
-  _abort_metadata: Arc<dyn AbortMetadata>,
-  task_control: Mutex<Option<ControlCharge>>,
+  shared: Weak<Shared>,
+  reference: TaskRef,
+  task_control: Mutex<ControlCharge>,
 }
 
-impl<F: Future + Send + 'static> Task<F> {
-  fn lock_future(&self) -> MutexGuard<'_, Option<Pin<Box<F>>>> {
+impl<T> Task<T> {
+  fn lock_future(&self) -> MutexGuard<'_, Option<Driver>> {
     self.future.lock().unwrap_or_else(PoisonError::into_inner)
   }
 
@@ -106,31 +105,26 @@ impl<F: Future + Send + 'static> Task<F> {
   }
 
   fn release_future_frame_control(&self) {
-    if let Some(control) = self
+    let result = self
       .task_control
       .lock()
       .unwrap_or_else(PoisonError::into_inner)
-      .as_mut()
-    {
-      let result = control.try_resize(std::mem::size_of::<Self>());
-      debug_assert!(
-        result.is_ok(),
-        "released future frame Control charge failed"
-      );
-    }
+      .try_resize(std::mem::size_of::<Self>());
+    debug_assert!(
+      result.is_ok(),
+      "released future frame Control charge failed"
+    );
   }
 
-  fn stage(&self, outcome: Result<F::Output, AsyncJoinError>) {
-    let mut staged = self.staged.lock().unwrap_or_else(PoisonError::into_inner);
-    *staged = Some(outcome);
+  fn stage(&self, outcome: Result<T, AsyncJoinError>) {
+    self.join.stage(outcome);
   }
 
   fn release_waiter(&self) {
-    let waiter = self
-      .waiter
-      .lock()
-      .unwrap_or_else(PoisonError::into_inner)
-      .take();
+    let waiter = std::mem::replace(
+      &mut *self.waiter.lock().unwrap_or_else(PoisonError::into_inner),
+      WaiterState::Released,
+    );
     drop(waiter);
   }
 
@@ -143,15 +137,6 @@ impl<F: Future + Send + 'static> Task<F> {
     drop(admission);
   }
 
-  fn release_task_waker(&self) {
-    let waker = self
-      .waker
-      .lock()
-      .unwrap_or_else(PoisonError::into_inner)
-      .take();
-    drop(waker);
-  }
-
   fn drop_future_and_stage(&self, error: AsyncJoinError) {
     if let Some(payload) = self.finish_future() {
       self.stage(Err(AsyncJoinError::Panicked(payload)));
@@ -159,22 +144,16 @@ impl<F: Future + Send + 'static> Task<F> {
       self.stage(Err(error));
     }
     self.release_waiter();
-    self.release_task_waker();
     self.release_task_admission();
   }
 }
 
-impl<F> ErasedTask for Task<F>
-where
-  F: Future + Send + 'static,
-  F::Output: Send + 'static,
-{
+impl<T: Send + 'static> ErasedTask for Task<T> {
   fn poll(&self, cx: &mut Context<'_>, permit: PollPermit) -> (PollResult, Option<PollPermit>) {
     let _task_context =
-      TaskContextGuard::enter_with_resource(Some(self.id), self.resources.clone());
+      TaskContextGuard::enter_with_resource(Some(self.join.id()), self.resources.clone());
     let Some(mut future) = self.lock_future().take() else {
       self.release_waiter();
-      self.release_task_waker();
       self.release_task_admission();
       drop(permit);
       return (PollResult::Ready, None);
@@ -182,29 +161,36 @@ where
     // Take ownership before calling user code. The task-state mutex is never
     // held while polling or dropping the future.
     let cpu_execution = CpuExecutionGuard::enter(permit.cpu_domain_identity());
+    *self.command.lock().unwrap_or_else(PoisonError::into_inner) = DriverCommand::Poll;
     let result = {
       let _cooperative_poll = super::entry::CooperativePollGuard::enter();
       panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx)))
     };
     drop(cpu_execution);
     match result {
-      Ok(std::task::Poll::Pending) => {
+      Ok(Poll::Pending) if !self.join.has_staged() => {
         *self.lock_future() = Some(future);
         (PollResult::Pending, Some(permit))
       }
-      Ok(std::task::Poll::Ready(output)) => {
+      Ok(_) => {
         // Release before user destructors, output staging or cleanup.
         drop(permit);
         let cleanup_panic = panic::catch_unwind(AssertUnwindSafe(|| drop(future))).err();
         self.release_future_frame_control();
         if let Some(payload) = cleanup_panic {
-          drop_contained(output);
-          self.stage(Err(AsyncJoinError::Panicked(payload)));
-        } else {
-          self.stage(Ok(output));
+          let outcome = self.join.take_staged();
+          if matches!(outcome, Some(Err(AsyncJoinError::Panicked(_)))) {
+            // The original poll panic wins over a second panic from Drop.
+            drop_contained(payload);
+            if let Some(outcome) = outcome {
+              self.stage(outcome);
+            }
+          } else {
+            drop_contained(outcome);
+            self.stage(Err(AsyncJoinError::Panicked(payload)));
+          }
         }
         self.release_waiter();
-        self.release_task_waker();
         self.release_task_admission();
         (PollResult::Ready, None)
       }
@@ -216,7 +202,6 @@ where
         self.release_future_frame_control();
         self.stage(Err(AsyncJoinError::Panicked(payload)));
         self.release_waiter();
-        self.release_task_waker();
         self.release_task_admission();
         (PollResult::Ready, None)
       }
@@ -225,7 +210,7 @@ where
 
   fn cancel(&self) {
     let _task_context =
-      TaskContextGuard::enter_with_resource(Some(self.id), self.resources.clone());
+      TaskContextGuard::enter_with_resource(Some(self.join.id()), self.resources.clone());
     let panic = self.finish_future();
     let outcome = match panic {
       Some(payload) => Err(AsyncJoinError::Panicked(payload)),
@@ -233,20 +218,15 @@ where
     };
     self.stage(outcome);
     self.release_waiter();
-    self.release_task_waker();
     self.release_task_admission();
   }
 
   fn publish(&self) {
     let _task_context =
-      TaskContextGuard::enter_with_resource(Some(self.id), self.resources.clone());
+      TaskContextGuard::enter_with_resource(Some(self.join.id()), self.resources.clone());
     self.release_waiter();
     self.release_task_admission();
-    let staged = self
-      .staged
-      .lock()
-      .unwrap_or_else(PoisonError::into_inner)
-      .take();
+    let staged = self.join.take_staged();
     if let Some(outcome) = staged
       && let Some(unclaimed) = self.join.publish(outcome)
     {
@@ -258,37 +238,35 @@ where
     let Some(tenant) = &self.tenant else {
       return DomainCpuAdmission::Unbounded;
     };
-    let waiter = self
-      .waiter
-      .lock()
-      .unwrap_or_else(PoisonError::into_inner)
-      .as_ref()
-      .map(Arc::clone);
-    let Some(waiter) = waiter else {
-      return DomainCpuAdmission::Rejected(DomainError::WaitersFull);
+    let waiter = {
+      let mut state = self.waiter.lock().unwrap_or_else(PoisonError::into_inner);
+      match std::mem::replace(&mut *state, WaiterState::InUse) {
+        WaiterState::Available(waiter) => waiter,
+        other => {
+          *state = other;
+          return DomainCpuAdmission::Rejected(DomainError::WaitersFull);
+        }
+      }
     };
-    match waiter.waiter.try_acquire_or_register(tenant, waker) {
+    let result = waiter.try_acquire_or_register(tenant, waker);
+    let mut state = self.waiter.lock().unwrap_or_else(PoisonError::into_inner);
+    if matches!(*state, WaiterState::Released) {
+      drop(state);
+      drop(waiter);
+      drop(result);
+      return DomainCpuAdmission::Rejected(DomainError::WaitersFull);
+    }
+    *state = WaiterState::Available(waiter);
+    drop(state);
+    match result {
       Ok(Some(ticket)) => DomainCpuAdmission::Acquired(ticket),
       Ok(None) => DomainCpuAdmission::Waiting,
       Err(error) => DomainCpuAdmission::Rejected(error),
     }
   }
 
-  fn tenant_domain(&self) -> Option<&TenantDomain> {
-    self.tenant.as_ref()
-  }
-
-  fn task_waker(
-    &self,
-    create: &mut dyn FnMut() -> Result<Waker, DomainError>,
-  ) -> Result<Waker, DomainError> {
-    let mut cached = self.waker.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(waker) = cached.as_ref() {
-      return Ok(waker.clone());
-    }
-    let waker = create()?;
-    *cached = Some(waker.clone());
-    Ok(waker)
+  fn task_waker(self: Arc<Self>) -> Waker {
+    Waker::from(self)
   }
 
   fn fail_resource(&self, error: DomainError) {
@@ -304,147 +282,155 @@ pub(super) fn drop_contained<T>(value: T) {
   }
 }
 
-impl<F> Task<F>
+// The driver is boxed directly. F can itself be a Pin<Box<dyn Future>>;
+// moving that value into the frame does not put another box around F.
+async fn driver<F>(future: F, owner: Weak<Task<F::Output>>)
 where
   F: Future + Send + 'static,
   F::Output: Send + 'static,
 {
-  pub(super) fn reserve_domain_admission(
-    tenant: Option<&TenantDomain>,
-  ) -> Result<TaskDomainAdmission, DomainError> {
-    let task_control_bytes = std::mem::size_of::<Self>()
-      .checked_add(std::mem::size_of::<F>())
-      .ok_or(DomainError::Invalid)?;
-    let join_control_bytes = std::mem::size_of::<JoinState<F::Output>>();
-    let abort_control_bytes = abort_metadata_bytes::<AsyncTaskAbort>();
-    let finished_control_bytes = finished_flag_bytes();
-    let waiter_control_bytes = if tenant.is_some() {
-      std::mem::size_of::<ChargedDomainWaiter>()
-    } else {
-      0
+  let mut future = std::pin::pin!(future);
+  std::future::poll_fn(|cx| {
+    let Some(owner) = owner.upgrade() else {
+      return Poll::Ready(());
     };
-    let all_control_bytes = task_control_bytes
-      .checked_add(join_control_bytes)
-      .and_then(|bytes| bytes.checked_add(abort_control_bytes))
-      .and_then(|bytes| bytes.checked_add(finished_control_bytes))
-      .and_then(|bytes| bytes.checked_add(waiter_control_bytes))
+    // Each driver reads only its own task's command. It stays suspended after
+    // producing an output so the caller can release the poll permit before
+    // dropping the driver (and therefore the pinned user future).
+    let command = std::mem::replace(
+      &mut *owner.command.lock().unwrap_or_else(PoisonError::into_inner),
+      DriverCommand::Idle,
+    );
+    if matches!(command, DriverCommand::Poll) {
+      // Catch inside the async frame: unwinding through the driver would
+      // destroy the pinned future before the caller releases its poll permit.
+      match panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+        Ok(Poll::Ready(output)) => owner.stage(Ok(output)),
+        Ok(Poll::Pending) => {}
+        Err(payload) => owner.stage(Err(AsyncJoinError::Panicked(payload))),
+      }
+    }
+    Poll::Pending
+  })
+  .await;
+}
+
+fn driver_bytes<F, D>(_: fn(F, Weak<Task<F::Output>>) -> D) -> usize
+where
+  F: Future,
+{
+  std::mem::size_of::<D>()
+}
+
+impl<T: Send + 'static> Task<T> {
+  pub(super) fn reserve_domain_admission<F>(
+    tenant: Option<&TenantDomain>,
+  ) -> Result<TaskDomainAdmission, DomainError>
+  where
+    F: Future<Output = T> + Send + 'static,
+  {
+    let bytes = std::mem::size_of::<Self>()
+      .checked_add(driver_bytes(driver::<F>))
       .ok_or(DomainError::Invalid)?;
-
-    let (task, task_control, join_control, abort_control, finished_control, waiter_control) =
-      if let Some(tenant) = tenant {
-        let request = DomainResources::ZERO
-          .with(DomainResource::Tasks, 1)
-          .with(DomainResource::Control, all_control_bytes);
-        let mut combined = tenant.try_acquire(request)?;
-        let task = combined.split_off(DomainResources::ZERO.with(DomainResource::Tasks, 1))?;
-        let mut control = ControlCharge::from_ticket(Some(tenant), combined, all_control_bytes);
-        let task_control = control.split_off(task_control_bytes)?;
-        let join_control = control.split_off(join_control_bytes)?;
-        let abort_control = control.split_off(abort_control_bytes)?;
-        let finished_control = control.split_off(finished_control_bytes)?;
-        (
-          Some(task),
-          task_control,
-          join_control,
-          abort_control,
-          finished_control,
-          control,
-        )
-      } else {
-        (
-          None,
-          ControlCharge::unbounded(task_control_bytes),
-          ControlCharge::unbounded(join_control_bytes),
-          ControlCharge::unbounded(abort_control_bytes),
-          ControlCharge::unbounded(finished_control_bytes),
-          ControlCharge::unbounded(waiter_control_bytes),
-        )
-      };
-
+    let (task, task_control) = if let Some(tenant) = tenant {
+      let request = DomainResources::ZERO
+        .with(DomainResource::Tasks, 1)
+        .with(DomainResource::Control, bytes);
+      let mut combined = tenant.try_acquire(request)?;
+      let task = combined.split_off(DomainResources::ZERO.with(DomainResource::Tasks, 1))?;
+      (
+        Some(task),
+        ControlCharge::from_ticket(Some(tenant), combined, bytes),
+      )
+    } else {
+      (None, ControlCharge::unbounded(bytes))
+    };
     Ok(TaskDomainAdmission {
       tenant: tenant.cloned(),
       waiter: None,
       task,
       task_control,
-      join_control,
-      abort_control,
-      finished_control,
-      waiter_control,
     })
   }
 
-  pub(super) fn create(
+  pub(super) fn create<F>(
     future: F,
     id: TaskId,
     resources: Option<ResourceScope>,
     domain: TaskDomainAdmission,
     shared: Weak<Shared>,
-    task: TaskRef,
-  ) -> (Arc<dyn ErasedTask>, AsyncJob<F::Output>) {
+    reference: TaskRef,
+  ) -> (Arc<dyn ErasedTask>, AsyncJob<T>)
+  where
+    F: Future<Output = T> + Send + 'static,
+  {
     let TaskDomainAdmission {
       tenant,
       waiter,
       task: task_admission,
       task_control,
-      join_control,
-      abort_control,
-      finished_control,
-      waiter_control,
     } = domain;
-    let abort = new_abort_metadata(
-      AsyncTaskAbort { shared, task },
-      abort_control,
-      finished_control,
-    );
-    let join = JoinState::with_id(id, join_control, Arc::clone(&abort));
     #[cfg(all(test, not(loom)))]
     super::allocation_tests::record();
-    #[cfg(all(test, not(loom)))]
-    if std::mem::size_of::<F>() != 0 {
+    let task = Arc::new_cyclic(|owner| {
+      let driver = driver(future, owner.clone());
+      debug_assert_eq!(
+        task_control.bytes(),
+        std::mem::size_of::<Self>() + std::mem::size_of_val(&driver)
+      );
+      #[cfg(all(test, not(loom)))]
       super::allocation_tests::record();
-    }
-    let task = Arc::new(Self {
-      future: Mutex::new(Some(Box::pin(future))),
-      staged: Mutex::new(None),
-      join: Arc::clone(&join),
-      id,
-      resources,
-      tenant,
-      waker: Mutex::new(None),
-      waiter: Mutex::new(waiter.map(|waiter| {
-        #[cfg(all(test, not(loom)))]
-        super::allocation_tests::record();
-        Arc::new(ChargedDomainWaiter {
-          waiter,
-          _control: waiter_control,
-        })
-      })),
-      task_admission: Mutex::new(task_admission),
-      _abort_metadata: Arc::clone(&abort),
-      task_control: Mutex::new(Some(task_control)),
+      Self {
+        future: Mutex::new(Some(Box::pin(driver))),
+        command: Mutex::new(DriverCommand::Idle),
+        join: JoinState::embedded(id, ControlCharge::unbounded(0), None),
+        resources,
+        tenant,
+        waiter: Mutex::new(waiter.map_or(WaiterState::Released, WaiterState::Available)),
+        task_admission: Mutex::new(task_admission),
+        shared,
+        reference,
+        task_control: Mutex::new(task_control),
+      }
     });
-    let erased: Arc<dyn ErasedTask> = task;
-    (erased, AsyncJob::new_with_metadata(join, abort))
+    let abort: Arc<dyn AbortMetadata> = task.clone();
+    let job = AsyncJob::merged(Arc::clone(&task), abort);
+    (task, job)
   }
 }
 
-struct AsyncTaskAbort {
-  shared: Weak<Shared>,
-  task: TaskRef,
+impl<T: Send + 'static> Wake for Task<T> {
+  fn wake(self: Arc<Self>) {
+    self.wake_by_ref();
+  }
+
+  fn wake_by_ref(self: &Arc<Self>) {
+    if let Some(shared) = self.shared.upgrade() {
+      shared.wake(self.reference);
+    }
+  }
 }
 
-impl AbortAction for AsyncTaskAbort {
+impl<T: Send + 'static> AbortMetadata for Task<T> {
   fn abort(&self) {
     if let Some(shared) = self.shared.upgrade() {
-      shared.abort(self.task);
+      shared.abort(self.reference);
     }
+  }
+
+  fn is_finished(&self) -> bool {
+    self.join.is_finished()
+  }
+
+  fn set_finished(&self) {
+    self.join.set_finished();
   }
 }
 
 #[cfg(all(test, not(loom)))]
 mod control_tests {
   use super::*;
-  use crate::runtime::resource_domain::{DomainWaitPool, ResourceDomain};
+  use crate::runtime::resource_domain::ResourceDomain;
 
   fn ceiling() -> DomainResources {
     DomainResources::ZERO
@@ -461,15 +447,8 @@ mod control_tests {
     let global_base = domain.snapshot().used.get(DomainResource::Control);
     let tenant_base = tenant.snapshot().unwrap().used.get(DomainResource::Control);
     type F = std::future::Ready<()>;
-    let expected = std::mem::size_of::<Task<F>>()
-      + std::mem::size_of::<F>()
-      + std::mem::size_of::<JoinState<()>>()
-      + abort_metadata_bytes::<AsyncTaskAbort>()
-      + finished_flag_bytes()
-      + std::mem::size_of::<ChargedDomainWaiter>();
-
-    let admission = Task::<F>::reserve_domain_admission(Some(&tenant))
-      .unwrap_or_else(|error| panic!("combined admission failed: {error}"));
+    let expected = std::mem::size_of::<Task<()>>() + driver_bytes(driver::<F>);
+    let admission = Task::<()>::reserve_domain_admission::<F>(Some(&tenant)).unwrap();
     assert_eq!(
       domain.snapshot().used.get(DomainResource::Control),
       global_base + expected
@@ -492,7 +471,67 @@ mod control_tests {
   }
 
   #[test]
-  fn merged_metadata_preserves_each_control_release_boundary() {
+  fn concurrent_waiter_release_during_acquire_does_not_restore_lease() {
+    struct CancelOnDrop(Weak<dyn ErasedTask>);
+    // Waker::noop cannot carry the destructor that reenters cancellation.
+    #[allow(clippy::manual_noop_waker)]
+    impl Wake for CancelOnDrop {
+      fn wake(self: Arc<Self>) {}
+    }
+    impl Drop for CancelOnDrop {
+      fn drop(&mut self) {
+        if let Some(task) = self.0.upgrade() {
+          task.cancel();
+        }
+      }
+    }
+    let limits = ceiling();
+    let domain = ResourceDomain::with_waiters(limits, 1, 1).unwrap();
+    let tenant = domain.tenant(limits).unwrap();
+    let pool = tenant.reserve_waiters(1).unwrap();
+    let cpu = tenant
+      .try_acquire(DomainResources::ZERO.with(DomainResource::Cpu, 2))
+      .unwrap();
+    type F = std::future::Pending<()>;
+    let mut admission = Task::<()>::reserve_domain_admission::<F>(Some(&tenant)).unwrap();
+    admission.waiter = Some(pool.try_lease().unwrap());
+    let (task, job) = Task::create(
+      std::future::pending::<()>(),
+      TaskId::test_sentinel(),
+      None,
+      admission,
+      Weak::new(),
+      TaskRef::test_sentinel(),
+    );
+    let old = Waker::from(Arc::new(CancelOnDrop(Arc::downgrade(&task))));
+    assert!(matches!(
+      task.acquire_cpu(&old),
+      DomainCpuAdmission::Waiting
+    ));
+    drop(old);
+    // Replacing the domain's old waker reenters cancellation while the
+    // waiter is out of the task mutex. Cleanup must win over reinsertion.
+    assert!(matches!(
+      task.acquire_cpu(Waker::noop()),
+      DomainCpuAdmission::Rejected(DomainError::WaitersFull)
+    ));
+    drop(pool.try_lease().expect("cancelled waiter was restored"));
+    task.publish();
+    assert!(job.is_finished());
+    drop(cpu);
+    assert_eq!(domain.snapshot().used.get(DomainResource::Cpu), 0);
+  }
+
+  #[test]
+  fn task_output_uses_one_inline_storage_location() {
+    let small = std::mem::size_of::<Task<()>>();
+    let large = std::mem::size_of::<Task<[u8; 4096]>>();
+    println!("Task<()>={small} Task<[u8;4096]>={large}");
+    assert!(large - small <= 4096, "output storage was duplicated");
+  }
+
+  #[test]
+  fn merged_state_retains_exact_charge_until_last_handle_or_waker() {
     type F = std::future::Ready<usize>;
     let limits = ceiling();
     let domain = ResourceDomain::with_waiters(limits, 1, 1).unwrap();
@@ -510,11 +549,9 @@ mod control_tests {
         tenant_base + bytes
       );
     };
-    let task_bytes = std::mem::size_of::<Task<F>>();
-    let join_bytes = std::mem::size_of::<JoinState<usize>>();
-    let metadata_bytes = abort_metadata_bytes::<AsyncTaskAbort>() + finished_flag_bytes();
+    let task_bytes = std::mem::size_of::<Task<usize>>();
     let before = super::super::allocation_tests::count();
-    let mut admission = Task::<F>::reserve_domain_admission(Some(&tenant)).unwrap();
+    let mut admission = Task::<usize>::reserve_domain_admission::<F>(Some(&tenant)).unwrap();
     admission.waiter = Some(pool.try_lease().unwrap());
     let (task, job) = Task::create(
       std::future::ready(7usize),
@@ -525,74 +562,81 @@ mod control_tests {
       TaskRef::test_sentinel(),
     );
     let abort = job.abort_handle();
-    assert_control(
-      task_bytes
-        + std::mem::size_of::<F>()
-        + join_bytes
-        + metadata_bytes
-        + std::mem::size_of::<ChargedDomainWaiter>(),
-    );
+    let waker = Arc::clone(&task).task_waker();
+    assert_control(task_bytes + driver_bytes(driver::<F>));
     task.cancel();
     assert!(!abort.is_finished());
     assert_eq!(domain.snapshot().used.get(DomainResource::Tasks), 0);
-    assert_control(task_bytes + join_bytes + metadata_bytes);
+    assert_control(task_bytes);
+    // Cancellation returns the inline waiter to the pool before publication.
+    drop(pool.try_lease().unwrap());
     task.publish();
     assert!(abort.is_finished());
-    assert_control(task_bytes + join_bytes + metadata_bytes);
     drop(task);
-    assert_control(join_bytes + metadata_bytes);
+    assert_control(task_bytes);
     drop(job);
-    assert_control(metadata_bytes);
+    assert_control(task_bytes);
     drop(abort);
+    assert_control(task_bytes);
+    drop(waker);
     assert_control(0);
-    // Includes the tenant waiter wrapper, but this cancelled-before-poll
-    // task never creates a waker. The old path needed six constructors here.
-    assert_eq!(super::super::allocation_tests::count() - before, 5);
+    assert_eq!(super::super::allocation_tests::count() - before, 2);
+  }
+}
+
+#[cfg(all(test, loom))]
+mod model {
+  use super::*;
+  use loom::sync::Arc as ModelArc;
+  use loom::sync::atomic::{AtomicBool, Ordering};
+
+  struct ObserveWake(ModelArc<AtomicBool>);
+
+  impl Wake for ObserveWake {
+    fn wake(self: Arc<Self>) {
+      self.0.store(true, Ordering::Release);
+    }
   }
 
   #[test]
-  fn charged_domain_waiter_arc_retains_exact_payload_until_final_clone() {
-    let limits = ceiling();
-    let domain = ResourceDomain::with_waiters(limits, 1, 2).unwrap();
-    let tenant = domain.tenant(limits).unwrap();
-    let global_base = domain.snapshot().used.get(DomainResource::Control);
-    let tenant_base = tenant.snapshot().unwrap().used.get(DomainResource::Control);
-    let pool_bytes = DomainWaitPool::control_payload_bytes();
-    let wrapper_bytes = std::mem::size_of::<ChargedDomainWaiter>();
-    let pool = tenant.reserve_waiters(1).unwrap();
-    assert_eq!(
-      domain.snapshot().used.get(DomainResource::Control),
-      global_base + pool_bytes
-    );
-    let waiter = pool.try_lease().unwrap();
-    let owner = Arc::new(ChargedDomainWaiter {
-      waiter,
-      _control: ControlCharge::try_new(Some(&tenant), wrapper_bytes).unwrap(),
+  fn merged_publication_racing_join_observer_keeps_completion_and_wake() {
+    loom::model(|| {
+      let admission =
+        Task::<usize>::reserve_domain_admission::<std::future::Ready<usize>>(None).unwrap();
+      let (task, mut job) = Task::create(
+        std::future::ready(7),
+        TaskId::test_sentinel(),
+        None,
+        admission,
+        Weak::new(),
+        TaskRef::test_sentinel(),
+      );
+      let abort = job.abort_handle();
+      let stale = Arc::clone(&task).task_waker();
+      task.cancel();
+      assert!(!abort.is_finished());
+      stale.wake_by_ref();
+      assert!(!abort.is_finished());
+      let observed = ModelArc::new(AtomicBool::new(false));
+      let notified = ModelArc::clone(&observed);
+      let observer = loom::thread::spawn(move || {
+        let waker = Waker::from(Arc::new(ObserveWake(notified)));
+        let ready = Pin::new(&mut job)
+          .poll_finished(&mut Context::from_waker(&waker))
+          .is_ready();
+        (ready, job)
+      });
+      let publisher = loom::thread::spawn(move || task.publish());
+      let (ready, mut job) = observer.join().unwrap();
+      publisher.join().unwrap();
+      assert!(ready || observed.load(Ordering::Acquire));
+      assert!(abort.is_finished());
+      assert!(matches!(
+        job.take_finished(),
+        Some(Err(AsyncJoinError::Cancelled))
+      ));
+      stale.wake();
+      assert!(abort.is_finished());
     });
-    assert_eq!(
-      domain.snapshot().used.get(DomainResource::Control),
-      global_base + pool_bytes + wrapper_bytes
-    );
-    assert_eq!(
-      tenant.snapshot().unwrap().used.get(DomainResource::Control),
-      tenant_base + pool_bytes + wrapper_bytes
-    );
-
-    let last = Arc::clone(&owner);
-    drop(pool);
-    drop(owner);
-    assert_eq!(
-      domain.snapshot().used.get(DomainResource::Control),
-      global_base + pool_bytes + wrapper_bytes
-    );
-    drop(last);
-    assert_eq!(
-      domain.snapshot().used.get(DomainResource::Control),
-      global_base
-    );
-    assert_eq!(
-      tenant.snapshot().unwrap().used.get(DomainResource::Control),
-      tenant_base
-    );
   }
 }

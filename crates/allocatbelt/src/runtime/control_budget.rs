@@ -228,7 +228,7 @@ fn async_control_rejection_returns_future_and_rolls_back_both_ledgers() {
 }
 
 #[test]
-fn async_task_waker_control_failure_finishes_without_polling_future() {
+fn async_task_waker_needs_no_control_admission_after_spawn() {
   let (domain, tenant, resources) = bound_resources();
   let (entered_tx, entered_rx) = mpsc::sync_channel(1);
   let (release_tx, release_rx) = mpsc::sync_channel(1);
@@ -282,15 +282,8 @@ fn async_task_waker_control_failure_finishes_without_polling_future() {
     );
     thread::yield_now();
   };
-  assert!(matches!(
-    outcome,
-    Err(
-      crate::runtime::asynchronous::AsyncJoinError::ResourceDomain(DomainError::Exhausted(
-        DomainResource::Control
-      ))
-    )
-  ));
-  assert_eq!(polls.load(Ordering::SeqCst), 0);
+  assert_eq!(outcome.unwrap(), 19);
+  assert_eq!(polls.load(Ordering::SeqCst), 1);
   assert_eq!(domain.snapshot().used.get(DomainResource::Tasks), 0);
   drop(job);
   runtime
@@ -335,7 +328,9 @@ fn async_abort_metrics_and_child_scope_keep_control_until_final_owner_drop() {
   let retained_with_abort = control_used(domain.snapshot());
   assert!(retained_with_abort > domain_baseline);
   drop(abort);
-  wait_until(|| control_used(domain.snapshot()) < retained_with_abort);
+  // Abort and the saved waker retain the same merged allocation. Its complete
+  // payload remains charged until the last of those handles is dropped.
+  assert_eq!(control_used(domain.snapshot()), retained_with_abort);
 
   let retained_with_metrics = control_used(domain.snapshot());
   drop(handle);

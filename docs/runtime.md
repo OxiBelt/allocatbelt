@@ -1111,8 +1111,17 @@ as its one pending wake. Other wakes, abort and cancellation are taken under
 the task slot mutex, and a tag alias can cause at most one spurious poll.
 
 `AsyncJob::abort_handle` returns a clonable thread-safe control handle,
-including for local jobs whose outputs are `!Send`. It retains cancellation
-metadata rather than the future or result. `is_finished` becomes true when the
+including for local jobs whose outputs are `!Send`. For native worker tasks,
+abort handles and scheduler wakers retain the shared task bookkeeping allocation
+and its `Control` charge. It contains one inline output slot: the result remains
+there until the join consumes it or is dropped; a detached result is discarded
+by the publishing worker. Completion drops the boxed driver and user future and
+releases their frame charge before publication. Retained handles keep the empty
+slot's storage and bookkeeping charged, without keeping a consumed or discarded
+result value alive. Local jobs retain separate cancellation metadata. If the
+last runtime owner drops while native tasks are still admitted, that thread
+cancels them and publishes their outcomes, without an ambient task context if
+its thread-locals are already destroyed. `is_finished` becomes true when the
 terminal outcome is published after future destruction and admission release.
 Detaching a join alone leaves it false. It does not wait for completion callbacks,
 discarded-output destruction or the later scope-close publication/reclamation.
@@ -1908,9 +1917,14 @@ When a tenant resource domain is bound, root
 polls, owned tasks and blocking execution share its CPU and task admission.
 Declared scheduler payloads, owning facades, controlled scopes, queues, metrics,
 flags, waiter owners, byte buckets and feedback state retain Control charges
-through their final handles. An owned async task charges one scheduler waker
-on its first poll and reuses it until the task finishes, so a later poll cannot
-fail for lack of waker Control; clones the future retains keep that charge.
+through their final handles. A native worker task reserves its shared task
+bookkeeping and boxed driver payload at admission. Scheduler wakers reuse that
+allocation without another allocation or first-poll charge. Completion drops
+the driver and user future and releases the frame charge; the bookkeeping,
+including one inline output slot, remains charged until the last join, abort
+handle or scheduler waker is dropped. Consuming or dropping the join releases
+the result value (a detached result is discarded by the publishing worker),
+even while stale wakers or abort handles retain the empty slot's storage.
 Bound filesystem requests reserve their shared
 input-and-mutex payload before disk or job admission; that charge survives
 queued cancellation and detached execution. Caller-owned allocations reachable
