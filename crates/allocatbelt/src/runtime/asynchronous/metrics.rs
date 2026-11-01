@@ -26,6 +26,7 @@ pub(super) struct RuntimeMetricsInner {
   _control: ControlCharge,
 }
 
+#[repr(align(128))]
 pub(super) struct ThreadMetrics {
   pub(super) context: AsyncThreadContext,
   pub(super) alive: AtomicBool,
@@ -50,11 +51,12 @@ impl ThreadMetrics {
   }
 
   pub(super) fn add_busy_nanos(&self, nanos: u64) {
-    let _ = self
+    // Only the corresponding physical dispatcher writes this counter; other
+    // threads may sample it concurrently.
+    let current = self.busy_nanos.load(Ordering::Relaxed);
+    self
       .busy_nanos
-      .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_add(nanos))
-      });
+      .store(current.saturating_add(nanos), Ordering::Relaxed);
   }
 }
 

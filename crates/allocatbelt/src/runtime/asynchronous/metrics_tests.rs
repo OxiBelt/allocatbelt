@@ -384,6 +384,57 @@ fn callback_panics_are_contained_and_counted_without_losing_workers() {
 }
 
 #[test]
+fn busy_duration_accumulates_each_turn_on_the_dispatching_thread() {
+  let runtime = AsyncRuntime::new_with_handoffs(config(1, 1), HandoffConfig { max_handoffs: 1 })
+    .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
+  let metrics = runtime.metrics();
+  let task_metrics = metrics.clone();
+  let mut turns = 0;
+  let mut previous = Duration::ZERO;
+  let job = runtime
+    .handle()
+    .spawn(std::future::poll_fn(move |context| {
+      let worker = task_metrics
+        .thread(0)
+        .unwrap_or_else(|| panic!("worker missing"));
+      let helper = task_metrics
+        .thread(1)
+        .unwrap_or_else(|| panic!("helper missing"));
+      assert_eq!(worker.context.role, AsyncThreadRole::Worker);
+      assert_eq!(helper.context.role, AsyncThreadRole::HandoffHelper);
+      assert_eq!(helper.busy_duration, Duration::ZERO);
+      if turns > 0 {
+        assert!(
+          worker.busy_duration > previous,
+          "previous turn was not recorded"
+        );
+      }
+      previous = worker.busy_duration;
+      let until = Instant::now() + Duration::from_micros(20);
+      while Instant::now() < until {
+        std::hint::spin_loop();
+      }
+      turns += 1;
+      if turns == 64 {
+        Poll::Ready(())
+      } else {
+        context.waker().wake_by_ref();
+        Poll::Pending
+      }
+    }))
+    .unwrap_or_else(|error| panic!("spawn failed: {error}"));
+  runtime
+    .block_on(job)
+    .unwrap_or_else(|error| panic!("block_on failed: {error}"))
+    .unwrap_or_else(|error| panic!("task failed: {error}"));
+  runtime
+    .shutdown(AsyncShutdown::Drain)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+  assert!(metrics.thread(0).unwrap().busy_duration >= Duration::from_micros(64 * 20));
+  assert_eq!(metrics.thread(1).unwrap().busy_duration, Duration::ZERO);
+}
+
+#[test]
 fn busy_duration_excludes_handoff_closure_and_attributes_helper_turns() {
   let worker_park_hooks = Arc::new(AtomicUsize::new(0));
   let worker_unpark_hooks = Arc::new(AtomicUsize::new(0));

@@ -277,24 +277,22 @@ fn restore_phase(turn: DispatchTurn) {
 
 #[cfg(not(loom))]
 fn pause_busy() {
-  let paused = DISPATCHER
-    .try_with(|slot| {
-      let mut slot = slot.try_borrow_mut().ok()?;
-      let dispatcher = slot.as_mut()?;
-      let started = dispatcher.busy_since.take()?;
-      Some((
-        Arc::clone(&dispatcher.shared),
-        dispatcher.context.physical_index,
-        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-      ))
-    })
-    .ok()
-    .flatten();
-  if let Some((shared, physical_index, nanos)) = paused
-    && let Some(metrics) = shared.metrics.inner().thread(physical_index)
-  {
-    metrics.add_busy_nanos(nanos);
-  }
+  let _ = DISPATCHER.try_with(|slot| {
+    if let Ok(mut slot) = slot.try_borrow_mut()
+      && let Some(dispatcher) = slot.as_mut()
+      && let Some(started) = dispatcher.busy_since.take()
+    {
+      let nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+      if let Some(metrics) = dispatcher
+        .shared
+        .metrics
+        .inner()
+        .thread(dispatcher.context.physical_index)
+      {
+        metrics.add_busy_nanos(nanos);
+      }
+    }
+  });
 }
 
 #[cfg(loom)]
