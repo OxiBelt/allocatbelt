@@ -33,6 +33,8 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
+#[cfg(all(test, not(loom)))]
+mod allocation_tests;
 mod entry;
 mod handoff;
 mod handoff_protocol;

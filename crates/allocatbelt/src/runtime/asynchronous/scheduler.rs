@@ -53,6 +53,16 @@ pub(super) struct TaskRef {
   generation: u64,
 }
 
+#[cfg(all(test, not(loom)))]
+impl TaskRef {
+  pub(super) const fn test_sentinel() -> Self {
+    Self {
+      index: 0,
+      generation: 1,
+    }
+  }
+}
+
 struct ScopeSlot {
   generation: u64,
   scope: Option<Arc<ScopeCell>>,
@@ -768,6 +778,8 @@ fn task_waker(
   tenant: Option<&TenantDomain>,
 ) -> Result<Waker, DomainError> {
   let control = ControlCharge::try_new(tenant, std::mem::size_of::<TaskWake>())?;
+  #[cfg(all(test, not(loom)))]
+  super::allocation_tests::record();
   Ok(Waker::from(Arc::new(TaskWake {
     shared: Arc::downgrade(shared),
     task,
@@ -1168,6 +1180,51 @@ mod tests {
         }
       }
     }
+  }
+
+  #[test]
+  fn task_allocation_constructors_cover_spawn_cached_waker_and_completion() {
+    let runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 1,
+      max_scopes: 1,
+    })
+    .unwrap();
+    let before = super::super::allocation_tests::count();
+    let task_ref = TaskRef {
+      index: 0,
+      generation: 1,
+    };
+    let admission = Task::<std::future::Ready<usize>>::reserve_domain_admission(None).unwrap();
+    let (task, job) = Task::create(
+      std::future::ready(7usize),
+      super::super::identity::TaskId::test_sentinel(),
+      None,
+      admission,
+      Arc::downgrade(&runtime.shared),
+      task_ref,
+    );
+    let abort = job.abort_handle();
+    let mut create = || task_waker(&runtime.shared, task_ref, None);
+    let waker = task.task_waker(&mut create).unwrap();
+    drop(task.task_waker(&mut create).unwrap());
+    let permit = PollPermit {
+      release: PermitRelease::Free,
+      cpu_ticket: None,
+    };
+    assert!(matches!(
+      task.poll(&mut Context::from_waker(&waker), permit),
+      (PollResult::Ready, None)
+    ));
+    task.publish();
+    drop(task);
+    assert!(job.is_finished());
+    drop(job);
+    assert!(abort.is_finished());
+    drop(abort);
+    drop(waker);
+    assert_eq!(super::super::allocation_tests::count() - before, 5);
+    runtime.shutdown(AsyncShutdown::Drain).unwrap();
   }
 
   #[test]

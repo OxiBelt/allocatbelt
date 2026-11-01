@@ -391,12 +391,18 @@ where
       finished_control,
       waiter_control,
     } = domain;
-    let join = JoinState::with_id(id, join_control, finished_control);
     let abort = new_abort_metadata(
       AsyncTaskAbort { shared, task },
-      join.finished_flag(),
       abort_control,
+      finished_control,
     );
+    let join = JoinState::with_id(id, join_control, Arc::clone(&abort));
+    #[cfg(all(test, not(loom)))]
+    super::allocation_tests::record();
+    #[cfg(all(test, not(loom)))]
+    if std::mem::size_of::<F>() != 0 {
+      super::allocation_tests::record();
+    }
     let task = Arc::new(Self {
       future: Mutex::new(Some(Box::pin(future))),
       staged: Mutex::new(None),
@@ -406,6 +412,8 @@ where
       tenant,
       waker: Mutex::new(None),
       waiter: Mutex::new(waiter.map(|waiter| {
+        #[cfg(all(test, not(loom)))]
+        super::allocation_tests::record();
         Arc::new(ChargedDomainWaiter {
           waiter,
           _control: waiter_control,
@@ -481,6 +489,65 @@ mod control_tests {
       tenant_base
     );
     assert_eq!(domain.snapshot().used.get(DomainResource::Tasks), 0);
+  }
+
+  #[test]
+  fn merged_metadata_preserves_each_control_release_boundary() {
+    type F = std::future::Ready<usize>;
+    let limits = ceiling();
+    let domain = ResourceDomain::with_waiters(limits, 1, 1).unwrap();
+    let tenant = domain.tenant(limits).unwrap();
+    let pool = tenant.reserve_waiters(1).unwrap();
+    let global_base = domain.snapshot().used.get(DomainResource::Control);
+    let tenant_base = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+    let assert_control = |bytes| {
+      assert_eq!(
+        domain.snapshot().used.get(DomainResource::Control),
+        global_base + bytes
+      );
+      assert_eq!(
+        tenant.snapshot().unwrap().used.get(DomainResource::Control),
+        tenant_base + bytes
+      );
+    };
+    let task_bytes = std::mem::size_of::<Task<F>>();
+    let join_bytes = std::mem::size_of::<JoinState<usize>>();
+    let metadata_bytes = abort_metadata_bytes::<AsyncTaskAbort>() + finished_flag_bytes();
+    let before = super::super::allocation_tests::count();
+    let mut admission = Task::<F>::reserve_domain_admission(Some(&tenant)).unwrap();
+    admission.waiter = Some(pool.try_lease().unwrap());
+    let (task, job) = Task::create(
+      std::future::ready(7usize),
+      TaskId::test_sentinel(),
+      None,
+      admission,
+      Weak::new(),
+      TaskRef::test_sentinel(),
+    );
+    let abort = job.abort_handle();
+    assert_control(
+      task_bytes
+        + std::mem::size_of::<F>()
+        + join_bytes
+        + metadata_bytes
+        + std::mem::size_of::<ChargedDomainWaiter>(),
+    );
+    task.cancel();
+    assert!(!abort.is_finished());
+    assert_eq!(domain.snapshot().used.get(DomainResource::Tasks), 0);
+    assert_control(task_bytes + join_bytes + metadata_bytes);
+    task.publish();
+    assert!(abort.is_finished());
+    assert_control(task_bytes + join_bytes + metadata_bytes);
+    drop(task);
+    assert_control(join_bytes + metadata_bytes);
+    drop(job);
+    assert_control(metadata_bytes);
+    drop(abort);
+    assert_control(0);
+    // Includes the tenant waiter wrapper, but this cancelled-before-poll
+    // task never creates a waker. The old path needed six constructors here.
+    assert_eq!(super::super::allocation_tests::count() - before, 5);
   }
 
   #[test]

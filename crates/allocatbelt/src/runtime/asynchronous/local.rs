@@ -2141,12 +2141,12 @@ impl LocalHandle {
     let context_control =
       std::mem::replace(&mut domain.context_control, ControlCharge::unbounded(0));
     let task_admission = domain.task.take();
-    let join = JoinState::with_id(id, join_control, finished_control);
     let abort_metadata = new_abort_metadata(
       self.core.abort_action(task_ref),
-      join.finished_flag(),
       abort_control,
+      finished_control,
     );
+    let join = JoinState::with_id(id, join_control, Arc::clone(&abort_metadata));
     let abort = Arc::new(LocalAbortFlag::new(abort_flag_control));
     let task = Task {
       future: Some(Box::pin(future)),
@@ -2327,7 +2327,6 @@ impl LocalSendHandle {
     let context_control =
       std::mem::replace(&mut domain.context_control, ControlCharge::unbounded(0));
     drop(domain);
-    let join = JoinState::with_id(id, join_control, finished_control);
     let abort = Arc::new(LocalAbortFlag::new(abort_flag_control));
     let abort_target = Arc::new(LocalAbortTarget::new(abort_target_control));
     let abort_metadata = new_abort_metadata(
@@ -2337,9 +2336,10 @@ impl LocalSendHandle {
         control: Arc::downgrade(&self.control),
         notifier: Arc::clone(&self.notifier),
       },
-      join.finished_flag(),
       abort_control,
+      finished_control,
     );
+    let join = JoinState::with_id(id, join_control, Arc::clone(&abort_metadata));
     let request = SendRequest {
       future,
       id,

@@ -25,22 +25,25 @@ pub(super) trait AbortAction: Send + Sync {
 
 /// Shared completion and cancellation metadata retained by join and abort
 /// handles independently of the future and scheduler task slot.
+/// Spawned joins and their tasks retain this same owner, so embedding the
+/// completion flag preserves its lifetime without a separate allocation.
 pub(super) trait AbortMetadata: Send + Sync {
   fn abort(&self);
   fn is_finished(&self) -> bool;
+  fn set_finished(&self);
 }
 
-pub(super) struct FinishedFlag {
+struct FinishedFlag {
   value: AtomicBool,
   _control: ControlCharge,
 }
 
 impl FinishedFlag {
-  fn new(control: ControlCharge) -> Arc<Self> {
-    Arc::new(Self {
+  fn new(control: ControlCharge) -> Self {
+    Self {
       value: AtomicBool::new(false),
       _control: control,
-    })
+    }
   }
 
   fn is_set(&self) -> bool {
@@ -54,7 +57,7 @@ impl FinishedFlag {
 
 struct AbortOwner<A> {
   action: A,
-  finished: Arc<FinishedFlag>,
+  finished: FinishedFlag,
   _control: ControlCharge,
 }
 
@@ -66,10 +69,16 @@ impl<A: AbortAction> AbortMetadata for AbortOwner<A> {
   fn is_finished(&self) -> bool {
     self.finished.is_set()
   }
+
+  fn set_finished(&self) {
+    self.finished.set();
+  }
 }
 
 pub(super) fn abort_metadata_bytes<A>() -> usize {
-  std::mem::size_of::<AbortOwner<A>>()
+  // The embedded flag retains its own declared payload charge. Include all
+  // remaining bytes (including padding) in the abort owner's charge.
+  std::mem::size_of::<AbortOwner<A>>() - finished_flag_bytes()
 }
 
 pub(super) fn finished_flag_bytes() -> usize {
@@ -78,24 +87,45 @@ pub(super) fn finished_flag_bytes() -> usize {
 
 pub(super) fn new_abort_metadata<A: AbortAction + 'static>(
   action: A,
-  finished: Arc<FinishedFlag>,
   control: ControlCharge,
+  finished_control: ControlCharge,
 ) -> Arc<dyn AbortMetadata> {
+  #[cfg(all(test, not(loom)))]
+  super::allocation_tests::record();
   Arc::new(AbortOwner {
     action,
-    finished,
+    finished: FinishedFlag::new(finished_control),
     _control: control,
   })
 }
 
 #[cfg(test)]
-struct CallbackAbort(Arc<dyn Fn() + Send + Sync>);
+struct CallbackAbort {
+  callback: Arc<dyn Fn() + Send + Sync>,
+  completion: Arc<dyn AbortMetadata>,
+}
 
 #[cfg(test)]
-impl AbortAction for CallbackAbort {
+impl AbortMetadata for CallbackAbort {
   fn abort(&self) {
-    (self.0)();
+    (self.callback)();
   }
+
+  fn is_finished(&self) -> bool {
+    self.completion.is_finished()
+  }
+
+  fn set_finished(&self) {
+    self.completion.set_finished();
+  }
+}
+
+#[cfg(test)]
+struct NoopAbort;
+
+#[cfg(test)]
+impl AbortAction for NoopAbort {
+  fn abort(&self) {}
 }
 
 /// Why an async task did not produce its output.
@@ -143,7 +173,8 @@ enum Slot<T> {
 
 pub(super) struct JoinState<T> {
   slot: Mutex<Slot<T>>,
-  finished: Arc<FinishedFlag>,
+  // Output-independent metadata also works for non-Send local outputs.
+  finished: Arc<dyn AbortMetadata>,
   id: TaskId,
   _control: ControlCharge,
 }
@@ -152,14 +183,16 @@ impl<T> JoinState<T> {
   pub(super) fn with_id(
     id: TaskId,
     control: ControlCharge,
-    finished_control: ControlCharge,
+    finished: Arc<dyn AbortMetadata>,
   ) -> Arc<Self> {
+    #[cfg(all(test, not(loom)))]
+    super::allocation_tests::record();
     Arc::new(Self {
       slot: Mutex::new(Slot::Pending(PendingWakers {
         join: None,
         finished: None,
       })),
-      finished: FinishedFlag::new(finished_control),
+      finished,
       id,
       _control: control,
     })
@@ -172,12 +205,12 @@ impl<T> JoinState<T> {
     Self::with_id(
       TaskId::test_sentinel(),
       ControlCharge::unbounded(std::mem::size_of::<Self>()),
-      ControlCharge::unbounded(finished_flag_bytes()),
+      new_abort_metadata(
+        NoopAbort,
+        ControlCharge::unbounded(abort_metadata_bytes::<NoopAbort>()),
+        ControlCharge::unbounded(finished_flag_bytes()),
+      ),
     )
-  }
-
-  pub(super) fn finished_flag(&self) -> Arc<FinishedFlag> {
-    Arc::clone(&self.finished)
   }
 
   fn lock(&self) -> MutexGuard<'_, Slot<T>> {
@@ -194,7 +227,7 @@ impl<T> JoinState<T> {
     match std::mem::replace(&mut *slot, Slot::Taken) {
       Slot::Pending(wakers) => {
         *slot = Slot::Ready(Some(result));
-        self.finished.set();
+        self.finished.set_finished();
         drop(slot);
         if let Some(waker) = wakers.finished
           && let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| waker.wake()))
@@ -215,7 +248,7 @@ impl<T> JoinState<T> {
       }
       Slot::Taken => {
         *slot = Slot::Taken;
-        self.finished.set();
+        self.finished.set_finished();
         drop(slot);
         Some(result)
       }
@@ -250,11 +283,10 @@ impl<T> AsyncJob<T> {
 
   #[cfg(test)]
   pub(super) fn new(state: Arc<JoinState<T>>, abort: Arc<dyn Fn() + Send + Sync>) -> Self {
-    let metadata = new_abort_metadata(
-      CallbackAbort(abort),
-      state.finished_flag(),
-      ControlCharge::unbounded(abort_metadata_bytes::<CallbackAbort>()),
-    );
+    let metadata = Arc::new(CallbackAbort {
+      callback: abort,
+      completion: Arc::clone(&state.finished),
+    });
     Self::new_with_metadata(state, metadata)
   }
 
@@ -283,7 +315,7 @@ impl<T> AsyncJob<T> {
   /// Whether the terminal join outcome has been published after task cleanup.
   #[must_use]
   pub fn is_finished(&self) -> bool {
-    self.state.finished.is_set()
+    self.state.finished.is_finished()
   }
 
   /// Polls for terminal completion without taking the task's result.
@@ -292,7 +324,7 @@ impl<T> AsyncJob<T> {
   /// notification before they consume this join handle.
   pub fn poll_finished(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
     let this = self.get_mut();
-    if this.state.finished.is_set() {
+    if this.state.finished.is_finished() {
       return Poll::Ready(());
     }
 
@@ -304,7 +336,7 @@ impl<T> AsyncJob<T> {
         drop(replacement);
         return Poll::Ready(());
       };
-      if this.state.finished.is_set() {
+      if this.state.finished.is_finished() {
         drop(slot);
         drop(replacement);
         return Poll::Ready(());
@@ -318,7 +350,7 @@ impl<T> AsyncJob<T> {
   /// Takes an outcome already announced by `poll_finished`, without cloning a
   /// caller waker while consuming a completion notification.
   pub(super) fn take_finished(&mut self) -> Option<Result<T, AsyncJoinError>> {
-    if !self.state.finished.is_set() {
+    if !self.state.finished.is_finished() {
       return None;
     }
     let outcome = {
@@ -558,15 +590,19 @@ mod tests {
     let join_bytes = std::mem::size_of::<JoinState<usize>>();
     let finished_bytes = super::finished_flag_bytes();
     let abort_bytes = super::abort_metadata_bytes::<TestAbort>();
-    let join = JoinState::with_id(
-      super::TaskId::test_sentinel(),
-      ControlCharge::try_new(Some(&tenant), join_bytes).unwrap(),
-      ControlCharge::try_new(Some(&tenant), finished_bytes).unwrap(),
+    assert_eq!(
+      abort_bytes + finished_bytes,
+      std::mem::size_of::<super::AbortOwner<TestAbort>>()
     );
     let metadata = super::new_abort_metadata(
       TestAbort,
-      join.finished_flag(),
       ControlCharge::try_new(Some(&tenant), abort_bytes).unwrap(),
+      ControlCharge::try_new(Some(&tenant), finished_bytes).unwrap(),
+    );
+    let join = JoinState::with_id(
+      super::TaskId::test_sentinel(),
+      ControlCharge::try_new(Some(&tenant), join_bytes).unwrap(),
+      Arc::clone(&metadata),
     );
     let job = AsyncJob::new_with_metadata(Arc::clone(&join), metadata);
     let abort = job.abort_handle();
@@ -600,6 +636,65 @@ mod tests {
       tenant.snapshot().unwrap().used.get(DomainResource::Control),
       base_tenant
     );
+  }
+
+  #[test]
+  fn retained_abort_metadata_does_not_retain_join_or_output() {
+    struct Output(Arc<AtomicUsize>);
+
+    impl Drop for Output {
+      fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+      }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let metadata = super::new_abort_metadata(
+      TestAbort,
+      ControlCharge::unbounded(super::abort_metadata_bytes::<TestAbort>()),
+      ControlCharge::unbounded(super::finished_flag_bytes()),
+    );
+    let weak_metadata = Arc::downgrade(&metadata);
+    let state = JoinState::with_id(
+      super::TaskId::test_sentinel(),
+      ControlCharge::unbounded(std::mem::size_of::<JoinState<Output>>()),
+      Arc::clone(&metadata),
+    );
+    let weak_state = Arc::downgrade(&state);
+    let mut job = AsyncJob::new_with_metadata(Arc::clone(&state), metadata);
+    let abort = job.abort_handle();
+    assert!(state.publish(Ok(Output(Arc::clone(&drops)))).is_none());
+    drop(state);
+    // Consuming the result while retaining the job must release the output.
+    let output = job.take_finished().unwrap().unwrap();
+    drop(output);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    drop(job);
+    assert!(weak_state.upgrade().is_none());
+    assert!(weak_metadata.upgrade().is_some());
+    assert!(abort.is_finished());
+    drop(abort);
+    assert!(weak_metadata.upgrade().is_none());
+
+    // An unconsumed result is destroyed by detaching, even with an abort
+    // handle alive. Detached publication still returns output to the worker.
+    for publish_first in [true, false] {
+      let state = JoinState::new();
+      let job = AsyncJob::new(Arc::clone(&state), Arc::new(|| {}));
+      let abort = job.abort_handle();
+      if publish_first {
+        assert!(state.publish(Ok(Output(Arc::clone(&drops)))).is_none());
+      }
+      drop(job);
+      if !publish_first {
+        let staged = state.publish(Ok(Output(Arc::clone(&drops))));
+        assert!(staged.is_some());
+        drop(staged);
+      }
+      drop(state);
+      assert!(abort.is_finished());
+    }
+    assert_eq!(drops.load(Ordering::SeqCst), 3);
   }
 
   #[test]
