@@ -1298,15 +1298,9 @@ mod loom_tests {
         thread::spawn(move || {
           let chain = lock(&victim).steal_front(&model.links);
           chain.map(|chain| {
-            // Release the victim before acquiring the receiving lane.
-            let own = Mutex::new(LaneQueue::new());
-            let index = {
-              let mut own = lock(&own);
-              own.append_chain(&model.links, chain);
-              let index = own.pop(&model.links).unwrap();
-              assert!(own.check(&model.links).is_empty());
-              index
-            };
+            // A two-entry victim yields one entry, dispatched directly
+            // without entering the receiving lane.
+            let index = chain.into_single().unwrap();
             assert!(index == 1 || index == 2);
             if index == 1 {
               model.dispatch(index);

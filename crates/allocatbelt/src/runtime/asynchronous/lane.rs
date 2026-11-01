@@ -41,6 +41,19 @@ pub(super) struct Chain {
   len: usize,
 }
 
+impl Chain {
+  /// Consume a one-entry chain and return its index. A longer chain is
+  /// returned unchanged for appending.
+  pub(super) fn into_single(self) -> Result<usize, Self> {
+    if self.len == 1 {
+      debug_assert_eq!(self.first, self.last);
+      Ok(self.first)
+    } else {
+      Err(self)
+    }
+  }
+}
+
 #[derive(Debug)]
 pub(super) struct LaneQueue {
   head: usize,
@@ -775,22 +788,32 @@ mod loom_tests {
                 (chain, expected)
               })
             };
-            // Acquiring the receiving lane only after releasing the victim.
+            // A lone stolen entry is dispatched directly; a larger chain is
+            // appended to the receiving lane only after releasing the victim.
+            let mut popped = Vec::new();
             let own = Mutex::new(LaneQueue::new());
             let mut own = own.lock().unwrap();
             own.push(&links, count);
             let mut expected = vec![count];
             if let Some((chain, indices)) = stolen {
-              expected.extend(indices);
-              own.append_chain(&links, chain);
+              match chain.into_single() {
+                Ok(index) => {
+                  assert_eq!(indices, [index]);
+                  popped.push(index);
+                }
+                Err(chain) => {
+                  expected.extend(indices);
+                  own.append_chain(&links, chain);
+                }
+              }
             }
             assert_eq!(own.check(&links), expected);
-            let mut popped = Vec::new();
+            let direct = popped.len();
             while let Some(index) = own.pop(&links) {
               popped.push(index);
               own.check(&links);
             }
-            assert_eq!(popped, expected);
+            assert_eq!(popped[direct..], expected);
             popped
           })
         };
@@ -825,14 +848,16 @@ mod loom_tests {
       AtomicUsize::new(0),
     ]);
     let kick = Arc::new(Mutex::new(None));
+    let dispatched = Arc::new(Mutex::new(Vec::new()));
     let searcher = {
-      let (links, victim, sleeper, parked, lengths, other) = (
+      let (links, victim, sleeper, parked, lengths, other, dispatched) = (
         Arc::clone(&links),
         Arc::clone(&victim),
         Arc::clone(&sleeper),
         Arc::clone(&parked),
         Arc::clone(&lengths),
         Arc::clone(&other),
+        Arc::clone(&dispatched),
       );
       thread::spawn(move || {
         let (chain, remains, before) = {
@@ -863,8 +888,10 @@ mod loom_tests {
             before != 1 || kicked.is_none(),
             "last-entry steal woke a holder"
           );
-          let mut own = sleeper.lock().unwrap();
-          own.append_chain(&links[..], chain);
+          // Victims here hold at most two entries, so every steal takes one
+          // entry, which bypasses the receiving lane for direct dispatch.
+          let index = chain.into_single().unwrap();
+          dispatched.lock().unwrap().push(index);
           return false;
         }
         if search_or_park(
@@ -927,7 +954,7 @@ mod loom_tests {
         "holder slept without a covering notification"
       );
     }
-    let mut popped = Vec::new();
+    let mut popped = dispatched.lock().unwrap().clone();
     for queue in [&victim, &sleeper] {
       let mut queue = queue.lock().unwrap();
       queue.finish_sleep();

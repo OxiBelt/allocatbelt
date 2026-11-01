@@ -886,6 +886,21 @@ impl Distributed {
       if remains {
         self.wake_one_parked();
       }
+      // A lone stolen entry bypasses the receiving lane. An abort that set its
+      // cleanup flag before this load routes it to overflow; a later abort is
+      // seen under the slot lock by the dispatch decision, as after a pop.
+      let chain = match chain.into_single() {
+        Ok(index) => {
+          #[cfg(all(test, not(loom)))]
+          self.steals.fetch_add(1, Ordering::Relaxed);
+          if self.links[index].cleanup.load(Ordering::SeqCst) {
+            self.push_cleanup(shared, index);
+            return None;
+          }
+          return Some(index);
+        }
+        Err(chain) => chain,
+      };
       let (first, remains, cleanup) = {
         let mut queue = self.lane(seat);
         queue.append_chain(&self.links, chain);

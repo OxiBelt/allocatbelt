@@ -996,9 +996,11 @@ Dead seats are excluded; among live seats it skips parked dispatchers unless
 all are parked. A dispatcher takes its own front entry, then searches other
 lanes in a pseudo-random order, then takes one
 shared overflow entry. An idle dispatcher can take a busy lane's oldest
-entries, including a single remaining one. A steal moves that entry or the
-oldest bounded half (at most 32) of a larger lane to the receiving lane's tail,
-preserving order. A multi-entry victim keeps at least one entry. Inserting
+entries, including a single remaining one. A steal takes the oldest entry,
+or the oldest bounded half (at most 32) of a larger lane. A stealer dispatches
+a lone stolen entry directly without placing it on its own lane, and moves a
+larger chain to its lane's tail, preserving order. A multi-entry victim keeps
+at least one entry. Inserting
 ready work onto a lane whose dispatcher is awake wakes one parked dispatcher,
 if available, even for a lone entry. An insertion that claims a parked lane
 wakes only that lane's dispatcher. This applies to spawns, idle task wakes and

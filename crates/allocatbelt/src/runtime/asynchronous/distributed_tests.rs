@@ -658,7 +658,10 @@ fn stealing_last_entry_does_not_wake_or_lock_a_parked_dispatcher_case() {
     let before = d.lane_locks.load(Ordering::Relaxed);
     let index = d.try_steal(&shared, 0, &mut 1).unwrap();
     let locks = d.lane_locks.load(Ordering::Relaxed) - before;
-    assert_eq!(locks, if count == 1 { 2 } else { 3 });
+    // Only the victim lock, plus the kick of a parked dispatcher while
+    // entries remain; the lone stolen entry never enters the thief's lane.
+    assert_eq!(locks, if count == 1 { 1 } else { 2 });
+    assert!(d.lane(0).check(&d.links).is_empty());
     assert_eq!(d.parked.is_set(2), count == 1);
     assert_eq!(d.lane(2).take_recheck(), count != 1);
     assert_eq!(d.lane(1).check(&d.links).len(), count - 1);
@@ -672,6 +675,91 @@ fn stealing_last_entry_does_not_wake_or_lock_a_parked_dispatcher_case() {
     d.lane(2).finish_sleep();
     check_distributed(&shared);
   }
+}
+
+#[test]
+fn single_stolen_entry_is_returned_without_entering_the_thief_lane() {
+  each_spin_configuration(single_stolen_entry_is_returned_without_entering_the_thief_lane_case);
+}
+
+fn single_stolen_entry_is_returned_without_entering_the_thief_lane_case() {
+  for count in [1, 2, 3, 4] {
+    let (shared, root) = shared(config(2, 4));
+    let d = engine(&shared);
+    let jobs: Vec<_> = (0..count)
+      .map(|_| {
+        d.next_lane.store(1, Ordering::Relaxed);
+        shared.spawn(root, async {}).unwrap()
+      })
+      .collect();
+    let queued = d.lane(1).check(&d.links);
+    let steals = d.steals.load(Ordering::Relaxed);
+    let index = d.try_steal(&shared, 0, &mut 1).unwrap();
+    assert_eq!(d.steals.load(Ordering::Relaxed) - steals, 1);
+    // The oldest entry is returned; only a multi-entry steal reaches lane 0.
+    assert_eq!(index, queued[0]);
+    let taken = (count / 2).max(1);
+    assert_eq!(d.lane(0).check(&d.links), queued[1..taken]);
+    assert_eq!(d.lane(1).check(&d.links), queued[taken..]);
+    assert_eq!(
+      shared.metrics.inner().lane_depth[0]
+        .0
+        .load(Ordering::SeqCst),
+      taken - 1
+    );
+    assert_eq!(
+      shared.metrics.inner().overflow_depth.load(Ordering::SeqCst),
+      0
+    );
+    run(&shared, d.dispatch_decision(&shared, index).unwrap());
+    for seat in [0, 0, 1, 1] {
+      if let Some(work) = selected(&shared, seat) {
+        run(&shared, work);
+      }
+    }
+    for job in jobs {
+      finish(job).unwrap();
+    }
+    check_distributed(&shared);
+  }
+}
+
+#[test]
+fn single_stolen_cleanup_entry_moves_to_overflow_and_is_cancelled() {
+  each_spin_configuration(single_stolen_cleanup_entry_moves_to_overflow_and_is_cancelled_case);
+}
+
+fn single_stolen_cleanup_entry_moves_to_overflow_and_is_cancelled_case() {
+  let (shared, root) = shared(config(2, 2));
+  let d = engine(&shared);
+  d.next_lane.store(1, Ordering::Relaxed);
+  let job = shared.spawn(root, async {}).unwrap();
+  let index = d.lane(1).check(&d.links)[0];
+  // An abort whose lane scan ran while the entry was detached by the steal.
+  {
+    let mut slot = d.slot(index);
+    d.links[index].cleanup.store(true, Ordering::SeqCst);
+    assert!(!slot.protocol.abort());
+  }
+  assert_eq!(d.try_steal(&shared, 0, &mut 1), None);
+  assert!(d.lane(0).check(&d.links).is_empty());
+  assert!(d.lane(1).check(&d.links).is_empty());
+  assert_eq!(
+    shared.metrics.inner().lane_depth[0]
+      .0
+      .load(Ordering::SeqCst),
+    0
+  );
+  assert_eq!(lock(&d.overflow, 4).check(&d.links), [index]);
+  assert_eq!(
+    shared.metrics.inner().overflow_depth.load(Ordering::SeqCst),
+    1
+  );
+  let work = selected(&shared, 0).unwrap();
+  assert!(matches!(work, Selected::Cancel(..)));
+  run(&shared, work);
+  assert!(matches!(finish(job), Err(AsyncJoinError::Cancelled)));
+  check_distributed(&shared);
 }
 
 /// Checks only quiescent points, when no entries or permits are in transit.
@@ -854,7 +942,8 @@ fn spawn_wake_completion_and_steal_lock_counts_case() {
   d.lane(0).take_recheck();
   let before = d.lane_locks.load(Ordering::Relaxed);
   let work = selected(&shared, 0).unwrap();
-  assert_eq!(d.lane_locks.load(Ordering::Relaxed) - before, 3);
+  // Own lane, then the victim; the lone stolen entry skips the thief's lane.
+  assert_eq!(d.lane_locks.load(Ordering::Relaxed) - before, 2);
   run(&shared, work);
   for _ in 0..2 {
     run(&shared, selected(&shared, 1).unwrap());
