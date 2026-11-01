@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub(super) const NIL: usize = usize::MAX;
 pub(super) const STEAL_MAX: usize = 32;
+#[cfg(not(loom))]
+pub(crate) const PARK_SPIN_ROUNDS: usize = 128;
 
 #[derive(Debug)]
 pub(super) struct QueueLink {

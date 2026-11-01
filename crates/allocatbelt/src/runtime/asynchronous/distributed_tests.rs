@@ -113,6 +113,86 @@ fn run(shared: &Arc<Shared>, work: Selected) {
 }
 
 #[test]
+fn work_arriving_during_spin_runs_without_a_park() {
+  let (mut shared, root) = shared(config(2, 1));
+  let park_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+  let attempts = Arc::clone(&park_attempts);
+  Arc::get_mut(&mut shared).unwrap().thread_options =
+    super::super::super::ControlledThreadOptions::unbounded(
+      AsyncThreadOptions::new().on_thread_park(move |context| {
+        if context.role == AsyncThreadRole::Worker && context.index == 0 {
+          attempts.fetch_add(1, Ordering::SeqCst);
+        }
+      }),
+    );
+  let job = Arc::new(Mutex::new(None));
+  let completed = Arc::new(AtomicBool::new(false));
+  let thread = {
+    let shared = Arc::clone(&shared);
+    let job = Arc::clone(&job);
+    let completed = Arc::clone(&completed);
+    std::thread::spawn(move || {
+      let producer = Arc::clone(&shared);
+      SPIN_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+          *job.lock().unwrap() = Some(
+            producer
+              .spawn(root, async move {
+                completed.store(true, Ordering::SeqCst);
+              })
+              .unwrap(),
+          );
+        }));
+      });
+      let context = AsyncThreadContext {
+        role: AsyncThreadRole::Worker,
+        index: 0,
+        physical_index: 0,
+      };
+      let d = engine(&shared);
+      let Search::Got(index) = d.search_or_park(&shared, 0, &mut 1, context) else {
+        panic!("expected work");
+      };
+      run(&shared, d.dispatch_decision(&shared, index).unwrap());
+    })
+  };
+  join_worker(thread);
+  assert!(completed.load(Ordering::SeqCst));
+  assert_eq!(shared.metrics.snapshot().threads[0].parks, 0);
+  assert_eq!(park_attempts.load(Ordering::SeqCst), 0);
+  finish(job.lock().unwrap().take().unwrap()).unwrap();
+  shared.close(false);
+}
+
+#[test]
+fn idle_dispatchers_park_after_spinning() {
+  let runtime = runtime(2, 1);
+  wait(|| {
+    runtime
+      .metrics()
+      .snapshot()
+      .threads
+      .iter()
+      .all(|thread| thread.parks > 0)
+  });
+  std::thread::sleep(Duration::from_millis(20));
+  let snapshot = runtime.metrics().snapshot();
+  assert!(
+    snapshot
+      .threads
+      .iter()
+      .all(|thread| thread.parks > thread.unparks)
+  );
+  assert!(
+    snapshot
+      .threads
+      .iter()
+      .all(|thread| thread.busy_duration == Duration::ZERO)
+  );
+  shutdown(runtime, AsyncShutdown::Drain);
+}
+
+#[test]
 fn one_spawn_into_four_parked_lanes_wakes_only_its_dispatcher() {
   let (shared, root) = shared(config(4, 1));
   let d = engine(&shared);

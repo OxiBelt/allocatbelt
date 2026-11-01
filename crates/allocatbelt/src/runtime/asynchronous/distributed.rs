@@ -10,6 +10,11 @@ use super::*;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::AtomicBool;
 
+#[cfg(all(test, not(loom)))]
+thread_local! {
+  static SPIN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(debug_assertions)]
 thread_local! {
   static LOCK_LEVEL: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
@@ -145,6 +150,7 @@ pub(super) struct Distributed {
   seat_cv: Condvar,
   helper_yield: AtomicBool,
   worker_yield: AtomicBool,
+  closing: AtomicBool,
   closed_empty: AtomicBool,
   #[cfg(all(test, not(loom)))]
   slot_locks: AtomicUsize,
@@ -246,6 +252,7 @@ impl Distributed {
       seat_cv: Condvar::new(),
       helper_yield: AtomicBool::new(false),
       worker_yield: AtomicBool::new(false),
+      closing: AtomicBool::new(false),
       closed_empty: AtomicBool::new(false),
       #[cfg(all(test, not(loom)))]
       slot_locks: AtomicUsize::new(0),
@@ -601,6 +608,7 @@ impl Distributed {
   }
 
   pub(super) fn close(&self, shared: &Shared, cancel: bool) {
+    self.closing.store(true, Ordering::Release);
     {
       let mut state = self.admission(shared);
       state.closed = true;
@@ -912,6 +920,40 @@ impl Distributed {
       match self.search(shared, seat, random) {
         Search::Empty => {}
         found => return found,
+      }
+      #[cfg(not(loom))]
+      {
+        let mut work = false;
+        for _ in 0..super::super::lane::PARK_SPIN_ROUNDS {
+          // Stop on the raw worker-yield hint without locking seats: while a
+          // handoff keeps it set, no worker spins, intentionally.
+          if self.closing.load(Ordering::Acquire)
+            || self.helper_yield.load(Ordering::Acquire)
+            || self.worker_yield.load(Ordering::Acquire)
+          {
+            break;
+          }
+          std::hint::spin_loop();
+          #[cfg(all(test, not(loom)))]
+          SPIN_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+              hook();
+            }
+          });
+          let metrics = shared.metrics.inner();
+          if metrics
+            .lane_depth
+            .iter()
+            .any(|depth| depth.0.load(Ordering::SeqCst) != 0)
+            || metrics.overflow_depth.load(Ordering::SeqCst) != 0
+          {
+            work = true;
+            break;
+          }
+        }
+        if work {
+          continue;
+        }
       }
       cache::flush();
       shared.thread_park_attempted(context);
