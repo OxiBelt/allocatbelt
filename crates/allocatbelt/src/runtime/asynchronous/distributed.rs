@@ -174,6 +174,29 @@ pub(super) struct Distributed {
   unwind_seat: AtomicUsize,
 }
 
+struct SpawnReservation<'a> {
+  distributed: &'a Distributed,
+  shared: &'a Shared,
+  reference: Option<TaskRef>,
+}
+
+impl Drop for SpawnReservation<'_> {
+  fn drop(&mut self) {
+    if let Some(reference) = self.reference.take() {
+      let mut slot = self.distributed.slot(reference.index);
+      debug_assert!(slot.protocol.matches(reference.generation));
+      debug_assert!(slot.task.is_none());
+      slot.protocol.rollback_reservation();
+      let reusable = slot.protocol.next_generation().is_some();
+      let scope = slot.scope.take();
+      drop(slot);
+      self
+        .distributed
+        .complete(self.shared, reference.index, reusable, None, scope);
+    }
+  }
+}
+
 fn table<T>(len: usize, mut new: impl FnMut() -> T) -> Result<Vec<T>, AsyncError> {
   let mut result = Vec::new();
   result
@@ -473,8 +496,10 @@ impl Distributed {
     F: Future + Send + 'static,
     F::Output: Send + 'static,
   {
-    let scope_cell = {
-      let state = self.admission(shared);
+    #[cfg(all(test, not(loom)))]
+    shared.before_spawn_admission_for_test();
+    let (scope_cell, task_ref) = {
+      let mut state = self.admission(shared);
       if state.closed {
         return Err(AsyncSpawnError::new(AsyncError::Closed, future));
       }
@@ -484,12 +509,38 @@ impl Distributed {
       if scope_cell.protocol.is_closed() {
         return Err(AsyncSpawnError::new(AsyncError::Closed, future));
       }
-      if state.free_tasks.peek().is_none() {
+      let Some(index) = state.free_tasks.first() else {
         return Err(AsyncSpawnError::new(AsyncError::Full, future));
-      }
-      scope_cell
+      };
+      let mut slot = self.slot(index);
+      let Some(generation) = (slot.task.is_none() && !slot.protocol.admitted())
+        .then(|| slot.protocol.next_generation())
+        .flatten()
+      else {
+        return Err(AsyncSpawnError::new(AsyncError::Full, future));
+      };
+      state.free_tasks.remove(index);
+      self.links[index].cleanup.store(false, Ordering::SeqCst);
+      slot.protocol.admit(generation);
+      slot.scope = Some((scope, Arc::clone(&scope_cell)));
+      scope_cell.protocol.add_task();
+      state.admitted += 1;
+      shared
+        .metrics
+        .inner()
+        .alive_tasks
+        .store(state.admitted, Ordering::Relaxed);
+      (scope_cell, TaskRef { index, generation })
     };
-
+    // Until publication, close can mark this slot for cleanup but cannot
+    // enqueue it. Any failure returns the reserved slot through this guard.
+    let mut reservation = SpawnReservation {
+      distributed: self,
+      shared,
+      reference: Some(task_ref),
+    };
+    // On unwind, drop the uninstalled future before returning its admission.
+    let future = future;
     let tenant = scope_cell.tenant.as_ref();
     if let Some(tenant) = tenant
       && let Err(error) = tenant.validate_cpu_execution()
@@ -531,71 +582,37 @@ impl Distributed {
       return Err(AsyncSpawnError::new(AsyncError::TaskIdExhausted, future));
     };
     #[cfg(all(test, not(loom)))]
-    // Resource reservations are complete, and no scheduler lock is held.
-    shared.before_spawn_admission_for_test();
-    let mut state = self.admission(shared);
-    if state.closed {
-      drop(state);
-      drop(domain);
-      return Err(AsyncSpawnError::new(AsyncError::Closed, future));
-    }
-    let Some(current_scope) = get_scope(&state, scope) else {
-      drop(state);
-      drop(domain);
-      return Err(AsyncSpawnError::new(AsyncError::Closed, future));
+    shared.after_spawn_reservation_for_test();
+    let job = {
+      let mut slot = self.slot(task_ref.index);
+      debug_assert!(slot.protocol.matches(task_ref.generation));
+      debug_assert!(slot.task.is_none());
+      // Publication wins only while both runtime and scope remain open.
+      // Keep F movable until this check, and serialize installation with
+      // close's slot scan. Allocation holds no admission lock.
+      if self.closing.load(Ordering::Acquire)
+        || scope_cell.protocol.is_closed()
+        || slot.protocol.aborting_queued()
+      {
+        drop(slot);
+        drop(domain);
+        return Err(AsyncSpawnError::new(AsyncError::Closed, future));
+      }
+      let (task, job) = Task::create(
+        future,
+        task_id,
+        scope_cell.resources.clone(),
+        domain,
+        Arc::downgrade(shared),
+        task_ref,
+      );
+      slot.task = Some(task);
+      let inserted = slot.protocol.queue();
+      debug_assert!(inserted);
+      job
     };
-    if current_scope.protocol.is_closed() {
-      drop(state);
-      drop(domain);
-      return Err(AsyncSpawnError::new(AsyncError::Closed, future));
-    }
-    if !Arc::ptr_eq(current_scope, &scope_cell) {
-      drop(state);
-      drop(domain);
-      return Err(AsyncSpawnError::new(AsyncError::Full, future));
-    }
-    let Some(Reverse(index)) = state.free_tasks.peek().copied() else {
-      drop(state);
-      drop(domain);
-      return Err(AsyncSpawnError::new(AsyncError::Full, future));
-    };
-    let mut slot = self.slot(index);
-    let Some(generation) = (slot.task.is_none() && !slot.protocol.admitted())
-      .then(|| slot.protocol.next_generation())
-      .flatten()
-    else {
-      drop(slot);
-      drop(state);
-      drop(domain);
-      return Err(AsyncSpawnError::new(AsyncError::Full, future));
-    };
-    let popped = state.free_tasks.pop();
-    debug_assert_eq!(popped, Some(Reverse(index)));
-    let task_ref = TaskRef { index, generation };
-    let (task, job) = Task::create(
-      future,
-      task_id,
-      scope_cell.resources.clone(),
-      domain,
-      Arc::downgrade(shared),
-      task_ref,
-    );
-    self.links[index].cleanup.store(false, Ordering::SeqCst);
-    slot.protocol.admit(generation);
-    scope_cell.protocol.add_task();
-    slot.scope = Some((scope, scope_cell));
-    slot.task = Some(task);
-    let inserted = slot.protocol.queue();
-    debug_assert!(inserted);
-    state.admitted += 1;
-    shared
-      .metrics
-      .inner()
-      .alive_tasks
-      .store(state.admitted, Ordering::Relaxed);
-    drop(slot);
-    drop(state);
-    self.push_ready(shared, index, ReadyInsertion::Publish);
+    reservation.reference = None;
+    self.push_ready(shared, task_ref.index, ReadyInsertion::Publish);
     Ok(job)
   }
 
@@ -631,7 +648,7 @@ impl Distributed {
     }
     let requeue = {
       let mut slot = self.slot(index);
-      if slot.task.is_none()
+      if !slot.protocol.admitted()
         || generation.is_some_and(|g| !slot.protocol.matches(g))
         || scope.is_some_and(|s| slot.scope.as_ref().is_none_or(|(r, _)| *r != s))
       {
@@ -639,6 +656,10 @@ impl Distributed {
       }
       self.links[index].cleanup.store(true, Ordering::SeqCst);
       let inserted = slot.protocol.abort();
+      if slot.task.is_none() {
+        // The reserving spawner owns publication, including cleanup routing.
+        return;
+      }
       let unlinked = if !inserted
         && slot.protocol.aborting_queued()
         && let Some((_, cell)) = &slot.scope
@@ -865,7 +886,7 @@ impl Distributed {
     let empty_after_close = {
       let mut state = self.admission(shared);
       if reusable {
-        state.free_tasks.push(Reverse(index));
+        state.free_tasks.insert(index);
       }
       state.admitted -= 1;
       shared

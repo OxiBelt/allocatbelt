@@ -5,8 +5,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -15,6 +13,8 @@ use std::task::{Context, Waker};
 
 #[path = "distributed.rs"]
 mod distributed;
+#[path = "free_slots.rs"]
+mod free_slots;
 
 use super::handoff;
 use super::handoff_protocol::{DispatchTurn, HandoffLoan};
@@ -34,6 +34,7 @@ use crate::runtime::resource_domain::{
   DomainWaitPool, DomainWaiter, TenantDomain, payload_bytes,
 };
 use distributed::Distributed;
+use free_slots::FreeSlots;
 
 thread_local! {
   static WORKER_RUNTIME: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -77,7 +78,7 @@ impl ScopeSlot {
 struct State {
   closed: bool,
   admitted: usize,
-  free_tasks: BinaryHeap<Reverse<usize>>,
+  free_tasks: FreeSlots,
   scopes: Vec<ScopeSlot>,
 }
 
@@ -92,6 +93,8 @@ pub(super) struct Shared {
   /// Deterministic admission interleavings; absent from non-test builds.
   #[cfg(all(test, not(loom)))]
   spawn_admission_test_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+  #[cfg(all(test, not(loom)))]
+  spawn_reserved_test_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
   #[cfg(all(test, not(loom)))]
   lock_acquisitions: AtomicUsize,
   _control: ControlCharge,
@@ -189,8 +192,7 @@ impl Shared {
     let tenant = resources.as_ref().and_then(ResourceScope::tenant_domain);
     let mut requested_control = std::mem::size_of::<Shared>();
     for bytes in [
-      payload_bytes::<Reverse<usize>>(config.max_outstanding)
-        .map_err(AsyncError::ResourceDomain)?,
+      FreeSlots::requested_control(config.max_outstanding)?,
       payload_bytes::<ScopeSlot>(config.max_scopes).map_err(AsyncError::ResourceDomain)?,
       std::mem::size_of::<ScopeCell>(),
     ] {
@@ -204,13 +206,7 @@ impl Shared {
     let mut control =
       ControlCharge::try_new(tenant, requested_control).map_err(AsyncError::ResourceDomain)?;
 
-    let mut free_tasks = BinaryHeap::new();
-    free_tasks
-      .try_reserve_exact(config.max_outstanding)
-      .map_err(|_| AsyncError::OutOfMemory)?;
-    for index in 0..config.max_outstanding {
-      free_tasks.push(Reverse(index));
-    }
+    let free_tasks = FreeSlots::new(config.max_outstanding)?;
     let mut scopes = Vec::new();
     scopes
       .try_reserve_exact(config.max_scopes)
@@ -253,7 +249,7 @@ impl Shared {
     let distributed = Distributed::new(config, max_handoffs, park_spin)?;
     let mut actual_control = std::mem::size_of::<Shared>();
     for bytes in [
-      payload_bytes::<Reverse<usize>>(free_tasks.capacity()).map_err(AsyncError::ResourceDomain)?,
+      free_tasks.actual_control()?,
       payload_bytes::<ScopeSlot>(scopes.capacity()).map_err(AsyncError::ResourceDomain)?,
       std::mem::size_of::<ScopeCell>(),
     ] {
@@ -284,6 +280,8 @@ impl Shared {
         #[cfg(all(test, not(loom)))]
         spawn_admission_test_hook: Mutex::new(None),
         #[cfg(all(test, not(loom)))]
+        spawn_reserved_test_hook: Mutex::new(None),
+        #[cfg(all(test, not(loom)))]
         lock_acquisitions: AtomicUsize::new(0),
         _control: control,
       }),
@@ -310,6 +308,26 @@ impl Shared {
   fn before_spawn_admission_for_test(&self) {
     let hook = self
       .spawn_admission_test_hook
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .clone();
+    if let Some(hook) = hook {
+      hook();
+    }
+  }
+
+  #[cfg(all(test, not(loom)))]
+  pub(super) fn set_spawn_reserved_test_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+    *self
+      .spawn_reserved_test_hook
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner) = Some(hook);
+  }
+
+  #[cfg(all(test, not(loom)))]
+  fn after_spawn_reservation_for_test(&self) {
+    let hook = self
+      .spawn_reserved_test_hook
       .lock()
       .unwrap_or_else(PoisonError::into_inner)
       .clone();

@@ -990,6 +990,20 @@ scope. Rejection returns the original future. Ready work uses per-dispatcher
 FIFO lanes with bounded helper seat adoption. Ordering across tasks is not
 guaranteed. A future that never returns from `poll` cannot be preempted.
 
+An in-progress spawn reserves its task slot and scope unfinished-task count
+before domain admission and task construction. Such reservations count toward
+`max_outstanding` and the alive-task gauge immediately, so concurrent spawns can
+observe `Full` earlier and close waits for publication or rollback. Successful
+spawn takes the admission mutex once; tenant domain reservations still run
+outside scheduler locks. Construction and publication use the slot mutex and
+recheck runtime/scope closure before consuming the future. If close wins that
+check, rejection returns the original unpolled, undropped future. Rollback
+releases admission and scope accounting and restores the unpublished generation;
+failed spawns cannot exhaust slot generations. Free slots are kept in one bitmap
+under the admission mutex and scanned from the lowest word and bit, preserving
+lowest-index reuse. Each spawn scans up to `ceil(max_outstanding / 64)` bitmap
+words, so lookup cost grows with the configured outstanding-task bound.
+
 The executor appends newly ready, self-woken, requeued and quota-released
 tasks to a lane chosen by a round-robin counter and the parked mask. Dead
 seats are excluded; among live seats it skips parked dispatchers unless all
@@ -2027,8 +2041,9 @@ Reads may lag by up to 64 consecutive turns of an open busy period.
 This remains solely a per-thread wall-time diagnostic; it never feeds spin,
 park, wake or quota decisions.
 The alive-task gauge is stored from the admitted count under the admission
-mutex after admission and release. Its update points still bracket future
-cleanup and precede join publication; relaxed readers may see adjacent moments.
+mutex after reservation and release. It includes in-progress spawns before
+domain admission or task construction and stays charged through future cleanup;
+release precedes join publication. Relaxed readers may see adjacent moments.
 Scalar and per-thread reads allocate nothing;
 `try_snapshot` reports reservation failure, while the convenience snapshot
 allocates ordinary metadata. Fields are sampled independently rather than

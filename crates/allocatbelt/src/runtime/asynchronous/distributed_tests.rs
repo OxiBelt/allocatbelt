@@ -1051,13 +1051,8 @@ fn check_distributed(shared: &Shared) {
       free.push(index);
     }
   }
-  let mut heap: Vec<_> = state
-    .free_tasks
-    .iter()
-    .map(|Reverse(index)| *index)
-    .collect();
-  heap.sort_unstable();
-  assert_eq!(free, heap);
+  let bitmap: Vec<_> = state.free_tasks.iter().collect();
+  assert_eq!(free, bitmap);
   assert_eq!(state.admitted, admitted);
   assert_eq!(shared.metrics.num_alive_tasks(), admitted);
 }
@@ -1099,6 +1094,93 @@ fn pending_self_yields_take_zero_global_two_slot_and_two_lane_locks_case() {
 }
 
 #[test]
+fn drain_close_waits_for_reserved_task_rollback() {
+  let (shared, root) = shared(config(1, 1));
+  let (entered, reached) = mpsc::channel();
+  let release = Arc::new((Mutex::new(false), Condvar::new()));
+  let gate = Arc::clone(&release);
+  shared.set_spawn_reserved_test_hook(Arc::new(move || {
+    entered.send(()).unwrap();
+    let guard = gate.0.lock().unwrap();
+    let (guard, timeout) = gate
+      .1
+      .wait_timeout_while(guard, Duration::from_secs(5), |open| !*open)
+      .unwrap();
+    assert!(*guard && !timeout.timed_out());
+  }));
+  let producer = Arc::clone(&shared);
+  let spawner = std::thread::spawn(move || producer.spawn(root, async { 7 }));
+  reached.recv_timeout(Duration::from_secs(5)).unwrap();
+  shared.close(false);
+  assert_eq!(shared.lock().admitted, 1);
+  assert!(!engine(&shared).closed_empty.load(Ordering::Acquire));
+  assert!(selected(&shared, 0).is_none());
+  *release.0.lock().unwrap() = true;
+  release.1.notify_all();
+  let error = join_worker(spawner).unwrap_err();
+  assert_eq!(error.kind, AsyncError::Closed);
+  let mut future = std::pin::pin!(error.into_future());
+  assert_eq!(
+    future
+      .as_mut()
+      .poll(&mut Context::from_waker(Waker::noop())),
+    Poll::Ready(7)
+  );
+  assert!(selected(&shared, 0).is_none());
+  assert!(engine(&shared).closed_empty.load(Ordering::Acquire));
+  check_distributed(&shared);
+}
+
+#[test]
+fn reservation_unwind_drops_the_future_before_releasing_admission() {
+  struct Probe {
+    shared: Arc<Shared>,
+    drops: Arc<AtomicUsize>,
+  }
+  impl Future for Probe {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+      panic!("unpublished future polled");
+    }
+  }
+  impl Drop for Probe {
+    fn drop(&mut self) {
+      assert_eq!(self.shared.metrics.num_alive_tasks(), 1);
+      assert!(self.shared.state.try_lock().is_ok());
+      assert!(engine(&self.shared).slots[0].state.try_lock().is_ok());
+      self.drops.fetch_add(1, Ordering::Relaxed);
+    }
+  }
+  let (shared, root) = shared(config(1, 1));
+  {
+    let mut slot = engine(&shared).slot(0);
+    slot.protocol.admit(u64::MAX - 1);
+    slot.protocol.finish_cancel();
+  }
+  shared.set_spawn_reserved_test_hook(Arc::new(|| panic!("injected allocation failure")));
+  let drops = Arc::new(AtomicUsize::new(0));
+  let result = panic::catch_unwind(AssertUnwindSafe(|| {
+    shared.spawn(
+      root,
+      Probe {
+        shared: Arc::clone(&shared),
+        drops: Arc::clone(&drops),
+      },
+    )
+  }));
+  assert!(result.is_err());
+  assert_eq!(drops.load(Ordering::Relaxed), 1);
+  assert_eq!(shared.metrics.num_alive_tasks(), 0);
+  assert_eq!(engine(&shared).slot(0).protocol.generation(), u64::MAX - 1);
+  check_distributed(&shared);
+  shared.set_spawn_reserved_test_hook(Arc::new(|| {}));
+  let job = shared.spawn(root, async { 7 }).unwrap();
+  run(&shared, selected(&shared, 0).unwrap());
+  assert_eq!(finish(job).unwrap(), 7);
+  check_distributed(&shared);
+}
+
+#[test]
 fn spawn_wake_completion_and_steal_lock_counts() {
   each_spin_configuration(spawn_wake_completion_and_steal_lock_counts_case);
 }
@@ -1118,7 +1200,7 @@ fn spawn_wake_completion_and_steal_lock_counts_case() {
       d.slot_locks.load(Ordering::Relaxed) - before.1,
       d.lane_locks.load(Ordering::Relaxed) - before.2
     ),
-    (2, 1, 1)
+    (1, 2, 1)
   );
   let work = selected(&shared, 0).unwrap();
   let reference = match &work {
@@ -1658,7 +1740,7 @@ fn distributed_control_charges_match_requested_and_actual_tables_case() {
   let (shared, _) = shared(cfg);
   let d = engine(&shared);
   let expected = std::mem::size_of::<Shared>()
-    + payload_bytes::<Reverse<usize>>(cfg.max_outstanding).unwrap()
+    + FreeSlots::requested_control(cfg.max_outstanding).unwrap()
     + payload_bytes::<ScopeSlot>(cfg.max_scopes).unwrap()
     + std::mem::size_of::<ScopeCell>()
     + Distributed::requested_control(cfg).unwrap();
@@ -2611,10 +2693,7 @@ fn exhausted_task_generation_is_skipped_without_hiding_other_slots() {
 fn exhausted_task_generation_is_skipped_without_hiding_other_slots_case() {
   let (shared, root) = shared(config(1, 2));
   let d = engine(&shared);
-  shared
-    .lock()
-    .free_tasks
-    .retain(|Reverse(index)| *index != 0);
+  shared.lock().free_tasks.remove(0);
   {
     let mut slot = d.slot(0);
     slot.protocol.admit(u64::MAX);
@@ -2654,11 +2733,11 @@ fn all_exhausted_task_generations_return_full_without_admission_case() {
 }
 
 #[test]
-fn free_task_heap_reuses_the_lowest_completed_slot() {
-  each_spin_configuration(free_task_heap_reuses_the_lowest_completed_slot_case);
+fn free_task_bitmap_reuses_the_lowest_completed_slot() {
+  each_spin_configuration(free_task_bitmap_reuses_the_lowest_completed_slot_case);
 }
 
-fn free_task_heap_reuses_the_lowest_completed_slot_case() {
+fn free_task_bitmap_reuses_the_lowest_completed_slot_case() {
   let (shared, root) = shared(config(1, 4));
   let d = engine(&shared);
   let jobs: Vec<_> = (0..4)

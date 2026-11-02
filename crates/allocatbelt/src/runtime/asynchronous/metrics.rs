@@ -161,8 +161,9 @@ impl RuntimeMetrics {
     self.0.workers
   }
 
-  /// Returns the current number of admitted task slots, including cleanup.
-  /// The admission mutex serializes stores after admission and release; reads
+  /// Returns the current number of reserved task slots, including in-progress
+  /// spawns before domain admission/construction and cancellation cleanup.
+  /// The admission mutex serializes stores after reservation and release; reads
   /// remain relaxed and can observe an adjacent moment.
   #[must_use]
   pub fn num_alive_tasks(&self) -> usize {
@@ -272,7 +273,7 @@ pub struct RuntimeMetricsSnapshot {
   pub num_workers: usize,
   /// Maximum simultaneous dispatchers, equal to `num_workers`.
   pub dispatch_ceiling: usize,
-  /// Admitted task slots still owned by the executor, including cleanup.
+  /// Reserved task slots, including in-progress spawns and cleanup.
   pub num_alive_tasks: usize,
   /// Current tasks queued in lanes or ready lists, including scope poll waiters.
   pub global_queue_depth: usize,

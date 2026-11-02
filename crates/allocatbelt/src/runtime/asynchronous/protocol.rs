@@ -208,6 +208,14 @@ impl PollProtocol {
     self.abort = false;
   }
 
+  pub(super) fn rollback_reservation(&mut self) {
+    // No task or handle was published with this generation. Reuse it so
+    // failed spawns cannot exhaust the slot's generation counter.
+    debug_assert!(self.admitted && !self.running && self.generation > 0);
+    self.generation -= 1;
+    self.release();
+  }
+
   pub(super) fn admitted(&self) -> bool {
     self.admitted
   }
@@ -1212,46 +1220,108 @@ mod loom_tests {
   }
 
   #[test]
-  fn loom_close_races_spawn_and_aborts_every_admitted_slot() {
-    bounded_model(|| {
-      let admission = Arc::new(Mutex::new(false));
-      let slot = Arc::new(Mutex::new(PollProtocol::new()));
-      let spawner = {
-        let admission = Arc::clone(&admission);
-        let slot = Arc::clone(&slot);
-        thread::spawn(move || {
-          let closed = lock(&admission);
-          if *closed {
-            return false;
-          }
+  fn loom_close_races_spawn_reservation_publication_and_rollback() {
+    // Runtime drain, runtime cancellation, and owned-scope close.
+    for close_kind in 0..3 {
+      for publish in [false, true] {
+        bounded_model(move || {
+          // The admission count includes reserved, not yet published slots.
+          let admission = Arc::new(Mutex::new((false, 0usize)));
+          let mut protocol = PollProtocol::new();
+          protocol.admit(u64::MAX - 1);
+          protocol.finish_cancel();
+          let slot = Arc::new(Mutex::new((protocol, false)));
+          let closing = Arc::new(super::AtomicBool::new(false));
+          let scope = Arc::new(ScopeProtocol::new(false));
+          let spawner = {
+            let admission = Arc::clone(&admission);
+            let slot = Arc::clone(&slot);
+            let closing = Arc::clone(&closing);
+            let scope = Arc::clone(&scope);
+            thread::spawn(move || {
+              {
+                let mut state = lock(&admission);
+                if state.0 || scope.is_closed() {
+                  return false;
+                }
+                lock(&slot).0.admit(u64::MAX);
+                scope.add_task();
+                state.1 += 1;
+              }
+              // Fallible domain reservations hold neither scheduler lock.
+              {
+                let mut slot = lock(&slot);
+                if publish
+                  && !closing.load(super::Ordering::Acquire)
+                  && !scope.is_closed()
+                  && !slot.0.aborting_queued()
+                {
+                  assert!(slot.0.queue());
+                  slot.1 = true;
+                  return true;
+                }
+              }
+              // Return the still-movable original future, with no publication.
+              lock(&slot).0.rollback_reservation();
+              lock(&admission).1 -= 1;
+              assert!(scope.complete_one());
+              false
+            })
+          };
+          let closer = {
+            let admission = Arc::clone(&admission);
+            let slot = Arc::clone(&slot);
+            let closing = Arc::clone(&closing);
+            let scope = Arc::clone(&scope);
+            thread::spawn(move || {
+              if close_kind != 2 {
+                closing.store(true, super::Ordering::Release);
+              }
+              {
+                let mut state = lock(&admission);
+                if close_kind == 2 {
+                  scope.close();
+                } else {
+                  state.0 = true;
+                }
+                if state.1 == 0 {
+                  assert!(!lock(&slot).0.admitted());
+                }
+              }
+              if close_kind != 0 {
+                let mut slot = lock(&slot);
+                if slot.0.admitted() {
+                  let _ = slot.0.abort();
+                  // No physical queue entry until the spawner publishes.
+                }
+              }
+            })
+          };
+          let spawned = spawner.join().unwrap();
+          closer.join().unwrap();
+          assert_eq!(*lock(&admission), (close_kind != 2, usize::from(spawned)));
+          assert_eq!(scope.active(), usize::from(spawned));
           let mut slot = lock(&slot);
-          slot.admit(1);
-          assert!(slot.queue());
-          true
-        })
-      };
-      let closer = {
-        let admission = Arc::clone(&admission);
-        let slot = Arc::clone(&slot);
-        thread::spawn(move || {
-          *lock(&admission) = true;
-          let mut slot = lock(&slot);
-          if slot.admitted() {
-            let _ = slot.abort();
+          assert_eq!(slot.0.admitted(), spawned);
+          assert_eq!(slot.1, spawned);
+          assert_eq!(slot.0.generation(), u64::MAX - u64::from(!spawned));
+          if spawned {
+            let cancel = close_kind != 0;
+            assert_eq!(slot.0.begin_poll(), Some(cancel));
+            if cancel {
+              slot.0.finish_cancel();
+            } else {
+              assert_eq!(slot.0.finish_poll(true), PollFinish::Complete);
+            }
+            lock(&admission).1 -= 1;
+            assert!(scope.complete_one());
           }
-        })
-      };
-      let spawned = spawner.join().unwrap();
-      closer.join().unwrap();
-      assert!(*lock(&admission));
-      let mut slot = lock(&slot);
-      assert_eq!(slot.admitted(), spawned);
-      if spawned {
-        assert_eq!(slot.begin_poll(), Some(true));
-        slot.finish_cancel();
+          assert!(!slot.0.admitted());
+          assert_eq!(lock(&admission).1, 0);
+          assert_eq!(scope.active(), 0);
+        });
       }
-      assert!(!slot.admitted());
-    });
+    }
   }
 
   #[test]

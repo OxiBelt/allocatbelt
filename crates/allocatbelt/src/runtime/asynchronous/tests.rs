@@ -335,7 +335,7 @@ fn join_spawn_thread<T: Send + 'static>(
 }
 
 #[test]
-fn concurrent_spawns_select_distinct_slots_after_the_shared_snapshot() {
+fn concurrent_spawns_select_distinct_slots_under_one_admission_lock() {
   let runtime = runtime(1, 2, 1);
   let (arrivals, hook_timed_out, hook) = spawn_pair_barrier_hook();
   runtime.shared.set_spawn_admission_test_hook(hook);
@@ -441,7 +441,7 @@ fn scope_close_after_domain_reservation_rolls_back_and_returns_the_future() {
     .unwrap_or_else(|error| panic!("resource scope creation failed: {error}"));
   let scope_baseline = domain.snapshot().used;
   let (entered, release, hook_timed_out, hook) = admission_gate_hook();
-  runtime.shared.set_spawn_admission_test_hook(hook);
+  runtime.shared.set_spawn_reserved_test_hook(hook);
 
   let (future, polls, drops) = pending_admission_probe();
   let handle = scope.handle();
@@ -465,10 +465,19 @@ fn scope_close_after_domain_reservation_rolls_back_and_returns_the_future() {
   );
   assert!(reserved.get(DomainResource::Control) > scope_baseline.get(DomainResource::Control));
 
-  block_on(scope.close());
+  let mut close = Box::pin(scope.close());
+  assert!(
+    close
+      .as_mut()
+      .poll(&mut Context::from_waker(Waker::noop()))
+      .is_pending()
+  );
+  assert_eq!(runtime.metrics().num_alive_tasks(), 1);
+  assert_eq!(drops.load(Ordering::SeqCst), 0);
   release_admission_hook(&release);
   let error = join_spawn_thread(spawn_thread, "scope-close spawn").unwrap_err();
   assert!(!hook_timed_out.load(Ordering::SeqCst));
+  block_on(close);
   assert_eq!(error.kind, super::AsyncError::Closed);
   assert_eq!(polls.load(Ordering::SeqCst), 0);
   let future = error.into_future();
@@ -485,7 +494,7 @@ fn scope_close_after_domain_reservation_rolls_back_and_returns_the_future() {
 fn runtime_close_after_spawn_reservation_returns_the_unpolled_future() {
   let runtime = runtime(1, 1, 1);
   let (entered, release, hook_timed_out, hook) = admission_gate_hook();
-  runtime.shared.set_spawn_admission_test_hook(hook);
+  runtime.shared.set_spawn_reserved_test_hook(hook);
 
   let (future, polls, drops) = pending_admission_probe();
   let handle = runtime.handle();
@@ -501,13 +510,16 @@ fn runtime_close_after_spawn_reservation_returns_the_unpolled_future() {
       .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
     panic!("runtime-close spawn did not reach final admission");
   }
-  runtime
-    .shutdown_before_deadline(AsyncShutdown::CancelPending)
-    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
+  runtime.shared.close(true);
+  assert_eq!(runtime.metrics().num_alive_tasks(), 1);
+  assert_eq!(drops.load(Ordering::SeqCst), 0);
   release_admission_hook(&release);
 
   let error = join_spawn_thread(spawn_thread, "runtime-close spawn").unwrap_err();
   assert!(!hook_timed_out.load(Ordering::SeqCst));
+  runtime
+    .shutdown_before_deadline(AsyncShutdown::CancelPending)
+    .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
   assert_eq!(error.kind, super::AsyncError::Closed);
   assert_eq!(polls.load(Ordering::SeqCst), 0);
   let future = error.into_future();
