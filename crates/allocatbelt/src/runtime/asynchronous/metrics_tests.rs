@@ -384,13 +384,13 @@ fn callback_panics_are_contained_and_counted_without_losing_workers() {
 }
 
 #[test]
-fn busy_duration_accumulates_each_turn_on_the_dispatching_thread() {
+fn busy_duration_accumulates_continuous_dispatcher_work() {
   let runtime = AsyncRuntime::new_with_handoffs(config(1, 1), HandoffConfig { max_handoffs: 1 })
     .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
   let metrics = runtime.metrics();
   let task_metrics = metrics.clone();
   let mut turns = 0;
-  let mut previous = Duration::ZERO;
+  let mut published = Duration::ZERO;
   let job = runtime
     .handle()
     .spawn(std::future::poll_fn(move |context| {
@@ -403,19 +403,21 @@ fn busy_duration_accumulates_each_turn_on_the_dispatching_thread() {
       assert_eq!(worker.context.role, AsyncThreadRole::Worker);
       assert_eq!(helper.context.role, AsyncThreadRole::HandoffHelper);
       assert_eq!(helper.busy_duration, Duration::ZERO);
-      if turns > 0 {
-        assert!(
-          worker.busy_duration > previous,
-          "previous turn was not recorded"
-        );
+      // This self-waking task never parks or hands off. Each fixed group
+      // of 64 completed turns must publish while its busy period stays open.
+      if turns != 0 && turns % 64 == 0 {
+        assert!(worker.busy_duration > published);
+        assert!(worker.busy_duration >= Duration::from_micros(turns * 20));
+        published = worker.busy_duration;
+      } else {
+        assert_eq!(worker.busy_duration, published);
       }
-      previous = worker.busy_duration;
       let until = Instant::now() + Duration::from_micros(20);
       while Instant::now() < until {
         std::hint::spin_loop();
       }
       turns += 1;
-      if turns == 64 {
+      if turns == 193 {
         Poll::Ready(())
       } else {
         context.waker().wake_by_ref();
@@ -430,8 +432,96 @@ fn busy_duration_accumulates_each_turn_on_the_dispatching_thread() {
   runtime
     .shutdown(AsyncShutdown::Drain)
     .unwrap_or_else(|error| panic!("shutdown failed: {error}"));
-  assert!(metrics.thread(0).unwrap().busy_duration >= Duration::from_micros(64 * 20));
+  assert!(metrics.thread(0).unwrap().busy_duration >= Duration::from_micros(193 * 20));
   assert_eq!(metrics.thread(1).unwrap().busy_duration, Duration::ZERO);
+}
+
+#[test]
+fn busy_duration_excludes_lane_park_interval() {
+  let runtime = AsyncRuntime::new(config(1, 1))
+    .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
+  let metrics = runtime.metrics();
+  let task_metrics = metrics.clone();
+  let (started_tx, started_rx) = mpsc::channel();
+  let job = runtime
+    .handle()
+    .spawn(async move {
+      let worker = task_metrics.thread(0).unwrap();
+      started_tx.send((Instant::now(), worker.parks)).unwrap();
+    })
+    .unwrap_or_else(|error| panic!("spawn failed: {error}"));
+  runtime.block_on(job).unwrap().unwrap();
+  let (started, parks) = started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+  let deadline = Instant::now() + Duration::from_secs(2);
+  while metrics.thread(0).unwrap().parks == parks {
+    assert!(
+      Instant::now() < deadline,
+      "worker did not enter its lane wait"
+    );
+    thread::yield_now();
+  }
+  // No work is submitted during this known idle interval. Actual-wait
+  // metrics establish that the worker reached the lane park after its turn.
+  let parked = Instant::now();
+  thread::sleep(Duration::from_millis(120));
+  let idle = parked.elapsed();
+  let job = runtime
+    .handle()
+    .spawn(async {})
+    .unwrap_or_else(|error| panic!("spawn failed: {error}"));
+  runtime.block_on(job).unwrap().unwrap();
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+  let wall = started.elapsed();
+  let busy = metrics.thread(0).unwrap().busy_duration;
+  assert!(
+    busy + idle / 2 < wall,
+    "lane wait leaked into busy time: busy={busy:?}, wall={wall:?}, idle={idle:?}"
+  );
+}
+
+#[test]
+fn stop_hook_sees_final_busy_period() {
+  let (metrics_tx, metrics_rx) = mpsc::channel::<super::RuntimeMetrics>();
+  let metrics_rx = Mutex::new(metrics_rx);
+  let (stopped_tx, stopped_rx) = mpsc::channel();
+  let runtime = AsyncRuntime::new_with_thread_options(
+    config(1, 1),
+    AsyncThreadOptions::new().on_thread_stop(move |context| {
+      let metrics = metrics_rx
+        .lock()
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+      stopped_tx
+        .send(
+          metrics
+            .thread(context.physical_index)
+            .unwrap()
+            .busy_duration,
+        )
+        .unwrap();
+    }),
+  )
+  .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
+  let metrics = runtime.metrics();
+  metrics_tx.send(metrics.clone()).unwrap();
+  let handle = runtime.handle();
+  let job = handle
+    .clone()
+    .spawn(async move {
+      let until = Instant::now() + Duration::from_millis(1);
+      while Instant::now() < until {
+        std::hint::spin_loop();
+      }
+      // Close during the sole turn so exit cannot publish via a lane wait.
+      handle.shared.close(false);
+    })
+    .unwrap_or_else(|error| panic!("spawn failed: {error}"));
+  runtime.block_on(job).unwrap().unwrap();
+  runtime.shutdown(AsyncShutdown::Drain).unwrap();
+  let stopped_busy = stopped_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+  assert!(stopped_busy >= Duration::from_millis(1));
+  assert_eq!(stopped_busy, metrics.thread(0).unwrap().busy_duration);
 }
 
 #[test]

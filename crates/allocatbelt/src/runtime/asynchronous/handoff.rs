@@ -225,12 +225,38 @@ enum Phase {
   HandedOff,
 }
 
+// Fixed diagnostic publication cadence; never scheduler policy input.
+#[cfg(not(loom))]
+const BUSY_FLUSH_TURNS: usize = 64;
+
 struct DispatcherThread {
   shared: Arc<Shared>,
   context: AsyncThreadContext,
   phase: Phase,
   #[cfg(not(loom))]
   busy_since: Option<Instant>,
+  #[cfg(not(loom))]
+  busy_turns: usize,
+}
+
+#[cfg(not(loom))]
+impl DispatcherThread {
+  fn publish_busy(&mut self, keep_open: bool) {
+    if let Some(started) = self.busy_since.take() {
+      let now = Instant::now();
+      let nanos = now.duration_since(started).as_nanos().min(u64::MAX as u128) as u64;
+      self.busy_since = keep_open.then_some(now);
+      self.busy_turns = 0;
+      if let Some(metrics) = self
+        .shared
+        .metrics
+        .inner()
+        .thread(self.context.physical_index)
+      {
+        metrics.add_busy_nanos(nanos);
+      }
+    }
+  }
 }
 
 thread_local! {
@@ -276,27 +302,18 @@ fn restore_phase(turn: DispatchTurn) {
 }
 
 #[cfg(not(loom))]
-fn pause_busy() {
+pub(super) fn pause_busy() {
   let _ = DISPATCHER.try_with(|slot| {
     if let Ok(mut slot) = slot.try_borrow_mut()
       && let Some(dispatcher) = slot.as_mut()
-      && let Some(started) = dispatcher.busy_since.take()
     {
-      let nanos = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-      if let Some(metrics) = dispatcher
-        .shared
-        .metrics
-        .inner()
-        .thread(dispatcher.context.physical_index)
-      {
-        metrics.add_busy_nanos(nanos);
-      }
+      dispatcher.publish_busy(false);
     }
   });
 }
 
 #[cfg(loom)]
-fn pause_busy() {}
+pub(super) fn pause_busy() {}
 
 #[cfg(not(loom))]
 fn resume_busy() {
@@ -307,6 +324,7 @@ fn resume_busy() {
       && matches!(&dispatcher.phase, Phase::Dispatching(_))
     {
       dispatcher.busy_since = Some(Instant::now());
+      dispatcher.busy_turns = 0;
     }
   });
 }
@@ -323,13 +341,21 @@ pub(super) fn enter_turn(turn: DispatchTurn) {
 /// Ends this thread's owned turn and returns its permit for release under
 /// the scheduler lock.
 pub(super) fn leave_turn() -> Option<DispatchTurn> {
-  pause_busy();
   DISPATCHER
     .try_with(|slot| {
       let mut slot = slot.borrow_mut();
       let thread = slot.as_mut()?;
       match std::mem::replace(&mut thread.phase, Phase::Idle) {
-        Phase::Dispatching(turn) => Some(turn),
+        Phase::Dispatching(turn) => {
+          #[cfg(not(loom))]
+          if thread.busy_since.is_some() {
+            thread.busy_turns += 1;
+            if thread.busy_turns == BUSY_FLUSH_TURNS {
+              thread.publish_busy(true);
+            }
+          }
+          Some(turn)
+        }
         other => {
           debug_assert!(matches!(other, Phase::Idle));
           thread.phase = other;
@@ -356,6 +382,8 @@ impl DispatcherGuard {
           phase: Phase::Idle,
           #[cfg(not(loom))]
           busy_since: None,
+          #[cfg(not(loom))]
+          busy_turns: 0,
         })
       })
       .ok()
@@ -367,6 +395,7 @@ impl DispatcherGuard {
 
 impl Drop for DispatcherGuard {
   fn drop(&mut self) {
+    pause_busy();
     let removed = DISPATCHER
       .try_with(|slot| slot.borrow_mut().take())
       .ok()

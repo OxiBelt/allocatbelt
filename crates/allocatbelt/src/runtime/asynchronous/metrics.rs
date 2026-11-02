@@ -1,5 +1,6 @@
 //! Retained, point-in-time diagnostics for an asynchronous runtime.
 
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -12,16 +13,29 @@ pub(super) enum MetricsBuildError {
   ResourceDomain(DomainError),
 }
 
-#[repr(align(64))]
-pub(super) struct PaddedCounter(pub(super) AtomicUsize);
+// Isolate independently written shared lines, including adjacent-line fetches.
+// Mask padding costs one entry per 64 lanes; task wake words stay compact.
+#[repr(align(128))]
+#[derive(Debug)]
+pub(super) struct Padded<T>(pub(super) T);
+
+impl<T> Deref for Padded<T> {
+  type Target = T;
+
+  fn deref(&self) -> &Self::Target {
+    &self.0
+  }
+}
+
+pub(super) type PaddedCounter = Padded<AtomicUsize>;
 
 pub(super) struct RuntimeMetricsInner {
   pub(super) workers: usize,
-  pub(super) alive_tasks: AtomicUsize,
+  pub(super) alive_tasks: Padded<AtomicUsize>,
   pub(super) lane_depth: Vec<PaddedCounter>,
-  pub(super) blocked_depth: AtomicUsize,
-  pub(super) overflow_depth: AtomicUsize,
-  pub(super) hook_panics: AtomicUsize,
+  pub(super) blocked_depth: Padded<AtomicUsize>,
+  pub(super) overflow_depth: Padded<AtomicUsize>,
+  pub(super) hook_panics: Padded<AtomicUsize>,
   pub(super) threads: Vec<ThreadMetrics>,
   _control: ControlCharge,
 }
@@ -63,8 +77,17 @@ impl ThreadMetrics {
 /// A cloneable diagnostic view that remains usable after runtime shutdown.
 ///
 /// The executor updates these counters on every runtime, whether or not the
-/// application reads them. Busy accounting takes a monotonic timestamp at
-/// each turn boundary. Scalar and per-thread getters allocate nothing;
+/// application reads them. Busy accounting timestamps the start of a turn
+/// only when no busy period is open (also on successful handoff restoration).
+/// It publishes elapsed time just before a lane or seat condition wait, after
+/// a successful handoff, on dispatcher exit before the stop hook, and every
+/// 64 completed consecutive turns. Consecutive turns share a
+/// period, including intervening cleanup, queue searches and spinning. The
+/// first search after a wait is excluded until a turn starts. Reads may lag
+/// by up to 64 consecutive turns of an open busy period. This per-thread
+/// wall-time diagnostic never
+/// controls spinning, parking, wakes or poll quotas.
+/// Scalar and per-thread getters allocate nothing;
 /// [`snapshot`](Self::snapshot) allocates a vector, while
 /// [`try_snapshot`](Self::try_snapshot) reports reservation failure. Every
 /// counter is sampled independently with relaxed ordering; these reads do not
@@ -97,7 +120,7 @@ impl RuntimeMetrics {
     lane_depth
       .try_reserve_exact(lanes)
       .map_err(|_| MetricsBuildError::OutOfMemory)?;
-    lane_depth.resize_with(lanes, || PaddedCounter(AtomicUsize::new(0)));
+    lane_depth.resize_with(lanes, || Padded(AtomicUsize::new(0)));
     let actual = std::mem::size_of::<RuntimeMetricsInner>()
       .checked_add(
         payload_bytes::<ThreadMetrics>(threads.capacity())
@@ -112,11 +135,11 @@ impl RuntimeMetrics {
       .map_err(MetricsBuildError::ResourceDomain)?;
     Ok(Self(Arc::new(RuntimeMetricsInner {
       workers,
-      alive_tasks: AtomicUsize::new(0),
+      alive_tasks: Padded(AtomicUsize::new(0)),
       lane_depth,
-      blocked_depth: AtomicUsize::new(0),
-      overflow_depth: AtomicUsize::new(0),
-      hook_panics: AtomicUsize::new(0),
+      blocked_depth: Padded(AtomicUsize::new(0)),
+      overflow_depth: Padded(AtomicUsize::new(0)),
+      hook_panics: Padded(AtomicUsize::new(0)),
       threads,
       _control: control,
     })))
@@ -139,6 +162,8 @@ impl RuntimeMetrics {
   }
 
   /// Returns the current number of admitted task slots, including cleanup.
+  /// The admission mutex serializes stores after admission and release; reads
+  /// remain relaxed and can observe an adjacent moment.
   #[must_use]
   pub fn num_alive_tasks(&self) -> usize {
     self.0.alive_tasks.load(Ordering::Relaxed)
@@ -231,8 +256,12 @@ pub struct AsyncThreadMetrics {
   pub parks: usize,
   /// Number of returns from scheduler waits, including spurious wakeups.
   pub unparks: usize,
-  /// Wall time spent dispatching turns, including their cleanup and excluding
-  /// parking and successful handoff closures/restoration waits.
+  /// Published wall time in continuous dispatch periods, including cleanup
+  /// and searches/spinning between turns, excluding condition waits and
+  /// successful handoff closures/restoration waits. Reads may lag by up to
+  /// 64 consecutive turns of an open busy period; see [`RuntimeMetrics`] for
+  /// timestamp boundaries.
+  /// This is per-thread diagnostic time, never scheduler policy input.
   pub busy_duration: std::time::Duration,
 }
 

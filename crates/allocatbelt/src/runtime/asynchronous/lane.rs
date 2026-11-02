@@ -4,6 +4,8 @@
 
 #![forbid(unsafe_code)]
 
+use super::metrics::Padded;
+
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(loom))]
@@ -239,8 +241,8 @@ impl LaneQueue {
 
 #[derive(Debug)]
 pub(super) struct ParkedMask {
-  words: Vec<AtomicU64>,
-  dead: Vec<AtomicU64>,
+  words: Vec<Padded<AtomicU64>>,
+  dead: Vec<Padded<AtomicU64>>,
   lanes: usize,
 }
 
@@ -249,8 +251,12 @@ impl ParkedMask {
   pub(super) fn new(lanes: usize) -> Self {
     assert!(lanes > 0);
     Self {
-      words: (0..lanes.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
-      dead: (0..lanes.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+      words: (0..lanes.div_ceil(64))
+        .map(|_| Padded(AtomicU64::new(0)))
+        .collect(),
+      dead: (0..lanes.div_ceil(64))
+        .map(|_| Padded(AtomicU64::new(0)))
+        .collect(),
       lanes,
     }
   }
@@ -258,10 +264,10 @@ impl ParkedMask {
   pub(super) fn try_new(lanes: usize) -> Result<Self, std::collections::TryReserveError> {
     let mut words = Vec::new();
     words.try_reserve_exact(lanes.div_ceil(64))?;
-    words.resize_with(lanes.div_ceil(64), || AtomicU64::new(0));
+    words.resize_with(lanes.div_ceil(64), || Padded(AtomicU64::new(0)));
     let mut dead = Vec::new();
     dead.try_reserve_exact(lanes.div_ceil(64))?;
-    dead.resize_with(lanes.div_ceil(64), || AtomicU64::new(0));
+    dead.resize_with(lanes.div_ceil(64), || Padded(AtomicU64::new(0)));
     Ok(Self { words, dead, lanes })
   }
 
@@ -388,16 +394,16 @@ impl VictimOrder {
 /// counters are separate words; neither records a dispatcher identity.
 #[derive(Debug)]
 pub(super) struct Searching {
-  searching: AtomicUsize,
-  waking: AtomicUsize,
+  searching: Padded<AtomicUsize>,
+  waking: Padded<AtomicUsize>,
   max: usize,
 }
 
 impl Searching {
   pub(super) fn new(max: usize) -> Self {
     Self {
-      searching: AtomicUsize::new(0),
-      waking: AtomicUsize::new(0),
+      searching: Padded(AtomicUsize::new(0)),
+      waking: Padded(AtomicUsize::new(0)),
       max,
     }
   }

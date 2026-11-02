@@ -872,6 +872,7 @@ fn executor_thread<R>(
   }
   impl Drop for StopGuard<'_> {
     fn drop(&mut self) {
+      handoff::pause_busy();
       self.shared.thread_stopped(self.context);
     }
   }

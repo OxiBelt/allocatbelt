@@ -30,9 +30,20 @@ thread_local! {
   static COOPERATIVE_BUDGET: Cell<u16> = const { Cell::new(DEFAULT_BUDGET) };
   static COOPERATIVE_POLL_ACTIVE: Cell<bool> = const { Cell::new(false) };
   static COOPERATIVE_POLL_DEPTH: Cell<u16> = const { Cell::new(0) };
-  static CURRENT_TASK_ID: Cell<Option<TaskId>> = const { Cell::new(None) };
   static LOCAL_EXECUTION: Cell<bool> = const { Cell::new(false) };
-  static CURRENT_RESOURCE_SCOPE: RefCell<Option<ResourceScope>> = const { RefCell::new(None) };
+  static TASK_CONTEXT: RefCell<TaskContext> = const { RefCell::new(TaskContext {
+    task_id: Cell::new(None),
+    resources: RefCell::new(None),
+    #[cfg(debug_assertions)]
+    lock_level: Cell::new(0),
+  }) };
+}
+
+struct TaskContext {
+  task_id: Cell<Option<TaskId>>,
+  resources: RefCell<Option<ResourceScope>>,
+  #[cfg(debug_assertions)]
+  lock_level: Cell<u8>,
 }
 
 struct ContextNode {
@@ -218,12 +229,14 @@ impl TaskContextGuard {
   ) -> Self {
     // Final runtime cleanup can run during thread-local destruction, after
     // these slots are gone; the task then runs without an ambient context.
-    let previous = CURRENT_TASK_ID
-      .try_with(|current| current.replace(task_id))
-      .unwrap_or(None);
-    let previous_resources = CURRENT_RESOURCE_SCOPE
-      .try_with(|current| current.replace(resources))
-      .unwrap_or(None);
+    let (previous, previous_resources) = TASK_CONTEXT
+      .try_with(|current| {
+        let current = current.borrow();
+        let previous = current.task_id.replace(task_id);
+        let previous_resources = current.resources.replace(resources);
+        (previous, previous_resources)
+      })
+      .unwrap_or((None, None));
     Self {
       previous,
       previous_resources,
@@ -234,9 +247,12 @@ impl TaskContextGuard {
 
 impl Drop for TaskContextGuard {
   fn drop(&mut self) {
-    let _ = CURRENT_TASK_ID.try_with(|current| current.set(self.previous));
-    let _ = CURRENT_RESOURCE_SCOPE.try_with(|current| {
-      let replaced = current.replace(self.previous_resources.take());
+    let _ = TASK_CONTEXT.try_with(|current| {
+      let replaced = {
+        let current = current.borrow();
+        current.task_id.set(self.previous);
+        current.resources.replace(self.previous_resources.take())
+      };
       drop(replaced);
     });
   }
@@ -247,8 +263,8 @@ impl Drop for TaskContextGuard {
 /// root poll. Unbound contexts return `None`.
 #[must_use]
 pub fn try_current_resource_scope() -> Option<ResourceScope> {
-  CURRENT_RESOURCE_SCOPE
-    .try_with(|current| current.borrow().clone())
+  TASK_CONTEXT
+    .try_with(|current| current.borrow().resources.borrow().clone())
     .unwrap_or(None)
 }
 
@@ -517,7 +533,31 @@ pub(in crate::runtime) fn poll_cooperative_composed<T>(
 /// Returns the identity of the task currently being polled or cleaned up.
 #[must_use]
 pub fn try_task_id() -> Option<TaskId> {
-  CURRENT_TASK_ID.try_with(Cell::get).unwrap_or(None)
+  TASK_CONTEXT
+    .try_with(|current| current.borrow().task_id.get())
+    .unwrap_or(None)
+}
+
+pub(super) fn dispatch_lock_level() -> u8 {
+  #[cfg(debug_assertions)]
+  {
+    TASK_CONTEXT
+      .try_with(|current| current.borrow().lock_level.get())
+      .unwrap_or(0)
+  }
+  #[cfg(not(debug_assertions))]
+  {
+    0
+  }
+}
+
+pub(super) fn set_dispatch_lock_level(level: u8) {
+  #[cfg(debug_assertions)]
+  {
+    let _ = TASK_CONTEXT.try_with(|current| current.borrow().lock_level.set(level));
+  }
+  #[cfg(not(debug_assertions))]
+  let _ = level;
 }
 
 /// Returns the identity of the task currently being polled or cleaned up.

@@ -2012,8 +2012,24 @@ Hooks receive stable physical worker/helper identities and run outside runtime
 locks and TLS borrows. Hook panics are contained and counted. Park attempts
 that skip a condition wait still pair callbacks; metrics count actual waits.
 `RuntimeMetrics` remains readable after shutdown and distinguishes primary
-dispatch capacity from physical helper threads. Busy time excludes handoff
-closures and restoration waits. Scalar and per-thread reads allocate nothing;
+dispatch capacity from physical helper threads. Each physical thread timestamps
+busy time at the start of its first dispatched turn after installation or a
+condition wait, and after successful handoff restoration. The period stays
+open across consecutive turns, including cleanup, queue searches and spinning
+between them. It is timestamped and published just before a lane or seat
+condition wait, after a successful handoff before invoking its closure, or on
+dispatcher exit before the stop hook (including unwind). An open period also
+publishes every 64 completed consecutive turns, with one clock read per 64
+turns. This interval is a fixed compile-time constant, independent of load,
+timing and history. Parking, handed-off closures and restoration
+waits are excluded, as is the initial search after a wait until a turn starts.
+Reads may lag by up to 64 consecutive turns of an open busy period.
+This remains solely a per-thread wall-time diagnostic; it never feeds spin,
+park, wake or quota decisions.
+The alive-task gauge is stored from the admitted count under the admission
+mutex after admission and release. Its update points still bracket future
+cleanup and precede join publication; relaxed readers may see adjacent moments.
+Scalar and per-thread reads allocate nothing;
 `try_snapshot` reports reservation failure, while the convenience snapshot
 allocates ordinary metadata. Fields are sampled independently rather than
 transactionally. Counter updates and monotonic timestamps are present even

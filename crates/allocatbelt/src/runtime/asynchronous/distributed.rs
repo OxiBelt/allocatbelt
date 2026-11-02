@@ -8,6 +8,7 @@ use super::super::handoff_protocol::SeatTable;
 use super::super::lane::{
   LaneQueue, ParkedMask, QueueLink, SearchGuard, Searching, VictimOrder, choose_lane,
 };
+use super::super::metrics::Padded;
 #[cfg(not(loom))]
 use super::super::park_spin::SpinnerSlots;
 use super::*;
@@ -19,26 +20,11 @@ thread_local! {
   static SPIN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(debug_assertions)]
-thread_local! {
-  static LOCK_LEVEL: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-}
-
 fn lock_level() -> u8 {
-  #[cfg(debug_assertions)]
-  {
-    LOCK_LEVEL.get()
-  }
-  #[cfg(not(debug_assertions))]
-  {
-    0
-  }
+  super::super::entry::dispatch_lock_level()
 }
 fn set_lock_level(level: u8) {
-  #[cfg(debug_assertions)]
-  LOCK_LEVEL.set(level);
-  #[cfg(not(debug_assertions))]
-  let _ = level;
+  super::super::entry::set_dispatch_lock_level(level);
 }
 
 pub(super) fn assert_admission_order() {
@@ -93,7 +79,7 @@ fn lock<T>(mutex: &Mutex<T>, level: u8) -> Guard<'_, T> {
   }
 }
 
-#[repr(align(64))]
+#[repr(align(128))]
 struct SlotCell {
   state: Mutex<SlotState>,
 }
@@ -160,14 +146,14 @@ pub(super) struct Distributed {
   links: Vec<QueueLink>,
   lanes: Vec<Lane>,
   parked: ParkedMask,
-  next_lane: AtomicUsize,
-  overflow: Mutex<LaneQueue>,
+  next_lane: Padded<AtomicUsize>,
+  overflow: Padded<Mutex<LaneQueue>>,
   seats: Mutex<SeatTable>,
   seat_cv: Condvar,
-  helper_yield: AtomicBool,
-  worker_yield: AtomicBool,
-  closing: AtomicBool,
-  closed_empty: AtomicBool,
+  helper_yield: Padded<AtomicBool>,
+  worker_yield: Padded<AtomicBool>,
+  closing: Padded<AtomicBool>,
+  closed_empty: Padded<AtomicBool>,
   #[cfg(all(test, not(loom)))]
   slot_locks: AtomicUsize,
   #[cfg(all(test, not(loom)))]
@@ -210,7 +196,7 @@ fn control_sizes(
     payload_bytes::<SlotCell>(slots),
     payload_bytes::<QueueLink>(links),
     payload_bytes::<Lane>(lanes),
-    payload_bytes::<AtomicU64>(words),
+    payload_bytes::<Padded<AtomicU64>>(words),
     payload_bytes::<usize>(vacant),
     payload_bytes::<bool>(helpers),
   ] {
@@ -284,16 +270,16 @@ impl Distributed {
         cv: Condvar::new(),
       })?,
       parked: ParkedMask::try_new(config.workers).map_err(|_| AsyncError::OutOfMemory)?,
-      next_lane: AtomicUsize::new(0),
-      overflow: Mutex::new(LaneQueue::new()),
+      next_lane: Padded(AtomicUsize::new(0)),
+      overflow: Padded(Mutex::new(LaneQueue::new())),
       seats: Mutex::new(
         SeatTable::try_new(config.workers, max_handoffs).map_err(|_| AsyncError::OutOfMemory)?,
       ),
       seat_cv: Condvar::new(),
-      helper_yield: AtomicBool::new(false),
-      worker_yield: AtomicBool::new(false),
-      closing: AtomicBool::new(false),
-      closed_empty: AtomicBool::new(false),
+      helper_yield: Padded(AtomicBool::new(false)),
+      worker_yield: Padded(AtomicBool::new(false)),
+      closing: Padded(AtomicBool::new(false)),
+      closed_empty: Padded(AtomicBool::new(false)),
       #[cfg(all(test, not(loom)))]
       slot_locks: AtomicUsize::new(0),
       #[cfg(all(test, not(loom)))]
@@ -601,12 +587,12 @@ impl Distributed {
     slot.task = Some(task);
     let inserted = slot.protocol.queue();
     debug_assert!(inserted);
+    state.admitted += 1;
     shared
       .metrics
       .inner()
       .alive_tasks
-      .fetch_add(1, Ordering::Relaxed);
-    state.admitted += 1;
+      .store(state.admitted, Ordering::Relaxed);
     drop(slot);
     drop(state);
     self.push_ready(shared, index, ReadyInsertion::Publish);
@@ -886,7 +872,7 @@ impl Distributed {
         .metrics
         .inner()
         .alive_tasks
-        .fetch_sub(1, Ordering::Relaxed);
+        .store(state.admitted, Ordering::Relaxed);
       state.closed && state.admitted == 0
     };
     if let Some(task) = task {
@@ -1183,6 +1169,7 @@ impl Distributed {
       }
       let mut queue = self.lane(seat);
       if queue.prepare_sleep() {
+        handoff::pause_busy();
         shared.thread_parked(context);
         let guard = match queue.inner.take() {
           Some(guard) => guard,
@@ -1282,6 +1269,7 @@ impl Distributed {
     context: AsyncThreadContext,
     mut seats: Guard<'_, SeatTable>,
   ) {
+    handoff::pause_busy();
     shared.thread_parked(context);
     let guard = seats.inner.take().unwrap_or_else(|| unreachable!());
     seats.inner = Some(
