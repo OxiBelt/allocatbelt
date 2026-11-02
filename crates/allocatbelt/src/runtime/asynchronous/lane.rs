@@ -62,6 +62,7 @@ pub(super) struct LaneQueue {
   sleeping: bool,
   notified: bool,
   recheck: bool,
+  pub(super) search_kick: bool,
 }
 
 impl LaneQueue {
@@ -73,6 +74,7 @@ impl LaneQueue {
       sleeping: false,
       notified: false,
       recheck: false,
+      search_kick: false,
     }
   }
 
@@ -297,14 +299,26 @@ impl ParkedMask {
     self.words[lane / 64].fetch_and(!bit, Ordering::SeqCst) & bit != 0
   }
 
+  #[cfg(test)]
   pub(super) fn claim_any(&self, start: usize) -> Option<usize> {
     // Pair the producer's length publication with its mask scan in Loom's
     // model of the SeqCst total order. Native accesses already have it.
     #[cfg(loom)]
     loom::sync::atomic::fence(Ordering::SeqCst);
+    self.claim_any_with(start, |lane| self.claim(lane))
+  }
+
+  /// The callback serializes a claim with the lane sleep state.
+  pub(super) fn claim_any_with(
+    &self,
+    start: usize,
+    mut claim: impl FnMut(usize) -> bool,
+  ) -> Option<usize> {
+    #[cfg(loom)]
+    loom::sync::atomic::fence(Ordering::SeqCst);
     (0..self.lanes)
       .map(|offset| (start % self.lanes + offset) % self.lanes)
-      .find(|&lane| !self.is_dead(lane) && self.is_set(lane) && self.claim(lane))
+      .find(|&lane| !self.is_dead(lane) && self.is_set(lane) && claim(lane))
   }
 
   pub(super) fn first_clear_from(&self, start: usize) -> Option<usize> {
@@ -370,22 +384,145 @@ impl VictimOrder {
   }
 }
 
+/// Construction-time admission and outstanding search notifications. The two
+/// counters are separate words; neither records a dispatcher identity.
+#[derive(Debug)]
+pub(super) struct Searching {
+  searching: AtomicUsize,
+  waking: AtomicUsize,
+  max: usize,
+}
+
+impl Searching {
+  pub(super) fn new(max: usize) -> Self {
+    Self {
+      searching: AtomicUsize::new(0),
+      waking: AtomicUsize::new(0),
+      max,
+    }
+  }
+
+  pub(super) fn try_enter(&self) -> Option<SearchGuard<'_>> {
+    let mut current = self.searching.load(Ordering::SeqCst);
+    loop {
+      if current >= self.max {
+        return None;
+      }
+      match self.searching.compare_exchange_weak(
+        current,
+        current + 1,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+      ) {
+        Ok(_) => {
+          return Some(SearchGuard {
+            state: self,
+            active: true,
+          });
+        }
+        Err(actual) => current = actual,
+      }
+    }
+  }
+
+  pub(super) fn wake_allowed(&self) -> bool {
+    #[cfg(loom)]
+    loom::sync::atomic::fence(Ordering::SeqCst);
+    self.max != 0
+      && self.searching.load(Ordering::SeqCst) == 0
+      && self.waking.load(Ordering::SeqCst) == 0
+  }
+
+  pub(super) fn kicked(&self) {
+    self.waking.fetch_add(1, Ordering::SeqCst);
+  }
+
+  /// Called by the receiving seat after its entry decision, or on abandonment.
+  /// Return whether a denied receiver must restart. The search-count load
+  /// follows the decrement, crossing a last exit that observed this receipt.
+  pub(super) fn acknowledge(&self, in_search: bool) -> bool {
+    let previous = self.waking.fetch_sub(1, Ordering::SeqCst);
+    debug_assert_ne!(previous, 0);
+    #[cfg(loom)]
+    loom::sync::atomic::fence(Ordering::SeqCst);
+    self.searching.load(Ordering::SeqCst) == 0 && !in_search
+  }
+
+  /// Only the post-advertisement check of whether entry could now succeed.
+  fn entry_possible(&self) -> bool {
+    self.searching.load(Ordering::SeqCst) < self.max
+  }
+
+  #[cfg(all(test, not(loom)))]
+  pub(super) fn max_for_test(&self) -> usize {
+    self.max
+  }
+
+  #[cfg(test)]
+  pub(super) fn current(&self) -> usize {
+    self.searching.load(Ordering::SeqCst)
+  }
+
+  #[cfg(test)]
+  pub(super) fn pending(&self) -> usize {
+    self.waking.load(Ordering::SeqCst)
+  }
+}
+
+/// Owns exactly one successful increment, including across a spin retry.
+pub(super) struct SearchGuard<'a> {
+  state: &'a Searching,
+  active: bool,
+}
+
+impl SearchGuard<'_> {
+  /// Return whether this decrement was the last. No wake is owed by Drop.
+  pub(super) fn leave(mut self) -> bool {
+    self.active = false;
+    self.decrement() == 1
+  }
+
+  fn decrement(&self) -> usize {
+    let previous = self.state.searching.fetch_sub(1, Ordering::SeqCst);
+    #[cfg(loom)]
+    loom::sync::atomic::fence(Ordering::SeqCst);
+    previous
+  }
+}
+
+impl Drop for SearchGuard<'_> {
+  fn drop(&mut self) {
+    if self.active {
+      self.decrement();
+    }
+  }
+}
+
 /// The final park handshake after own/steal/overflow searches
 /// failed. A true result permits the caller to test `prepare_sleep` under its
 /// lane lock and wait there. A false result requires a fresh full search.
 /// The iterator must load SeqCst lengths lazily, after advertisement, and the
 /// closure must load overflow the same way. Producers publish a SeqCst length
-/// before claiming and kicking a sleeper.
+/// before claiming and kicking a sleeper. A denied dispatcher may ignore
+/// other lanes only while admission is still full after advertisement.
 pub(super) fn search_or_park(
   seat: usize,
   parked: &ParkedMask,
+  searching: &Searching,
   lane_len: impl IntoIterator<Item = (usize, usize)>,
   overflow_hint: impl FnOnce() -> usize,
+  searched: bool,
 ) -> bool {
   parked.advertise(seat);
+  // SeqCst orders the parker's ack -> advertise -> admission read against
+  // the finder's searching decrement -> waking read -> parked claim. If the
+  // finder exits first, available admission makes us rescan other lanes;
+  // otherwise our advertisement precedes its claim (or a covering kick).
+  // This read asks only whether entry could succeed, never reserves a slot.
+  let entry_possible = searching.entry_possible();
   let work = lane_len
     .into_iter()
-    .any(|(lane, len)| lane != seat && len != 0)
+    .any(|(lane, len)| (searched || entry_possible || lane == seat) && len != 0)
     || overflow_hint() != 0;
   if work {
     let _ = parked.claim(seat);
@@ -567,6 +704,61 @@ mod tests {
   }
 
   #[test]
+  fn searching_caps_entry_and_releases_during_unwind() {
+    let state = Searching::new(2);
+    let first = state.try_enter().unwrap();
+    assert!(
+      std::panic::catch_unwind(|| {
+        let _second = state.try_enter().unwrap();
+        assert!(state.try_enter().is_none());
+        panic!("injected search unwind");
+      })
+      .is_err()
+    );
+    assert_eq!(state.current(), 1);
+    assert!(first.leave());
+    assert_eq!(state.current(), 0);
+    assert!(state.wake_allowed());
+  }
+
+  #[test]
+  fn park_rescan_ignores_other_lanes_only_while_steal_is_denied() {
+    let mask = ParkedMask::new(2);
+    let lengths = [AtomicUsize::new(0), AtomicUsize::new(1)];
+    let searching = Searching::new(1);
+    let guard = searching.try_enter().unwrap();
+    let rescan = |searched: bool, overflow: usize| {
+      search_or_park(
+        0,
+        &mask,
+        &searching,
+        lengths
+          .iter()
+          .enumerate()
+          .map(|(lane, len)| (lane, len.load(Ordering::SeqCst))),
+        || overflow,
+        searched,
+      )
+    };
+    assert!(!rescan(true, 0));
+    assert!(!mask.is_set(0));
+    assert!(rescan(false, 0));
+    assert!(mask.claim(0));
+    assert!(!rescan(false, 1));
+    assert!(!mask.is_set(0));
+    drop(guard);
+    // The prior denial no longer permits sleep beside another lane's work.
+    assert!(!rescan(false, 0));
+    assert!(!mask.is_set(0));
+    let guard = searching.try_enter().unwrap();
+    // If a competitor fills the slot before our retry, it covers that work.
+    assert!(searching.try_enter().is_none());
+    assert!(rescan(false, 0));
+    assert!(mask.claim(0));
+    drop(guard);
+  }
+
+  #[test]
   fn park_rescans_stealable_lanes_and_overflow() {
     let mask = ParkedMask::new(2);
     let lengths = [AtomicUsize::new(0), AtomicUsize::new(0)];
@@ -574,22 +766,26 @@ mod tests {
     assert!(search_or_park(
       0,
       &mask,
+      &Searching::new(1),
       lengths
         .iter()
         .enumerate()
         .map(|(lane, len)| (lane, len.load(Ordering::SeqCst))),
       || overflow.load(Ordering::SeqCst),
+      true,
     ));
     assert!(mask.claim(0));
     lengths[1].store(1, Ordering::SeqCst);
     assert!(!search_or_park(
       0,
       &mask,
+      &Searching::new(1),
       lengths
         .iter()
         .enumerate()
         .map(|(lane, len)| (lane, len.load(Ordering::SeqCst))),
       || overflow.load(Ordering::SeqCst),
+      true,
     ));
     assert!(!mask.is_set(0));
     lengths[1].store(0, Ordering::SeqCst);
@@ -597,11 +793,13 @@ mod tests {
     assert!(!search_or_park(
       0,
       &mask,
+      &Searching::new(1),
       lengths
         .iter()
         .enumerate()
         .map(|(lane, len)| (lane, len.load(Ordering::SeqCst))),
       || overflow.load(Ordering::SeqCst),
+      true,
     ));
   }
 }
@@ -897,11 +1095,13 @@ mod loom_tests {
         if search_or_park(
           0,
           &parked,
+          &Searching::new(1),
           lengths
             .iter()
             .enumerate()
             .map(|(lane, len)| (lane, len.load(Ordering::SeqCst))),
           || 0,
+          true,
         ) {
           sleeper.lock().unwrap().prepare_sleep()
         } else {
@@ -979,6 +1179,229 @@ mod loom_tests {
     for initial_entry in [false, true] {
       loom::model(move || steal_push_park(true, initial_entry));
     }
+  }
+
+  /// One busy owner keeps an entry queued. The last finder is about to run
+  /// another entry; a woken dispatcher races that exit and a new producer.
+  fn denied_woken_last_exit_and_producer(cap: usize) {
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = Some(3);
+    model.check(move || {
+      let searching = Arc::new(Searching::new(cap));
+      // One seat per searcher, plus the denied seat and a busy owner.
+      let parked = Arc::new(ParkedMask::new(cap + 2));
+      let sleeper = Arc::new(Mutex::new(LaneQueue::new()));
+      let depth = Arc::new(AtomicUsize::new(1));
+      // Own-lane pop has taken an earlier receipt; entry is still pending.
+      searching.kicked();
+      let exiting = Arc::new(AtomicBool::new(false));
+      let wake = {
+        let (searching, parked, sleeper) = (
+          Arc::clone(&searching),
+          Arc::clone(&parked),
+          Arc::clone(&sleeper),
+        );
+        move || {
+          if searching.wake_allowed() {
+            parked.claim_any_with(0, |seat| {
+              assert_eq!(seat, 0);
+              let mut queue = sleeper.lock().unwrap();
+              if !parked.claim(seat) {
+                return false;
+              }
+              searching.kicked();
+              assert!(!queue.search_kick);
+              queue.search_kick = true;
+              queue.request_recheck();
+              true
+            });
+          }
+        }
+      };
+      let last = {
+        let (searching, depth, wake, exiting) = (
+          Arc::clone(&searching),
+          Arc::clone(&depth),
+          wake.clone(),
+          Arc::clone(&exiting),
+        );
+        thread::spawn(move || {
+          let mut guards: Vec<_> = (0..cap).map(|_| searching.try_enter().unwrap()).collect();
+          exiting.store(true, Ordering::SeqCst);
+          while guards.len() > 1 {
+            drop(guards.pop());
+          }
+          if guards.pop().unwrap().leave() && depth.load(Ordering::SeqCst) != 0 {
+            wake();
+          }
+        })
+      };
+      // Wait only for initial occupancy, before racing the final exit.
+      while !exiting.load(Ordering::SeqCst) {
+        thread::yield_now();
+      }
+      let producer = {
+        let (depth, wake) = (Arc::clone(&depth), wake.clone());
+        thread::spawn(move || {
+          depth.fetch_add(1, Ordering::SeqCst);
+          wake();
+        })
+      };
+      let mut guard = searching.try_enter();
+      let restart = searching.acknowledge(guard.is_some());
+      if restart {
+        guard = searching.try_enter();
+        assert!(guard.is_some());
+      }
+      let asleep = if let Some(guard) = guard {
+        depth.swap(0, Ordering::SeqCst);
+        if guard.leave() && depth.load(Ordering::SeqCst) != 0 {
+          wake();
+        }
+        false
+      } else {
+        let mut queue = sleeper.lock().unwrap();
+        if queue.search_kick {
+          false
+        } else {
+          search_or_park(
+            0,
+            &parked,
+            &searching,
+            std::iter::once((0, 0))
+              .chain(std::iter::once_with(|| (1, depth.load(Ordering::SeqCst)))),
+            || 0,
+            false,
+          ) && queue.prepare_sleep()
+        }
+      };
+      last.join().unwrap();
+      producer.join().unwrap();
+      let queue = sleeper.lock().unwrap();
+      assert!(
+        !asleep || depth.load(Ordering::SeqCst) == 0 || queue.search_kick,
+        "denied woken dispatcher slept beside queued work without a search kick"
+      );
+    });
+  }
+
+  #[test]
+  fn loom_denied_woken_last_exit_and_producer_cap_one() {
+    denied_woken_last_exit_and_producer(1);
+  }
+
+  #[test]
+  fn loom_denied_woken_last_exit_and_producer_cap_two() {
+    denied_woken_last_exit_and_producer(2);
+  }
+
+  #[test]
+  fn loom_woken_ack_crossing_last_exit_requires_restart() {
+    for cap in [1, 2] {
+      loom::model(move || {
+        let searching = Arc::new(Searching::new(cap));
+        let mut guards: Vec<_> = (0..cap).map(|_| searching.try_enter().unwrap()).collect();
+        searching.kicked();
+        // A woken receiver makes its own entry decision and is denied.
+        assert!(searching.try_enter().is_none());
+        let depth = Arc::new(AtomicUsize::new(0));
+        let producer = {
+          let (searching, depth) = (Arc::clone(&searching), Arc::clone(&depth));
+          thread::spawn(move || {
+            depth.store(1, Ordering::SeqCst);
+            assert!(!searching.wake_allowed());
+          })
+        };
+        producer.join().unwrap();
+        while guards.len() > 1 {
+          drop(guards.pop());
+        }
+        assert!(guards.pop().unwrap().leave());
+        assert_eq!(searching.current(), 0);
+        // Last exit cannot kick: the old receipt is still outstanding.
+        assert!(!searching.wake_allowed());
+        let restart = searching.acknowledge(false);
+        assert_eq!(searching.pending(), 0);
+        assert!(
+          restart,
+          "last exit left work to a denied receiver that did not restart"
+        );
+        let guard = searching.try_enter().unwrap();
+        assert_eq!(depth.swap(0, Ordering::SeqCst), 1);
+        assert!(guard.leave());
+      });
+    }
+  }
+
+  #[test]
+  fn loom_woken_own_pop_crosses_last_exit_and_suppressed_producer() {
+    bounded_model(|| {
+      let searching = Arc::new(Searching::new(1));
+      let parked = Arc::new(ParkedMask::new(3));
+      let sleeper = Arc::new(Mutex::new(LaneQueue::new()));
+      parked.advertise(2);
+      assert!(sleeper.lock().unwrap().prepare_sleep());
+      let depth = Arc::new(AtomicUsize::new(0));
+      // Seat 1 has already received a kick and will pop its own entry.
+      searching.kicked();
+      let last = searching.try_enter().unwrap();
+      let wake = {
+        let (searching, parked, sleeper) = (
+          Arc::clone(&searching),
+          Arc::clone(&parked),
+          Arc::clone(&sleeper),
+        );
+        move || {
+          if searching.wake_allowed() {
+            parked.claim_any_with(0, |seat| {
+              assert_eq!(seat, 2);
+              let mut queue = sleeper.lock().unwrap();
+              if !parked.claim(seat) {
+                return false;
+              }
+              searching.kicked();
+              assert!(!queue.search_kick);
+              queue.search_kick = true;
+              queue.request_recheck();
+              true
+            });
+          }
+        }
+      };
+      let producer = {
+        let (searching, depth) = (Arc::clone(&searching), Arc::clone(&depth));
+        thread::spawn(move || {
+          depth.store(1, Ordering::SeqCst);
+          // The outstanding receipt suppresses this producer even if the
+          // last searcher has already left.
+          assert!(!searching.wake_allowed());
+        })
+      };
+      producer.join().unwrap();
+      let receiver = {
+        let (searching, depth, wake) = (Arc::clone(&searching), Arc::clone(&depth), wake.clone());
+        thread::spawn(move || {
+          let links = [QueueLink::new()];
+          let mut own = LaneQueue::new();
+          own.search_kick = true;
+          own.push(&links, 0);
+          assert_eq!(own.pop(&links), Some(0));
+          let woken = std::mem::take(&mut own.search_kick);
+          let uncovered = woken && searching.acknowledge(false);
+          if uncovered && depth.load(Ordering::SeqCst) != 0 {
+            wake();
+          }
+        })
+      };
+      if last.leave() && depth.load(Ordering::SeqCst) != 0 {
+        wake();
+      }
+      receiver.join().unwrap();
+      assert_eq!(searching.current(), 0);
+      assert_eq!(depth.load(Ordering::SeqCst), 1);
+      assert!(sleeper.lock().unwrap().search_kick);
+      assert_eq!(searching.pending(), 1);
+    });
   }
 
   #[test]

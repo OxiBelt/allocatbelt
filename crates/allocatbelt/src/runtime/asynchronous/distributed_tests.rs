@@ -12,6 +12,7 @@ use super::super::super::park_spin::Policy;
 
 thread_local! {
   static TEST_SPIN_POLICY: std::cell::Cell<Policy> = std::cell::Cell::new(Policy::default());
+  static TEST_SEARCH_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 fn spin_options() -> AsyncRuntimeOptions {
@@ -26,10 +27,28 @@ fn each_spin_configuration(mut test: impl FnMut()) {
     TEST_SPIN_POLICY.set(Policy {
       rounds,
       max_spinners: Some(1),
+      max_searchers: TEST_SEARCH_CAP.get(),
     });
     test();
   }
   TEST_SPIN_POLICY.set(Policy::default());
+}
+
+/// Runs `test` with the default search limit, a cap of one and unlimited entry.
+fn each_search_configuration(mut test: impl FnMut()) {
+  for cap in [None, Some(1), Some(usize::MAX)] {
+    TEST_SEARCH_CAP.set(cap);
+    test();
+  }
+  TEST_SEARCH_CAP.set(None);
+}
+
+/// Binds the steal cap at half of `workers`, rounded up, for this test thread.
+fn half_search_cap(workers: usize) {
+  TEST_SPIN_POLICY.set(Policy {
+    max_searchers: Some(workers.div_ceil(2)),
+    ..Policy::default()
+  });
 }
 
 fn config(workers: usize, tasks: usize) -> AsyncConfig {
@@ -116,7 +135,8 @@ fn selected(shared: &Arc<Shared>, seat: usize) -> Option<Selected> {
   let d = engine(shared);
   let mut random = seat as u64 + 1;
   loop {
-    match d.search(shared, seat, &mut random) {
+    let mut guard = None;
+    match d.search(shared, seat, &mut random, &mut guard) {
       Search::Got(index) => {
         if let Some(work) = d.dispatch_decision(shared, index) {
           return Some(work);
@@ -344,6 +364,7 @@ fn work_arriving_during_spin_runs_without_a_park() {
     TEST_SPIN_POLICY.set(Policy {
       rounds,
       max_spinners: Some(1),
+      max_searchers: TEST_SEARCH_CAP.get(),
     });
     work_arriving_during_spin_runs_without_a_park_case();
   }
@@ -461,7 +482,9 @@ fn one_spawn_into_four_parked_lanes_wakes_only_its_dispatcher_case() {
 
 #[test]
 fn two_blocking_polls_start_before_deadline() {
-  each_spin_configuration(two_blocking_polls_start_before_deadline_case);
+  each_search_configuration(|| {
+    each_spin_configuration(two_blocking_polls_start_before_deadline_case)
+  });
 }
 
 fn two_blocking_polls_start_before_deadline_case() {
@@ -501,7 +524,9 @@ fn two_blocking_polls_start_before_deadline_case() {
 
 #[test]
 fn external_spawns_start_all_blocking_polls_before_deadline() {
-  each_spin_configuration(external_spawns_start_all_blocking_polls_before_deadline_case);
+  each_search_configuration(|| {
+    each_spin_configuration(external_spawns_start_all_blocking_polls_before_deadline_case)
+  });
 }
 
 fn external_spawns_start_all_blocking_polls_before_deadline_case() {
@@ -548,7 +573,9 @@ fn external_spawns_start_all_blocking_polls_before_deadline_case() {
 
 #[test]
 fn external_idle_wake_behind_blocked_poll_runs_before_deadline() {
-  each_spin_configuration(external_idle_wake_behind_blocked_poll_runs_before_deadline_case);
+  each_search_configuration(|| {
+    each_spin_configuration(external_idle_wake_behind_blocked_poll_runs_before_deadline_case)
+  });
 }
 
 fn external_idle_wake_behind_blocked_poll_runs_before_deadline_case() {
@@ -601,7 +628,9 @@ fn external_idle_wake_behind_blocked_poll_runs_before_deadline_case() {
 
 #[test]
 fn lone_entry_behind_blocked_poll_runs_on_idle_worker() {
-  each_spin_configuration(lone_entry_behind_blocked_poll_runs_on_idle_worker_case);
+  each_search_configuration(|| {
+    each_spin_configuration(lone_entry_behind_blocked_poll_runs_on_idle_worker_case)
+  });
 }
 
 fn lone_entry_behind_blocked_poll_runs_on_idle_worker_case() {
@@ -760,6 +789,195 @@ fn single_stolen_cleanup_entry_moves_to_overflow_and_is_cancelled_case() {
   run(&shared, work);
   assert!(matches!(finish(job), Err(AsyncJoinError::Cancelled)));
   check_distributed(&shared);
+}
+
+#[test]
+fn denied_searcher_parks_without_spinning_until_last_finder_exits() {
+  TEST_SEARCH_CAP.set(Some(1));
+  each_spin_configuration(|| {
+    let (shared, root) = shared(config(2, 3));
+    let d = engine(&shared);
+    let guard = d.searching.try_enter().unwrap();
+    d.next_lane.store(0, Ordering::Relaxed);
+    let job = shared.spawn(root, async {}).unwrap();
+    let worker1 = start_worker(&shared, 1);
+    wait(|| lane_sleeping(&shared, 1));
+    let rounds = d.spin_rounds.load(Ordering::Relaxed);
+    let denials = d.steal_denials.load(Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(lane_sleeping(&shared, 1));
+    assert_eq!(d.spin_rounds.load(Ordering::Relaxed), rounds);
+    assert_eq!(d.steal_denials.load(Ordering::Relaxed), denials);
+    assert!(!job.is_finished());
+    // Model a finder taking another entry, leaving this entry behind.
+    d.found_work(&shared, &mut Some(guard));
+    finish(job).unwrap();
+    shared.close(false);
+    join_worker(worker1);
+    assert_eq!(d.searching.current(), 0);
+    assert_eq!(d.searching.pending(), 0);
+    check_distributed(&shared);
+  });
+  TEST_SEARCH_CAP.set(None);
+}
+
+#[test]
+fn zero_search_cap_publishes_and_woken_own_pops_do_not_kick_searchers() {
+  TEST_SEARCH_CAP.set(Some(0));
+  each_spin_configuration(|| {
+    for owner in 0..4 {
+      let (shared, root) = shared(config(4, 3));
+      let d = engine(&shared);
+      for seat in 0..4 {
+        d.parked.advertise(seat);
+        assert!(d.lane(seat).prepare_sleep());
+      }
+      d.next_lane.store(owner, Ordering::Relaxed);
+      let first = shared.spawn(root, async {}).unwrap();
+      assert!(!d.parked.is_set(owner));
+      assert_eq!(d.lane_notifies.load(Ordering::Relaxed), 1);
+      // Further publishes target the now-claimed owner while other lanes
+      // remain parked. Its first two own-pops will leave work queued.
+      let second = shared.spawn(root, async {}).unwrap();
+      let third = shared.spawn(root, async {}).unwrap();
+      assert_eq!(d.lane(owner).len(), 3);
+      assert_eq!(d.wake_searches.load(Ordering::Relaxed), 0);
+      d.lane(owner).finish_sleep();
+      for remaining in (0..3).rev() {
+        run(&shared, selected(&shared, owner).unwrap());
+        assert_eq!(d.lane(owner).len(), remaining);
+        assert_eq!(d.wake_searches.load(Ordering::Relaxed), 0);
+        assert_eq!(d.searching.current(), 0);
+        assert_eq!(d.searching.pending(), 0);
+        for seat in 0..4 {
+          assert!(!d.lane(seat).search_kick);
+          assert_eq!(d.parked.is_set(seat), seat != owner);
+        }
+      }
+      assert_eq!(d.lane_notifies.load(Ordering::Relaxed), 1);
+      finish(first).unwrap();
+      finish(second).unwrap();
+      finish(third).unwrap();
+      for seat in 0..4 {
+        d.lane(seat).finish_sleep();
+      }
+      check_distributed(&shared);
+    }
+  });
+  TEST_SEARCH_CAP.set(None);
+}
+
+#[test]
+fn producer_suppression_and_last_found_exit_wake_once() {
+  for held in [false, true] {
+    half_search_cap(4);
+    let (shared, root) = shared(config(4, 5));
+    let d = engine(&shared);
+    let other = held.then(|| d.searching.try_enter().unwrap());
+    let mut finder = Some(d.searching.try_enter().unwrap());
+    for seat in [2, 3] {
+      d.parked.advertise(seat);
+      assert!(d.lane(seat).prepare_sleep());
+    }
+    let wakes = d.wake_searches.load(Ordering::Relaxed);
+    d.next_lane.store(1, Ordering::Relaxed);
+    let job = shared.spawn(root, async {}).unwrap();
+    assert_eq!(d.wake_searches.load(Ordering::Relaxed), wakes);
+    d.found_work(&shared, &mut finder);
+    assert_eq!(
+      d.wake_searches.load(Ordering::Relaxed) - wakes,
+      usize::from(!held)
+    );
+    drop(other);
+    // A non-finding park exit sends no wake.
+    if held {
+      assert!(d.parked.is_set(2) && d.parked.is_set(3));
+      d.search_wake();
+    }
+    let woken = if d.parked.is_set(2) { 3 } else { 2 };
+    assert_eq!(d.searching.pending(), 1);
+    d.next_lane.store(1, Ordering::Relaxed);
+    let second = shared.spawn(root, async {}).unwrap();
+    assert_eq!(d.searching.pending(), 1);
+    run(&shared, selected(&shared, woken).unwrap());
+    run(&shared, selected(&shared, woken).unwrap());
+    finish(job).unwrap();
+    finish(second).unwrap();
+    for seat in [2, 3] {
+      d.lane(seat).finish_sleep();
+      d.acknowledge_search_kick(seat);
+    }
+    assert_eq!(d.searching.pending(), 0);
+    check_distributed(&shared);
+  }
+  TEST_SPIN_POLICY.set(Policy::default());
+}
+
+#[test]
+fn searching_defaults_to_half_and_keeps_accounting_when_unlimited() {
+  for (workers, cap, expected) in [
+    (1, None, 1),
+    (2, None, 1),
+    (3, None, 2),
+    (4, None, 2),
+    (4, Some(1), 1),
+    (4, Some(4), 4),
+    (4, Some(usize::MAX), 4),
+    (4, Some(0), 0),
+  ] {
+    TEST_SPIN_POLICY.set(Policy {
+      max_searchers: cap,
+      ..Policy::default()
+    });
+    let (shared, _) = shared(config(workers, 1));
+    let d = engine(&shared);
+    let entered: Vec<_> = (0..expected)
+      .map(|_| d.searching.try_enter().unwrap())
+      .collect();
+    assert_eq!(d.searching.current(), expected);
+    if cap != Some(usize::MAX) {
+      assert!(d.searching.try_enter().is_none());
+    }
+    drop(entered);
+    assert_eq!(d.searching.current(), 0);
+  }
+  TEST_SPIN_POLICY.set(Policy::default());
+  let options = AsyncRuntimeOptions::new().max_searching_dispatchers(3);
+  assert_eq!(options.park_spin.max_searchers, Some(3));
+}
+
+#[test]
+fn abandoned_seat_settles_its_search_kick() {
+  let (shared, _) = shared(config(2, 1));
+  let d = engine(&shared);
+  let turn = d.seats().claim(1);
+  d.parked.advertise(1);
+  assert!(d.lane(1).prepare_sleep());
+  d.search_wake();
+  assert_eq!(d.searching.pending(), 1);
+  d.abandon_turn(&shared, turn);
+  assert_eq!(d.searching.pending(), 0);
+  assert!(!d.lane(1).search_kick);
+}
+
+#[test]
+fn acknowledged_search_kick_allows_later_external_work_to_wake() {
+  each_search_configuration(|| {
+    each_spin_configuration(|| {
+      let (shared, root) = shared(config(2, 2));
+      let d = engine(&shared);
+      let worker1 = start_worker(&shared, 1);
+      wait(|| lane_sleeping(&shared, 1));
+      d.search_wake();
+      wait(|| lane_sleeping(&shared, 1) && d.searching.pending() == 0);
+      d.next_lane.store(0, Ordering::Relaxed);
+      let job = shared.spawn(root, async {}).unwrap();
+      finish(job).unwrap();
+      shared.close(false);
+      join_worker(worker1);
+      assert_eq!(d.searching.pending(), 0);
+    })
+  });
 }
 
 /// Checks only quiescent points, when no entries or permits are in transit.
@@ -1092,7 +1310,9 @@ fn nonbinding_boundary_uses_no_quota_lock_case() {
 
 #[test]
 fn stolen_tasks_obey_exact_scope_limits_under_contention() {
-  each_spin_configuration(stolen_tasks_obey_exact_scope_limits_under_contention_case);
+  each_search_configuration(|| {
+    each_spin_configuration(stolen_tasks_obey_exact_scope_limits_under_contention_case)
+  });
 }
 
 fn stolen_tasks_obey_exact_scope_limits_under_contention_case() {
@@ -1606,7 +1826,9 @@ fn round_robin_alternative_runs_the_same_wake_and_finish_paths_case() {
 
 #[test]
 fn repeated_bursts_and_long_polls_leave_no_stealable_work_asleep() {
-  each_spin_configuration(repeated_bursts_and_long_polls_leave_no_stealable_work_asleep_case);
+  each_search_configuration(|| {
+    each_spin_configuration(repeated_bursts_and_long_polls_leave_no_stealable_work_asleep_case)
+  });
 }
 
 fn repeated_bursts_and_long_polls_leave_no_stealable_work_asleep_case() {
@@ -2594,6 +2816,7 @@ fn fixed_rounds_are_unchanged_by_repeated_idle_parks() {
     TEST_SPIN_POLICY.set(Policy {
       rounds,
       max_spinners: Some(1),
+      max_searchers: TEST_SEARCH_CAP.get(),
     });
     let (shared, root) = shared(config(1, 1));
     let d = engine(&shared);
@@ -2663,6 +2886,7 @@ fn spinner_limit_binds_only_below_the_worker_seat_count() {
       Policy {
         rounds,
         max_spinners: cap,
+        max_searchers: TEST_SEARCH_CAP.get(),
       },
     )
     .unwrap();
@@ -2688,9 +2912,13 @@ fn burst_respects_spinner_cap_and_denied_dispatchers_park_immediately() {
     TEST_SPIN_POLICY.set(Policy {
       rounds: 4096,
       max_spinners: Some(cap),
+      max_searchers: TEST_SEARCH_CAP.get(),
     });
     let (shared, root) = shared(config(4, 64));
     let d = engine(&shared);
+    // Spinning also requires search admission. Hold the effective cap so
+    // the fixture works when search admission is lower than the spin cap.
+    let cap = cap.min(d.searching.max_for_test());
     let (entered, entering) = mpsc::channel();
     let mut releases = Vec::new();
     let mut workers = Vec::new();
@@ -2770,6 +2998,7 @@ fn dispatcher_unwind_inside_spin_releases_its_slot() {
   TEST_SPIN_POLICY.set(Policy {
     rounds: 128,
     max_spinners: Some(1),
+    max_searchers: TEST_SEARCH_CAP.get(),
   });
   let (shared, _) = shared(config(2, 1));
   SPIN_HOOK.with(|hook| {
@@ -2825,4 +3054,115 @@ fn final_shared_drop_cleans_admitted_future_with_retained_handles() {
     Pin::new(&mut job).poll(&mut Context::from_waker(Waker::noop())),
     Poll::Ready(Err(AsyncJoinError::Cancelled))
   ));
+}
+
+#[test]
+fn woken_own_pop_keeps_a_searcher_or_kick_for_other_lanes() {
+  TEST_SPIN_POLICY.set(Policy {
+    max_searchers: Some(1),
+    ..Policy::default()
+  });
+  let (shared, root) = shared(config(3, 3));
+  let d = engine(&shared);
+  let mut finder = Some(d.searching.try_enter().unwrap());
+  for seat in [1, 2] {
+    d.parked.advertise(seat);
+    assert!(d.lane(seat).prepare_sleep());
+  }
+  d.next_lane.store(0, Ordering::Relaxed);
+  let other = shared.spawn(root, async {}).unwrap();
+  d.next_lane.store(1, Ordering::Relaxed);
+  d.found_work(&shared, &mut finder);
+  assert!(d.lane(1).search_kick);
+  assert!(d.parked.is_set(2));
+  d.next_lane.store(1, Ordering::Relaxed);
+  let own = shared.spawn(root, async {}).unwrap();
+  let wakes = d.wake_searches.load(Ordering::Relaxed);
+  let work = selected(&shared, 1).unwrap();
+  assert_eq!(d.lane(0).len(), 1);
+  assert_eq!(d.searching.current(), 0);
+  assert!(
+    d.searching.pending() != 0 || !d.parked.is_set(2),
+    "woken own-pop consumed the last search receipt beside another lane's work"
+  );
+  assert_eq!(d.wake_searches.load(Ordering::Relaxed) - wakes, 1);
+  run(&shared, work);
+  run(&shared, selected(&shared, 0).unwrap());
+  finish(own).unwrap();
+  finish(other).unwrap();
+}
+
+#[test]
+fn yielding_dispatcher_passes_search_coverage_before_seat_handoff() {
+  for (receipt, left_before_yield) in [(false, false), (true, false), (false, true)] {
+    TEST_SPIN_POLICY.set(Policy {
+      max_searchers: Some(1),
+      ..Policy::default()
+    });
+    let (shared, root) = shared(config(3, 1));
+    let d = engine(&shared);
+    let mut guard = (!receipt).then(|| d.searching.try_enter().unwrap());
+    d.parked.advertise(2);
+    assert!(d.lane(2).prepare_sleep());
+    if receipt {
+      d.searching.kicked();
+      d.lane(1).search_kick = true;
+    }
+    d.next_lane.store(0, Ordering::Relaxed);
+    let job = shared.spawn(root, async {}).unwrap();
+    assert_eq!(d.searching.pending(), usize::from(receipt));
+    if left_before_yield {
+      // The park path dropped searching and rescanned queued work, then
+      // observed a yield hint on its next iteration.
+      drop(guard.take());
+    }
+    let wakes = d.wake_searches.load(Ordering::Relaxed);
+    d.retire_search_kick(&shared, 1, &mut guard);
+    assert!(guard.is_none());
+    assert!(!d.lane(1).search_kick);
+    assert!(d.lane(2).search_kick);
+    assert_eq!(d.searching.pending(), 1);
+    assert_eq!(d.wake_searches.load(Ordering::Relaxed) - wakes, 1);
+    run(&shared, selected(&shared, 2).unwrap());
+    finish(job).unwrap();
+  }
+}
+
+#[test]
+fn woken_recheck_and_denied_overflow_pop_keep_last_searcher_coverage() {
+  TEST_SPIN_POLICY.set(Policy {
+    max_searchers: Some(1),
+    ..Policy::default()
+  });
+  let (shared, root) = shared(config(3, 2));
+  let d = engine(&shared);
+  let mut guard = Some(d.searching.try_enter().unwrap());
+  d.parked.advertise(2);
+  assert!(d.lane(2).prepare_sleep());
+  d.searching.kicked();
+  d.lane(1).search_kick = true;
+  d.kick(1);
+  d.next_lane.store(0, Ordering::Relaxed);
+  let other = shared.spawn(root, async {}).unwrap();
+  let cleanup = shared.spawn(root, std::future::pending::<()>()).unwrap();
+  cleanup.abort();
+  let mut denied = None;
+  assert!(matches!(
+    d.search(&shared, 1, &mut 1, &mut denied),
+    Search::Recheck
+  ));
+  assert!(d.lane(1).search_kick);
+  assert_eq!(d.searching.pending(), 1);
+  let Search::Got(index) = d.search(&shared, 1, &mut 1, &mut denied) else {
+    panic!("denied receiver did not take overflow cleanup");
+  };
+  assert!(denied.is_none());
+  assert_eq!(d.searching.pending(), 0);
+  assert!(d.parked.is_set(2));
+  d.found_work(&shared, &mut guard);
+  assert!(d.lane(2).search_kick);
+  run(&shared, d.dispatch_decision(&shared, index).unwrap());
+  run(&shared, selected(&shared, 2).unwrap());
+  assert!(matches!(finish(cleanup), Err(AsyncJoinError::Cancelled)));
+  finish(other).unwrap();
 }

@@ -991,27 +991,29 @@ FIFO lanes with bounded helper seat adoption. Ordering across tasks is not
 guaranteed. A future that never returns from `poll` cannot be preempted.
 
 The executor appends newly ready, self-woken, requeued and quota-released
-tasks to a lane chosen by a round-robin counter and the parked mask.
-Dead seats are excluded; among live seats it skips parked dispatchers unless
-all are parked. A dispatcher takes its own front entry, then searches other
-lanes in a pseudo-random order, then takes one
-shared overflow entry. An idle dispatcher can take a busy lane's oldest
-entries, including a single remaining one. A steal takes the oldest entry,
-or the oldest bounded half (at most 32) of a larger lane. A stealer dispatches
-a lone stolen entry directly without placing it on its own lane, and moves a
-larger chain to its lane's tail, preserving order. A multi-entry victim keeps
-at least one entry. Inserting
-ready work onto a lane whose dispatcher is awake wakes one parked dispatcher,
-if available, even for a lone entry. An insertion that claims a parked lane
-wakes only that lane's dispatcher. This applies to spawns, idle task wakes and
-quota transfers or releases. A task's own end-of-poll requeue wakes nobody;
-the finishing dispatcher continues searching. Work remaining after a pop or
+tasks to a lane chosen by a round-robin counter and the parked mask. Dead
+seats are excluded; among live seats it skips parked dispatchers unless all
+are parked. A dispatcher takes its own front entry, then searches other
+lanes in a pseudo-random order, then takes one shared overflow entry.
+Searching and spinning admit a fixed number of dispatchers at once (see
+`max_searching_dispatchers` below). An idle dispatcher can take a busy
+lane's oldest entries, including a single remaining one. A steal takes the
+oldest entry, or the oldest bounded half (at most 32) of a larger lane. A
+stealer dispatches a lone stolen entry directly without placing it on its
+own lane, and moves a larger chain to its lane's tail, preserving order. A
+multi-entry victim keeps at least one entry. Inserting ready work onto a
+lane whose dispatcher is awake wakes one parked dispatcher, if available,
+even for a lone entry. An insertion that claims a parked lane wakes only
+that lane's dispatcher. This applies to spawns, idle task wakes and quota
+transfers or releases. A task's own end-of-poll requeue wakes nobody; the
+finishing dispatcher continues searching. Work remaining after a pop or
 steal wakes one parked dispatcher, if available. Taking a lane's last entry
-wakes nobody.
-There is no per-task lane affinity or global scope rotation. A larger ready
-scope can receive proportionally more polls, and scope readiness order can
-change across lanes. Each task still polls exclusively, and ready tasks make
-progress if every poll returns; there is no time bound.
+wakes nobody. These wake decisions use the searching state described for
+`max_searching_dispatchers` below. There is no per-task lane affinity or
+global scope rotation. A larger ready scope can receive proportionally more
+polls, and scope readiness order can change across lanes. Each task still
+polls exclusively, and ready tasks make progress if every poll returns;
+there is no time bound.
 
 A binding scope keeps quota-blocked entries in FIFO order. Each release passes
 its permit directly to the oldest blocked entry, which reenters a lane without
@@ -1444,13 +1446,15 @@ local execution already polls one future at a time. Native tests exercise
 saturation, cross-scope progress, FIFO quota transfer, cancellation, shutdown,
 slot reuse and cleanup; a same-source Loom model checks poll-slot acquire/release transitions.
 
-The executor and Loom call the same park-advertise/rescan helper. The
-same-source Loom models cover lane park/push, stealing versus
-owner pop and push, quota gating and transfer, abort and close versus spawn.
-They use tiny queues and do not model real condvar timing, OS threads, metrics,
-Control charges or task internals. Native tests cover those integration paths.
-`global_queue_depth` sums lane, blocked and overflow depths; samples are
-independent and can briefly omit an entry moving between queues.
+The same-source Loom models cover lane park/push, stealing versus owner pop
+and push, search admission versus a denied dispatcher's park, quota gating
+and transfer, abort and close versus spawn. They use the shipped admission
+counter, parked mask and park-advertise/rescan helper, and mirror the
+engine's wake decision. They use tiny queues and do not model real condvar
+timing, OS threads, metrics, Control charges or task internals. Native tests
+cover those integration paths. `global_queue_depth` sums lane, blocked and
+overflow depths; samples are independent and can briefly omit an entry
+moving between queues.
 
 ## Explicit cgroup controls
 
@@ -1597,19 +1601,56 @@ overflow entry. Other holders may steal from a vacant seat's lane under the
 usual bounds, including its last entry.
 
 `AsyncRuntimeOptions::park_spin(ParkSpin::fixed(rounds))` controls the
-lock-free ready-hint checks before a distributed dispatcher attempts to park.
-The round limit is fixed at construction and defaults to 128; zero disables
-spinning. `AsyncRuntimeOptions::max_spinning_dispatchers(K)` fixes the cap on
-simultaneously spinning dispatchers, defaulting to the worker count; a cap at or above the
-worker count does not limit spinning. Zero skips spinning. A dispatcher that cannot acquire a spinner slot proceeds directly to
-the existing park handshake. A guard releases its slot on every spin exit,
-including work, closing, handoff yield, exhaustion and unwinding. Releasing a
-slot sends no wake. Closing and handoff yield hints stop the spin early. The
-condvar park remains untimed. Loom builds omit spinning and the slot counter.
+lock-free ready-hint checks before a distributed dispatcher attempts to
+park. The round limit is fixed at construction and defaults to 128; zero
+disables spinning. `AsyncRuntimeOptions::max_spinning_dispatchers(K)` fixes
+an additional cap on simultaneously spinning dispatchers, defaulting to the
+worker count. Spinning also requires search admission, so by default at most
+half the workers, rounded up, spin. A spinner cap at or above the worker
+count adds no limit. Zero skips spinning. A dispatcher that cannot acquire a
+spinner slot proceeds directly to the existing park handshake. A guard
+releases its slot on every spin exit, including work, closing, handoff
+yield, exhaustion and unwinding. Releasing a slot sends no wake. Closing and
+handoff yield hints stop the spin early. The condvar park remains untimed.
+Loom builds omit spinning and the spinner slot counter; search admission and
+wake decisions remain.
+
+`AsyncRuntimeOptions::max_searching_dispatchers(K)` fixes the cap on
+dispatchers searching other lanes and spinning at once. The default is half
+the workers, rounded up, fixed at construction. A cap at or above the worker
+count leaves entry unlimited; wake suppression still applies.
+A dispatcher checks its own lane before attempting entry. An admitted
+dispatcher then steals, checks overflow and spins for the fixed configured
+rounds, subject also to the spinner cap. A denied dispatcher checks overflow
+and parks without spinning. A dispatcher stops searching before running a
+task or parking. Closing and handoff yield stop the search.
+
+While a dispatcher is searching, or a dispatcher woken to search has not yet
+made its entry decision, new work does not wake another dispatcher. The
+woken dispatcher makes its own admission attempt; a kick grants no search
+entry. When the last searcher finds work and work remains queued in any lane
+or overflow, it wakes one parked dispatcher. A search-woken dispatcher that
+takes its own lane's work acknowledges its kick without entering searching;
+if no searcher covers remaining queued work, it attempts one search wake
+before polling. A yielding dispatcher also checks for queued work and
+attempts a search wake after releasing its search slot and acknowledging any
+kick, including when it left searching before observing the yield hint.
+These wake attempts use the same suppression while searching or waking is
+non-zero, and retain no deferred wake. Non-last exits send no wake. An empty
+search checks all lanes and overflow before parking, without sending a wake.
+After advertising its parked seat, a denied dispatcher rechecks whether
+search admission could now succeed. If so, it also rescans other lanes and
+restarts when work remains; otherwise it checks only its own lane and
+overflow. A retry either enters searching or finds the cap full again, with
+an active searcher covering the queued work. Lane selection, parked lane
+owner notifications and close notifications are unchanged. Zero disables
+searching other lanes, spinning and search kicks; an entry can then wait
+behind a blocking poll on its own lane until that poll returns.
 
 For `--lane async --executor bounded`, the latency benchmark accepts
-`--park-spin fixed:N` and `--max-spinners K`. CSV columns are unchanged; record
-the selected flags alongside benchmark results.
+`--park-spin fixed:N`, `--max-spinners K` and `--max-searchers K`. CSV
+columns are unchanged; record the selected flags alongside benchmark
+results.
 
 With `W` workers and `B` helpers, at most `W` dispatcher turns and `B` handed-off
 closures are active. Reserving a loan precedes releasing the dispatcher permit.

@@ -5,7 +5,9 @@
 #![forbid(unsafe_code)]
 
 use super::super::handoff_protocol::SeatTable;
-use super::super::lane::{LaneQueue, ParkedMask, QueueLink, VictimOrder, choose_lane};
+use super::super::lane::{
+  LaneQueue, ParkedMask, QueueLink, SearchGuard, Searching, VictimOrder, choose_lane,
+};
 #[cfg(not(loom))]
 use super::super::park_spin::SpinnerSlots;
 use super::*;
@@ -152,6 +154,9 @@ pub(super) struct Distributed {
   max_concurrent_spinners: AtomicUsize,
   #[cfg(all(test, not(loom)))]
   spin_rounds: AtomicUsize,
+  searching: Searching,
+  #[cfg(all(test, not(loom)))]
+  steal_denials: AtomicUsize,
   slots: Vec<SlotCell>,
   links: Vec<QueueLink>,
   lanes: Vec<Lane>,
@@ -246,8 +251,9 @@ impl Distributed {
     max_handoffs: usize,
     park_spin: super::super::park_spin::Policy,
   ) -> Result<Self, AsyncError> {
-    #[cfg(loom)]
-    let _ = park_spin;
+    let max_searchers = park_spin
+      .max_searchers
+      .unwrap_or(config.workers.div_ceil(2));
     Ok(Self {
       #[cfg(not(loom))]
       spin_limit: park_spin.rounds,
@@ -262,6 +268,9 @@ impl Distributed {
       max_concurrent_spinners: AtomicUsize::new(0),
       #[cfg(all(test, not(loom)))]
       spin_rounds: AtomicUsize::new(0),
+      searching: Searching::new(max_searchers),
+      #[cfg(all(test, not(loom)))]
+      steal_denials: AtomicUsize::new(0),
       slots: table(config.max_outstanding, || SlotCell {
         word: PollWord::new(),
         state: Mutex::new(SlotState {
@@ -403,7 +412,7 @@ impl Distributed {
       self.lanes[seat].cv.notify_one();
     }
     if search {
-      self.wake_one_parked();
+      self.search_wake();
     }
   }
 
@@ -417,7 +426,7 @@ impl Distributed {
         .overflow_depth
         .store(queue.len(), Ordering::SeqCst);
     }
-    self.wake_one_parked();
+    self.search_wake();
   }
 
   fn kick(&self, seat: usize) {
@@ -433,15 +442,41 @@ impl Distributed {
       self.kick(seat);
     }
   }
-  fn wake_one_parked(&self) {
+  fn search_wake(&self) {
+    if !self.searching.wake_allowed() {
+      return;
+    }
     #[cfg(all(test, not(loom)))]
     self.wake_searches.fetch_add(1, Ordering::Relaxed);
-    if let Some(seat) = self
+    let mut notify = false;
+    let claimed = self
       .parked
-      .claim_any(self.next_lane.load(Ordering::Relaxed))
+      .claim_any_with(self.next_lane.load(Ordering::Relaxed), |seat| {
+        let mut queue = self.lane(seat);
+        if self.parked.is_dead(seat) || !self.parked.claim(seat) {
+          return false;
+        }
+        // Advertisement and receipt installation share the lane lock, so a
+        // seat cannot be claimed twice before acknowledging its prior kick.
+        debug_assert!(!queue.search_kick);
+        self.searching.kicked();
+        queue.search_kick = true;
+        notify = queue.request_recheck();
+        true
+      });
+    if let Some(seat) = claimed
+      && notify
     {
-      self.kick(seat);
+      #[cfg(all(test, not(loom)))]
+      self.lane_notifies.fetch_add(1, Ordering::Relaxed);
+      self.lanes[seat].cv.notify_one();
     }
+  }
+
+  #[cfg(test)]
+  fn acknowledge_search_kick(&self, seat: usize) -> bool {
+    let received = std::mem::take(&mut self.lane(seat).search_kick);
+    received && self.searching.acknowledge(false)
   }
 
   pub(super) fn spawn<F>(
@@ -884,7 +919,7 @@ impl Distributed {
         (chain, queue.len() != 0)
       };
       if remains {
-        self.wake_one_parked();
+        self.search_wake();
       }
       // A lone stolen entry bypasses the receiving lane. An abort that set its
       // cleanup flag before this load routes it to overflow; a later abort is
@@ -921,53 +956,139 @@ impl Distributed {
             .store(queue.len(), Ordering::SeqCst);
           queue.len() - before
         };
-        for _ in 0..count {
-          self.wake_one_parked();
+        if count != 0 {
+          self.search_wake();
         }
       }
       #[cfg(all(test, not(loom)))]
       self.steals.fetch_add(1, Ordering::Relaxed);
       if remains {
-        self.wake_one_parked();
+        self.search_wake();
       }
       return first;
     }
     None
   }
 
-  fn search(&self, shared: &Shared, seat: usize, random: &mut u64) -> Search {
-    let (first, recheck, remains) = {
+  fn any_work(&self, shared: &Shared) -> bool {
+    let metrics = shared.metrics.inner();
+    metrics
+      .lane_depth
+      .iter()
+      .any(|depth| depth.0.load(Ordering::SeqCst) != 0)
+      || metrics.overflow_depth.load(Ordering::SeqCst) != 0
+  }
+
+  fn found_work(&self, shared: &Shared, guard: &mut Option<SearchGuard<'_>>) {
+    if guard.take().is_some_and(SearchGuard::leave) && self.any_work(shared) {
+      self.search_wake();
+    }
+  }
+
+  fn park_rescan(&self, shared: &Shared, seat: usize, searched: bool) -> bool {
+    let queue = self.lane(seat);
+    // A kick arriving after the entry decision requires another iteration.
+    // Serialize this test and advertisement with search_wake's claim.
+    if queue.search_kick {
+      return false;
+    }
+    super::super::lane::search_or_park(
+      seat,
+      &self.parked,
+      &self.searching,
+      shared
+        .metrics
+        .inner()
+        .lane_depth
+        .iter()
+        .enumerate()
+        .map(|(index, len)| (index, len.0.load(Ordering::SeqCst))),
+      || shared.metrics.inner().overflow_depth.load(Ordering::SeqCst),
+      searched,
+    )
+  }
+
+  fn search<'a>(
+    &'a self,
+    shared: &Shared,
+    seat: usize,
+    random: &mut u64,
+    guard: &mut Option<SearchGuard<'a>>,
+  ) -> Search {
+    let (first, recheck, remains, woken) = {
       let mut queue = self.lane(seat);
       let first = queue.pop(&self.links);
       let recheck = first.is_none() && queue.take_recheck();
       self.publish_depth(shared, seat, &queue);
-      (first, recheck, queue.len() != 0)
+      let woken = !recheck && std::mem::take(&mut queue.search_kick);
+      (first, recheck, queue.len() != 0, woken)
     };
     if let Some(index) = first {
-      if remains {
-        self.wake_one_parked();
+      // Own-lane work is the entry decision; it needs no search admission.
+      // Taking own-lane work consumes the kick without entering searching.
+      // If acknowledgement finds no searcher, pass coverage to a sleeper
+      // before this task can block inside its poll.
+      let uncovered = woken && self.searching.acknowledge(false);
+      if remains || (uncovered && self.any_work(shared)) {
+        self.search_wake();
       }
+      self.found_work(shared, guard);
       return Search::Got(index);
     }
     if recheck {
       return Search::Recheck;
     }
-    if let Some(index) = self.try_steal(shared, seat, random) {
+    if guard.is_none() {
+      *guard = self.searching.try_enter();
+      #[cfg(all(test, not(loom)))]
+      if guard.is_none() {
+        self.steal_denials.fetch_add(1, Ordering::Relaxed);
+      }
+    }
+    if woken && self.searching.acknowledge(guard.is_some()) {
+      return Search::Recheck;
+    }
+    if guard.is_some()
+      && let Some(index) = self.try_steal(shared, seat, random)
+    {
+      self.found_work(shared, guard);
       return Search::Got(index);
     }
     if shared.metrics.inner().overflow_depth.load(Ordering::SeqCst) != 0 {
-      let mut queue = lock(&self.overflow, 4);
-      let first = queue.pop(&self.links);
-      shared
-        .metrics
-        .inner()
-        .overflow_depth
-        .store(queue.len(), Ordering::SeqCst);
+      let first = {
+        let mut queue = lock(&self.overflow, 4);
+        let first = queue.pop(&self.links);
+        shared
+          .metrics
+          .inner()
+          .overflow_depth
+          .store(queue.len(), Ordering::SeqCst);
+        first
+      };
       if let Some(index) = first {
+        self.found_work(shared, guard);
         return Search::Got(index);
       }
     }
     Search::Empty
+  }
+
+  fn retire_search_kick(&self, shared: &Shared, seat: usize, guard: &mut Option<SearchGuard<'_>>) {
+    drop(guard.take());
+    {
+      let mut queue = self.lane(seat);
+      self.parked.claim(seat);
+      if std::mem::take(&mut queue.search_kick) {
+        self.searching.acknowledge(false);
+      }
+    }
+    // A yielding seat may wait for a restorer before searching again. Pass
+    // coverage now, after settling its receipt and releasing the lane lock.
+    // Its search slot may already have been dropped for the park rescan
+    // before it observed the yield hint. The wake gate checks coverage now.
+    if self.any_work(shared) {
+      self.search_wake();
+    }
   }
 
   fn search_or_park(
@@ -977,6 +1098,7 @@ impl Distributed {
     random: &mut u64,
     context: AsyncThreadContext,
   ) -> Search {
+    let mut searcher = None;
     loop {
       let should_yield =
         if context.role == super::super::thread_options::AsyncThreadRole::HandoffHelper {
@@ -985,20 +1107,31 @@ impl Distributed {
           self.worker_yield.load(Ordering::Acquire) && self.seats().worker_should_yield()
         };
       if should_yield {
+        self.retire_search_kick(shared, seat, &mut searcher);
         return Search::Recheck;
       }
-      match self.search(shared, seat, random) {
+      match self.search(shared, seat, random, &mut searcher) {
         Search::Empty => {}
+        Search::Recheck => {
+          if self.closing.load(Ordering::Acquire)
+            || self.helper_yield.load(Ordering::Acquire)
+            || self.worker_yield.load(Ordering::Acquire)
+          {
+            self.retire_search_kick(shared, seat, &mut searcher);
+            return Search::Recheck;
+          }
+          continue;
+        }
         found => return found,
       }
       #[cfg(not(loom))]
-      let spinner = if self.spin_limit != 0 && self.limit_spinners {
+      let spinner = if searcher.is_some() && self.spin_limit != 0 && self.limit_spinners {
         self.spinners.try_acquire()
       } else {
         None
       };
       #[cfg(not(loom))]
-      if self.spin_limit != 0 && (!self.limit_spinners || spinner.is_some()) {
+      if searcher.is_some() && self.spin_limit != 0 && (!self.limit_spinners || spinner.is_some()) {
         #[cfg(test)]
         self
           .max_concurrent_spinners
@@ -1023,13 +1156,7 @@ impl Distributed {
               hook();
             }
           });
-          let metrics = shared.metrics.inner();
-          if metrics
-            .lane_depth
-            .iter()
-            .any(|depth| depth.0.load(Ordering::SeqCst) != 0)
-            || metrics.overflow_depth.load(Ordering::SeqCst) != 0
-          {
+          if self.any_work(shared) {
             work = true;
             break;
           }
@@ -1040,20 +1167,11 @@ impl Distributed {
       }
       #[cfg(not(loom))]
       drop(spinner);
+      let searched = searcher.is_some();
+      drop(searcher.take());
       cache::flush();
       shared.thread_park_attempted(context);
-      if !super::super::lane::search_or_park(
-        seat,
-        &self.parked,
-        shared
-          .metrics
-          .inner()
-          .lane_depth
-          .iter()
-          .enumerate()
-          .map(|(index, len)| (index, len.0.load(Ordering::SeqCst))),
-        || shared.metrics.inner().overflow_depth.load(Ordering::SeqCst),
-      ) {
+      if !self.park_rescan(shared, seat, searched) {
         shared.thread_unpark_callback(context);
         cache::set_shard(context.physical_index);
         continue;
@@ -1087,8 +1205,12 @@ impl Distributed {
   pub(super) fn abandon_turn(&self, shared: &Shared, turn: DispatchTurn) {
     let seat = turn.seat();
     {
-      let _queue = self.lane(seat);
+      let mut queue = self.lane(seat);
       self.parked.mark_dead(seat);
+      self.parked.claim(seat);
+      if std::mem::take(&mut queue.search_kick) {
+        self.searching.acknowledge(false);
+      }
     }
     loop {
       let first = {
@@ -1100,13 +1222,7 @@ impl Distributed {
       let Some(index) = first else {
         break;
       };
-      let mut queue = lock(&self.overflow, 4);
-      queue.push(&self.links, index);
-      shared
-        .metrics
-        .inner()
-        .overflow_depth
-        .store(queue.len(), Ordering::SeqCst);
+      self.push_cleanup(shared, index);
     }
     // Keep the seat held until its lane has drained: a helper or restorer
     // must not adopt it while abandonment is moving entries to overflow.

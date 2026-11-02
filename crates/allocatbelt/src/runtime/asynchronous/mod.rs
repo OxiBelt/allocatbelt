@@ -165,15 +165,37 @@ impl AsyncRuntimeOptions {
     self
   }
 
-  /// Caps dispatchers simultaneously in the pre-park spin. Defaults to the
-  /// worker count. Zero skips spinning; a dispatcher denied a slot proceeds
-  /// directly to the existing park handshake. Slots are released before
-  /// parking, dispatching work, or yielding, including during unwinding.
-  /// Values at or above the worker count do not limit spinning. The cap is
-  /// fixed at construction and is ignored under Loom.
+  /// Adds a cap on dispatchers simultaneously in the pre-park spin. Defaults
+  /// to the worker count. Spinning also requires search admission, so by
+  /// default at most half the workers, rounded up, spin. Zero skips spinning;
+  /// a dispatcher denied a spinner slot proceeds directly to the existing
+  /// park handshake. Slots are released before parking, dispatching work, or
+  /// yielding, including during unwinding. Values at or above the worker count
+  /// add no limit. The cap is fixed at construction. Loom builds omit spinning
+  /// and spinner slots; search admission and wake decisions remain.
   #[must_use]
   pub const fn max_spinning_dispatchers(mut self, max: usize) -> Self {
     self.park_spin.max_spinners = Some(max);
+    self
+  }
+
+  /// At most `max` dispatchers search other lanes and spin at once. The
+  /// default is half the workers, rounded up, fixed at construction. A value
+  /// at or above the worker count leaves entry unlimited, with the same wake
+  /// behaviour.
+  ///
+  /// While a dispatcher searches, or a dispatcher woken to search has not yet
+  /// made its entry decision, new work does not wake another dispatcher.
+  /// When the last searcher finds work and work remains queued, it wakes one
+  /// parked dispatcher. A denied dispatcher checks overflow and parks without
+  /// spinning. Lane selection and notifications of parked lane owners are
+  /// unchanged.
+  ///
+  /// Zero disables searching other lanes and spinning. An entry can then
+  /// wait behind a blocking poll on its own lane until that poll returns.
+  #[must_use]
+  pub const fn max_searching_dispatchers(mut self, max: usize) -> Self {
+    self.park_spin.max_searchers = Some(max);
     self
   }
 

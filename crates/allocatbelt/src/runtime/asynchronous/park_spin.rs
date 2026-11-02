@@ -1,4 +1,5 @@
-//! Construction-time pre-park spin configuration and concurrent spinner slots.
+//! Construction-time dispatcher search configuration: pre-park spin, the
+//! searcher cap and concurrent spinner slots.
 
 #![forbid(unsafe_code)]
 
@@ -37,6 +38,8 @@ impl Default for ParkSpin {
 pub(super) struct Policy {
   pub(super) rounds: u32,
   pub(super) max_spinners: Option<usize>,
+  /// Search admission cap; `None` uses half the workers, rounded up.
+  pub(super) max_searchers: Option<usize>,
 }
 
 impl Default for Policy {
@@ -45,6 +48,7 @@ impl Default for Policy {
     Self {
       rounds,
       max_spinners: None,
+      max_searchers: None,
     }
   }
 }
