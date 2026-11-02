@@ -267,6 +267,7 @@ impl<T> JoinState<T> {
     drop_contained(old);
   }
 
+  #[cfg(all(test, loom))]
   pub(super) fn has_staged(&self) -> bool {
     matches!(*self.lock(), Slot::Staged { .. })
   }

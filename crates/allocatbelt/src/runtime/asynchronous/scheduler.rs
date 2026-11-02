@@ -624,8 +624,17 @@ impl Shared {
     self.distributed.request_scope_close(self, scope);
   }
 
+  #[cfg(test)]
   pub(super) fn wake(&self, task_ref: TaskRef) {
     self.distributed.wake(self, task_ref);
+  }
+
+  pub(super) fn wake_task(shared: &Weak<Self>, word: &PollWord, task_ref: TaskRef) {
+    if !word.notify_running()
+      && let Some(shared) = shared.upgrade()
+    {
+      shared.distributed.wake(&shared, task_ref);
+    }
   }
 
   pub(super) fn abort(&self, task_ref: TaskRef) {

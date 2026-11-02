@@ -95,7 +95,6 @@ fn lock<T>(mutex: &Mutex<T>, level: u8) -> Guard<'_, T> {
 
 #[repr(align(64))]
 struct SlotCell {
-  word: PollWord,
   state: Mutex<SlotState>,
 }
 struct SlotState {
@@ -272,7 +271,6 @@ impl Distributed {
       #[cfg(all(test, not(loom)))]
       steal_denials: AtomicUsize::new(0),
       slots: table(config.max_outstanding, || SlotCell {
-        word: PollWord::new(),
         state: Mutex::new(SlotState {
           protocol: PollProtocol::new(),
           task: None,
@@ -598,11 +596,11 @@ impl Distributed {
     );
     self.links[index].cleanup.store(false, Ordering::SeqCst);
     slot.protocol.admit(generation);
-    slot.scope = Some((scope, Arc::clone(&scope_cell)));
+    scope_cell.protocol.add_task();
+    slot.scope = Some((scope, scope_cell));
     slot.task = Some(task);
     let inserted = slot.protocol.queue();
     debug_assert!(inserted);
-    scope_cell.protocol.add_task();
     shared
       .metrics
       .inner()
@@ -616,10 +614,7 @@ impl Distributed {
   }
 
   pub(super) fn wake(&self, shared: &Shared, task_ref: TaskRef) {
-    let Some(cell) = self.slots.get(task_ref.index) else {
-      return;
-    };
-    if cell.word.notify_running(task_ref.generation) {
+    if self.slots.get(task_ref.index).is_none() {
       return;
     }
     let inserted = {
@@ -764,25 +759,29 @@ impl Distributed {
   fn dispatch_decision(&self, shared: &Arc<Shared>, index: usize) -> Option<Selected> {
     let mut slot = self.slot(index);
     let task = Arc::clone(slot.task.as_ref()?);
-    let (_, cell) = slot.scope.as_ref()?;
-    let cell = Arc::clone(cell);
     let task_ref = TaskRef {
       index,
       generation: slot.protocol.generation(),
     };
     let reserved = std::mem::take(&mut slot.reserved_permit);
     if slot.protocol.aborting_queued() {
+      let cell = if reserved {
+        Some(Arc::clone(&slot.scope.as_ref()?.1))
+      } else {
+        None
+      };
       let began = slot.protocol.begin_poll();
       debug_assert_eq!(began, Some(true));
       drop(slot);
-      if reserved {
+      if let Some(cell) = cell {
         self.release_permit(shared, &cell);
       }
       return Some(Selected::Cancel(task_ref, task));
     }
+    let (_, cell) = slot.scope.as_ref()?;
     let release = if cell.binding {
       if !reserved {
-        let mut dispatch = self.scope(&cell);
+        let mut dispatch = self.scope(cell);
         if !dispatch.try_acquire() {
           dispatch.block(&self.links, index);
           shared
@@ -795,17 +794,19 @@ impl Distributed {
       }
       PermitRelease::Scope {
         shared: Arc::downgrade(shared),
-        cell,
+        cell: Arc::clone(cell),
       }
     } else if cell.reference.is_some() {
       cell.active_stat.fetch_add(1, Ordering::Relaxed);
-      PermitRelease::Counted { cell }
+      PermitRelease::Counted {
+        cell: Arc::clone(cell),
+      }
     } else {
       PermitRelease::Free
     };
     let began = slot.protocol.begin_poll();
     debug_assert_eq!(began, Some(false));
-    self.slots[index].word.begin(task_ref.generation);
+    task.poll_word().begin();
     Some(Selected::Poll(
       task_ref,
       task,
@@ -821,7 +822,11 @@ impl Distributed {
     if !slot.protocol.matches(task_ref.generation) || slot.task.is_none() {
       return;
     }
-    if self.slots[task_ref.index].word.finish() {
+    if slot
+      .task
+      .as_ref()
+      .is_some_and(|task| task.poll_word().finish())
+    {
       let inserted = slot.protocol.wake();
       debug_assert!(!inserted);
     }

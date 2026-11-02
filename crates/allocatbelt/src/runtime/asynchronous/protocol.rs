@@ -320,11 +320,11 @@ const RUNNING: u64 = 1;
 const NOTIFIED: u64 = 1 << 1;
 const FLAGS: u64 = RUNNING | NOTIFIED;
 
-/// A task slot's lock-free wake record: the low 62 bits of the polled
-/// generation, shifted above `RUNNING` and `NOTIFIED`. The scheduler mutex
-/// owns every transition except `notify_running`, which only sets `NOTIFIED`
-/// on a running word with the waker's tag. Admission, generation and abort
-/// state stay in `PollProtocol`.
+/// A task object's running/notified flags. The object is never reused for
+/// another task, even when its scheduler slot is reused. Slot generation and
+/// abort state live only in `PollProtocol`, under the slot mutex.
+/// The scheduler owns all transitions except setting `NOTIFIED` on a running
+/// task. A stale waker retains its old task object and cannot notify a new one.
 pub(super) struct PollWord(AtomicU64);
 
 impl PollWord {
@@ -332,29 +332,19 @@ impl PollWord {
     Self(AtomicU64::new(0))
   }
 
-  /// A stale waker whose generation aliases the current one after 2^62 slot
-  /// reuses can only set `NOTIFIED`, which requests one spurious poll; futures
-  /// must already tolerate that.
-  const fn tag(generation: u64) -> u64 {
-    generation << 2
+  /// Begins a poll under the slot mutex with no prior running poll.
+  pub(super) fn begin(&self) {
+    debug_assert_eq!(self.0.load(Ordering::Relaxed), 0);
+    self.0.store(RUNNING, Ordering::Release);
   }
 
-  /// Marks a poll of `generation` as running. Called under the scheduler
-  /// mutex while the flags are clear, so no unlocked writer races the store.
-  pub(super) fn begin(&self, generation: u64) {
-    debug_assert_eq!(self.0.load(Ordering::Relaxed) & FLAGS, 0);
-    self
-      .0
-      .store(Self::tag(generation) | RUNNING, Ordering::Release);
-  }
-
-  /// Records a wake of a running `generation` poll without the scheduler
-  /// mutex. Each success is a release RMW, so `finish` acquires the waker's
-  /// prior writes. False sends the caller to the locked wake path.
-  pub(super) fn notify_running(&self, generation: u64) -> bool {
-    let running = Self::tag(generation) | RUNNING;
+  /// Records a wake without the slot mutex. The only unlocked RMW sets
+  /// `NOTIFIED`; it cannot change running, admission, generation or abort.
+  /// Each success releases the waker's prior writes for `finish` to acquire.
+  /// False sends the caller to the locked, generation-checked wake path.
+  pub(super) fn notify_running(&self) -> bool {
     let mut current = self.0.load(Ordering::Acquire);
-    while current & !NOTIFIED == running {
+    while current & RUNNING != 0 {
       match self.0.compare_exchange(
         current,
         current | NOTIFIED,
@@ -748,7 +738,7 @@ mod loom_tests {
     assert!(protocol.queue());
     assert_eq!(protocol.begin_poll(), Some(false));
     let word = PollWord::new();
-    word.begin(generation);
+    word.begin();
     Arc::new(WordSlot {
       locked: Mutex::new((protocol, 0)),
       word,
@@ -762,8 +752,8 @@ mod loom_tests {
     }
   }
 
-  fn word_wake(slot: &WordSlot, generation: u64) {
-    if !slot.word.notify_running(generation) {
+  fn word_wake(slot: &WordSlot, word: &PollWord, generation: u64) {
+    if !word.notify_running() {
       locked_wake(slot, generation);
     }
   }
@@ -787,13 +777,13 @@ mod loom_tests {
       let poller = {
         let slot = Arc::clone(&slot);
         thread::spawn(move || {
-          word_wake(&slot, 1);
+          word_wake(&slot, &slot.word, 1);
           word_finish(&slot, false)
         })
       };
       let waker = {
         let slot = Arc::clone(&slot);
-        thread::spawn(move || word_wake(&slot, 1))
+        thread::spawn(move || word_wake(&slot, &slot.word, 1))
       };
       let locked = {
         let slot = Arc::clone(&slot);
@@ -822,7 +812,7 @@ mod loom_tests {
       };
       let waker = {
         let slot = Arc::clone(&slot);
-        thread::spawn(move || word_wake(&slot, 1))
+        thread::spawn(move || word_wake(&slot, &slot.word, 1))
       };
       let _ = poller.join().unwrap();
       waker.join().unwrap();
@@ -845,7 +835,7 @@ mod loom_tests {
       };
       let waker = {
         let slot = Arc::clone(&slot);
-        thread::spawn(move || word_wake(&slot, 1))
+        thread::spawn(move || word_wake(&slot, &slot.word, 1))
       };
       assert_eq!(poller.join().unwrap(), PollFinish::Complete);
       waker.join().unwrap();
@@ -860,9 +850,14 @@ mod loom_tests {
   fn loom_stale_generation_word_wake_cannot_queue_a_reused_slot() {
     bounded_model(|| {
       let slot = running_slot(2);
+      // A retained stale task owns a different, finished word. Only the
+      // slot reference is reused, so its slow wake must check generation.
+      let stale_word = Arc::new(PollWord::new());
+      stale_word.begin();
+      assert!(!stale_word.finish());
       let stale = {
         let slot = Arc::clone(&slot);
-        thread::spawn(move || word_wake(&slot, 1))
+        thread::spawn(move || word_wake(&slot, &stale_word, 1))
       };
       let poller = {
         let slot = Arc::clone(&slot);
@@ -871,17 +866,9 @@ mod loom_tests {
       stale.join().unwrap();
       assert_eq!(poller.join().unwrap(), PollFinish::Idle);
       assert_eq!(slot.word.flags(), (false, false));
-      let mut locked = lock(&slot.locked);
+      let locked = lock(&slot.locked);
       assert_eq!(locked.1, 0);
       assert!(!locked.0.queued);
-      // A truncated-tag alias of the running generation only adds one poll.
-      assert!(locked.0.queue());
-      assert_eq!(locked.0.begin_poll(), Some(false));
-      slot.word.begin(2);
-      drop(locked);
-      assert!(slot.word.notify_running(2 + (1 << 62)));
-      assert_eq!(word_finish(&slot, false), PollFinish::Requeue);
-      assert_eq!(lock(&slot.locked).1, 1);
     });
   }
 

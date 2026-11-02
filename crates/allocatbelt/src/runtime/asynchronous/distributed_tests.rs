@@ -2699,6 +2699,7 @@ fn running_wakes_coalesce_and_stale_generations_do_not_wake_reused_slots_case() 
   let (shared, root) = shared(config(1, 1));
   let d = engine(&shared);
   let old_job = shared.spawn(root, std::future::pending::<()>()).unwrap();
+  let old_task = Arc::clone(d.slot(0).task.as_ref().unwrap());
   let old = TaskRef {
     index: 0,
     generation: 1,
@@ -2713,29 +2714,25 @@ fn running_wakes_coalesce_and_stale_generations_do_not_wake_reused_slots_case() 
     Selected::Poll(reference, ..) => *reference,
     _ => panic!("expected a poll"),
   };
+  let task = match &work {
+    Selected::Poll(_, task, _) => Arc::clone(task),
+    _ => panic!(),
+  };
+  let wake = |task: &Arc<dyn ErasedTask>, reference| {
+    Shared::wake_task(&Arc::downgrade(&shared), task.poll_word(), reference)
+  };
   assert_ne!(old.generation, current.generation);
-  shared.wake(old);
-  assert_eq!(d.slots[0].word.flags(), (true, false));
+  wake(&old_task, old);
+  assert_eq!(task.poll_word().flags(), (true, false));
   for _ in 0..3 {
-    shared.wake(current);
+    wake(&task, current);
   }
-  assert_eq!(d.slots[0].word.flags(), (true, true));
+  assert_eq!(task.poll_word().flags(), (true, true));
   run(&shared, work);
-  assert_eq!(d.slots[0].word.flags(), (false, false));
+  assert_eq!(task.poll_word().flags(), (false, false));
   check_distributed(&shared);
   run(&shared, selected(&shared, 0).unwrap());
-  shared.wake(old);
-  assert!(selected(&shared, 0).is_none());
-  // A truncated-tag alias may cause one spurious poll, then becomes idle.
-  shared.wake(current);
-  let work = selected(&shared, 0).unwrap();
-  shared.wake(TaskRef {
-    generation: current.generation.wrapping_add(1 << 62),
-    ..current
-  });
-  assert_eq!(d.slots[0].word.flags(), (true, true));
-  run(&shared, work);
-  run(&shared, selected(&shared, 0).unwrap());
+  wake(&old_task, old);
   assert!(selected(&shared, 0).is_none());
   shared.abort(current);
   run(&shared, selected(&shared, 0).unwrap());

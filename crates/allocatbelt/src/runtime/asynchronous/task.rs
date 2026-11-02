@@ -9,6 +9,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use super::entry::TaskContextGuard;
 use super::identity::TaskId;
 use super::join::{AbortMetadata, AsyncJob, AsyncJoinError, JoinState};
+use super::protocol::PollWord;
 use super::scheduler::{PollPermit, Shared, TaskRef};
 use crate::runtime::cpu_execution::CpuExecutionGuard;
 use crate::runtime::managed::ResourceScope;
@@ -56,16 +57,18 @@ pub(super) trait ErasedTask: Send + Sync {
   /// Returns a waker backed by the typed task Arc, without another allocation.
   fn task_waker(self: Arc<Self>) -> Waker;
 
+  /// Task-owned flags, never shared with a later occupant of the slot.
+  fn poll_word(&self) -> &PollWord;
+
   /// Stages a typed resource failure without polling user code.
   fn fail_resource(&self, error: DomainError);
 }
 
 type Driver = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-#[derive(Clone, Copy)]
-enum DriverCommand {
-  Idle,
-  Poll,
+struct TaskState {
+  future: Option<Driver>,
+  staged: bool,
 }
 
 // Taking a waiter for domain admission must not undo concurrent cleanup.
@@ -80,10 +83,11 @@ enum WaiterState {
 /// Only the boxed driver contains the user future. Terminal paths take and
 /// drop it before publishing, even when stale handles retain this allocation.
 pub(super) struct Task<T> {
-  future: Mutex<Option<Driver>>,
-  command: Mutex<DriverCommand>,
+  state: Mutex<TaskState>,
+  word: PollWord,
   pub(super) join: JoinState<T>,
   resources: Option<ResourceScope>,
+  // Fixed at construction; only absence permits skipping tenant cleanup locks.
   tenant: Option<TenantDomain>,
   waiter: Mutex<WaiterState>,
   task_admission: Mutex<Option<DomainReservation>>,
@@ -93,18 +97,21 @@ pub(super) struct Task<T> {
 }
 
 impl<T> Task<T> {
-  fn lock_future(&self) -> MutexGuard<'_, Option<Driver>> {
-    self.future.lock().unwrap_or_else(PoisonError::into_inner)
+  fn lock_state(&self) -> MutexGuard<'_, TaskState> {
+    self.state.lock().unwrap_or_else(PoisonError::into_inner)
   }
 
   fn finish_future(&self) -> Option<Box<dyn std::any::Any + Send>> {
-    let future = self.lock_future().take();
+    let future = self.lock_state().future.take();
     let panic = panic::catch_unwind(AssertUnwindSafe(|| drop(future))).err();
     self.release_future_frame_control();
     panic
   }
 
   fn release_future_frame_control(&self) {
+    if self.tenant.is_none() {
+      return;
+    }
     let result = self
       .task_control
       .lock()
@@ -118,9 +125,13 @@ impl<T> Task<T> {
 
   fn stage(&self, outcome: Result<T, AsyncJoinError>) {
     self.join.stage(outcome);
+    self.lock_state().staged = true;
   }
 
   fn release_waiter(&self) {
+    if self.tenant.is_none() {
+      return;
+    }
     let waiter = std::mem::replace(
       &mut *self.waiter.lock().unwrap_or_else(PoisonError::into_inner),
       WaiterState::Released,
@@ -129,6 +140,9 @@ impl<T> Task<T> {
   }
 
   fn release_task_admission(&self) {
+    if self.tenant.is_none() {
+      return;
+    }
     let admission = self
       .task_admission
       .lock()
@@ -152,7 +166,7 @@ impl<T: Send + 'static> ErasedTask for Task<T> {
   fn poll(&self, cx: &mut Context<'_>, permit: PollPermit) -> (PollResult, Option<PollPermit>) {
     let _task_context =
       TaskContextGuard::enter_with_resource(Some(self.join.id()), self.resources.clone());
-    let Some(mut future) = self.lock_future().take() else {
+    let Some(mut future) = self.lock_state().future.take() else {
       self.release_waiter();
       self.release_task_admission();
       drop(permit);
@@ -161,18 +175,20 @@ impl<T: Send + 'static> ErasedTask for Task<T> {
     // Take ownership before calling user code. The task-state mutex is never
     // held while polling or dropping the future.
     let cpu_execution = CpuExecutionGuard::enter(permit.cpu_domain_identity());
-    *self.command.lock().unwrap_or_else(PoisonError::into_inner) = DriverCommand::Poll;
     let result = {
       let _cooperative_poll = super::entry::CooperativePollGuard::enter();
       panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx)))
     };
     drop(cpu_execution);
     match result {
-      Ok(Poll::Pending) if !self.join.has_staged() => {
-        *self.lock_future() = Some(future);
-        (PollResult::Pending, Some(permit))
-      }
-      Ok(_) => {
+      Ok(result) => {
+        if result.is_pending() {
+          let mut state = self.lock_state();
+          if !state.staged {
+            state.future = Some(future);
+            return (PollResult::Pending, Some(permit));
+          }
+        }
         // Release before user destructors, output staging or cleanup.
         drop(permit);
         let cleanup_panic = panic::catch_unwind(AssertUnwindSafe(|| drop(future))).err();
@@ -269,6 +285,10 @@ impl<T: Send + 'static> ErasedTask for Task<T> {
     Waker::from(self)
   }
 
+  fn poll_word(&self) -> &PollWord {
+    &self.word
+  }
+
   fn fail_resource(&self, error: DomainError) {
     self.drop_future_and_stage(AsyncJoinError::ResourceDomain(error));
   }
@@ -294,21 +314,11 @@ where
     let Some(owner) = owner.upgrade() else {
       return Poll::Ready(());
     };
-    // Each driver reads only its own task's command. It stays suspended after
-    // producing an output so the caller can release the poll permit before
-    // dropping the driver (and therefore the pinned user future).
-    let command = std::mem::replace(
-      &mut *owner.command.lock().unwrap_or_else(PoisonError::into_inner),
-      DriverCommand::Idle,
-    );
-    if matches!(command, DriverCommand::Poll) {
-      // Catch inside the async frame: unwinding through the driver would
-      // destroy the pinned future before the caller releases its poll permit.
-      match panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
-        Ok(Poll::Ready(output)) => owner.stage(Ok(output)),
-        Ok(Poll::Pending) => {}
-        Err(payload) => owner.stage(Err(AsyncJoinError::Panicked(payload))),
-      }
+    // Keep the driver suspended until the caller releases the permit.
+    match panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+      Ok(Poll::Ready(output)) => owner.stage(Ok(output)),
+      Ok(Poll::Pending) => {}
+      Err(payload) => owner.stage(Err(AsyncJoinError::Panicked(payload))),
     }
     Poll::Pending
   })
@@ -381,8 +391,11 @@ impl<T: Send + 'static> Task<T> {
       #[cfg(all(test, not(loom)))]
       super::allocation_tests::record();
       Self {
-        future: Mutex::new(Some(Box::pin(driver))),
-        command: Mutex::new(DriverCommand::Idle),
+        state: Mutex::new(TaskState {
+          future: Some(Box::pin(driver)),
+          staged: false,
+        }),
+        word: PollWord::new(),
         join: JoinState::embedded(id, ControlCharge::unbounded(0), None),
         resources,
         tenant,
@@ -405,9 +418,7 @@ impl<T: Send + 'static> Wake for Task<T> {
   }
 
   fn wake_by_ref(self: &Arc<Self>) {
-    if let Some(shared) = self.shared.upgrade() {
-      shared.wake(self.reference);
-    }
+    Shared::wake_task(&self.shared, &self.word, self.reference);
   }
 }
 

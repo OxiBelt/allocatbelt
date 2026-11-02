@@ -1108,11 +1108,17 @@ after any in-flight poll returns. Owned scopes cancel their children on drop;
 Future cleanup and admission release precede join publication. Scheduler locks
 never cover user polling, destructors or completion callbacks. Generation tags
 make retained stale wakers harmless without retaining completed futures.
-A wake of a task whose poll is running, including its own, sets a per-slot
-atomic flag tagged with the low 62 generation bits instead of taking the
-task slot mutex; the poll's completion takes that flag under the same mutex
-as its one pending wake. Other wakes, abort and cancellation are taken under
-the task slot mutex, and a tag alias can cause at most one spurious poll.
+A wake of a task whose poll is running, including its own, sets only the
+notified bit in that task object's running/notified atomic word, without
+taking the task slot mutex or upgrading the scheduler reference. Completion
+takes that notification under the slot mutex as its one pending wake.
+The task object is never reused: a retained stale waker owns the old object's
+word even after its slot is reused. Other wakes take the slot mutex and check
+the full generation there; abort and cancellation also stay under that mutex.
+The driver and its staged-status flag share a task-state mutex, which is never
+held during user polling or destruction. Tasks constructed without a tenant
+skip tenant-only cleanup locks; this choice depends only on tenant absence,
+not on current resource limits.
 
 `AsyncJob::abort_handle` returns a clonable thread-safe control handle,
 including for local jobs whose outputs are `!Send`. For native worker tasks,
