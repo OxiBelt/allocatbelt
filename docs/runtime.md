@@ -1129,8 +1129,12 @@ takes that notification under the slot mutex as its one pending wake.
 The task object is never reused: a retained stale waker owns the old object's
 word even after its slot is reused. Other wakes take the slot mutex and check
 the full generation there; abort and cancellation also stay under that mutex.
-The driver and its staged-status flag share a task-state mutex, which is never
-held during user polling or destruction. Tasks constructed without a tenant
+The task allocation is a pinned `sys` cell (`Pin<Arc<TaskCell>>`) that
+stores the user future inline next to the runtime's bookkeeping; its atomic
+claim serializes polling and in-place destruction, and its pinned-only API is
+what makes polling the inline future sound (see
+[the unsafe inventory](unsafe-boundary.md)). The staged-status flag is under a
+task-state mutex that is never held during user polling or destruction. Tasks constructed without a tenant
 skip tenant-only cleanup locks; this choice depends only on tenant absence,
 not on current resource limits.
 
@@ -1139,10 +1143,11 @@ including for local jobs whose outputs are `!Send`. For native worker tasks,
 abort handles and scheduler wakers retain the shared task bookkeeping allocation
 and its `Control` charge. It contains one inline output slot: the result remains
 there until the join consumes it or is dropped; a detached result is discarded
-by the publishing worker. Completion drops the boxed driver and user future and
-releases their frame charge before publication. Retained handles keep the empty
-slot's storage and bookkeeping charged, without keeping a consumed or discarded
-result value alive. Local jobs retain separate cancellation metadata. If the
+by the publishing worker. Completion drops the inline user future in place
+before publication; its storage is part of the one task allocation and stays
+charged with it. Retained handles keep the empty slot's and future's storage
+and the bookkeeping charged, without keeping a consumed or discarded result
+value or a dropped future alive. Local jobs retain separate cancellation metadata. If the
 last runtime owner drops while native tasks are still admitted, that thread
 cancels them and publishes their outcomes, without an ambient task context if
 its thread-locals are already destroyed. `is_finished` becomes true when the
@@ -1980,12 +1985,14 @@ When a tenant resource domain is bound, root
 polls, owned tasks and blocking execution share its CPU and task admission.
 Declared scheduler payloads, owning facades, controlled scopes, queues, metrics,
 flags, waiter owners, byte buckets and feedback state retain Control charges
-through their final handles. A native worker task reserves its shared task
-bookkeeping and boxed driver payload at admission. Scheduler wakers reuse that
-allocation without another allocation or first-poll charge. Completion drops
-the driver and user future and releases the frame charge; the bookkeeping,
-including one inline output slot, remains charged until the last join, abort
-handle or scheduler waker is dropped. Consuming or dropping the join releases
+through their final handles. A native worker task reserves its one task
+allocation at admission: the shared bookkeeping with the user future stored
+inline (a caller's own box is moved in, not boxed again). Scheduler wakers
+reuse that allocation without another allocation or first-poll charge.
+Completion drops the user future in place without changing the allocation;
+the whole allocation, including one inline output slot and the dropped
+future's storage, remains charged until the last join, abort handle or
+scheduler waker is dropped. Consuming or dropping the join releases
 the result value (a detached result is discarded by the publishing worker),
 even while stale wakers or abort handles retain the empty slot's storage.
 Bound filesystem requests reserve their shared

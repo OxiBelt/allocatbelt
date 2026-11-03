@@ -151,11 +151,13 @@ fn run(shared: &Arc<Shared>, work: Selected) {
   let d = engine(shared);
   match work {
     Selected::Cancel(reference, task) => {
-      task.cancel();
+      task.as_ref().cancel();
       d.finish_cancel(shared, reference, task);
     }
     Selected::Poll(reference, task, permit) => {
-      let (result, permit) = task.poll(&mut Context::from_waker(Waker::noop()), permit);
+      let (result, permit) = task
+        .as_ref()
+        .poll(&mut Context::from_waker(Waker::noop()), permit);
       drop(permit);
       d.finish_poll(shared, reference, matches!(result, PollResult::Ready));
     }
@@ -2778,7 +2780,7 @@ fn running_wakes_coalesce_and_stale_generations_do_not_wake_reused_slots_case() 
   let (shared, root) = shared(config(1, 1));
   let d = engine(&shared);
   let old_job = shared.spawn(root, std::future::pending::<()>()).unwrap();
-  let old_task = Arc::clone(d.slot(0).task.as_ref().unwrap());
+  let old_task = d.slot(0).task.clone().unwrap();
   let old = TaskRef {
     index: 0,
     generation: 1,
@@ -2794,10 +2796,10 @@ fn running_wakes_coalesce_and_stale_generations_do_not_wake_reused_slots_case() 
     _ => panic!("expected a poll"),
   };
   let task = match &work {
-    Selected::Poll(_, task, _) => Arc::clone(task),
+    Selected::Poll(_, task, _) => task.clone(),
     _ => panic!(),
   };
-  let wake = |task: &Arc<dyn ErasedTask>, reference| {
+  let wake = |task: &Pin<Arc<dyn ErasedTask>>, reference| {
     Shared::wake_task(&Arc::downgrade(&shared), task.poll_word(), reference)
   };
   assert_ne!(old.generation, current.generation);
@@ -3120,7 +3122,7 @@ fn final_shared_drop_cleans_admitted_future_with_retained_handles() {
     .unwrap();
   let abort = job.abort_handle();
   let task = engine(&shared).slot(0).task.as_ref().unwrap().clone();
-  let waker = task.task_waker();
+  let waker = task.clone().task_waker();
   assert!(!dropped.load(Ordering::SeqCst));
   drop(shared);
   assert!(dropped.load(Ordering::SeqCst));

@@ -2,8 +2,8 @@
 
 `allocatbelt` is one package with responsibility-focused modules. `core` (`crates/allocatbelt/src/core/`) carries `#![forbid(unsafe_code)]` as an inner attribute, so it contains **0** `unsafe` sites, and the `publish = false` package `allocatbelt-core-check` compiles the same source as a `#![no_std]`, `#![forbid(unsafe_code)]` crate of its own, which runs the core's tests, the checking model and loom. The optional `runtime` module also carries `#![forbid(unsafe_code)]`; its
 blocking and owned-future implementations are shared with the unpublished runtime façade
-and remains safe. Runtime signal installation and fixed TCP option syscalls add
-narrow `sys` boundaries listed below. Library `unsafe` is in `sys`, `arch`,
+and remains safe. Runtime signal installation, fixed TCP option syscalls and
+the inline async task future cell add narrow `sys` boundaries listed below. Library `unsafe` is in `sys`, `arch`,
 `global` (with `rseq`) and the opt-in `region` API; benchmark-only `unsafe` is
 limited to the diagnostic allocator wrapper and SIMD candidates, listed below.
 Every `unsafe` block holds exactly one unsafe operation and carries a
@@ -50,6 +50,62 @@ tests change dispositions only in subprocesses; actual listener-table Loom
 models cover cancellation, slot reuse and registration versus delivery/close.
 Handlers persist after subscriptions drop; unrelated concurrent application
 handler replacement has the registry's installation-race limitations.
+
+### `sys/runtime_task_cell.rs` (optional `runtime`)
+
+A native async task is one `Arc`: `TaskCell<H, F>` stores the runtime's
+bookkeeping `H` next to the user future `F` instead of boxing the future a
+second time. Soundness rests on structural pinning, not on a check: the cell
+exists only as the `Pin<Arc<TaskCell<H, F>>>` that its sole constructor
+`TaskCell::new` returns, no API gives out the cell by value, by `&mut` or as
+an unpinned `Arc` or `Weak`, the methods that touch the future
+(`poll_future`, `drop_future`) take `self: Pin<&Self>`, and the cell is never
+`Unpin`: the module holds the cell's one `Unpin` impl behind a bound that
+never holds, so no other code can write one, and safe code has no way out of
+the `Pin`. The pin
+guarantee of `Arc::pin` therefore holds for the future from its first poll
+until `Drop` runs in place, for any safe caller and any call order. The
+bookkeeping is reached only by shared reference (`header`); a `Waker` built
+from the allocation (`waker`) shares it without another allocation. Unsizing
+the handle to `Pin<Arc<dyn Trait>>` keeps all of this, and the runtime's
+erased task, join and abort handles are such pinned `Arc`s.
+
+One `AtomicU8` serializes access: `poll_future` moves `PRESENT` → `POLLING`
+with one acquire compare-and-swap and releases with one release store
+(`PRESENT` after `Pending`, `COMPLETE` after `Ready`, `POISONED` if the poll
+unwinds); `drop_future` and `Drop` move `PRESENT`/`COMPLETE`/`POISONED` →
+`ABSENT` with an acquire-release compare-and-swap loop (a failed
+compare-and-swap reads the latest state, unlike the plain load that
+`fetch_update` starts with) and drop in place exactly once. Any other state,
+including a poll already in progress on another thread or reentrantly from
+the future itself, is rejected without touching the value. The release store
+and the acquire claims are the only synchronization the cell needs: a poll on
+one thread and a drop or the next poll on another are ordered by them alone.
+
+Its unit tests run under Miri in CI (Stacked and Tree Borrows, several seeds)
+and cover completion, drop before and after completion, a panicking poll and
+destructor (through `drop_future` and through the cell's `Drop`), reentrant,
+concurrent and racing polls, a destructor that reenters its cell, a
+self-referential `async` block, a `RefCell` borrow held across a yield, an
+intrusive registration of the future's own address that only its `Drop`
+withdraws, wakers sharing the allocation, and the cross-thread hand-overs
+(poll on one thread, drop or the last owner's `Drop` on another, synchronized
+only by `Relaxed` flags), which Miri's data-race detector fails if the
+poll-exit store is weakened to `Relaxed`. A test checks that the cell is
+never `Unpin`. Moving a polled cell out of its allocation, for example out
+of a box or an `Arc`, cannot be written against this API; the sound forms of
+those cases (drop in place) are tests. Loom compiles the runtime without `sys` and models a boxed stand-in
+with the same state machine and pinned-handle API, so Loom does not cover
+this cell.
+
+| Location | Kind | Operation | Why it is sound |
+|---|---|---|---|
+| `TaskCell` | `unsafe impl Sync` (for `H: Sync`, `F: Send`) | — | The value is reached only through `poll_future` and `drop_future`/`Drop`, each of which first claims the cell with an acquire read-modify-write that at most one caller wins (`POLLING` and `ABSENT` accept no further claim), so two threads never hold references to it at once; the atomic is shared freely and the header is a plain shared field. The same reasoning makes `Mutex<F>` `Sync`. |
+| `TaskCell::unpinned` | block | `Pin::into_inner_unchecked` of a clone of the pinned `Arc` | Private. The unpinned `Arc` goes only to `Waker::from`, whose vtable hands it back solely to this module's `Wake` implementation (which reads the header and never moves out of the `Arc`) and otherwise drops it in place like any owner, or to a strong count in tests; no unpinned `Arc` or `Weak` reaches a caller, so the allocation stays pinned until its last owner drops it in place. |
+| `TaskCell::poll_future` | block | `&mut *pointer` into the `UnsafeCell<ManuallyDrop<F>>` | The `PRESENT` → `POLLING` claim succeeded, so no other reference exists while it is held; both wrappers are `repr(transparent)`, so the cast pointer is the initialized, aligned `F` the cell was built with, not yet dropped (`drop_future` refuses `POLLING` and only ever succeeds once, into the final `ABSENT`, which the claim rejects). |
+| `TaskCell::poll_future` | block | `Pin::new_unchecked(&mut F)` | Structural pinning: `self` is `Pin<&Self>` of a `!Unpin` cell that is reachable only through shared references, has no method that moves or replaces the value and destroys it in place in `Drop`, so the cell's pin guarantee extends to the field. Its memory stays valid and unmoved until `drop_future` or `Drop`, both of which need the claim this reference holds to be released first. |
+| `TaskCell::drop_in_place` | block | `ptr::drop_in_place` of the stored `F` | The claim into `ABSENT` succeeded exactly once, from a state in which the value is initialized and not being polled, and `ABSENT` is final, so no reference to the value exists now or later; only the pinned `drop_future` and the in-place `Drop` reach it, so the value is at the address it was polled at. A destructor that panics still counts as having run once. |
+| `runtime_task_cell.rs` tests (test only) | block ×3 | `Pin::get_unchecked_mut` and a field read of the node being polled, one write through a registered pointer | The intrusive-registration test: a pinned future publishes its own address and withdraws it in `Drop`; the write happens only while the registration is in place, under the registry lock that excludes the withdrawal. Miri checks the test. |
 
 ### `sys/runtime_net_options.rs` (optional `runtime`)
 

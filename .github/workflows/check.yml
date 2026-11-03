@@ -424,6 +424,40 @@ jobs:
           MIRIFLAGS="$MIRIFLAGS -Zmiri-tree-borrows" \
             cargo +nightly-2026-09-27 miri test --locked -p allocatbelt --lib region::
 
+  # The one pinned allocation of a native async task (`runtime` feature):
+  # the `sys` cell's pointer code under Miri (Stacked and Tree Borrows),
+  # including its cross-thread hand-over tests, which Miri's data-race
+  # detector checks against the cell's release/acquire protocol.
+  miri-task-cell:
+    name: Miri (async task cell, nightly)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install the pinned nightly toolchain with Miri
+        run: |
+          rustup toolchain install nightly-2026-09-27 --profile minimal --component miri,rust-src
+          cargo +nightly-2026-09-27 miri setup
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo +nightly-2026-09-27 fetch --locked
+
+      - name: Task cell tests under Miri
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-many-seeds=0..8
+        run: |
+          cargo +nightly-2026-09-27 miri test --locked -p allocatbelt --features runtime \
+            --lib sys::runtime_task_cell
+          MIRIFLAGS="$MIRIFLAGS -Zmiri-tree-borrows" \
+            cargo +nightly-2026-09-27 miri test --locked -p allocatbelt --features runtime \
+              --lib sys::runtime_task_cell
+
   # Plan phase 3: the bit scans lower to tzcnt/popcnt/lzcnt on x86-64-v3
   # and to ctz/cpop/clz on riscv64 with Zbb (assembly only, no qemu).
   scalar-isa:

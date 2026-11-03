@@ -7,6 +7,7 @@
 
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Waker};
@@ -797,8 +798,8 @@ fn get_scope(state: &State, scope: ScopeRef) -> Option<&Arc<ScopeCell>> {
 
 /// Adds an admitted task to its scope's ready list at most once.
 enum Selected {
-  Poll(TaskRef, Arc<dyn ErasedTask>, PollPermit),
-  Cancel(TaskRef, Arc<dyn ErasedTask>),
+  Poll(TaskRef, Pin<Arc<dyn ErasedTask>>, PollPermit),
+  Cancel(TaskRef, Pin<Arc<dyn ErasedTask>>),
 }
 
 /// Releases one scope's active-poll reservation on every exit path before
@@ -1196,8 +1197,7 @@ mod tests {
       index: 0,
       generation: 1,
     };
-    let admission =
-      Task::<usize>::reserve_domain_admission::<std::future::Ready<usize>>(None).unwrap();
+    let admission = Task::<std::future::Ready<usize>>::reserve_domain_admission(None).unwrap();
     let (task, job) = Task::create(
       std::future::ready(7usize),
       super::super::identity::TaskId::test_sentinel(),
@@ -1207,8 +1207,8 @@ mod tests {
       task_ref,
     );
     let abort = job.abort_handle();
-    let waker = Arc::clone(&task).task_waker();
-    let cached = Arc::clone(&task).task_waker();
+    let waker = task.clone().task_waker();
+    let cached = task.clone().task_waker();
     assert!(waker.will_wake(&cached));
     drop(cached);
     let permit = PollPermit {
@@ -1216,7 +1216,7 @@ mod tests {
       cpu_ticket: None,
     };
     assert!(matches!(
-      task.poll(&mut Context::from_waker(&waker), permit),
+      task.as_ref().poll(&mut Context::from_waker(&waker), permit),
       (PollResult::Ready, None)
     ));
     task.publish();
@@ -1226,18 +1226,20 @@ mod tests {
     assert!(abort.is_finished());
     drop(abort);
     drop(waker);
-    assert_eq!(super::super::allocation_tests::count() - before, 2);
+    assert_eq!(super::super::allocation_tests::count() - before, 1);
     runtime.shutdown(AsyncShutdown::Drain).unwrap();
   }
 
   /// Checks that terminal cleanup breaks the typed Arc waker cache cycle,
   /// including a cache recreated after terminal cleanup.
-  fn assert_terminal_path_has_no_waker_cycle<F>(future: F, finish: impl FnOnce(&dyn ErasedTask))
-  where
+  fn assert_terminal_path_has_no_waker_cycle<F>(
+    future: F,
+    finish: impl FnOnce(Pin<&dyn ErasedTask>),
+  ) where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
   {
-    let admission = Task::<F::Output>::reserve_domain_admission::<F>(None).unwrap();
+    let admission = Task::<F>::reserve_domain_admission(None).unwrap();
     let (task, job) = Task::create(
       future,
       super::super::identity::TaskId::test_sentinel(),
@@ -1246,28 +1248,35 @@ mod tests {
       Weak::new(),
       TaskRef::test_sentinel(),
     );
-    let weak = Arc::downgrade(&task);
-    let before = Arc::strong_count(&task);
-    let waker = Arc::clone(&task).task_waker();
-    assert_eq!(Arc::strong_count(&task), before + 1);
-    let cached = Arc::clone(&task).task_waker();
+    let before = strong_count(&task);
+    let waker = task.clone().task_waker();
+    assert_eq!(strong_count(&task), before + 1);
+    let cached = task.clone().task_waker();
     assert!(waker.will_wake(&cached));
     drop(cached);
     finish(task.as_ref());
-    assert_eq!(Arc::strong_count(&task), before + 1);
+    assert_eq!(strong_count(&task), before + 1);
     drop(waker);
-    assert_eq!(Arc::strong_count(&task), before);
-    // A dispatch after cleanup finds no driver; its waker has no cached owner.
-    let recreated = Arc::clone(&task).task_waker();
+    assert_eq!(strong_count(&task), before);
+    // A dispatch after cleanup finds no future; its waker has no cached owner.
+    let recreated = task.clone().task_waker();
     assert!(matches!(
-      task.poll(&mut Context::from_waker(&recreated), unscheduled_permit()),
+      task
+        .as_ref()
+        .poll(&mut Context::from_waker(&recreated), unscheduled_permit()),
       (PollResult::Ready, None)
     ));
-    assert_eq!(Arc::strong_count(&task), before + 1);
+    assert_eq!(strong_count(&task), before + 1);
     drop(recreated);
     drop(job);
+    // Only the local handle is left, so the last drop frees the allocation.
+    assert_eq!(strong_count(&task), 1);
     drop(task);
-    assert!(weak.upgrade().is_none());
+  }
+
+  /// The owners of an erased task allocation: handles, wakers and `task`.
+  fn strong_count(task: &Pin<Arc<dyn ErasedTask>>) -> usize {
+    task.clone().strong_count()
   }
 
   fn unscheduled_permit() -> PollPermit {

@@ -89,10 +89,10 @@ pub(super) fn new_abort_metadata<A: AbortAction + 'static>(
   action: A,
   control: ControlCharge,
   finished_control: ControlCharge,
-) -> Arc<dyn AbortMetadata> {
+) -> Pin<Arc<dyn AbortMetadata>> {
   #[cfg(all(test, not(loom)))]
   super::allocation_tests::record();
-  Arc::new(AbortOwner {
+  Arc::pin(AbortOwner {
     action,
     finished: FinishedFlag::new(finished_control),
     _control: control,
@@ -102,7 +102,7 @@ pub(super) fn new_abort_metadata<A: AbortAction + 'static>(
 #[cfg(test)]
 struct CallbackAbort {
   callback: Arc<dyn Fn() + Send + Sync>,
-  completion: Arc<dyn AbortMetadata>,
+  completion: Pin<Arc<dyn AbortMetadata>>,
 }
 
 #[cfg(test)]
@@ -178,7 +178,7 @@ enum Slot<T> {
 pub(super) struct JoinState<T> {
   slot: Mutex<Slot<T>>,
   // Output-independent metadata also works for non-Send local outputs.
-  finished: Option<Arc<dyn AbortMetadata>>,
+  finished: Option<Pin<Arc<dyn AbortMetadata>>>,
   completed: AtomicBool,
   id: TaskId,
   _control: ControlCharge,
@@ -188,7 +188,7 @@ impl<T> JoinState<T> {
   pub(super) fn with_id(
     id: TaskId,
     control: ControlCharge,
-    finished: Arc<dyn AbortMetadata>,
+    finished: Pin<Arc<dyn AbortMetadata>>,
   ) -> Arc<Self> {
     #[cfg(all(test, not(loom)))]
     super::allocation_tests::record();
@@ -198,7 +198,7 @@ impl<T> JoinState<T> {
   pub(super) fn embedded(
     id: TaskId,
     control: ControlCharge,
-    finished: Option<Arc<dyn AbortMetadata>>,
+    finished: Option<Pin<Arc<dyn AbortMetadata>>>,
   ) -> Self {
     Self {
       slot: Mutex::new(Slot::Pending(PendingWakers {
@@ -338,9 +338,15 @@ fn drop_contained<T>(value: T) {
   }
 }
 
+/// A task allocation that embeds its join state. The erased handle keeps
+/// the job independent of the task's future type.
+pub(super) trait MergedJoin<T>: Send + Sync {
+  fn join_state(&self) -> &JoinState<T>;
+}
+
 enum JobState<T> {
   Separate(Arc<JoinState<T>>),
-  Merged(Arc<super::task::Task<T>>),
+  Merged(Pin<Arc<dyn MergedJoin<T>>>),
 }
 
 impl<T> std::ops::Deref for JobState<T> {
@@ -349,7 +355,7 @@ impl<T> std::ops::Deref for JobState<T> {
   fn deref(&self) -> &Self::Target {
     match self {
       Self::Separate(state) => state,
-      Self::Merged(task) => &task.join,
+      Self::Merged(task) => task.join_state(),
     }
   }
 }
@@ -358,12 +364,15 @@ impl<T> std::ops::Deref for JobState<T> {
 /// task; call [`AsyncJob::abort`] to request cancellation.
 pub struct AsyncJob<T> {
   state: JobState<T>,
-  abort: Arc<dyn AbortMetadata>,
+  abort: Pin<Arc<dyn AbortMetadata>>,
   finished: bool,
 }
 
 impl<T> AsyncJob<T> {
-  pub(super) fn new_with_metadata(state: Arc<JoinState<T>>, abort: Arc<dyn AbortMetadata>) -> Self {
+  pub(super) fn new_with_metadata(
+    state: Arc<JoinState<T>>,
+    abort: Pin<Arc<dyn AbortMetadata>>,
+  ) -> Self {
     Self {
       state: JobState::Separate(state),
       abort,
@@ -371,7 +380,10 @@ impl<T> AsyncJob<T> {
     }
   }
 
-  pub(super) fn merged(state: Arc<super::task::Task<T>>, abort: Arc<dyn AbortMetadata>) -> Self {
+  pub(super) fn merged(
+    state: Pin<Arc<dyn MergedJoin<T>>>,
+    abort: Pin<Arc<dyn AbortMetadata>>,
+  ) -> Self {
     Self {
       state: JobState::Merged(state),
       abort,
@@ -381,9 +393,9 @@ impl<T> AsyncJob<T> {
 
   #[cfg(test)]
   pub(super) fn new(state: Arc<JoinState<T>>, abort: Arc<dyn Fn() + Send + Sync>) -> Self {
-    let metadata = Arc::new(CallbackAbort {
+    let metadata = Arc::pin(CallbackAbort {
       callback: abort,
-      completion: Arc::clone(state.finished.as_ref().unwrap()),
+      completion: Pin::clone(state.finished.as_ref().unwrap()),
     });
     Self::new_with_metadata(state, metadata)
   }
@@ -407,7 +419,7 @@ impl<T> AsyncJob<T> {
   #[must_use]
   pub fn abort_handle(&self) -> AbortHandle {
     AbortHandle {
-      abort: Arc::clone(&self.abort),
+      abort: Pin::clone(&self.abort),
       id: self.state.id,
     }
   }
@@ -478,7 +490,7 @@ impl<T> AsyncJob<T> {
 /// whose outputs are not `Send`. Dropping it neither cancels nor detaches work.
 #[derive(Clone)]
 pub struct AbortHandle {
-  abort: Arc<dyn AbortMetadata>,
+  abort: Pin<Arc<dyn AbortMetadata>>,
   id: TaskId,
 }
 
@@ -720,7 +732,7 @@ mod tests {
     let join = JoinState::with_id(
       super::TaskId::test_sentinel(),
       ControlCharge::try_new(Some(&tenant), join_bytes).unwrap(),
-      Arc::clone(&metadata),
+      Pin::clone(&metadata),
     );
     let job = AsyncJob::new_with_metadata(Arc::clone(&join), metadata);
     let abort = job.abort_handle();
@@ -766,17 +778,31 @@ mod tests {
       }
     }
 
+    /// Dropped with the metadata allocation, which the pinned handle
+    /// cannot be weakly observed through.
+    struct CountedAbort(Arc<AtomicUsize>);
+
+    impl super::AbortAction for CountedAbort {
+      fn abort(&self) {}
+    }
+
+    impl Drop for CountedAbort {
+      fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+      }
+    }
+
     let drops = Arc::new(AtomicUsize::new(0));
+    let metadata_drops = Arc::new(AtomicUsize::new(0));
     let metadata = super::new_abort_metadata(
-      TestAbort,
-      ControlCharge::unbounded(super::abort_metadata_bytes::<TestAbort>()),
+      CountedAbort(Arc::clone(&metadata_drops)),
+      ControlCharge::unbounded(super::abort_metadata_bytes::<CountedAbort>()),
       ControlCharge::unbounded(super::finished_flag_bytes()),
     );
-    let weak_metadata = Arc::downgrade(&metadata);
     let state = JoinState::with_id(
       super::TaskId::test_sentinel(),
       ControlCharge::unbounded(std::mem::size_of::<JoinState<Output>>()),
-      Arc::clone(&metadata),
+      Pin::clone(&metadata),
     );
     let weak_state = Arc::downgrade(&state);
     let mut job = AsyncJob::new_with_metadata(Arc::clone(&state), metadata);
@@ -789,10 +815,10 @@ mod tests {
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     drop(job);
     assert!(weak_state.upgrade().is_none());
-    assert!(weak_metadata.upgrade().is_some());
+    assert_eq!(metadata_drops.load(Ordering::SeqCst), 0);
     assert!(abort.is_finished());
     drop(abort);
-    assert!(weak_metadata.upgrade().is_none());
+    assert_eq!(metadata_drops.load(Ordering::SeqCst), 1);
 
     // An unconsumed result is destroyed by detaching, even with an abort
     // handle alive. Detached publication still returns output to the worker.

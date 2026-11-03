@@ -1070,7 +1070,7 @@ struct Task<F: Future + 'static> {
   task_admission: Option<DomainReservation>,
   scope: Rc<ScopeCell>,
   resources: Option<ResourceScope>,
-  _abort_metadata: Arc<dyn AbortMetadata>,
+  _abort_metadata: Pin<Arc<dyn AbortMetadata>>,
   task_control: Option<ControlCharge>,
   context_control: ControlCharge,
 }
@@ -1234,7 +1234,7 @@ where
   task_admission: Option<DomainReservation>,
   task_control: ControlCharge,
   context_control: ControlCharge,
-  abort_metadata: Arc<dyn AbortMetadata>,
+  abort_metadata: Pin<Arc<dyn AbortMetadata>>,
   _request_control: ControlCharge,
 }
 
@@ -2146,7 +2146,7 @@ impl LocalHandle {
       abort_control,
       finished_control,
     );
-    let join = JoinState::with_id(id, join_control, Arc::clone(&abort_metadata));
+    let join = JoinState::with_id(id, join_control, Pin::clone(&abort_metadata));
     let abort = Arc::new(LocalAbortFlag::new(abort_flag_control));
     let task = Task {
       future: Some(Box::pin(future)),
@@ -2159,7 +2159,7 @@ impl LocalHandle {
       task_admission,
       resources: scope.resources.clone(),
       scope: Rc::clone(&scope),
-      _abort_metadata: Arc::clone(&abort_metadata),
+      _abort_metadata: Pin::clone(&abort_metadata),
       task_control: Some(task_control),
       context_control,
     };
@@ -2339,12 +2339,12 @@ impl LocalSendHandle {
       abort_control,
       finished_control,
     );
-    let join = JoinState::with_id(id, join_control, Arc::clone(&abort_metadata));
+    let join = JoinState::with_id(id, join_control, Pin::clone(&abort_metadata));
     let request = SendRequest {
       future,
       id,
       join: Arc::clone(&join),
-      abort_metadata: Arc::clone(&abort_metadata),
+      abort_metadata: Pin::clone(&abort_metadata),
       abort: Arc::clone(&abort),
       abort_target: Arc::clone(&abort_target),
       admission,

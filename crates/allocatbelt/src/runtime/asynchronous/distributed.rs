@@ -13,6 +13,7 @@ use super::super::metrics::Padded;
 use super::super::park_spin::SpinnerSlots;
 use super::*;
 use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 
 #[cfg(all(test, not(loom)))]
@@ -85,7 +86,7 @@ struct SlotCell {
 }
 struct SlotState {
   protocol: PollProtocol,
-  task: Option<Arc<dyn ErasedTask>>,
+  task: Option<Pin<Arc<dyn ErasedTask>>>,
   scope: Option<(ScopeRef, Arc<ScopeCell>)>,
   reserved_permit: bool,
 }
@@ -334,7 +335,7 @@ impl Distributed {
         .take();
       if let Some(task) = task {
         // Final-owner cleanup runs without any scheduler mutex held.
-        task.cancel();
+        task.as_ref().cancel();
         task.publish();
       }
     }
@@ -550,7 +551,7 @@ impl Distributed {
         future,
       ));
     }
-    let mut domain = match Task::<F::Output>::reserve_domain_admission::<F>(tenant) {
+    let mut domain = match Task::<F>::reserve_domain_admission(tenant) {
       Ok(domain) => domain,
       Err(error) => {
         return Err(AsyncSpawnError::new(
@@ -765,7 +766,7 @@ impl Distributed {
 
   fn dispatch_decision(&self, shared: &Arc<Shared>, index: usize) -> Option<Selected> {
     let mut slot = self.slot(index);
-    let task = Arc::clone(slot.task.as_ref()?);
+    let task = Pin::clone(slot.task.as_ref()?);
     let task_ref = TaskRef {
       index,
       generation: slot.protocol.generation(),
@@ -846,10 +847,10 @@ impl Distributed {
         self.complete(shared, task_ref.index, reusable, task, scope);
       }
       PollFinish::CancelCleanup => {
-        let task = slot.task.as_ref().map(Arc::clone);
+        let task = slot.task.clone();
         drop(slot);
         if let Some(task) = task {
-          task.cancel();
+          task.as_ref().cancel();
           self.finish_cancel(shared, task_ref, task);
         }
       }
@@ -861,7 +862,7 @@ impl Distributed {
     }
   }
 
-  fn finish_cancel(&self, shared: &Arc<Shared>, task_ref: TaskRef, task: Arc<dyn ErasedTask>) {
+  fn finish_cancel(&self, shared: &Arc<Shared>, task_ref: TaskRef, task: Pin<Arc<dyn ErasedTask>>) {
     let mut slot = self.slot(task_ref.index);
     if !slot.protocol.matches(task_ref.generation) || slot.task.is_none() {
       return;
@@ -880,7 +881,7 @@ impl Distributed {
     shared: &Shared,
     index: usize,
     reusable: bool,
-    task: Option<Arc<dyn ErasedTask>>,
+    task: Option<Pin<Arc<dyn ErasedTask>>>,
     scope: Option<(ScopeRef, Arc<ScopeCell>)>,
   ) {
     let empty_after_close = {
@@ -1518,24 +1519,24 @@ impl Distributed {
       handoff::enter_turn(seat.take());
       match selected {
         Selected::Cancel(task_ref, task) => {
-          task.cancel();
+          task.as_ref().cancel();
           self.finish_cancel(shared, task_ref, task);
         }
         Selected::Poll(task_ref, task, permit) => {
           super::super::entry::reset_budget();
-          let waker = Arc::clone(&task).task_waker();
+          let waker = task.clone().task_waker();
           let mut context = Context::from_waker(&waker);
           let (result, mut permit) = match task.acquire_cpu(&waker) {
-            DomainCpuAdmission::Unbounded => task.poll(&mut context, permit),
+            DomainCpuAdmission::Unbounded => task.as_ref().poll(&mut context, permit),
             DomainCpuAdmission::Acquired(ticket) => {
               let mut permit = permit;
               permit.set_cpu_ticket(ticket);
-              task.poll(&mut context, permit)
+              task.as_ref().poll(&mut context, permit)
             }
             DomainCpuAdmission::Waiting => (PollResult::Pending, Some(permit)),
             DomainCpuAdmission::Rejected(error) => {
               drop(permit);
-              task.fail_resource(error);
+              task.as_ref().fail_resource(error);
               (PollResult::Ready, None)
             }
           };

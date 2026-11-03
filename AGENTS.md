@@ -46,7 +46,8 @@ the local `CONTRIBUTING.md`, follow the local contributor guidance.
 - Preserve [design constraints](docs/design-constraints.md). A change that
   breaks one needs the review named there before implementation.
 - Keep unsafe code within the documented syscall, architecture, allocator
-  adapter and region API boundaries, plus benchmark-only SIMD kernels.
+  adapter, async task future cell and region API boundaries, plus
+  benchmark-only SIMD kernels.
   Each unsafe block has one unsafe operation and a `// SAFETY:` comment;
   update [the inventory](docs/unsafe-boundary.md) when the boundary changes.
 - Follow `rustfmt.toml` (two-space indentation) and workspace lints. Declare

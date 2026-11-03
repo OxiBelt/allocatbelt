@@ -38,6 +38,8 @@ pub(crate) mod runtime_net_options;
 pub(crate) mod runtime_ring;
 #[cfg(feature = "runtime")]
 pub(crate) mod runtime_signal;
+#[cfg(feature = "runtime")]
+pub(crate) mod runtime_task_cell;
 
 pub use platform::{Capabilities, KernelVersion, probe};
 #[cfg(feature = "io-uring")]

@@ -4,11 +4,11 @@ use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Waker};
 
 use super::entry::TaskContextGuard;
 use super::identity::TaskId;
-use super::join::{AbortMetadata, AsyncJob, AsyncJoinError, JoinState};
+use super::join::{AbortMetadata, AsyncJob, AsyncJoinError, JoinState, MergedJoin};
 use super::protocol::PollWord;
 use super::scheduler::{PollPermit, Shared, TaskRef};
 use crate::runtime::cpu_execution::CpuExecutionGuard;
@@ -17,6 +17,10 @@ use crate::runtime::resource_domain::{
   ControlCharge, DomainError, DomainReservation, DomainResource, DomainResources, DomainWaiter,
   TenantDomain,
 };
+#[cfg(not(loom))]
+use crate::sys::runtime_task_cell::{CellPoll, TaskCell, TaskHeader};
+#[cfg(loom)]
+use loom_cell::{CellPoll, TaskCell, TaskHeader};
 
 pub(super) enum DomainCpuAdmission {
   Unbounded,
@@ -37,37 +41,47 @@ pub(super) enum PollResult {
   Ready,
 }
 
+/// A native task, reached only through its pinned allocation. The methods
+/// that may touch the stored future take `Pin<&Self>`, which is all the
+/// pinned `Arc` hands out.
 pub(super) trait ErasedTask: Send + Sync {
   /// Polls once without a scheduler lock. The scheduler protocol serializes
-  /// polling and cancellation cleanup; the mutex transfers driver ownership.
+  /// polling and cancellation cleanup; the future cell's claim serializes
+  /// access to the stored future even without it.
   /// Pending returns the quota permit for the caller's locked completion.
-  fn poll(&self, cx: &mut Context<'_>, permit: PollPermit) -> (PollResult, Option<PollPermit>);
+  fn poll(
+    self: Pin<&Self>,
+    cx: &mut Context<'_>,
+    permit: PollPermit,
+  ) -> (PollResult, Option<PollPermit>);
 
   /// Drops a cancelled future and stages its terminal outcome, with no
   /// scheduler lock held.
-  fn cancel(&self);
+  fn cancel(self: Pin<&Self>);
 
   /// Publishes the staged outcome after scheduler admission has been
   /// released.
   fn publish(&self);
 
   /// Attempts to take one CPU ticket or enrolls the task's scheduler waker.
-  fn acquire_cpu(&self, waker: &std::task::Waker) -> DomainCpuAdmission;
+  fn acquire_cpu(&self, waker: &Waker) -> DomainCpuAdmission;
 
-  /// Returns a waker backed by the typed task Arc, without another allocation.
-  fn task_waker(self: Arc<Self>) -> Waker;
+  /// Returns a waker backed by the task allocation, without another
+  /// allocation.
+  fn task_waker(self: Pin<Arc<Self>>) -> Waker;
 
   /// Task-owned flags, never shared with a later occupant of the slot.
   fn poll_word(&self) -> &PollWord;
 
   /// Stages a typed resource failure without polling user code.
-  fn fail_resource(&self, error: DomainError);
+  fn fail_resource(self: Pin<&Self>, error: DomainError);
+
+  /// The owners of the allocation besides this consumed handle.
+  #[cfg(test)]
+  fn strong_count(self: Pin<Arc<Self>>) -> usize;
 }
 
-type Driver = Pin<Box<dyn Future<Output = ()> + Send>>;
-
 struct TaskState {
-  future: Option<Driver>,
   staged: bool,
 }
 
@@ -79,13 +93,15 @@ enum WaiterState {
   Released,
 }
 
-/// One allocation shared by the scheduler, join, abort handles and wakers.
-/// Only the boxed driver contains the user future. Terminal paths take and
-/// drop it before publishing, even when stale handles retain this allocation.
-pub(super) struct Task<T> {
+/// The bookkeeping half of a task allocation, shared by the scheduler, join,
+/// abort handles and wakers. It lives next to the user future in the one
+/// pinned [`TaskCell`]; terminal paths drop the future in place before
+/// publishing, even when stale handles retain the allocation, whose size
+/// (and `Control` charge) does not change.
+pub(super) struct TaskBookkeeping<F: Future> {
   state: Mutex<TaskState>,
   word: PollWord,
-  pub(super) join: JoinState<T>,
+  pub(super) join: JoinState<F::Output>,
   resources: Option<ResourceScope>,
   // Fixed at construction; only absence permits skipping tenant cleanup locks.
   tenant: Option<TenantDomain>,
@@ -93,37 +109,23 @@ pub(super) struct Task<T> {
   task_admission: Mutex<Option<DomainReservation>>,
   shared: Weak<Shared>,
   reference: TaskRef,
-  task_control: Mutex<ControlCharge>,
+  // The whole allocation's charge, held until the last handle or waker.
+  _task_control: ControlCharge,
 }
 
-impl<T> Task<T> {
+/// One allocation: the bookkeeping and the user future, pinned together.
+pub(super) type Task<F> = TaskCell<TaskBookkeeping<F>, F>;
+
+impl<F> TaskBookkeeping<F>
+where
+  F: Future + Send + 'static,
+  F::Output: Send + 'static,
+{
   fn lock_state(&self) -> MutexGuard<'_, TaskState> {
     self.state.lock().unwrap_or_else(PoisonError::into_inner)
   }
 
-  fn finish_future(&self) -> Option<Box<dyn std::any::Any + Send>> {
-    let future = self.lock_state().future.take();
-    let panic = panic::catch_unwind(AssertUnwindSafe(|| drop(future))).err();
-    self.release_future_frame_control();
-    panic
-  }
-
-  fn release_future_frame_control(&self) {
-    if self.tenant.is_none() {
-      return;
-    }
-    let result = self
-      .task_control
-      .lock()
-      .unwrap_or_else(PoisonError::into_inner)
-      .try_resize(std::mem::size_of::<Self>());
-    debug_assert!(
-      result.is_ok(),
-      "released future frame Control charge failed"
-    );
-  }
-
-  fn stage(&self, outcome: Result<T, AsyncJoinError>) {
+  fn stage(&self, outcome: Result<F::Output, AsyncJoinError>) {
     self.join.stage(outcome);
     self.lock_state().staged = true;
   }
@@ -150,112 +152,141 @@ impl<T> Task<T> {
       .take();
     drop(admission);
   }
+}
 
-  fn drop_future_and_stage(&self, error: AsyncJoinError) {
-    if let Some(payload) = self.finish_future() {
-      self.stage(Err(AsyncJoinError::Panicked(payload)));
+impl<F> Task<F>
+where
+  F: Future + Send + 'static,
+  F::Output: Send + 'static,
+{
+  /// Drops the future in place; returns the payload of a panicking
+  /// destructor.
+  fn finish_future(self: Pin<&Self>) -> Option<Box<dyn std::any::Any + Send>> {
+    panic::catch_unwind(AssertUnwindSafe(|| self.drop_future())).err()
+  }
+
+  /// Drops the future after its outcome was staged. A panicking destructor
+  /// replaces the staged outcome unless that outcome is already a panic:
+  /// the original poll panic wins over a second panic from `Drop`.
+  fn finish_future_after_staging(self: Pin<&Self>) {
+    let Some(payload) = self.finish_future() else {
+      return;
+    };
+    let this = self.header();
+    let outcome = this.join.take_staged();
+    if matches!(outcome, Some(Err(AsyncJoinError::Panicked(_)))) {
+      drop_contained(payload);
+      if let Some(outcome) = outcome {
+        this.stage(outcome);
+      }
     } else {
-      self.stage(Err(error));
+      drop_contained(outcome);
+      this.stage(Err(AsyncJoinError::Panicked(payload)));
     }
-    self.release_waiter();
-    self.release_task_admission();
+  }
+
+  fn drop_future_and_stage(self: Pin<&Self>, error: AsyncJoinError) {
+    let payload = self.finish_future();
+    let this = self.header();
+    if let Some(payload) = payload {
+      this.stage(Err(AsyncJoinError::Panicked(payload)));
+    } else {
+      this.stage(Err(error));
+    }
+    this.release_waiter();
+    this.release_task_admission();
   }
 }
 
-impl<T: Send + 'static> ErasedTask for Task<T> {
-  fn poll(&self, cx: &mut Context<'_>, permit: PollPermit) -> (PollResult, Option<PollPermit>) {
+impl<F> ErasedTask for Task<F>
+where
+  F: Future + Send + 'static,
+  F::Output: Send + 'static,
+{
+  fn poll(
+    self: Pin<&Self>,
+    cx: &mut Context<'_>,
+    permit: PollPermit,
+  ) -> (PollResult, Option<PollPermit>) {
+    let this = self.header();
     let _task_context =
-      TaskContextGuard::enter_with_resource(Some(self.join.id()), self.resources.clone());
-    let Some(mut future) = self.lock_state().future.take() else {
-      self.release_waiter();
-      self.release_task_admission();
-      drop(permit);
-      return (PollResult::Ready, None);
-    };
-    // Take ownership before calling user code. The task-state mutex is never
-    // held while polling or dropping the future.
+      TaskContextGuard::enter_with_resource(Some(this.join.id()), this.resources.clone());
+    // The cell claims the future before calling user code. The task-state
+    // mutex is never held while polling or dropping the future.
     let cpu_execution = CpuExecutionGuard::enter(permit.cpu_domain_identity());
     let result = {
       let _cooperative_poll = super::entry::CooperativePollGuard::enter();
-      panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx)))
+      panic::catch_unwind(AssertUnwindSafe(|| self.poll_future(cx)))
     };
     drop(cpu_execution);
-    match result {
-      Ok(result) => {
-        if result.is_pending() {
-          let mut state = self.lock_state();
-          if !state.staged {
-            state.future = Some(future);
-            return (PollResult::Pending, Some(permit));
-          }
+    let outcome = match result {
+      Ok(CellPoll::Pending) => {
+        if !this.lock_state().staged {
+          return (PollResult::Pending, Some(permit));
         }
-        // Release before user destructors, output staging or cleanup.
-        drop(permit);
-        let cleanup_panic = panic::catch_unwind(AssertUnwindSafe(|| drop(future))).err();
-        self.release_future_frame_control();
-        if let Some(payload) = cleanup_panic {
-          let outcome = self.join.take_staged();
-          if matches!(outcome, Some(Err(AsyncJoinError::Panicked(_)))) {
-            // The original poll panic wins over a second panic from Drop.
-            drop_contained(payload);
-            if let Some(outcome) = outcome {
-              self.stage(outcome);
-            }
-          } else {
-            drop_contained(outcome);
-            self.stage(Err(AsyncJoinError::Panicked(payload)));
-          }
-        }
-        self.release_waiter();
-        self.release_task_admission();
-        (PollResult::Ready, None)
+        // A terminal outcome was staged meanwhile; it owns the result.
+        None
       }
-      Err(payload) => {
+      Ok(CellPoll::Ready(output)) => Some(Ok(output)),
+      Ok(CellPoll::Rejected) => {
+        // No future to poll: it already completed, was cancelled or failed.
+        debug_assert!(
+          this.lock_state().staged,
+          "rejected poll without a staged outcome"
+        );
+        this.release_waiter();
+        this.release_task_admission();
         drop(permit);
-        if let Err(cleanup_payload) = panic::catch_unwind(AssertUnwindSafe(|| drop(future))) {
-          drop_contained(cleanup_payload);
-        }
-        self.release_future_frame_control();
-        self.stage(Err(AsyncJoinError::Panicked(payload)));
-        self.release_waiter();
-        self.release_task_admission();
-        (PollResult::Ready, None)
+        return (PollResult::Ready, None);
       }
+      Err(payload) => Some(Err(AsyncJoinError::Panicked(payload))),
+    };
+    if let Some(outcome) = outcome {
+      this.stage(outcome);
     }
+    // Release before user destructors or cleanup.
+    drop(permit);
+    self.finish_future_after_staging();
+    this.release_waiter();
+    this.release_task_admission();
+    (PollResult::Ready, None)
   }
 
-  fn cancel(&self) {
+  fn cancel(self: Pin<&Self>) {
+    let this = self.header();
     let _task_context =
-      TaskContextGuard::enter_with_resource(Some(self.join.id()), self.resources.clone());
+      TaskContextGuard::enter_with_resource(Some(this.join.id()), this.resources.clone());
     let panic = self.finish_future();
     let outcome = match panic {
       Some(payload) => Err(AsyncJoinError::Panicked(payload)),
       None => Err(AsyncJoinError::Cancelled),
     };
-    self.stage(outcome);
-    self.release_waiter();
-    self.release_task_admission();
+    this.stage(outcome);
+    this.release_waiter();
+    this.release_task_admission();
   }
 
   fn publish(&self) {
+    let this = self.header();
     let _task_context =
-      TaskContextGuard::enter_with_resource(Some(self.join.id()), self.resources.clone());
-    self.release_waiter();
-    self.release_task_admission();
-    let staged = self.join.take_staged();
+      TaskContextGuard::enter_with_resource(Some(this.join.id()), this.resources.clone());
+    this.release_waiter();
+    this.release_task_admission();
+    let staged = this.join.take_staged();
     if let Some(outcome) = staged
-      && let Some(unclaimed) = self.join.publish(outcome)
+      && let Some(unclaimed) = this.join.publish(outcome)
     {
       drop_contained(unclaimed);
     }
   }
 
-  fn acquire_cpu(&self, waker: &std::task::Waker) -> DomainCpuAdmission {
-    let Some(tenant) = &self.tenant else {
+  fn acquire_cpu(&self, waker: &Waker) -> DomainCpuAdmission {
+    let this = self.header();
+    let Some(tenant) = &this.tenant else {
       return DomainCpuAdmission::Unbounded;
     };
     let waiter = {
-      let mut state = self.waiter.lock().unwrap_or_else(PoisonError::into_inner);
+      let mut state = this.waiter.lock().unwrap_or_else(PoisonError::into_inner);
       match std::mem::replace(&mut *state, WaiterState::InUse) {
         WaiterState::Available(waiter) => waiter,
         other => {
@@ -265,7 +296,7 @@ impl<T: Send + 'static> ErasedTask for Task<T> {
       }
     };
     let result = waiter.try_acquire_or_register(tenant, waker);
-    let mut state = self.waiter.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut state = this.waiter.lock().unwrap_or_else(PoisonError::into_inner);
     if matches!(*state, WaiterState::Released) {
       drop(state);
       drop(waiter);
@@ -281,16 +312,21 @@ impl<T: Send + 'static> ErasedTask for Task<T> {
     }
   }
 
-  fn task_waker(self: Arc<Self>) -> Waker {
-    Waker::from(self)
+  fn task_waker(self: Pin<Arc<Self>>) -> Waker {
+    TaskCell::waker(&self)
   }
 
   fn poll_word(&self) -> &PollWord {
-    &self.word
+    &self.header().word
   }
 
-  fn fail_resource(&self, error: DomainError) {
+  fn fail_resource(self: Pin<&Self>, error: DomainError) {
     self.drop_future_and_stage(AsyncJoinError::ResourceDomain(error));
+  }
+
+  #[cfg(test)]
+  fn strong_count(self: Pin<Arc<Self>>) -> usize {
+    TaskCell::strong_count(&self) - 1
   }
 }
 
@@ -302,46 +338,18 @@ pub(super) fn drop_contained<T>(value: T) {
   }
 }
 
-// The driver is boxed directly. F can itself be a Pin<Box<dyn Future>>;
-// moving that value into the frame does not put another box around F.
-async fn driver<F>(future: F, owner: Weak<Task<F::Output>>)
+impl<F> Task<F>
 where
   F: Future + Send + 'static,
   F::Output: Send + 'static,
 {
-  let mut future = std::pin::pin!(future);
-  std::future::poll_fn(|cx| {
-    let Some(owner) = owner.upgrade() else {
-      return Poll::Ready(());
-    };
-    // Keep the driver suspended until the caller releases the permit.
-    match panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
-      Ok(Poll::Ready(output)) => owner.stage(Ok(output)),
-      Ok(Poll::Pending) => {}
-      Err(payload) => owner.stage(Err(AsyncJoinError::Panicked(payload))),
-    }
-    Poll::Pending
-  })
-  .await;
-}
-
-fn driver_bytes<F, D>(_: fn(F, Weak<Task<F::Output>>) -> D) -> usize
-where
-  F: Future,
-{
-  std::mem::size_of::<D>()
-}
-
-impl<T: Send + 'static> Task<T> {
-  pub(super) fn reserve_domain_admission<F>(
+  /// Reserves the task count and the `Control` charge of the one task
+  /// allocation, which stores the future inline. `F` can itself be a
+  /// `Pin<Box<dyn Future>>`; moving that value in does not box it again.
+  pub(super) fn reserve_domain_admission(
     tenant: Option<&TenantDomain>,
-  ) -> Result<TaskDomainAdmission, DomainError>
-  where
-    F: Future<Output = T> + Send + 'static,
-  {
-    let bytes = std::mem::size_of::<Self>()
-      .checked_add(driver_bytes(driver::<F>))
-      .ok_or(DomainError::Invalid)?;
+  ) -> Result<TaskDomainAdmission, DomainError> {
+    let bytes = std::mem::size_of::<Self>();
     let (task, task_control) = if let Some(tenant) = tenant {
       let request = DomainResources::ZERO
         .with(DomainResource::Tasks, 1)
@@ -363,38 +371,26 @@ impl<T: Send + 'static> Task<T> {
     })
   }
 
-  pub(super) fn create<F>(
+  pub(super) fn create(
     future: F,
     id: TaskId,
     resources: Option<ResourceScope>,
     domain: TaskDomainAdmission,
     shared: Weak<Shared>,
     reference: TaskRef,
-  ) -> (Arc<dyn ErasedTask>, AsyncJob<T>)
-  where
-    F: Future<Output = T> + Send + 'static,
-  {
+  ) -> (Pin<Arc<dyn ErasedTask>>, AsyncJob<F::Output>) {
     let TaskDomainAdmission {
       tenant,
       waiter,
       task: task_admission,
       task_control,
     } = domain;
+    debug_assert_eq!(task_control.bytes(), std::mem::size_of::<Self>());
     #[cfg(all(test, not(loom)))]
     super::allocation_tests::record();
-    let task = Arc::new_cyclic(|owner| {
-      let driver = driver(future, owner.clone());
-      debug_assert_eq!(
-        task_control.bytes(),
-        std::mem::size_of::<Self>() + std::mem::size_of_val(&driver)
-      );
-      #[cfg(all(test, not(loom)))]
-      super::allocation_tests::record();
-      Self {
-        state: Mutex::new(TaskState {
-          future: Some(Box::pin(driver)),
-          staged: false,
-        }),
+    let task = TaskCell::new(
+      TaskBookkeeping {
+        state: Mutex::new(TaskState { staged: false }),
         word: PollWord::new(),
         join: JoinState::embedded(id, ControlCharge::unbounded(0), None),
         resources,
@@ -403,38 +399,173 @@ impl<T: Send + 'static> Task<T> {
         task_admission: Mutex::new(task_admission),
         shared,
         reference,
-        task_control: Mutex::new(task_control),
-      }
-    });
-    let abort: Arc<dyn AbortMetadata> = task.clone();
-    let job = AsyncJob::merged(Arc::clone(&task), abort);
+        _task_control: task_control,
+      },
+      future,
+    );
+    let abort: Pin<Arc<dyn AbortMetadata>> = task.clone();
+    let merged: Pin<Arc<dyn MergedJoin<F::Output>>> = task.clone();
+    let job = AsyncJob::merged(merged, abort);
     (task, job)
   }
 }
 
-impl<T: Send + 'static> Wake for Task<T> {
-  fn wake(self: Arc<Self>) {
-    self.wake_by_ref();
+impl<F> MergedJoin<F::Output> for Task<F>
+where
+  F: Future + Send + 'static,
+  F::Output: Send + 'static,
+{
+  fn join_state(&self) -> &JoinState<F::Output> {
+    &self.header().join
   }
+}
 
-  fn wake_by_ref(self: &Arc<Self>) {
+impl<F> TaskHeader for TaskBookkeeping<F>
+where
+  F: Future + Send + 'static,
+  F::Output: Send + 'static,
+{
+  fn wake_by_ref(&self) {
     Shared::wake_task(&self.shared, &self.word, self.reference);
   }
 }
 
-impl<T: Send + 'static> AbortMetadata for Task<T> {
+impl<F> AbortMetadata for Task<F>
+where
+  F: Future + Send + 'static,
+  F::Output: Send + 'static,
+{
   fn abort(&self) {
-    if let Some(shared) = self.shared.upgrade() {
-      shared.abort(self.reference);
+    let this = self.header();
+    if let Some(shared) = this.shared.upgrade() {
+      shared.abort(this.reference);
     }
   }
 
   fn is_finished(&self) -> bool {
-    self.join.is_finished()
+    self.header().join.is_finished()
   }
 
   fn set_finished(&self) {
-    self.join.set_finished();
+    self.header().join.set_finished();
+  }
+}
+
+/// Loom compiles the runtime source in the unpublished façade, without
+/// `crate::sys`, so a boxed future stands in for the inline cell with the
+/// same state machine and the same pinned-handle API. Loom models therefore
+/// do not cover the unsafe cell; its own Miri-checked unit tests do.
+#[cfg(loom)]
+mod loom_cell {
+  use std::future::Future;
+  use std::pin::Pin;
+  use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+  use std::task::{Context, Poll, Wake, Waker};
+
+  pub(crate) enum CellPoll<T> {
+    Ready(T),
+    Pending,
+    Rejected,
+  }
+
+  pub(crate) trait TaskHeader: Send + Sync + 'static {
+    fn wake_by_ref(&self);
+  }
+
+  struct Slot<F> {
+    future: Option<Pin<Box<F>>>,
+    pollable: bool,
+  }
+
+  /// Boxes both halves, so the stand-in is `Unpin` whatever `H` and `F`
+  /// are and `Pin::into_inner` recovers the `Arc` for its wakers.
+  pub(crate) struct TaskCell<H, F> {
+    header: Box<H>,
+    slot: Mutex<Slot<F>>,
+  }
+
+  impl<H, F> TaskCell<H, F> {
+    pub(crate) fn new(header: H, future: F) -> Pin<Arc<Self>> {
+      Arc::pin(Self {
+        header: Box::new(header),
+        slot: Mutex::new(Slot {
+          future: Some(Box::pin(future)),
+          pollable: true,
+        }),
+      })
+    }
+
+    pub(crate) fn header(&self) -> &H {
+      &self.header
+    }
+
+    #[cfg(test)]
+    pub(crate) fn strong_count(this: &Pin<Arc<Self>>) -> usize {
+      Arc::strong_count(&Pin::into_inner(Pin::clone(this))) - 1
+    }
+
+    pub(crate) fn waker(this: &Pin<Arc<Self>>) -> Waker
+    where
+      H: TaskHeader,
+      F: Send + 'static,
+    {
+      Waker::from(Pin::into_inner(Pin::clone(this)))
+    }
+
+    fn try_claim(&self) -> Option<MutexGuard<'_, Slot<F>>> {
+      match self.slot.try_lock() {
+        Ok(slot) => Some(slot),
+        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+      }
+    }
+
+    pub(crate) fn poll_future(self: Pin<&Self>, cx: &mut Context<'_>) -> CellPoll<F::Output>
+    where
+      F: Future,
+    {
+      let Some(mut guard) = self.try_claim() else {
+        return CellPoll::Rejected;
+      };
+      let slot: &mut Slot<F> = &mut guard;
+      if !slot.pollable {
+        return CellPoll::Rejected;
+      }
+      let Some(future) = slot.future.as_mut() else {
+        return CellPoll::Rejected;
+      };
+      // Stays unpollable (poisoned) if the poll unwinds or completes.
+      slot.pollable = false;
+      let result = future.as_mut().poll(cx);
+      match result {
+        Poll::Ready(output) => CellPoll::Ready(output),
+        Poll::Pending => {
+          slot.pollable = true;
+          CellPoll::Pending
+        }
+      }
+    }
+
+    pub(crate) fn drop_future(self: Pin<&Self>) -> bool {
+      let Some(mut slot) = self.try_claim() else {
+        return false;
+      };
+      let taken = slot.future.take();
+      drop(slot);
+      let dropped = taken.is_some();
+      drop(taken);
+      dropped
+    }
+  }
+
+  impl<H: TaskHeader, F: Send + 'static> Wake for TaskCell<H, F> {
+    fn wake(self: Arc<Self>) {
+      self.header.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+      self.header.wake_by_ref();
+    }
   }
 }
 
@@ -442,6 +573,7 @@ impl<T: Send + 'static> AbortMetadata for Task<T> {
 mod control_tests {
   use super::*;
   use crate::runtime::resource_domain::ResourceDomain;
+  use std::task::Wake;
 
   fn ceiling() -> DomainResources {
     DomainResources::ZERO
@@ -458,8 +590,8 @@ mod control_tests {
     let global_base = domain.snapshot().used.get(DomainResource::Control);
     let tenant_base = tenant.snapshot().unwrap().used.get(DomainResource::Control);
     type F = std::future::Ready<()>;
-    let expected = std::mem::size_of::<Task<()>>() + driver_bytes(driver::<F>);
-    let admission = Task::<()>::reserve_domain_admission::<F>(Some(&tenant)).unwrap();
+    let expected = std::mem::size_of::<Task<F>>();
+    let admission = Task::<F>::reserve_domain_admission(Some(&tenant)).unwrap();
     assert_eq!(
       domain.snapshot().used.get(DomainResource::Control),
       global_base + expected
@@ -483,7 +615,7 @@ mod control_tests {
 
   #[test]
   fn concurrent_waiter_release_during_acquire_does_not_restore_lease() {
-    struct CancelOnDrop(Weak<dyn ErasedTask>);
+    struct CancelOnDrop(Pin<Arc<dyn ErasedTask>>);
     // Waker::noop cannot carry the destructor that reenters cancellation.
     #[allow(clippy::manual_noop_waker)]
     impl Wake for CancelOnDrop {
@@ -491,9 +623,7 @@ mod control_tests {
     }
     impl Drop for CancelOnDrop {
       fn drop(&mut self) {
-        if let Some(task) = self.0.upgrade() {
-          task.cancel();
-        }
+        self.0.as_ref().cancel();
       }
     }
     let limits = ceiling();
@@ -504,7 +634,7 @@ mod control_tests {
       .try_acquire(DomainResources::ZERO.with(DomainResource::Cpu, 2))
       .unwrap();
     type F = std::future::Pending<()>;
-    let mut admission = Task::<()>::reserve_domain_admission::<F>(Some(&tenant)).unwrap();
+    let mut admission = Task::<F>::reserve_domain_admission(Some(&tenant)).unwrap();
     admission.waiter = Some(pool.try_lease().unwrap());
     let (task, job) = Task::create(
       std::future::pending::<()>(),
@@ -514,7 +644,7 @@ mod control_tests {
       Weak::new(),
       TaskRef::test_sentinel(),
     );
-    let old = Waker::from(Arc::new(CancelOnDrop(Arc::downgrade(&task))));
+    let old = Waker::from(Arc::new(CancelOnDrop(task.clone())));
     assert!(matches!(
       task.acquire_cpu(&old),
       DomainCpuAdmission::Waiting
@@ -535,10 +665,20 @@ mod control_tests {
 
   #[test]
   fn task_output_uses_one_inline_storage_location() {
-    let small = std::mem::size_of::<Task<()>>();
-    let large = std::mem::size_of::<Task<[u8; 4096]>>();
-    println!("Task<()>={small} Task<[u8;4096]>={large}");
+    // `Pending<T>` has no state, so only the output slot grows.
+    let small = std::mem::size_of::<Task<std::future::Pending<()>>>();
+    let large = std::mem::size_of::<Task<std::future::Pending<[u8; 4096]>>>();
+    println!("Task<Pending<()>>={small} Task<Pending<[u8;4096]>>={large}");
     assert!(large - small <= 4096, "output storage was duplicated");
+  }
+
+  #[test]
+  fn task_stores_the_future_inline() {
+    // Same output type; only the future's state (none versus 4097 bytes)
+    // differs, and it is part of the one task allocation.
+    let stateless = std::mem::size_of::<Task<std::future::Pending<[u8; 4096]>>>();
+    let stateful = std::mem::size_of::<Task<std::future::Ready<[u8; 4096]>>>();
+    assert!(stateful - stateless >= 4096, "future storage is not inline");
   }
 
   #[test]
@@ -560,9 +700,9 @@ mod control_tests {
         tenant_base + bytes
       );
     };
-    let task_bytes = std::mem::size_of::<Task<usize>>();
+    let task_bytes = std::mem::size_of::<Task<F>>();
     let before = super::super::allocation_tests::count();
-    let mut admission = Task::<usize>::reserve_domain_admission::<F>(Some(&tenant)).unwrap();
+    let mut admission = Task::<F>::reserve_domain_admission(Some(&tenant)).unwrap();
     admission.waiter = Some(pool.try_lease().unwrap());
     let (task, job) = Task::create(
       std::future::ready(7usize),
@@ -573,11 +713,12 @@ mod control_tests {
       TaskRef::test_sentinel(),
     );
     let abort = job.abort_handle();
-    let waker = Arc::clone(&task).task_waker();
-    assert_control(task_bytes + driver_bytes(driver::<F>));
-    task.cancel();
+    let waker = task.clone().task_waker();
+    assert_control(task_bytes);
+    task.as_ref().cancel();
     assert!(!abort.is_finished());
     assert_eq!(domain.snapshot().used.get(DomainResource::Tasks), 0);
+    // The future was dropped in place; the one allocation keeps its size.
     assert_control(task_bytes);
     // Cancellation returns the inline waiter to the pool before publication.
     drop(pool.try_lease().unwrap());
@@ -591,7 +732,7 @@ mod control_tests {
     assert_control(task_bytes);
     drop(waker);
     assert_control(0);
-    assert_eq!(super::super::allocation_tests::count() - before, 2);
+    assert_eq!(super::super::allocation_tests::count() - before, 1);
   }
 }
 
@@ -600,6 +741,7 @@ mod model {
   use super::*;
   use loom::sync::Arc as ModelArc;
   use loom::sync::atomic::{AtomicBool, Ordering};
+  use std::task::Wake;
 
   struct ObserveWake(ModelArc<AtomicBool>);
 
@@ -612,8 +754,7 @@ mod model {
   #[test]
   fn merged_publication_racing_join_observer_keeps_completion_and_wake() {
     loom::model(|| {
-      let admission =
-        Task::<usize>::reserve_domain_admission::<std::future::Ready<usize>>(None).unwrap();
+      let admission = Task::<std::future::Ready<usize>>::reserve_domain_admission(None).unwrap();
       let (task, mut job) = Task::create(
         std::future::ready(7),
         TaskId::test_sentinel(),
@@ -623,8 +764,8 @@ mod model {
         TaskRef::test_sentinel(),
       );
       let abort = job.abort_handle();
-      let stale = Arc::clone(&task).task_waker();
-      task.cancel();
+      let stale = task.clone().task_waker();
+      task.as_ref().cancel();
       assert!(!abort.is_finished());
       stale.wake_by_ref();
       assert!(!abort.is_finished());

@@ -56,6 +56,16 @@ MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p allocatbelt-core-
 scripts/run-mutation-testing.sh
 ```
 
+Changes to the async task cell (`crates/allocatbelt/src/sys/runtime_task_cell.rs`)
+should run its Miri tests under both borrow models:
+
+```sh
+MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-many-seeds=0..8" \
+  cargo +nightly miri test --locked -p allocatbelt --features runtime --lib sys::runtime_task_cell
+MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-many-seeds=0..8 -Zmiri-tree-borrows" \
+  cargo +nightly miri test --locked -p allocatbelt --features runtime --lib sys::runtime_task_cell
+```
+
 For a complete bounded core campaign, `scripts/check-miri.sh --output DIR`
 uses the CI-pinned nightly and runs each test in its own process with a
 30-minute ceiling. It records the test outcome, process exit (including Miri

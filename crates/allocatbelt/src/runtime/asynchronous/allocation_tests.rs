@@ -16,7 +16,7 @@ pub(super) fn count() -> usize {
 }
 
 #[test]
-fn spawn_allocates_only_merged_state_and_driver() {
+fn spawn_allocates_only_the_merged_task_state() {
   use super::{AsyncConfig, AsyncRuntime, AsyncShutdown};
   use std::future::Future;
   use std::pin::Pin;
@@ -30,12 +30,12 @@ fn spawn_allocates_only_merged_state_and_driver() {
   let handle = runtime.handle();
   let before = count();
   let inline = handle.spawn(std::future::ready(7usize)).unwrap();
-  assert_eq!(count() - before, 2);
+  assert_eq!(count() - before, 1);
   // Construct the caller's box before measuring runtime constructors.
   let boxed: Pin<Box<dyn Future<Output = usize> + Send>> = Box::pin(async { 9 });
   let before = count();
   let boxed = handle.spawn(boxed).unwrap();
-  assert_eq!(count() - before, 2);
+  assert_eq!(count() - before, 1);
   runtime.shutdown(AsyncShutdown::Drain).unwrap();
   assert!(inline.is_finished());
   assert!(boxed.is_finished());
