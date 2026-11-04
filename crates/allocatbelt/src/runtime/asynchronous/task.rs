@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Waker};
 
@@ -100,6 +101,10 @@ enum WaiterState {
 /// (and `Control` charge) does not change.
 pub(super) struct TaskBookkeeping<F: Future> {
   state: Mutex<TaskState>,
+  /// Mirrors `TaskState::staged` for the pending-poll check, which reads it
+  /// without the mutex. It only records that an outcome was staged. Like
+  /// the mutex beside it, it is a `std` type under Loom too.
+  staged: AtomicBool,
   word: PollWord,
   pub(super) join: JoinState<F::Output>,
   resources: Option<ResourceScope>,
@@ -127,7 +132,30 @@ where
 
   fn stage(&self, outcome: Result<F::Output, AsyncJoinError>) {
     self.join.stage(outcome);
-    self.lock_state().staged = true;
+    let mut state = self.lock_state();
+    state.staged = true;
+    // Written while the mutex is held, after the outcome is staged, so the
+    // mirror never reports an outcome the join state does not hold yet.
+    self.staged.store(true, Ordering::Release);
+  }
+
+  /// Whether a terminal outcome was staged, read without the task-state
+  /// mutex.
+  ///
+  /// The flag only moves from false to true. The pending path needs to see
+  /// any `stage` that happens before its check: a cancellation or resource
+  /// failure that ran before this poll began, ordered through the scheduler
+  /// lock or the cell claim that serialized it with the poll. A load that
+  /// happens after the store observes it (write-read coherence), exactly
+  /// as the mutex-protected read did. A `stage` that is concurrent with the
+  /// check has no such order with either form; both forms then return
+  /// Pending and leave the outcome to the staging path, which owns the
+  /// future's cleanup. Acquire pairs with the Release store, so a true load
+  /// also makes the staged join value visible before
+  /// `finish_future_after_staging` takes it, although the join state's own
+  /// lock orders that access too.
+  fn is_staged(&self) -> bool {
+    self.staged.load(Ordering::Acquire)
   }
 
   fn release_waiter(&self) {
@@ -221,7 +249,7 @@ where
     drop(cpu_execution);
     let outcome = match result {
       Ok(CellPoll::Pending) => {
-        if !this.lock_state().staged {
+        if !this.is_staged() {
           return (PollResult::Pending, Some(permit));
         }
         // A terminal outcome was staged meanwhile; it owns the result.
@@ -231,7 +259,7 @@ where
       Ok(CellPoll::Rejected) => {
         // No future to poll: it already completed, was cancelled or failed.
         debug_assert!(
-          this.lock_state().staged,
+          this.lock_state().staged && this.is_staged(),
           "rejected poll without a staged outcome"
         );
         this.release_waiter();
@@ -389,6 +417,7 @@ where
     let task = TaskCell::new(
       TaskBookkeeping {
         state: Mutex::new(TaskState { staged: false }),
+        staged: AtomicBool::new(false),
         word: PollWord::new(),
         join: JoinState::embedded(id, ControlCharge::unbounded(0), None),
         resources,

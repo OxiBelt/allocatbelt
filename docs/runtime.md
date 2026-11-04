@@ -1143,8 +1143,10 @@ The task allocation is a pinned `sys` cell (`Pin<Arc<TaskCell>>`) that
 stores the user future inline next to the runtime's bookkeeping; its atomic
 claim serializes polling and in-place destruction, and its pinned-only API is
 what makes polling the inline future sound (see
-[the unsafe inventory](unsafe-boundary.md)). The staged-status flag is under a
-task-state mutex that is never held during user polling or destruction. Tasks constructed without a tenant
+[the unsafe inventory](unsafe-boundary.md)). The staged-status flag is written
+under a task-state mutex that is never held during user polling or
+destruction, together with an atomic copy that a pending poll reads without
+that mutex. Tasks constructed without a tenant
 skip tenant-only cleanup locks; this choice depends only on tenant absence,
 not on current resource limits.
 
