@@ -170,9 +170,10 @@ fn run(shared: &Arc<Shared>, work: Selected) {
       d.finish_cancel(shared, reference, task);
     }
     Selected::Poll(reference, task, permit) => {
-      let (result, permit) = task
-        .as_ref()
-        .poll(&mut Context::from_waker(Waker::noop()), permit);
+      let (result, permit) =
+        task
+          .as_ref()
+          .poll(&mut Context::from_waker(Waker::noop()), permit, &mut None);
       drop(permit);
       d.finish_poll(
         shared,

@@ -50,10 +50,14 @@ pub(super) trait ErasedTask: Send + Sync {
   /// polling and cancellation cleanup; the future cell's claim serializes
   /// access to the stored future even without it.
   /// Pending returns the quota permit for the caller's locked completion.
+  /// `cpu_ticket` is the CPU ticket held for this poll, if any; a ready poll
+  /// drops it right after the permit, and a pending poll leaves it with the
+  /// caller.
   fn poll(
     self: Pin<&Self>,
     cx: &mut Context<'_>,
     permit: PollPermit,
+    cpu_ticket: &mut Option<DomainReservation>,
   ) -> (PollResult, Option<PollPermit>);
 
   /// Drops a cancelled future and stages its terminal outcome, with no
@@ -235,13 +239,15 @@ where
     self: Pin<&Self>,
     cx: &mut Context<'_>,
     permit: PollPermit,
+    cpu_ticket: &mut Option<DomainReservation>,
   ) -> (PollResult, Option<PollPermit>) {
     let this = self.header();
     let _task_context =
       TaskContextGuard::enter_with_resource(Some(this.join.id()), this.resources.clone());
     // The cell claims the future before calling user code. The task-state
     // mutex is never held while polling or dropping the future.
-    let cpu_execution = CpuExecutionGuard::enter(permit.cpu_domain_identity());
+    let cpu_execution =
+      CpuExecutionGuard::enter(cpu_ticket.as_ref().map(DomainReservation::domain_identity));
     let result = {
       let _cooperative_poll = super::entry::CooperativePollGuard::enter();
       panic::catch_unwind(AssertUnwindSafe(|| self.poll_future(cx)))
@@ -265,6 +271,7 @@ where
         this.release_waiter();
         this.release_task_admission();
         drop(permit);
+        drop(cpu_ticket.take());
         return (PollResult::Ready, None);
       }
       Err(payload) => Some(Err(AsyncJoinError::Panicked(payload))),
@@ -274,6 +281,7 @@ where
     }
     // Release before user destructors or cleanup.
     drop(permit);
+    drop(cpu_ticket.take());
     self.finish_future_after_staging();
     this.release_waiter();
     this.release_task_admission();

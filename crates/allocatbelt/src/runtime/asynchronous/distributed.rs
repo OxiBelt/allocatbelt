@@ -878,14 +878,7 @@ impl Distributed {
     // The dequeued entry becomes this poll; wakes from here on set
     // `NOTIFIED` on the running word.
     task.poll_word().begin();
-    Some(Selected::Poll(
-      task_ref,
-      task,
-      PollPermit {
-        release,
-        cpu_ticket: None,
-      },
-    ))
+    Some(Selected::Poll(task_ref, task, PollPermit { release }))
   }
 
   /// Ends a poll. A pending poll changes only the task's word: it goes idle,
@@ -1584,12 +1577,16 @@ impl Distributed {
           super::super::entry::reset_budget();
           let waker = task.clone().task_waker();
           let mut context = Context::from_waker(&waker);
-          let (result, mut permit) = match task.acquire_cpu(&waker) {
-            DomainCpuAdmission::Unbounded => task.as_ref().poll(&mut context, permit),
+          // Unbounded polls carry no ticket. A pending poll drops its ticket
+          // before the permit; a ready poll drops both, permit first.
+          let mut cpu_ticket = None;
+          let (result, permit) = match task.acquire_cpu(&waker) {
+            DomainCpuAdmission::Unbounded => {
+              task.as_ref().poll(&mut context, permit, &mut cpu_ticket)
+            }
             DomainCpuAdmission::Acquired(ticket) => {
-              let mut permit = permit;
-              permit.set_cpu_ticket(ticket);
-              task.as_ref().poll(&mut context, permit)
+              cpu_ticket = Some(ticket);
+              task.as_ref().poll(&mut context, permit, &mut cpu_ticket)
             }
             DomainCpuAdmission::Waiting => (PollResult::Pending, Some(permit)),
             DomainCpuAdmission::Rejected(error) => {
@@ -1598,7 +1595,7 @@ impl Distributed {
               (PollResult::Ready, None)
             }
           };
-          drop(permit.as_mut().and_then(PollPermit::take_cpu_ticket));
+          drop(cpu_ticket);
           drop(permit);
           self.finish_poll(shared, task_ref, &task, matches!(result, PollResult::Ready));
         }

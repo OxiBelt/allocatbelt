@@ -31,8 +31,8 @@ use super::{AsyncConfig, AsyncError, AsyncSpawnError};
 use crate::runtime::cache;
 use crate::runtime::managed::ResourceScope;
 use crate::runtime::resource_domain::{
-  ControlCharge, DomainError, DomainIdentity, DomainReservation, DomainResource, DomainResources,
-  DomainWaitPool, DomainWaiter, TenantDomain, payload_bytes,
+  ControlCharge, DomainError, DomainReservation, DomainResource, DomainResources, DomainWaitPool,
+  DomainWaiter, TenantDomain, payload_bytes,
 };
 use distributed::Distributed;
 use free_slots::FreeSlots;
@@ -830,10 +830,11 @@ enum Selected {
 }
 
 /// Releases one scope's active-poll reservation on every exit path before
-/// terminal future/output cleanup can run.
+/// terminal future/output cleanup can run. A CPU ticket held for the poll is
+/// passed beside the permit, so the common unbounded poll moves only this
+/// small value.
 pub(super) struct PollPermit {
   release: PermitRelease,
-  cpu_ticket: Option<DomainReservation>,
 }
 
 enum PermitRelease {
@@ -845,26 +846,6 @@ enum PermitRelease {
     cell: Arc<ScopeCell>,
   },
   Free,
-  Disarmed,
-}
-
-impl PollPermit {
-  pub(super) fn cpu_domain_identity(&self) -> Option<DomainIdentity> {
-    self
-      .cpu_ticket
-      .as_ref()
-      .map(DomainReservation::domain_identity)
-  }
-
-  /// Returns the CPU ticket so it can be dropped as soon as the poll ends.
-  fn take_cpu_ticket(&mut self) -> Option<DomainReservation> {
-    self.cpu_ticket.take()
-  }
-
-  fn set_cpu_ticket(&mut self, ticket: DomainReservation) {
-    debug_assert!(self.cpu_ticket.is_none());
-    self.cpu_ticket = Some(ticket);
-  }
 }
 
 pub(super) struct RootAdmission {
@@ -875,16 +856,16 @@ pub(super) struct RootAdmission {
 
 impl Drop for PollPermit {
   fn drop(&mut self) {
-    match std::mem::replace(&mut self.release, PermitRelease::Disarmed) {
+    match &self.release {
       PermitRelease::Scope { shared, cell } => {
         if let Some(shared) = shared.upgrade() {
-          shared.distributed.release_permit(&shared, &cell);
+          shared.distributed.release_permit(&shared, cell);
         }
       }
       PermitRelease::Counted { cell } => {
         cell.active_stat.fetch_sub(1, Ordering::Relaxed);
       }
-      PermitRelease::Free | PermitRelease::Disarmed => {}
+      PermitRelease::Free => {}
     }
   }
 }
@@ -1240,10 +1221,11 @@ mod tests {
     drop(cached);
     let permit = PollPermit {
       release: PermitRelease::Free,
-      cpu_ticket: None,
     };
     assert!(matches!(
-      task.as_ref().poll(&mut Context::from_waker(&waker), permit),
+      task
+        .as_ref()
+        .poll(&mut Context::from_waker(&waker), permit, &mut None),
       (PollResult::Ready, None)
     ));
     task.publish();
@@ -1288,9 +1270,11 @@ mod tests {
     // A dispatch after cleanup finds no future; its waker has no cached owner.
     let recreated = task.clone().task_waker();
     assert!(matches!(
-      task
-        .as_ref()
-        .poll(&mut Context::from_waker(&recreated), unscheduled_permit()),
+      task.as_ref().poll(
+        &mut Context::from_waker(&recreated),
+        unscheduled_permit(),
+        &mut None
+      ),
       (PollResult::Ready, None)
     ));
     assert_eq!(strong_count(&task), before + 1);
@@ -1309,7 +1293,6 @@ mod tests {
   fn unscheduled_permit() -> PollPermit {
     PollPermit {
       release: PermitRelease::Free,
-      cpu_ticket: None,
     }
   }
 
@@ -1319,7 +1302,8 @@ mod tests {
       assert!(matches!(
         task.poll(
           &mut Context::from_waker(Waker::noop()),
-          unscheduled_permit()
+          unscheduled_permit(),
+          &mut None
         ),
         (PollResult::Ready, None)
       ));
@@ -1338,7 +1322,8 @@ mod tests {
         assert!(matches!(
           task.poll(
             &mut Context::from_waker(Waker::noop()),
-            unscheduled_permit()
+            unscheduled_permit(),
+            &mut None
           ),
           (PollResult::Ready, None)
         ));
