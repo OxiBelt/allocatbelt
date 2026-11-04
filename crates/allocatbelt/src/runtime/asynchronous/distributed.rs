@@ -85,7 +85,7 @@ struct SlotCell {
   state: Mutex<SlotState>,
 }
 struct SlotState {
-  protocol: PollProtocol,
+  protocol: SlotProtocol,
   task: Option<Pin<Arc<dyn ErasedTask>>>,
   scope: Option<ScopeRef>,
   /// The admitted task's retained scope owner. Root-scope tasks leave it
@@ -307,7 +307,7 @@ impl Distributed {
       steal_denials: AtomicUsize::new(0),
       slots: table(config.max_outstanding, || SlotCell {
         state: Mutex::new(SlotState {
-          protocol: PollProtocol::new(),
+          protocol: SlotProtocol::new(),
           task: None,
           scope: None,
           cell: None,
@@ -646,11 +646,13 @@ impl Distributed {
       // this reset. The abort/cleanup pairing keeps its SeqCst accesses.
       self.links[index].cleanup.store(false, Ordering::Relaxed);
       slot.protocol.admit(generation);
+      // No waker or abort handle exists yet, so publication owns the first
+      // queue entry.
+      let queued = task.poll_word().notify();
+      debug_assert_eq!(queued, PollNotify::Enqueue);
       slot.scope = Some(scope);
       slot.task = Some(task);
       slot.cell = reservation.cell.take();
-      let inserted = slot.protocol.queue();
-      debug_assert!(inserted);
       job
     };
     reservation.index = None;
@@ -658,19 +660,34 @@ impl Distributed {
     Ok(job)
   }
 
-  pub(super) fn wake(&self, shared: &Shared, task_ref: TaskRef) {
-    if self.slots.get(task_ref.index).is_none() {
-      return;
+  /// Inserts the queue entry a wake won from an idle task word, without the
+  /// slot mutex. The word belongs to the task object, and the slot is not
+  /// released while the word holds a queue entry or a turn, so the index
+  /// still names that task here; a finished task's word is `COMPLETE` and
+  /// never wins an entry again.
+  pub(super) fn enqueue_woken(&self, shared: &Shared, task_ref: TaskRef) {
+    if task_ref.index < self.slots.len() {
+      self.push_ready(shared, task_ref.index, ReadyInsertion::Publish);
     }
-    let inserted = {
-      let mut slot = self.slot(task_ref.index);
-      if !slot.protocol.matches(task_ref.generation) || slot.task.is_none() {
+  }
+
+  /// Wakes by reference, checking the generation under the slot mutex.
+  #[cfg(test)]
+  pub(super) fn wake(&self, shared: &Shared, task_ref: TaskRef) {
+    let Some(cell) = self.slots.get(task_ref.index) else {
+      return;
+    };
+    let task = {
+      let slot = lock(&cell.state, 2);
+      if !slot.protocol.matches(task_ref.generation) {
         return;
       }
-      slot.protocol.wake()
+      slot.task.clone()
     };
-    if inserted {
-      self.push_ready(shared, task_ref.index, ReadyInsertion::Publish);
+    if let Some(task) = task
+      && task.poll_word().notify() == PollNotify::Enqueue
+    {
+      self.enqueue_woken(shared, task_ref);
     }
   }
 
@@ -697,14 +714,19 @@ impl Distributed {
         return;
       }
       self.links[index].cleanup.store(true, Ordering::SeqCst);
-      let inserted = slot.protocol.abort();
-      if slot.task.is_none() {
+      slot.protocol.abort();
+      let Some(task) = slot.task.as_ref() else {
         // Publication installs the task with the admission; only a fixture
         // admits a slot without one, and it has nothing to route.
         return;
-      }
-      let unlinked = if !inserted
-        && slot.protocol.aborting_queued()
+      };
+      // The wake RMW decides the route. An idle task's entry is won here
+      // and goes straight to cleanup. A running task gains `NOTIFIED`, so
+      // its finish requeues it and dispatch then selects cancellation. A
+      // queued entry stays where it is unless it waits on a scope quota.
+      let notified = task.poll_word().notify();
+      let inserted = notified == PollNotify::Enqueue;
+      let unlinked = if notified == PollNotify::Queued
         && let Some(cell) = slot.scope_cell(shared)
         && cell.binding
       {
@@ -814,14 +836,13 @@ impl Distributed {
       generation: slot.protocol.generation(),
     };
     let reserved = std::mem::take(&mut slot.reserved_permit);
-    if slot.protocol.aborting_queued() {
+    if slot.protocol.aborting() {
       let cell = if reserved {
         Some(Arc::clone(slot.scope_cell(shared)?))
       } else {
         None
       };
-      let began = slot.protocol.begin_poll();
-      debug_assert_eq!(began, Some(true));
+      task.poll_word().begin();
       drop(slot);
       if let Some(cell) = cell {
         self.release_permit(shared, &cell);
@@ -854,8 +875,8 @@ impl Distributed {
     } else {
       PermitRelease::Free
     };
-    let began = slot.protocol.begin_poll();
-    debug_assert_eq!(began, Some(false));
+    // The dequeued entry becomes this poll; wakes from here on set
+    // `NOTIFIED` on the running word.
     task.poll_word().begin();
     Some(Selected::Poll(
       task_ref,
@@ -867,42 +888,35 @@ impl Distributed {
     ))
   }
 
-  fn finish_poll(&self, shared: &Arc<Shared>, task_ref: TaskRef, ready: bool) {
+  /// Ends a poll. A pending poll changes only the task's word: it goes idle,
+  /// or, when woken or aborted during the poll, keeps the queue entry this
+  /// finish then inserts; dispatch reads any abort under the slot mutex. A
+  /// completed poll releases the slot under its mutex.
+  fn finish_poll(
+    &self,
+    shared: &Arc<Shared>,
+    task_ref: TaskRef,
+    task: &Pin<Arc<dyn ErasedTask>>,
+    ready: bool,
+  ) {
+    if !ready {
+      if task.poll_word().finish_pending() {
+        self.push_ready(shared, task_ref.index, ReadyInsertion::PollRequeue);
+      }
+      return;
+    }
     let mut slot = self.slot(task_ref.index);
     if !slot.protocol.matches(task_ref.generation) || slot.task.is_none() {
       return;
     }
-    if slot
-      .task
-      .as_ref()
-      .is_some_and(|task| task.poll_word().finish())
-    {
-      let inserted = slot.protocol.wake();
-      debug_assert!(!inserted);
-    }
-    match slot.protocol.finish_poll(ready) {
-      PollFinish::Complete => {
-        let task = slot.task.take();
-        let scope = slot.scope.take();
-        let cell = slot.cell.take();
-        let reusable = slot.protocol.next_generation().is_some();
-        drop(slot);
-        self.complete(shared, task_ref.index, reusable, task, scope, cell);
-      }
-      PollFinish::CancelCleanup => {
-        let task = slot.task.clone();
-        drop(slot);
-        if let Some(task) = task {
-          task.as_ref().cancel();
-          self.finish_cancel(shared, task_ref, task);
-        }
-      }
-      PollFinish::Requeue => {
-        drop(slot);
-        self.push_ready(shared, task_ref.index, ReadyInsertion::PollRequeue);
-      }
-      PollFinish::Idle | PollFinish::Stale => {}
-    }
+    task.poll_word().complete();
+    slot.protocol.release();
+    let task = slot.task.take();
+    let scope = slot.scope.take();
+    let cell = slot.cell.take();
+    let reusable = slot.protocol.next_generation().is_some();
+    drop(slot);
+    self.complete(shared, task_ref.index, reusable, task, scope, cell);
   }
 
   fn finish_cancel(&self, shared: &Arc<Shared>, task_ref: TaskRef, task: Pin<Arc<dyn ErasedTask>>) {
@@ -913,7 +927,8 @@ impl Distributed {
     let slot_task = slot.task.take();
     let scope = slot.scope.take();
     let cell = slot.cell.take();
-    slot.protocol.finish_cancel();
+    task.poll_word().complete();
+    slot.protocol.release();
     let reusable = slot.protocol.next_generation().is_some();
     drop(slot);
     self.complete(shared, task_ref.index, reusable, slot_task, scope, cell);
@@ -1585,7 +1600,7 @@ impl Distributed {
           };
           drop(permit.as_mut().and_then(PollPermit::take_cpu_ticket));
           drop(permit);
-          self.finish_poll(shared, task_ref, matches!(result, PollResult::Ready));
+          self.finish_poll(shared, task_ref, &task, matches!(result, PollResult::Ready));
         }
       }
       seat.turn = Some(match handoff::leave_turn() {

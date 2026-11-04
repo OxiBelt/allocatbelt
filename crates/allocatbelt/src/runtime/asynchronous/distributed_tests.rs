@@ -174,7 +174,12 @@ fn run(shared: &Arc<Shared>, work: Selected) {
         .as_ref()
         .poll(&mut Context::from_waker(Waker::noop()), permit);
       drop(permit);
-      d.finish_poll(shared, reference, matches!(result, PollResult::Ready));
+      d.finish_poll(
+        shared,
+        reference,
+        &task,
+        matches!(result, PollResult::Ready),
+      );
     }
   }
 }
@@ -784,7 +789,8 @@ fn single_stolen_cleanup_entry_moves_to_overflow_and_is_cancelled_case() {
   {
     let mut slot = d.slot(index);
     d.links[index].cleanup.store(true, Ordering::SeqCst);
-    assert!(!slot.protocol.abort());
+    // The entry stays queued on the word, so this abort routes nothing.
+    assert!(slot.protocol.abort());
   }
   assert_eq!(d.try_steal(&shared, 0, &mut 1), None);
   assert!(d.lane(0).check(&d.links).is_empty());
@@ -1042,7 +1048,11 @@ fn check_distributed(shared: &Shared) {
             slot
               .scope_cell(shared)
               .is_some_and(|owner| Arc::ptr_eq(owner, cell))
-              && (slot.reserved_permit || slot.protocol.is_running())
+              && (slot.reserved_permit
+                || slot
+                  .task
+                  .as_ref()
+                  .is_some_and(|task| task.poll_word().flags().0))
           })
           .count();
         assert_eq!(dispatch.active(), active);
@@ -1060,7 +1070,13 @@ fn check_distributed(shared: &Shared) {
     admitted += usize::from(slot.protocol.admitted());
     assert_eq!(
       count,
-      usize::from(slot.protocol.is_queued() && !slot.protocol.is_running())
+      usize::from(
+        slot.protocol.admitted()
+          && slot
+            .task
+            .as_ref()
+            .is_some_and(|task| task.poll_word().is_queued())
+      )
     );
     if !slot.protocol.admitted() && slot.protocol.next_generation().is_some() {
       free.push(index);
@@ -1075,11 +1091,11 @@ fn check_distributed(shared: &Shared) {
 }
 
 #[test]
-fn pending_self_yields_take_zero_global_two_slot_and_two_lane_locks() {
-  each_spin_configuration(pending_self_yields_take_zero_global_two_slot_and_two_lane_locks_case);
+fn pending_self_yields_take_zero_global_one_slot_and_two_lane_locks() {
+  each_spin_configuration(pending_self_yields_take_zero_global_one_slot_and_two_lane_locks_case);
 }
 
-fn pending_self_yields_take_zero_global_two_slot_and_two_lane_locks_case() {
+fn pending_self_yields_take_zero_global_one_slot_and_two_lane_locks_case() {
   let runtime = runtime(1, 1);
   let shared = Arc::clone(&runtime.shared);
   let mut previous = None;
@@ -1094,7 +1110,7 @@ fn pending_self_yields_take_zero_global_two_slot_and_two_lane_locks_case() {
         d.lane_locks.load(Ordering::Relaxed),
       );
       if let Some((g, s, l)) = previous {
-        assert_eq!((counts.0 - g, counts.1 - s, counts.2 - l), (0, 2, 2));
+        assert_eq!((counts.0 - g, counts.1 - s, counts.2 - l), (0, 1, 2));
       }
       previous = Some(counts);
       polls += 1;
@@ -1172,7 +1188,7 @@ fn reservation_unwind_drops_the_future_before_releasing_admission() {
   {
     let mut slot = engine(&shared).slot(0);
     slot.protocol.admit(u64::MAX - 1);
-    slot.protocol.finish_cancel();
+    slot.protocol.release();
   }
   shared.set_spawn_reserved_test_hook(Arc::new(|| panic!("injected allocation failure")));
   let drops = Arc::new(AtomicUsize::new(0));
@@ -1226,20 +1242,23 @@ fn spawn_wake_completion_and_steal_lock_counts_case() {
     _ => panic!(),
   };
   run(&shared, work);
+  let task = d.slot(reference.index).task.clone().unwrap();
   let before = (
     shared.lock_acquisitions.load(Ordering::Relaxed),
     d.slot_locks.load(Ordering::Relaxed),
     d.lane_locks.load(Ordering::Relaxed),
   );
-  d.wake(&shared, reference);
+  // An idle wake wins the queue entry on the task word: no slot lock.
+  Shared::wake_task(&Arc::downgrade(&shared), task.poll_word(), reference);
   assert_eq!(
     (
       shared.lock_acquisitions.load(Ordering::Relaxed) - before.0,
       d.slot_locks.load(Ordering::Relaxed) - before.1,
       d.lane_locks.load(Ordering::Relaxed) - before.2
     ),
-    (0, 1, 1)
+    (0, 0, 1)
   );
+  drop(task);
   shared.abort(reference);
   let work = selected(&shared, 0)
     .or_else(|| selected(&shared, 1))
@@ -2713,7 +2732,7 @@ fn exhausted_task_generation_is_skipped_without_hiding_other_slots_case() {
   {
     let mut slot = d.slot(0);
     slot.protocol.admit(u64::MAX);
-    slot.protocol.finish_cancel();
+    slot.protocol.release();
   }
   let job = shared.spawn(root, async { 7 }).unwrap();
   assert_eq!(d.slot(0).protocol.generation(), u64::MAX);
@@ -2737,7 +2756,7 @@ fn all_exhausted_task_generations_return_full_without_admission_case() {
   for index in 0..2 {
     let mut slot = d.slot(index);
     slot.protocol.admit(u64::MAX);
-    slot.protocol.finish_cancel();
+    slot.protocol.release();
   }
   let error = shared
     .spawn(root, std::future::pending::<()>())
@@ -2824,9 +2843,12 @@ fn running_wakes_coalesce_and_stale_generations_do_not_wake_reused_slots_case() 
   }
   assert_eq!(task.poll_word().flags(), (true, true));
   run(&shared, work);
-  assert_eq!(task.poll_word().flags(), (false, false));
+  // The pending finish kept `NOTIFIED` for the one requeued entry.
+  assert_eq!(task.poll_word().flags(), (false, true));
+  assert!(old_task.poll_word().is_complete());
   check_distributed(&shared);
   run(&shared, selected(&shared, 0).unwrap());
+  assert_eq!(task.poll_word().flags(), (false, false));
   wake(&old_task, old);
   assert!(selected(&shared, 0).is_none());
   shared.abort(current);
@@ -3277,4 +3299,218 @@ fn metrics_handle_reads_the_admission_count_and_unbinds_with_the_scheduler() {
   drop(shared);
   assert!(!metrics.admission_bound());
   assert_eq!(metrics.num_alive_tasks(), 0);
+}
+
+/// A pending future the test completes by setting its flag.
+fn gated(open: &Arc<AtomicBool>) -> impl Future<Output = ()> + Send + 'static {
+  let open = Arc::clone(open);
+  std::future::poll_fn(move |_| {
+    if open.load(Ordering::Acquire) {
+      Poll::Ready(())
+    } else {
+      Poll::Pending
+    }
+  })
+}
+
+fn poll_reference(work: &Selected) -> (TaskRef, Pin<Arc<dyn ErasedTask>>) {
+  match work {
+    Selected::Poll(reference, task, _) => (*reference, task.clone()),
+    Selected::Cancel(..) => panic!("expected a poll"),
+  }
+}
+
+#[test]
+fn wakes_racing_a_pending_finish_leave_exactly_one_entry() {
+  let (shared, root) = shared(config(1, 1));
+  for round in 0..500 {
+    let open = Arc::new(AtomicBool::new(false));
+    let job = shared.spawn(root, gated(&open)).unwrap();
+    let work = selected(&shared, 0).unwrap();
+    let (reference, task) = poll_reference(&work);
+    let waker = {
+      let shared = Arc::downgrade(&shared);
+      let task = task.clone();
+      std::thread::spawn(move || {
+        for _ in 0..1 + round % 3 {
+          Shared::wake_task(&shared, task.poll_word(), reference);
+        }
+      })
+    };
+    run(&shared, work);
+    waker.join().unwrap();
+    // Requeued by the finish or by an idle wake, never both or neither.
+    assert_eq!(task.poll_word().flags(), (false, true));
+    check_distributed(&shared);
+    open.store(true, Ordering::Release);
+    run(&shared, selected(&shared, 0).unwrap());
+    finish(job).unwrap();
+    assert!(task.poll_word().is_complete());
+    assert!(selected(&shared, 0).is_none());
+    check_distributed(&shared);
+  }
+}
+
+#[test]
+fn external_wakes_racing_running_polls_are_never_lost() {
+  const WAKERS: usize = 4;
+  const WAKES: usize = 2_000;
+  let runtime = runtime(2, 4);
+  let tokens = Arc::new(AtomicUsize::new(0));
+  let consumed = Arc::new(AtomicUsize::new(0));
+  let (tx, rx) = mpsc::channel::<Waker>();
+  let job = {
+    let tokens = Arc::clone(&tokens);
+    let consumed = Arc::clone(&consumed);
+    let mut tx = Some(tx);
+    runtime
+      .handle()
+      .spawn(std::future::poll_fn(move |cx| {
+        if let Some(tx) = tx.take() {
+          for _ in 0..WAKERS {
+            tx.send(cx.waker().clone()).unwrap();
+          }
+        }
+        let taken = tokens.swap(0, Ordering::AcqRel);
+        if consumed.fetch_add(taken, Ordering::AcqRel) + taken == WAKERS * WAKES {
+          Poll::Ready(())
+        } else {
+          Poll::Pending
+        }
+      }))
+      .unwrap()
+  };
+  let wakers: Vec<_> = (0..WAKERS)
+    .map(|_| {
+      let waker = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+      let tokens = Arc::clone(&tokens);
+      std::thread::spawn(move || {
+        for _ in 0..WAKES {
+          tokens.fetch_add(1, Ordering::AcqRel);
+          waker.wake_by_ref();
+        }
+      })
+    })
+    .collect();
+  for waker in wakers {
+    waker.join().unwrap();
+  }
+  // A lost wake would leave the last tokens unconsumed and the task idle.
+  finish(job).unwrap();
+  assert_eq!(consumed.load(Ordering::Acquire), WAKERS * WAKES);
+  shutdown(runtime, AsyncShutdown::Drain);
+}
+
+#[test]
+fn abort_while_running_requeues_to_cleanup_and_cancels_on_dispatch() {
+  let (shared, root) = shared(config(1, 1));
+  let open = Arc::new(AtomicBool::new(false));
+  let job = shared.spawn(root, gated(&open)).unwrap();
+  let work = selected(&shared, 0).unwrap();
+  let (reference, task) = poll_reference(&work);
+  shared.abort(reference);
+  // Abort only marked the running word; the slot stays admitted.
+  assert_eq!(task.poll_word().flags(), (true, true));
+  assert!(engine(&shared).slot(reference.index).protocol.aborting());
+  // Ready output after the abort would win; keep the poll pending.
+  run(&shared, work);
+  let d = engine(&shared);
+  assert_eq!(lock(&d.overflow, 4).check(&d.links), [reference.index]);
+  assert!(d.lane(0).check(&d.links).is_empty());
+  check_distributed(&shared);
+  match selected(&shared, 0).unwrap() {
+    work @ Selected::Cancel(..) => run(&shared, work),
+    Selected::Poll(..) => panic!("aborted task was polled again"),
+  }
+  assert!(matches!(finish(job), Err(AsyncJoinError::Cancelled)));
+  assert!(task.poll_word().is_complete());
+  Shared::wake_task(&Arc::downgrade(&shared), task.poll_word(), reference);
+  assert!(selected(&shared, 0).is_none());
+  check_distributed(&shared);
+}
+
+#[test]
+fn abort_of_idle_task_racing_wake_inserts_one_entry_and_cancels() {
+  let (shared, root) = shared(config(1, 1));
+  for _ in 0..500 {
+    let open = Arc::new(AtomicBool::new(false));
+    let job = shared.spawn(root, gated(&open)).unwrap();
+    let work = selected(&shared, 0).unwrap();
+    let (reference, task) = poll_reference(&work);
+    run(&shared, work);
+    assert_eq!(task.poll_word().flags(), (false, false));
+    let start = Arc::new(std::sync::Barrier::new(2));
+    let waker = {
+      let shared = Arc::downgrade(&shared);
+      let task = task.clone();
+      let start = Arc::clone(&start);
+      std::thread::spawn(move || {
+        start.wait();
+        Shared::wake_task(&shared, task.poll_word(), reference);
+      })
+    };
+    start.wait();
+    shared.abort(reference);
+    waker.join().unwrap();
+    assert!(task.poll_word().is_queued());
+    check_distributed(&shared);
+    match selected(&shared, 0).unwrap() {
+      work @ Selected::Cancel(..) => run(&shared, work),
+      Selected::Poll(..) => panic!("aborted task was polled again"),
+    }
+    assert!(matches!(finish(job), Err(AsyncJoinError::Cancelled)));
+    assert!(selected(&shared, 0).is_none());
+    check_distributed(&shared);
+  }
+}
+
+#[test]
+fn drain_close_counts_notified_tasks_that_have_not_begun() {
+  let (shared, root) = shared(config(1, 2));
+  let d = engine(&shared);
+  let open = Arc::new(AtomicBool::new(false));
+  let woken = shared.spawn(root, gated(&open)).unwrap();
+  let work = selected(&shared, 0).unwrap();
+  let (reference, task) = poll_reference(&work);
+  run(&shared, work);
+  // One task woken after an idle finish, one never dispatched.
+  Shared::wake_task(&Arc::downgrade(&shared), task.poll_word(), reference);
+  let fresh = shared.spawn(root, async { 7 }).unwrap();
+  open.store(true, Ordering::Release);
+  shared.close(false);
+  assert_eq!(shared.lock().admitted, 2);
+  assert!(!d.closed_empty.load(Ordering::Acquire));
+  run(&shared, selected(&shared, 0).unwrap());
+  assert!(!d.closed_empty.load(Ordering::Acquire));
+  run(&shared, selected(&shared, 0).unwrap());
+  finish(woken).unwrap();
+  assert_eq!(finish(fresh).unwrap(), 7);
+  assert_eq!(shared.lock().admitted, 0);
+  assert!(d.closed_empty.load(Ordering::Acquire));
+  check_distributed(&shared);
+}
+
+#[test]
+fn cancel_close_cancels_notified_tasks_that_have_not_begun() {
+  let (shared, root) = shared(config(1, 2));
+  let d = engine(&shared);
+  let open = Arc::new(AtomicBool::new(false));
+  let woken = shared.spawn(root, gated(&open)).unwrap();
+  let work = selected(&shared, 0).unwrap();
+  let (reference, task) = poll_reference(&work);
+  run(&shared, work);
+  Shared::wake_task(&Arc::downgrade(&shared), task.poll_word(), reference);
+  let fresh = shared.spawn(root, async { 7 }).unwrap();
+  shared.close(true);
+  assert_eq!(shared.lock().admitted, 2);
+  for _ in 0..2 {
+    match selected(&shared, 0).unwrap() {
+      work @ Selected::Cancel(..) => run(&shared, work),
+      Selected::Poll(..) => panic!("cancelled close polled a queued task"),
+    }
+  }
+  assert!(matches!(finish(woken), Err(AsyncJoinError::Cancelled)));
+  assert!(matches!(finish(fresh), Err(AsyncJoinError::Cancelled)));
+  assert!(d.closed_empty.load(Ordering::Acquire));
+  check_distributed(&shared);
 }

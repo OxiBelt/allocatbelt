@@ -1131,14 +1131,20 @@ after any in-flight poll returns. Owned scopes cancel their children on drop;
 `close` waits for cleanup, result publication and scope-slot reclamation.
 Future cleanup and admission release precede join publication. Scheduler locks
 never cover user polling, destructors or completion callbacks. Generation tags
-make retained stale wakers harmless without retaining completed futures.
-A wake of a task whose poll is running, including its own, sets only the
-notified bit in that task object's running/notified atomic word, without
-taking the task slot mutex or upgrading the scheduler reference. Completion
-takes that notification under the slot mutex as its one pending wake.
-The task object is never reused: a retained stale waker owns the old object's
-word even after its slot is reused. Other wakes take the slot mutex and check
-the full generation there; abort and cancellation also stay under that mutex.
+make retained stale abort handles harmless without retaining completed futures.
+Each task object has one atomic word with running, notified and complete
+bits; a notified task that is not running owns exactly one queue entry. A
+wake is one read-modify-write on that word and takes no slot mutex: if it
+finds the task idle it inserts the queue entry; if the task is running it
+leaves the notified bit for the poll's finish; a queued or complete task is
+unchanged. A pending poll's finish is also one word operation without the
+slot mutex: it goes idle, or, when notified during the poll, requeues the
+task through the usual lane choice. Dispatch, completion and cancellation
+cleanup take the slot mutex, where the generation, admission and abort
+state live; abort marks the word like a wake, so a running task is requeued
+by its finish and the next dispatch selects cleanup. The task object is
+never reused, and completion marks its word complete before the slot is
+released, so a retained stale waker cannot queue a reused slot.
 The task allocation is a pinned `sys` cell (`Pin<Arc<TaskCell>>`) that
 stores the user future inline next to the runtime's bookkeeping; its atomic
 claim serializes polling and in-place destruction, and its pinned-only API is

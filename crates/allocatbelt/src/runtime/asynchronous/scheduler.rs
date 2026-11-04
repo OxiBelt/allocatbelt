@@ -22,7 +22,7 @@ use super::handoff_protocol::{DispatchTurn, HandoffLoan};
 use super::identity;
 use super::join::AsyncJob;
 use super::metrics::{Padded, RuntimeMetrics};
-use super::protocol::{PollFinish, PollProtocol, PollWord, ScopeProtocol};
+use super::protocol::{PollNotify, PollWord, ScopeProtocol, SlotProtocol};
 use super::task::{DomainCpuAdmission, ErasedTask, PollResult, Task};
 use super::thread_options::AsyncThreadContext;
 #[cfg(all(test, not(loom)))]
@@ -672,11 +672,14 @@ impl Shared {
     self.distributed.wake(self, task_ref);
   }
 
+  /// The task waker: one RMW on the task's word, and a queue insertion only
+  /// when that RMW found the task idle. No slot mutex. A wake that won the
+  /// entry after the runtime was dropped has nothing left to queue.
   pub(super) fn wake_task(shared: &Weak<Self>, word: &PollWord, task_ref: TaskRef) {
-    if !word.notify_running()
+    if word.notify() == PollNotify::Enqueue
       && let Some(shared) = shared.upgrade()
     {
-      shared.distributed.wake(&shared, task_ref);
+      shared.distributed.enqueue_woken(&shared, task_ref);
     }
   }
 
