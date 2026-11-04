@@ -1625,7 +1625,10 @@ It establishes no p99 result; use the separate paced latency lane for tails.
 The harness notifies its event queue and capacity window only while a thread
 waits on them (`--harness-notify waiting`, the default); `--harness-notify
 always` restores a notification on every event, which adds a wake system call
-per event to both executors' measurements. `--executor inline` (async lane)
+per event to both executors' measurements. `--harness-observer-spin N`
+(default 0) makes the observer spin up to N rounds of 64 spin-loop hints on an
+empty event queue before it sleeps, so executors can be compared without the
+harness's own sleep and wake cost. `--executor inline` (async lane)
 runs every future to completion on the producer thread and measures the
 harness alone. `--pin-workers CPUS` pins each executor thread to one CPU by
 its construction index, and `--pin-harness CPU,CPU` pins the producer and

@@ -36,6 +36,8 @@ const MAX_COUNT: usize = 1_000_000;
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
 const CSV_HEADER: &str = "allocator,lane,workload,mode,executor,workers,admission_window,arrival_rate,bytes,requested,attempted,completed,dropped,checksum,elapsed_ns,throughput_per_s,timer_overhead_ns,p50_ns,p95_ns,p99_ns,arrival_lateness_mean_ns,arrival_lateness_max_ns";
 const EVENT_BATCH: usize = 64;
+/// Spin-loop hints in one `--harness-observer-spin` round.
+const OBSERVER_SPIN_HINTS: usize = 64;
 const ASYNC_YIELD_ROUNDS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,6 +201,8 @@ impl PinFailures {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct HarnessOptions {
   notify: NotifyPolicy,
+  /// Rounds the observer spins on an empty event queue before it waits.
+  observer_spin: u32,
   pins: Option<HarnessPins>,
 }
 
@@ -274,6 +278,7 @@ impl Options {
     let mut workers_explicit = false;
     let mut arrival_rate_explicit = false;
     let mut harness_notify = None;
+    let mut observer_spin = None;
     let mut pin_workers = None;
     let mut pin_harness = None;
     let mut args = args.into_iter();
@@ -334,6 +339,12 @@ impl Options {
           })
         }
         "--harness-notify" => harness_notify = Some(NotifyPolicy::parse(&value()?)?),
+        "--harness-observer-spin" => {
+          observer_spin = Some(
+            u32::try_from(parse_u64(&arg, &value()?)?)
+              .map_err(|_| format!("{arg} must be at most {}", u32::MAX))?,
+          );
+        }
         "--pin-workers" => pin_workers = Some(parse_cpu_list(&arg, &value()?)?),
         "--pin-harness" => {
           pin_harness = Some(match parse_cpu_list(&arg, &value()?)?.as_slice() {
@@ -422,6 +433,9 @@ impl Options {
     }
     if harness_notify.is_some() && lane == Lane::Allocator {
       return Err("--harness-notify applies only to --lane blocking or async".to_owned());
+    }
+    if observer_spin.is_some() && lane == Lane::Allocator {
+      return Err("--harness-observer-spin applies only to --lane blocking or async".to_owned());
     }
     if pin_harness.is_some() && lane != Lane::Async {
       return Err("--pin-harness applies only to --lane async".to_owned());
@@ -530,6 +544,7 @@ impl Options {
       max_searchers,
       harness: HarnessOptions {
         notify: harness_notify.unwrap_or_default(),
+        observer_spin: observer_spin.unwrap_or_default(),
         pins: pin_harness,
       },
       pin_workers: pin_workers.map(Arc::from),
@@ -552,7 +567,7 @@ fn usage() -> &'static str {
   "usage: bench-latency-* --lane allocator|blocking|async [--workload local|aligned|mixed|ready|yielding|head-of-line|handoff] \\
    [--mode latency|throughput|capacity] [--executor bounded|tokio|inline] [--ops N|--jobs N] \\
    [--workers N] [--arrival-rate JOBS_PER_SECOND] [--window N] [--bytes N] [--block-us N] [--handoffs N] [--park-spin fixed:N] [--max-spinners K] [--max-searchers K] \\
-   [--harness-notify always|waiting] [--pin-workers CPUS] [--pin-harness CPU,CPU]\n\n   The bounded async executor uses distributed dispatch.\n   --executor inline (async lane only) runs every future to completion on the producer thread, measuring the harness without an executor.\n   --harness-notify waiting (the default) notifies the harness event queue and capacity window only while a thread waits on them; always notifies on every event, as earlier releases of this harness did.\n   --pin-workers pins each executor thread (bounded: workers then handoff helpers; tokio: workers) to one CPU by its index; CPUS is a comma list of ids or ranges such as 2-5,8. --pin-harness pins the producer and observer threads. Linux only."
+   [--harness-notify always|waiting] [--harness-observer-spin N] [--pin-workers CPUS] [--pin-harness CPU,CPU]\n\n   The bounded async executor uses distributed dispatch.\n   --executor inline (async lane only) runs every future to completion on the producer thread, measuring the harness without an executor.\n   --harness-notify waiting (the default) notifies the harness event queue and capacity window only while a thread waits on them; always notifies on every event, as earlier releases of this harness did.\n   --harness-observer-spin N (default 0) makes the observer spin up to N rounds of 64 spin-loop hints on an empty event queue before it sleeps, so the producer rarely pays a wake; use it to compare executors without the harness's own sleep and wake cost.\n   --pin-workers pins each executor thread (bounded: workers then handoff helpers; tokio: workers) to one CPU by its index; CPUS is a comma list of ids or ranges such as 2-5,8. --pin-harness pins the producer and observer threads. Linux only."
 }
 
 /// The workers column: inline runs have no executor threads.
@@ -829,6 +844,7 @@ struct EventQueue {
   wake: Condvar,
   capacity: usize,
   notify: NotifyPolicy,
+  observer_spin: u32,
 }
 
 impl EventQueue {
@@ -837,7 +853,18 @@ impl EventQueue {
     Self::with_notify(jobs, NotifyPolicy::Always)
   }
 
+  #[cfg(test)]
   fn with_notify(jobs: usize, notify: NotifyPolicy) -> Result<Arc<Self>, String> {
+    Self::with_harness(
+      jobs,
+      HarnessOptions {
+        notify,
+        ..HarnessOptions::default()
+      },
+    )
+  }
+
+  fn with_harness(jobs: usize, harness: HarnessOptions) -> Result<Arc<Self>, String> {
     let capacity = jobs
       .checked_mul(2)
       .and_then(|n| n.checked_add(1))
@@ -856,7 +883,8 @@ impl EventQueue {
       }),
       wake: Condvar::new(),
       capacity,
-      notify,
+      notify: harness.notify,
+      observer_spin: harness.observer_spin,
     }))
   }
 
@@ -918,6 +946,18 @@ impl EventQueue {
   fn drain(&self, batch: &mut Vec<ObserverEvent>, timeout: Duration) -> Result<(), String> {
     batch.clear();
     let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+    // Spinning with the mutex released lets a producer push without paying a
+    // wake; each round re-checks the state the wait below would observe.
+    for _ in 0..self.observer_spin {
+      if !state.queue.is_empty() || state.failure.is_some() || state.closed {
+        break;
+      }
+      drop(state);
+      for _ in 0..OBSERVER_SPIN_HINTS {
+        std::hint::spin_loop();
+      }
+      state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+    }
     if let Some(failure) = &state.failure {
       return Err(failure.clone());
     }
@@ -1616,7 +1656,7 @@ fn run_blocking(allocator: &str, o: &Options, overhead: u64) -> Result<(), Strin
   } else {
     Vec::new()
   };
-  let events = EventQueue::with_notify(o.count, o.harness.notify)?;
+  let events = EventQueue::with_harness(o.count, o.harness)?;
   let mut slots: Vec<Option<(Handle, Instant)>> =
     std::iter::repeat_with(|| None).take(o.count).collect();
   let mut wakers = Vec::with_capacity(o.count);
@@ -1834,7 +1874,7 @@ fn run_async(allocator: &str, o: &Options, overhead: u64) -> Result<(), String> 
   } else {
     Vec::new()
   };
-  let events = EventQueue::with_notify(o.count, o.harness.notify)?;
+  let events = EventQueue::with_harness(o.count, o.harness)?;
   let mut slots: Vec<Option<(Handle, Instant)>> =
     std::iter::repeat_with(|| None).take(o.count).collect();
   let mut wakers = Vec::with_capacity(o.count);
@@ -2278,7 +2318,7 @@ where
     pin_current_thread(pins.observer)?;
   }
   let producer_cpu = harness.pins.map(|pins| pins.producer);
-  let events = EventQueue::with_notify(count, harness.notify)?;
+  let events = EventQueue::with_harness(count, harness)?;
   let mut slots: Vec<Option<Handle>> = std::iter::repeat_with(|| None).take(count).collect();
   let mut wakers = Vec::with_capacity(count);
   for id in 0..count {
@@ -3788,6 +3828,58 @@ mod harness_tests {
   }
 
   #[test]
+  fn parser_validates_harness_observer_spin() {
+    for lane_args in [
+      &["--lane", "blocking", "--executor", "bounded"][..],
+      &["--lane", "async", "--executor", "tokio"],
+      &[
+        "--lane",
+        "async",
+        "--executor",
+        "inline",
+        "--mode",
+        "capacity",
+      ],
+    ] {
+      assert_eq!(parse(lane_args).unwrap().harness.observer_spin, 0);
+      for (value, expected) in [("0", 0), ("64", 64), ("4294967295", u32::MAX)] {
+        let args: Vec<_> = lane_args
+          .iter()
+          .copied()
+          .chain(["--harness-observer-spin", value])
+          .collect();
+        assert_eq!(
+          parse(&args).unwrap().harness.observer_spin,
+          expected,
+          "{args:?}"
+        );
+      }
+      for value in ["", "-1", "1.5", "x", "4294967296"] {
+        let args: Vec<_> = lane_args
+          .iter()
+          .copied()
+          .chain(["--harness-observer-spin", value])
+          .collect();
+        assert!(parse(&args).is_err(), "{args:?}");
+      }
+    }
+    assert!(
+      parse(&[
+        "--lane",
+        "async",
+        "--executor",
+        "bounded",
+        "--harness-observer-spin"
+      ])
+      .is_err()
+    );
+    assert_eq!(
+      parse(&["--lane", "allocator", "--harness-observer-spin", "8"]).unwrap_err(),
+      "--harness-observer-spin applies only to --lane blocking or async"
+    );
+  }
+
+  #[test]
   fn parser_validates_cpu_pins() {
     assert_eq!(parse_cpu_list("--pin-workers", "3").unwrap(), [3]);
     assert_eq!(
@@ -3947,6 +4039,51 @@ mod harness_tests {
 
   // A lost wakeup would stall one drain for its full timeout, which the
   // shorter completion deadline turns into a failure.
+  /// A zero timeout makes any condition wait return empty at once, so an
+  /// event pushed later reaches the batch only through the spin rounds.
+  #[test]
+  fn observer_spin_drains_events_pushed_while_spinning() {
+    let harness = HarnessOptions {
+      notify: NotifyPolicy::Waiting,
+      observer_spin: u32::MAX,
+      pins: None,
+    };
+    let events = EventQueue::with_harness(1, harness).unwrap();
+    let mut batch = Vec::new();
+    std::thread::scope(|scope| {
+      scope.spawn(|| {
+        std::thread::sleep(Duration::from_millis(20));
+        events.ready(0);
+      });
+      events.drain(&mut batch, Duration::ZERO).unwrap();
+    });
+    assert!(matches!(batch.as_slice(), [ObserverEvent::Ready(0)]));
+    assert_eq!(
+      events
+        .state
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .waiters,
+      0
+    );
+
+    let events = EventQueue::with_harness(1, harness).unwrap();
+    std::thread::scope(|scope| {
+      scope.spawn(|| {
+        std::thread::sleep(Duration::from_millis(20));
+        events.close("closed while spinning");
+      });
+      assert_eq!(
+        events.drain(&mut batch, Duration::ZERO).unwrap_err(),
+        "closed while spinning"
+      );
+    });
+
+    let events = EventQueue::with_notify(1, NotifyPolicy::Waiting).unwrap();
+    events.drain(&mut batch, Duration::ZERO).unwrap();
+    assert!(batch.is_empty());
+  }
+
   #[test]
   fn waiting_notify_wakes_a_registered_event_drainer() {
     const JOBS: usize = 4_096;
