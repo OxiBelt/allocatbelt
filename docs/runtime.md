@@ -1602,6 +1602,15 @@ arrival rate and reports `NA` for arrival rate, lateness, timer overhead and
 all percentiles. Its throughput includes submission and collection costs.
 It establishes no p99 result; use the separate paced latency lane for tails.
 
+The harness notifies its event queue and capacity window only while a thread
+waits on them (`--harness-notify waiting`, the default); `--harness-notify
+always` restores a notification on every event, which adds a wake system call
+per event to both executors' measurements. `--executor inline` (async lane)
+runs every future to completion on the producer thread and measures the
+harness alone. `--pin-workers CPUS` pins each executor thread to one CPU by
+its construction index, and `--pin-harness CPU,CPU` pins the producer and
+observer threads; both are fixed for the run and Linux only.
+
 `scripts/bench-latency.sh` supports these lanes and validates all 22 binary
 CSV fields, checksums and explicit worker/window/byte configuration. It
 alternates fresh-process comparator order and records source and binary

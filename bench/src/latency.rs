@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use allocatbelt::runtime::{
   Config, Resources, Runtime, ShutdownMode,
   asynchronous::{
-    AsyncConfig, AsyncHandle, AsyncRuntime, AsyncRuntimeOptions, AsyncShutdown,
+    AsyncConfig, AsyncHandle, AsyncRuntime, AsyncRuntimeOptions, AsyncShutdown, AsyncThreadOptions,
     BlockInPlaceErrorKind, HandoffConfig, ParkSpin, try_block_in_place,
   },
 };
@@ -67,6 +67,139 @@ enum Mode {
 enum ExecutorKind {
   Bounded,
   Tokio,
+  /// No executor: the producer runs each future to completion inline, so the
+  /// harness path is measured on its own.
+  Inline,
+}
+
+/// When the harness event queue and capacity window notify their condition
+/// variables. `Waiting` skips the notify, and its futex syscall, while no
+/// thread has registered as a waiter under the same mutex.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum NotifyPolicy {
+  Always,
+  #[default]
+  Waiting,
+}
+
+impl NotifyPolicy {
+  fn parse(value: &str) -> Result<Self, String> {
+    match value {
+      "always" => Ok(Self::Always),
+      "waiting" => Ok(Self::Waiting),
+      other => Err(format!(
+        "unknown --harness-notify {other:?} (always or waiting)"
+      )),
+    }
+  }
+
+  fn wakes(self, waiters: usize) -> bool {
+    match self {
+      Self::Always => true,
+      Self::Waiting => waiters > 0,
+    }
+  }
+}
+
+/// Fixed CPUs for the harness producer and observer threads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HarnessPins {
+  producer: usize,
+  observer: usize,
+}
+
+/// CPU ids a pinned thread may use; the parser bound matches Linux cpu_set_t.
+const MAX_PIN_CPU: usize = 1024;
+
+/// Parses `0,2-5,7` into the listed CPU ids, keeping order and repeats so
+/// the mapping from thread index to CPU stays exactly as written.
+fn parse_cpu_list(flag: &str, value: &str) -> Result<Vec<usize>, String> {
+  let cpu = |item: &str| -> Result<usize, String> {
+    let cpu = parse_usize(flag, item)?;
+    if cpu >= MAX_PIN_CPU {
+      return Err(format!("{flag} CPU {cpu} must be below {MAX_PIN_CPU}"));
+    }
+    Ok(cpu)
+  };
+  let mut cpus = Vec::new();
+  for item in value.split(',') {
+    match item.split_once('-') {
+      Some((first, last)) => {
+        let (first, last) = (cpu(first)?, cpu(last)?);
+        if first > last {
+          return Err(format!("{flag} range {item:?} must not descend"));
+        }
+        cpus.extend(first..=last);
+      }
+      None => cpus.push(cpu(item)?),
+    }
+  }
+  Ok(cpus)
+}
+
+/// Pins the calling thread to one CPU for the rest of its life.
+#[cfg(target_os = "linux")]
+fn pin_current_thread(cpu: usize) -> Result<(), String> {
+  use rustix::thread::{CpuSet, sched_setaffinity};
+  if cpu >= CpuSet::MAX_CPU {
+    return Err(format!("cannot pin to CPU {cpu}: above the affinity mask"));
+  }
+  let mut set = CpuSet::new();
+  set.set(cpu);
+  sched_setaffinity(None, &set).map_err(|error| format!("cannot pin to CPU {cpu}: {error}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread(cpu: usize) -> Result<(), String> {
+  Err(format!(
+    "cannot pin to CPU {cpu}: CPU pinning is supported only on Linux"
+  ))
+}
+
+/// Keeps the first pin failure reported from an executor thread-start hook,
+/// which cannot return an error itself.
+#[derive(Default)]
+struct PinFailures(Mutex<Option<String>>);
+
+impl PinFailures {
+  fn record(&self, error: String) {
+    self
+      .0
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .get_or_insert(error);
+  }
+
+  fn check(&self) -> Result<(), String> {
+    self
+      .0
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .clone()
+      .map_or(Ok(()), Err)
+  }
+
+  fn pin(&self, cpus: &[usize], index: usize) {
+    let result = cpus.get(index).map_or_else(
+      || {
+        Err(format!(
+          "executor thread {index} started beyond the {} CPUs of --pin-workers",
+          cpus.len()
+        ))
+      },
+      |&cpu| pin_current_thread(cpu),
+    );
+    if let Err(error) = result {
+      self.record(format!("executor thread {index}: {error}"));
+    }
+  }
+}
+
+/// Harness-side settings shared by the paced and capacity runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HarnessOptions {
+  notify: NotifyPolicy,
+  pins: Option<HarnessPins>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +248,8 @@ struct Options {
   park_spin: SpinPolicy,
   max_spinners: Option<usize>,
   max_searchers: Option<usize>,
+  harness: HarnessOptions,
+  pin_workers: Option<Arc<[usize]>>,
 }
 
 impl Options {
@@ -138,6 +273,9 @@ impl Options {
     let mut block_explicit = false;
     let mut workers_explicit = false;
     let mut arrival_rate_explicit = false;
+    let mut harness_notify = None;
+    let mut pin_workers = None;
+    let mut pin_harness = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
       let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
@@ -187,7 +325,24 @@ impl Options {
           executor = Some(match value()?.as_str() {
             "bounded" => ExecutorKind::Bounded,
             "tokio" => ExecutorKind::Tokio,
-            other => return Err(format!("unknown executor {other:?} (bounded or tokio)")),
+            "inline" => ExecutorKind::Inline,
+            other => {
+              return Err(format!(
+                "unknown executor {other:?} (bounded, tokio or inline)"
+              ));
+            }
+          })
+        }
+        "--harness-notify" => harness_notify = Some(NotifyPolicy::parse(&value()?)?),
+        "--pin-workers" => pin_workers = Some(parse_cpu_list(&arg, &value()?)?),
+        "--pin-harness" => {
+          pin_harness = Some(match parse_cpu_list(&arg, &value()?)?.as_slice() {
+            &[producer, observer] => HarnessPins { producer, observer },
+            _ => {
+              return Err(
+                "--pin-harness needs the producer and observer CPUs as CPU,CPU".to_owned(),
+              );
+            }
           })
         }
         "--ops" | "--jobs" => count = Some(parse_usize(&arg, &value()?)?),
@@ -257,7 +412,36 @@ impl Options {
       (Lane::Blocking | Lane::Async, None) => {
         return Err("--executor is required for --lane blocking or async".to_owned());
       }
+      (Lane::Blocking, Some(ExecutorKind::Inline)) => {
+        return Err("--executor inline applies only to --lane async".to_owned());
+      }
       _ => {}
+    }
+    if executor == Some(ExecutorKind::Inline) && workers_explicit {
+      return Err("--workers does not apply to --executor inline".to_owned());
+    }
+    if harness_notify.is_some() && lane == Lane::Allocator {
+      return Err("--harness-notify applies only to --lane blocking or async".to_owned());
+    }
+    if pin_harness.is_some() && lane != Lane::Async {
+      return Err("--pin-harness applies only to --lane async".to_owned());
+    }
+    if let Some(cpus) = &pin_workers {
+      let threads = match (lane, executor) {
+        (Lane::Async, Some(ExecutorKind::Bounded)) => workers + handoffs,
+        (Lane::Async, Some(ExecutorKind::Tokio)) => workers,
+        _ => {
+          return Err(
+            "--pin-workers applies only to --lane async --executor bounded or tokio".to_owned(),
+          );
+        }
+      };
+      if cpus.len() != threads {
+        return Err(format!(
+          "--pin-workers lists {} CPUs for {threads} executor threads",
+          cpus.len()
+        ));
+      }
     }
     if handoffs_explicit && (lane != Lane::Async || executor != Some(ExecutorKind::Bounded)) {
       return Err("--handoffs applies only to --lane async --executor bounded".to_owned());
@@ -344,6 +528,11 @@ impl Options {
       park_spin: park_spin.unwrap_or_default(),
       max_spinners,
       max_searchers,
+      harness: HarnessOptions {
+        notify: harness_notify.unwrap_or_default(),
+        pins: pin_harness,
+      },
+      pin_workers: pin_workers.map(Arc::from),
       lane,
       workload,
       mode,
@@ -361,8 +550,18 @@ impl Options {
 
 fn usage() -> &'static str {
   "usage: bench-latency-* --lane allocator|blocking|async [--workload local|aligned|mixed|ready|yielding|head-of-line|handoff] \\
-   [--mode latency|throughput|capacity] [--executor bounded|tokio] [--ops N|--jobs N] \\
-   [--workers N] [--arrival-rate JOBS_PER_SECOND] [--window N] [--bytes N] [--block-us N] [--handoffs N] [--park-spin fixed:N] [--max-spinners K] [--max-searchers K]\n\n   The bounded async executor uses distributed dispatch."
+   [--mode latency|throughput|capacity] [--executor bounded|tokio|inline] [--ops N|--jobs N] \\
+   [--workers N] [--arrival-rate JOBS_PER_SECOND] [--window N] [--bytes N] [--block-us N] [--handoffs N] [--park-spin fixed:N] [--max-spinners K] [--max-searchers K] \\
+   [--harness-notify always|waiting] [--pin-workers CPUS] [--pin-harness CPU,CPU]\n\n   The bounded async executor uses distributed dispatch.\n   --executor inline (async lane only) runs every future to completion on the producer thread, measuring the harness without an executor.\n   --harness-notify waiting (the default) notifies the harness event queue and capacity window only while a thread waits on them; always notifies on every event, as earlier releases of this harness did.\n   --pin-workers pins each executor thread (bounded: workers then handoff helpers; tokio: workers) to one CPU by its index; CPUS is a comma list of ids or ranges such as 2-5,8. --pin-harness pins the producer and observer threads. Linux only."
+}
+
+/// The workers column: inline runs have no executor threads.
+fn executor_workers(o: &Options) -> usize {
+  if o.executor == Some(ExecutorKind::Inline) {
+    0
+  } else {
+    o.workers
+  }
 }
 
 fn parse_u64(flag: &str, value: &str) -> Result<u64, String> {
@@ -570,11 +769,14 @@ enum Handle {
   Tokio(tokio::task::JoinHandle<u64>),
   BoundedAsync(allocatbelt::runtime::asynchronous::AsyncJob<u64>),
   TokioAsync(tokio::task::JoinHandle<u64>),
+  /// A future already run to completion on the submitting thread.
+  Inline(u64),
 }
 
 impl Handle {
   fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<u64, String>> {
     match self {
+      Self::Inline(value) => Poll::Ready(Ok(*value)),
       Self::Bounded(job) => Pin::new(job)
         .poll(cx)
         .map(|result| result.map_err(|error| format!("bounded join: {error}"))),
@@ -596,6 +798,7 @@ impl Handle {
       Self::Bounded(job) => job.is_finished(),
       Self::Tokio(job) | Self::TokioAsync(job) => job.is_finished(),
       Self::BoundedAsync(job) => job.is_finished(),
+      Self::Inline(_) => true,
     }
   }
 }
@@ -617,16 +820,24 @@ struct EventState {
   ready_queued: Vec<bool>,
   failure: Option<String>,
   closed: bool,
+  /// Threads registered under this mutex before waiting on `wake`.
+  waiters: usize,
 }
 
 struct EventQueue {
   state: Mutex<EventState>,
   wake: Condvar,
   capacity: usize,
+  notify: NotifyPolicy,
 }
 
 impl EventQueue {
+  #[cfg(test)]
   fn new(jobs: usize) -> Result<Arc<Self>, String> {
+    Self::with_notify(jobs, NotifyPolicy::Always)
+  }
+
+  fn with_notify(jobs: usize, notify: NotifyPolicy) -> Result<Arc<Self>, String> {
     let capacity = jobs
       .checked_mul(2)
       .and_then(|n| n.checked_add(1))
@@ -641,10 +852,21 @@ impl EventQueue {
         ready_queued: vec![false; jobs],
         failure: None,
         closed: false,
+        waiters: 0,
       }),
       wake: Condvar::new(),
       capacity,
+      notify,
     }))
+  }
+
+  /// Wakes one drainer. The waiter count is read under the mutex that a
+  /// drainer holds while registering, so a registered drainer is either
+  /// already inside the condition wait or has yet to release the mutex.
+  fn notify_one(&self, state: &EventState) {
+    if self.notify.wakes(state.waiters) {
+      self.wake.notify_one();
+    }
   }
 
   fn push(&self, event: ObserverEvent) -> Result<(), String> {
@@ -655,11 +877,11 @@ impl EventQueue {
     if state.queue.len() == self.capacity {
       let message = "observer event queue exceeded its preallocated bound".to_owned();
       state.failure = Some(message.clone());
-      self.wake.notify_one();
+      self.notify_one(&state);
       return Err(message);
     }
     state.queue.push_back(event);
-    self.wake.notify_one();
+    self.notify_one(&state);
     Ok(())
   }
 
@@ -674,7 +896,7 @@ impl EventQueue {
       state.ready_queued[id] = true;
       state.queue.push_back(ObserverEvent::Ready(id));
     }
-    self.wake.notify_one();
+    self.notify_one(&state);
   }
 
   /// Rejects later events and readiness, makes the next drain fail with the
@@ -700,11 +922,13 @@ impl EventQueue {
       return Err(failure.clone());
     }
     if state.queue.is_empty() {
+      state.waiters += 1;
       let (next, waited) = self
         .wake
         .wait_timeout(state, timeout)
         .unwrap_or_else(PoisonError::into_inner);
       state = next;
+      state.waiters -= 1;
       if state.queue.is_empty() && waited.timed_out() {
         return Ok(());
       }
@@ -789,6 +1013,7 @@ impl Executors {
     keep_alive: Duration,
   ) -> Result<Self, String> {
     match kind {
+      ExecutorKind::Inline => Err("inline executor has no blocking lane".to_owned()),
       ExecutorKind::Bounded => {
         let memory = jobs
           .checked_mul(bytes)
@@ -828,6 +1053,7 @@ impl Executors {
 
   fn submit(&self, kind: ExecutorKind, work: Work) -> Result<Handle, String> {
     match kind {
+      ExecutorKind::Inline => Err("inline executor has no blocking lane".to_owned()),
       ExecutorKind::Bounded => self
         .bounded
         .as_ref()
@@ -862,7 +1088,7 @@ impl Executors {
         .ok_or("Tokio executor missing")?
         .block_on(h)
         .map_err(|e| format!("Tokio join: {e}")),
-      Handle::BoundedAsync(_) | Handle::TokioAsync(_) => {
+      Handle::BoundedAsync(_) | Handle::TokioAsync(_) | Handle::Inline(_) => {
         Err("async join passed to blocking executor".to_owned())
       }
     }
@@ -887,6 +1113,44 @@ struct AsyncExecutors {
   bounded: Option<AsyncRuntime>,
   bounded_handle: Option<AsyncHandle>,
   tokio: Option<tokio::runtime::Runtime>,
+  pin_failures: Arc<PinFailures>,
+}
+
+/// Wakes the inline poll loop: the flag covers wakes that land while the
+/// loop is between polls, and `unpark` is sticky across the park below.
+struct InlineWake {
+  woken: AtomicBool,
+  thread: std::thread::Thread,
+}
+
+impl Wake for InlineWake {
+  fn wake(self: Arc<Self>) {
+    self.wake_by_ref();
+  }
+
+  fn wake_by_ref(self: &Arc<Self>) {
+    self.woken.store(true, Ordering::Release);
+    self.thread.unpark();
+  }
+}
+
+/// Runs `future` to completion on the calling thread, re-polling after each
+/// wake. Yielding futures wake themselves before returning Pending.
+fn run_inline(mut future: AsyncWork) -> u64 {
+  let wake = Arc::new(InlineWake {
+    woken: AtomicBool::new(false),
+    thread: std::thread::current(),
+  });
+  let waker = Waker::from(Arc::clone(&wake));
+  let mut cx = Context::from_waker(&waker);
+  loop {
+    if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+      return value;
+    }
+    while !wake.woken.swap(false, Ordering::AcqRel) {
+      std::thread::park();
+    }
+  }
 }
 
 impl Drop for AsyncExecutors {
@@ -898,6 +1162,7 @@ impl Drop for AsyncExecutors {
 }
 
 impl AsyncExecutors {
+  #[cfg(test)]
   fn new(
     kind: ExecutorKind,
     workers: usize,
@@ -907,7 +1172,44 @@ impl AsyncExecutors {
     max_spinners: Option<usize>,
     max_searchers: Option<usize>,
   ) -> Result<Self, String> {
+    Self::with_pinning(
+      kind,
+      workers,
+      window,
+      handoffs,
+      park_spin,
+      max_spinners,
+      max_searchers,
+      None,
+    )
+  }
+
+  /// Like [`Self::new`]; `pin_workers` pins each executor thread, at its
+  /// start, to the CPU at its construction-time index (the bounded
+  /// executor's physical index, or Tokio's start order). Threads are never
+  /// re-pinned. Hook failures surface through [`Self::check_pins`].
+  #[expect(
+    clippy::too_many_arguments,
+    reason = "the bench maps each option onto one executor setting"
+  )]
+  fn with_pinning(
+    kind: ExecutorKind,
+    workers: usize,
+    window: usize,
+    handoffs: usize,
+    park_spin: SpinPolicy,
+    max_spinners: Option<usize>,
+    max_searchers: Option<usize>,
+    pin_workers: Option<Arc<[usize]>>,
+  ) -> Result<Self, String> {
+    let pin_failures = Arc::new(PinFailures::default());
     match kind {
+      ExecutorKind::Inline => Ok(Self {
+        bounded: None,
+        bounded_handle: None,
+        tokio: None,
+        pin_failures,
+      }),
       ExecutorKind::Bounded => {
         let runtime = AsyncRuntime::new_with_options(
           AsyncConfig {
@@ -923,6 +1225,13 @@ impl AsyncExecutors {
             if let Some(cap) = max_searchers {
               options = options.max_searching_dispatchers(cap);
             }
+            if let Some(cpus) = pin_workers {
+              let failures = Arc::clone(&pin_failures);
+              options = options.thread_options(
+                AsyncThreadOptions::new()
+                  .on_thread_start(move |context| failures.pin(&cpus, context.physical_index)),
+              );
+            }
             if handoffs == 0 {
               options
             } else {
@@ -937,24 +1246,43 @@ impl AsyncExecutors {
           bounded_handle: Some(runtime.handle()),
           bounded: Some(runtime),
           tokio: None,
+          pin_failures,
         })
       }
-      ExecutorKind::Tokio => Ok(Self {
-        bounded: None,
-        bounded_handle: None,
-        tokio: Some(
-          tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(workers)
-            .thread_name("latency-tokio-async")
-            .build()
-            .map_err(|e| format!("Tokio async runtime: {e}"))?,
-        ),
-      }),
+      ExecutorKind::Tokio => {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
+          .worker_threads(workers)
+          .thread_name("latency-tokio-async");
+        if let Some(cpus) = pin_workers {
+          let failures = Arc::clone(&pin_failures);
+          let started = AtomicUsize::new(0);
+          builder.on_thread_start(move || {
+            failures.pin(&cpus, started.fetch_add(1, Ordering::Relaxed));
+          });
+        }
+        Ok(Self {
+          bounded: None,
+          bounded_handle: None,
+          tokio: Some(
+            builder
+              .build()
+              .map_err(|e| format!("Tokio async runtime: {e}"))?,
+          ),
+          pin_failures,
+        })
+      }
     }
+  }
+
+  /// Fails with the first executor thread that could not be pinned.
+  fn check_pins(&self) -> Result<(), String> {
+    self.pin_failures.check()
   }
 
   fn submit(&self, kind: ExecutorKind, future: AsyncWork) -> Result<Handle, String> {
     match kind {
+      ExecutorKind::Inline => Ok(Handle::Inline(run_inline(future))),
       ExecutorKind::Bounded => self
         .bounded_handle
         .as_ref()
@@ -974,6 +1302,7 @@ impl AsyncExecutors {
 
   fn join(&self, handle: Handle) -> Result<u64, String> {
     match handle {
+      Handle::Inline(value) => Ok(value),
       Handle::BoundedAsync(job) => self
         .bounded
         .as_ref()
@@ -1107,6 +1436,11 @@ fn warm_async_workers(
     fn drop(&mut self) {
       self.0.store(true, Ordering::Release);
     }
+  }
+  if kind == ExecutorKind::Inline {
+    // No executor threads exist, and an inline warm task would spin on the
+    // gate that only its own return could release.
+    return Ok(());
   }
   let gate = Arc::new(AtomicBool::new(false));
   let release = WarmRelease(Arc::clone(&gate));
@@ -1282,7 +1616,7 @@ fn run_blocking(allocator: &str, o: &Options, overhead: u64) -> Result<(), Strin
   } else {
     Vec::new()
   };
-  let events = EventQueue::new(o.count)?;
+  let events = EventQueue::with_notify(o.count, o.harness.notify)?;
   let mut slots: Vec<Option<(Handle, Instant)>> =
     std::iter::repeat_with(|| None).take(o.count).collect();
   let mut wakers = Vec::with_capacity(o.count);
@@ -1446,6 +1780,7 @@ fn run_blocking(allocator: &str, o: &Options, overhead: u64) -> Result<(), Strin
   let kind_name = match kind {
     ExecutorKind::Bounded => "bounded",
     ExecutorKind::Tokio => "tokio",
+    ExecutorKind::Inline => return Err("inline executor has no blocking lane".to_owned()),
   };
   println!("{CSV_HEADER}");
   println!(
@@ -1476,7 +1811,7 @@ fn run_async(allocator: &str, o: &Options, overhead: u64) -> Result<(), String> 
   }
   let kind = o.executor.ok_or("async lane requires an executor")?;
   let trace_span = Duration::from_nanos(intended_offset_ns(o.count, o.arrival_rate));
-  let executors = AsyncExecutors::new(
+  let executors = AsyncExecutors::with_pinning(
     kind,
     o.workers,
     o.window,
@@ -1484,14 +1819,22 @@ fn run_async(allocator: &str, o: &Options, overhead: u64) -> Result<(), String> 
     o.park_spin,
     o.max_spinners,
     o.max_searchers,
+    o.pin_workers.clone(),
   )?;
   warm_async_workers(&executors, kind, o.workers.min(o.window))?;
+  executors.check_pins()?;
+  // Executor threads are all running, so pinning the observer now cannot
+  // narrow the affinity mask a later executor thread would inherit.
+  if let Some(pins) = o.harness.pins {
+    pin_current_thread(pins.observer)?;
+  }
+  let producer_cpu = o.harness.pins.map(|pins| pins.producer);
   let mut samples = if o.mode == Mode::Latency {
     Vec::with_capacity(o.count)
   } else {
     Vec::new()
   };
-  let events = EventQueue::new(o.count)?;
+  let events = EventQueue::with_notify(o.count, o.harness.notify)?;
   let mut slots: Vec<Option<(Handle, Instant)>> =
     std::iter::repeat_with(|| None).take(o.count).collect();
   let mut wakers = Vec::with_capacity(o.count);
@@ -1520,7 +1863,7 @@ fn run_async(allocator: &str, o: &Options, overhead: u64) -> Result<(), String> 
   let producer_latencies = Arc::clone(&short_latencies);
   let in_flight = Arc::new(AtomicUsize::new(0));
   let producer_in_flight = Arc::clone(&in_flight);
-  let (ready_tx, ready_rx) = mpsc::sync_channel::<()>(1);
+  let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
   let count = o.count;
   let arrival_rate = o.arrival_rate;
   let workload = o.workload;
@@ -1528,7 +1871,12 @@ fn run_async(allocator: &str, o: &Options, overhead: u64) -> Result<(), String> 
   let bytes = o.bytes;
   let window = o.window;
   let producer = std::thread::spawn(move || {
-    let _ = ready_tx.send(());
+    let pinned = producer_cpu.map_or(Ok(()), pin_current_thread);
+    let failed = pinned.is_err();
+    let _ = ready_tx.send(pinned);
+    if failed {
+      return executors;
+    }
     let base = producer_gate.wait();
     let mut attempted = 0usize;
     let mut dropped = 0usize;
@@ -1596,10 +1944,14 @@ fn run_async(allocator: &str, o: &Options, overhead: u64) -> Result<(), String> 
     });
     executors
   });
-  if let Err(error) = ready_rx.recv_timeout(COMPLETION_TIMEOUT) {
+  if let Err(error) = ready_rx
+    .recv_timeout(COMPLETION_TIMEOUT)
+    .map_err(|error| format!("async submission producer startup: {error}"))
+    .and_then(|pinned| pinned.map_err(|error| format!("async submission producer: {error}")))
+  {
     start_gate.open(Instant::now());
     let _ = producer.join();
-    return Err(format!("async submission producer startup: {error}"));
+    return Err(error);
   }
   let base = Instant::now();
   start_gate.open(base);
@@ -1666,6 +2018,7 @@ fn run_async(allocator: &str, o: &Options, overhead: u64) -> Result<(), String> 
   let mut executors = producer
     .join()
     .map_err(|_| "async submission producer panicked")?;
+  executors.check_pins()?;
   executors.shutdown()?;
   if attempted != o.count {
     return Err(format!(
@@ -1690,16 +2043,13 @@ fn run_async(allocator: &str, o: &Options, overhead: u64) -> Result<(), String> 
   } else {
     (None, None, None)
   };
-  let kind_name = match kind {
-    ExecutorKind::Bounded => "bounded-async",
-    ExecutorKind::Tokio => "tokio-async",
-  };
+  let kind_name = async_executor_name(kind);
   println!("{CSV_HEADER}");
   println!(
     "{allocator},async,{},{},{kind_name},{},{},{},{},{},{attempted},{completed},{dropped},0x{checksum:016x},{elapsed},{:.3},{overhead},{},{},{},{:.0},{lateness_max}",
     workload_name(workload),
     mode_name(o.mode),
-    o.workers,
+    executor_workers(o),
     o.window,
     o.arrival_rate,
     o.bytes,
@@ -1717,6 +2067,14 @@ fn run_async(allocator: &str, o: &Options, overhead: u64) -> Result<(), String> 
   Ok(())
 }
 
+fn async_executor_name(kind: ExecutorKind) -> &'static str {
+  match kind {
+    ExecutorKind::Bounded => "bounded-async",
+    ExecutorKind::Tokio => "tokio-async",
+    ExecutorKind::Inline => "inline-async",
+  }
+}
+
 /// The common outstanding window of capacity mode. The producer waits while
 /// it is full; only the observer releases a slot, after that job's public
 /// join is Ready. Closing wakes a waiting producer without acquiring.
@@ -1724,27 +2082,37 @@ struct CapacityWindow {
   state: Mutex<WindowState>,
   wake: Condvar,
   limit: usize,
+  notify: NotifyPolicy,
 }
 
 struct WindowState {
   held: usize,
   closed: bool,
+  /// Threads registered under this mutex before waiting on `wake`.
+  waiters: usize,
   // Counts admission checks so tests can distinguish waiting from spinning.
   #[cfg(test)]
   checks: usize,
 }
 
 impl CapacityWindow {
+  #[cfg(test)]
   fn new(limit: usize) -> Arc<Self> {
+    Self::with_notify(limit, NotifyPolicy::Always)
+  }
+
+  fn with_notify(limit: usize, notify: NotifyPolicy) -> Arc<Self> {
     Arc::new(Self {
       state: Mutex::new(WindowState {
         held: 0,
         closed: false,
+        waiters: 0,
         #[cfg(test)]
         checks: 0,
       }),
       wake: Condvar::new(),
       limit,
+      notify,
     })
   }
 
@@ -1763,10 +2131,12 @@ impl CapacityWindow {
         state.held += 1;
         return true;
       }
+      state.waiters += 1;
       state = self
         .wake
         .wait(state)
         .unwrap_or_else(PoisonError::into_inner);
+      state.waiters -= 1;
     }
   }
 
@@ -1776,8 +2146,13 @@ impl CapacityWindow {
       .held
       .checked_sub(1)
       .ok_or("capacity window accounting underflow")?;
+    // Read under the mutex: a registered waiter is inside the condition
+    // wait, or still holds the mutex this thread had to wait for.
+    let wake = self.notify.wakes(state.waiters);
     drop(state);
-    self.wake.notify_one();
+    if wake {
+      self.wake.notify_one();
+    }
     Ok(())
   }
 
@@ -1886,6 +2261,7 @@ fn run_capacity<E, S, X>(
   count: usize,
   window: usize,
   timeout: Duration,
+  harness: HarnessOptions,
   submit: S,
   expected: X,
 ) -> Result<(CapacityOutcome, E), String>
@@ -1897,7 +2273,12 @@ where
   if window == 0 || window > count {
     return Err("capacity window must be from 1 to the job count".to_owned());
   }
-  let events = EventQueue::new(count)?;
+  // The caller's executor threads are already running; see `run_async`.
+  if let Some(pins) = harness.pins {
+    pin_current_thread(pins.observer)?;
+  }
+  let producer_cpu = harness.pins.map(|pins| pins.producer);
+  let events = EventQueue::with_notify(count, harness.notify)?;
   let mut slots: Vec<Option<Handle>> = std::iter::repeat_with(|| None).take(count).collect();
   let mut wakers = Vec::with_capacity(count);
   for id in 0..count {
@@ -1907,12 +2288,12 @@ where
     })));
   }
   let mut batch = Vec::with_capacity(EVENT_BATCH);
-  let gate = CapacityWindow::new(window);
+  let gate = CapacityWindow::with_notify(window, harness.notify);
   let start = Arc::new(StartGate {
     base: Mutex::new(None),
     wake: Condvar::new(),
   });
-  let (ready_tx, ready_rx) = mpsc::sync_channel::<()>(1);
+  let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
   let producer = {
     let events = Arc::clone(&events);
     let gate = Arc::clone(&gate);
@@ -1921,7 +2302,12 @@ where
       .name("latency-capacity-producer".to_owned())
       .spawn(move || {
         let _close_on_panic = CloseOnPanic(Arc::clone(&events));
-        let _ = ready_tx.send(());
+        let pinned = producer_cpu.map_or(Ok(()), pin_current_thread);
+        let failed = pinned.is_err();
+        let _ = ready_tx.send(pinned);
+        if failed {
+          return executors;
+        }
         let base = start.wait();
         let mut attempted = 0usize;
         for id in 0..count {
@@ -1965,7 +2351,8 @@ where
   };
   ready_rx
     .recv_timeout(COMPLETION_TIMEOUT)
-    .map_err(|error| format!("capacity producer startup: {error}"))?;
+    .map_err(|error| format!("capacity producer startup: {error}"))?
+    .map_err(|error| format!("capacity producer: {error}"))?;
   let base = Instant::now();
   start.open(base);
 
@@ -2045,7 +2432,7 @@ fn capacity_row(
   format!(
     "{allocator},{lane},{},capacity,{executor},{},{},NA,{},{},{},{},0,0x{:016x},{},{:.3},NA,NA,NA,NA,NA,NA",
     workload_name(o.workload),
-    o.workers,
+    executor_workers(o),
     o.window,
     o.bytes,
     o.count,
@@ -2071,6 +2458,7 @@ fn run_blocking_capacity(allocator: &str, o: &Options) -> Result<(), String> {
     o.count,
     o.window,
     COMPLETION_TIMEOUT,
+    o.harness,
     move |executors: &Executors, id| executors.submit(kind, blocking_work(id, bytes)),
     |id| expected_blocking_checksum(id, bytes),
   )?;
@@ -2078,6 +2466,7 @@ fn run_blocking_capacity(allocator: &str, o: &Options) -> Result<(), String> {
   let executor = match kind {
     ExecutorKind::Bounded => "bounded",
     ExecutorKind::Tokio => "tokio",
+    ExecutorKind::Inline => return Err("inline executor has no blocking lane".to_owned()),
   };
   println!("{CSV_HEADER}");
   println!(
@@ -2089,7 +2478,7 @@ fn run_blocking_capacity(allocator: &str, o: &Options) -> Result<(), String> {
 
 fn run_async_capacity(allocator: &str, o: &Options) -> Result<(), String> {
   let kind = o.executor.ok_or("async lane requires an executor")?;
-  let executors = AsyncExecutors::new(
+  let executors = AsyncExecutors::with_pinning(
     kind,
     o.workers,
     o.window,
@@ -2097,24 +2486,25 @@ fn run_async_capacity(allocator: &str, o: &Options) -> Result<(), String> {
     o.park_spin,
     o.max_spinners,
     o.max_searchers,
+    o.pin_workers.clone(),
   )?;
   warm_async_workers(&executors, kind, o.workers.min(o.window))?;
+  executors.check_pins()?;
   let (workload, bytes, block_us) = (o.workload, o.bytes, o.block_us);
   let (outcome, mut executors) = run_capacity(
     executors,
     o.count,
     o.window,
     COMPLETION_TIMEOUT,
+    o.harness,
     move |executors: &AsyncExecutors, id| {
       executors.submit(kind, Box::pin(async_work(id, workload, bytes, block_us)))
     },
     |id| expected_async_checksum(id, workload, bytes),
   )?;
+  executors.check_pins()?;
   executors.shutdown()?;
-  let executor = match kind {
-    ExecutorKind::Bounded => "bounded-async",
-    ExecutorKind::Tokio => "tokio-async",
-  };
+  let executor = async_executor_name(kind);
   println!("{CSV_HEADER}");
   println!(
     "{}",
@@ -2543,6 +2933,8 @@ mod tests {
       park_spin: SpinPolicy::default(),
       max_spinners: None,
       max_searchers: None,
+      harness: HarnessOptions::default(),
+      pin_workers: None,
     };
     run_blocking("test", &options, 0).unwrap();
   }
@@ -2566,6 +2958,8 @@ mod tests {
           park_spin: SpinPolicy::default(),
           max_spinners: None,
           max_searchers: None,
+          harness: HarnessOptions::default(),
+          pin_workers: None,
         };
         run_async("test", &options, 0).unwrap();
       }
@@ -2843,6 +3237,7 @@ mod tests {
         4,
         1,
         Duration::from_millis(200),
+        HarnessOptions::default(),
         move |executors: &Executors, _| {
           job_submitted.fetch_add(1, Ordering::AcqRel);
           let gate = Arc::clone(&job_gate);
@@ -2877,6 +3272,7 @@ mod tests {
       8,
       2,
       Duration::from_secs(30),
+      HarnessOptions::default(),
       |executors: &Executors, id| {
         if id == 3 {
           Err("scripted rejection".to_owned())
@@ -2899,6 +3295,7 @@ mod tests {
       8,
       2,
       Duration::from_secs(30),
+      HarnessOptions::default(),
       |executors: &Executors, id| executors.submit(ExecutorKind::Bounded, blocking_work(id, 1)),
       |id| expected_blocking_checksum(id, 1).wrapping_add(u64::from(id == 5)),
     );
@@ -2920,6 +3317,7 @@ mod tests {
       4,
       1,
       Duration::from_secs(30),
+      HarnessOptions::default(),
       |executors: &AsyncExecutors, id| {
         executors.submit(
           ExecutorKind::Bounded,
@@ -2958,6 +3356,7 @@ mod tests {
         count,
         4,
         COMPLETION_TIMEOUT,
+        HarnessOptions::default(),
         move |executors: &Executors, id| executors.submit(kind, blocking_work(id, 64)),
         |id| expected_blocking_checksum(id, 64),
       )
@@ -2981,6 +3380,7 @@ mod tests {
           count,
           4,
           COMPLETION_TIMEOUT,
+          HarnessOptions::default(),
           move |executors: &AsyncExecutors, id| {
             executors.submit(kind, Box::pin(async_work(id, workload, 64, 2_000)))
           },
@@ -3019,6 +3419,8 @@ mod tests {
         park_spin: SpinPolicy::default(),
         max_spinners: None,
         max_searchers: None,
+        harness: HarnessOptions::default(),
+        pin_workers: None,
       };
       run_blocking("test", &blocking, 0).unwrap();
       let asynchronous = Options {
@@ -3048,6 +3450,8 @@ mod tests {
       park_spin: SpinPolicy::default(),
       max_spinners: None,
       max_searchers: None,
+      harness: HarnessOptions::default(),
+      pin_workers: None,
     };
     let outcome = CapacityOutcome {
       attempted: 10,
@@ -3263,6 +3667,594 @@ mod park_spin_tests {
         assert_eq!(options.max_searchers, Some(cap.parse().unwrap()));
         run_async_capacity("test", &options).unwrap();
       }
+    }
+  }
+}
+
+#[cfg(test)]
+mod harness_tests {
+  use super::*;
+
+  fn parse(values: &[&str]) -> Result<Options, String> {
+    Options::parse(values.iter().map(|value| (*value).to_owned()))
+  }
+
+  #[test]
+  fn parser_validates_inline_executor() {
+    let paced = parse(&["--lane", "async", "--executor", "inline"]).unwrap();
+    assert_eq!(paced.executor, Some(ExecutorKind::Inline));
+    assert_eq!(executor_workers(&paced), 0);
+    let capacity = parse(&[
+      "--lane",
+      "async",
+      "--executor",
+      "inline",
+      "--mode",
+      "capacity",
+      "--window",
+      "8",
+    ])
+    .unwrap();
+    assert_eq!(capacity.window, 8);
+    assert_eq!(
+      parse(&["--lane", "blocking", "--executor", "inline"]).unwrap_err(),
+      "--executor inline applies only to --lane async"
+    );
+    assert_eq!(
+      parse(&["--lane", "async", "--executor", "inline", "--workers", "2"]).unwrap_err(),
+      "--workers does not apply to --executor inline"
+    );
+    assert!(
+      parse(&["--lane", "async", "--executor", "noop"])
+        .unwrap_err()
+        .contains("bounded, tokio or inline")
+    );
+    assert!(
+      parse(&[
+        "--lane",
+        "async",
+        "--executor",
+        "inline",
+        "--park-spin",
+        "fixed:1"
+      ])
+      .is_err()
+    );
+    assert!(parse(&["--lane", "async", "--executor", "inline", "--handoffs", "1"]).is_err());
+  }
+
+  #[test]
+  fn parser_validates_harness_notify() {
+    assert_eq!(NotifyPolicy::default(), NotifyPolicy::Waiting);
+    assert!(NotifyPolicy::Always.wakes(0));
+    assert!(!NotifyPolicy::Waiting.wakes(0));
+    assert!(NotifyPolicy::Waiting.wakes(1));
+    for (value, expected) in [
+      ("always", NotifyPolicy::Always),
+      ("waiting", NotifyPolicy::Waiting),
+    ] {
+      for lane_args in [
+        &["--lane", "blocking", "--executor", "bounded"][..],
+        &["--lane", "async", "--executor", "tokio"],
+        &[
+          "--lane",
+          "async",
+          "--executor",
+          "inline",
+          "--mode",
+          "capacity",
+        ],
+      ] {
+        let args: Vec<_> = lane_args
+          .iter()
+          .copied()
+          .chain(["--harness-notify", value])
+          .collect();
+        assert_eq!(parse(&args).unwrap().harness.notify, expected, "{args:?}");
+      }
+    }
+    assert_eq!(
+      parse(&["--lane", "async", "--executor", "bounded"])
+        .unwrap()
+        .harness
+        .notify,
+      NotifyPolicy::Waiting
+    );
+    assert!(
+      parse(&[
+        "--lane",
+        "async",
+        "--executor",
+        "bounded",
+        "--harness-notify",
+        "never"
+      ])
+      .is_err()
+    );
+    assert!(
+      parse(&[
+        "--lane",
+        "async",
+        "--executor",
+        "bounded",
+        "--harness-notify"
+      ])
+      .is_err()
+    );
+    assert_eq!(
+      parse(&["--lane", "allocator", "--harness-notify", "waiting"]).unwrap_err(),
+      "--harness-notify applies only to --lane blocking or async"
+    );
+  }
+
+  #[test]
+  fn parser_validates_cpu_pins() {
+    assert_eq!(parse_cpu_list("--pin-workers", "3").unwrap(), [3]);
+    assert_eq!(
+      parse_cpu_list("--pin-workers", "2-5,8,0-1").unwrap(),
+      [2, 3, 4, 5, 8, 0, 1]
+    );
+    assert_eq!(parse_cpu_list("--pin-workers", "7-7").unwrap(), [7]);
+    assert_eq!(parse_cpu_list("--pin-workers", "4,4").unwrap(), [4, 4]);
+    for value in [
+      "", "a", "1,", ",1", "3-2", "1-", "-1", "1024", "0-1024", "1 2",
+    ] {
+      assert!(parse_cpu_list("--pin-workers", value).is_err(), "{value:?}");
+    }
+    let bounded = parse(&[
+      "--lane",
+      "async",
+      "--executor",
+      "bounded",
+      "--workers",
+      "2",
+      "--pin-workers",
+      "1-2",
+    ])
+    .unwrap();
+    assert_eq!(bounded.pin_workers.as_deref(), Some(&[1, 2][..]));
+    let with_helpers = parse(&[
+      "--lane",
+      "async",
+      "--executor",
+      "bounded",
+      "--workers",
+      "2",
+      "--handoffs",
+      "1",
+      "--pin-workers",
+      "1-3",
+    ])
+    .unwrap();
+    assert_eq!(with_helpers.pin_workers.as_deref(), Some(&[1, 2, 3][..]));
+    let tokio = parse(&[
+      "--lane",
+      "async",
+      "--executor",
+      "tokio",
+      "--workers",
+      "3",
+      "--pin-workers",
+      "0,0,5",
+      "--pin-harness",
+      "6,7",
+    ])
+    .unwrap();
+    assert_eq!(tokio.pin_workers.as_deref(), Some(&[0, 0, 5][..]));
+    assert_eq!(
+      tokio.harness.pins,
+      Some(HarnessPins {
+        producer: 6,
+        observer: 7
+      })
+    );
+    // Workers shrink to the job count before the pin list is matched.
+    let shrunk = parse(&[
+      "--lane",
+      "async",
+      "--executor",
+      "tokio",
+      "--jobs",
+      "2",
+      "--pin-workers",
+      "0-1",
+    ])
+    .unwrap();
+    assert_eq!(shrunk.workers, 2);
+    assert_eq!(
+      parse(&[
+        "--lane",
+        "async",
+        "--executor",
+        "bounded",
+        "--workers",
+        "2",
+        "--pin-workers",
+        "1-3",
+      ])
+      .unwrap_err(),
+      "--pin-workers lists 3 CPUs for 2 executor threads"
+    );
+    assert_eq!(
+      parse(&[
+        "--lane",
+        "async",
+        "--executor",
+        "bounded",
+        "--workers",
+        "2",
+        "--handoffs",
+        "1",
+        "--pin-workers",
+        "1-2",
+      ])
+      .unwrap_err(),
+      "--pin-workers lists 2 CPUs for 3 executor threads"
+    );
+    for lane_args in [
+      &["--lane", "allocator"][..],
+      &[
+        "--lane",
+        "blocking",
+        "--executor",
+        "bounded",
+        "--workers",
+        "1",
+      ],
+      &["--lane", "async", "--executor", "inline"],
+    ] {
+      let args: Vec<_> = lane_args
+        .iter()
+        .copied()
+        .chain(["--pin-workers", "0"])
+        .collect();
+      assert_eq!(
+        parse(&args).unwrap_err(),
+        "--pin-workers applies only to --lane async --executor bounded or tokio",
+        "{args:?}"
+      );
+    }
+    for value in ["1", "1,2,3", "1-3", ""] {
+      assert!(
+        parse(&[
+          "--lane",
+          "async",
+          "--executor",
+          "bounded",
+          "--pin-harness",
+          value
+        ])
+        .is_err(),
+        "{value:?}"
+      );
+    }
+    for lane_args in [
+      &["--lane", "allocator"][..],
+      &["--lane", "blocking", "--executor", "tokio"],
+    ] {
+      let args: Vec<_> = lane_args
+        .iter()
+        .copied()
+        .chain(["--pin-harness", "0,1"])
+        .collect();
+      assert_eq!(
+        parse(&args).unwrap_err(),
+        "--pin-harness applies only to --lane async",
+        "{args:?}"
+      );
+    }
+  }
+
+  // A lost wakeup would stall one drain for its full timeout, which the
+  // shorter completion deadline turns into a failure.
+  #[test]
+  fn waiting_notify_wakes_a_registered_event_drainer() {
+    const JOBS: usize = 4_096;
+    let events = EventQueue::with_notify(JOBS, NotifyPolicy::Waiting).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let consumer = {
+      let events = Arc::clone(&events);
+      std::thread::spawn(move || {
+        let mut batch = Vec::with_capacity(EVENT_BATCH);
+        let mut seen = 0usize;
+        while seen < JOBS + 1 {
+          events.drain(&mut batch, Duration::from_secs(20)).unwrap();
+          seen += batch.len();
+        }
+        done_tx.send(seen).unwrap();
+      })
+    };
+    for id in 0..JOBS {
+      events.ready(id);
+      if id % 5 == 0 {
+        std::thread::yield_now();
+      }
+    }
+    events
+      .push(ObserverEvent::SubmissionStats {
+        attempted: JOBS,
+        dropped: 0,
+        lateness_sum: 0,
+        lateness_max: 0,
+      })
+      .unwrap();
+    assert_eq!(
+      done_rx.recv_timeout(Duration::from_secs(15)).unwrap(),
+      JOBS + 1
+    );
+    consumer.join().unwrap();
+    assert_eq!(events.state.lock().unwrap().waiters, 0);
+  }
+
+  #[test]
+  fn waiting_notify_wakes_a_registered_window_waiter() {
+    const ROUNDS: usize = 2_048;
+    let window = CapacityWindow::with_notify(1, NotifyPolicy::Waiting);
+    let (held_tx, held_rx) = mpsc::channel();
+    let producer = {
+      let window = Arc::clone(&window);
+      std::thread::spawn(move || {
+        for round in 0..ROUNDS {
+          assert!(window.acquire());
+          held_tx.send(round).unwrap();
+        }
+      })
+    };
+    for round in 0..ROUNDS {
+      assert_eq!(
+        held_rx.recv_timeout(Duration::from_secs(15)).unwrap(),
+        round
+      );
+      if round % 3 == 0 {
+        std::thread::yield_now();
+      }
+      window.release().unwrap();
+    }
+    producer.join().unwrap();
+    let state = window.state.lock().unwrap();
+    assert_eq!(state.held, 0);
+    assert_eq!(state.waiters, 0);
+  }
+
+  #[test]
+  fn waiting_notify_runs_capacity_end_to_end() {
+    for executor in ["bounded", "tokio", "inline"] {
+      let options = parse(&[
+        "--lane",
+        "async",
+        "--executor",
+        executor,
+        "--mode",
+        "capacity",
+        "--workload",
+        "yielding",
+        "--jobs",
+        "64",
+        "--window",
+        "4",
+        "--harness-notify",
+        "waiting",
+      ])
+      .unwrap();
+      run_async_capacity("test", &options).unwrap();
+    }
+  }
+
+  #[test]
+  fn inline_executor_runs_futures_on_the_submitting_thread() {
+    let executors = AsyncExecutors::new(
+      ExecutorKind::Inline,
+      1,
+      1,
+      0,
+      SpinPolicy::default(),
+      None,
+      None,
+    )
+    .unwrap();
+    let submitter = std::thread::current().id();
+    let handle = executors
+      .submit(
+        ExecutorKind::Inline,
+        Box::pin(async move {
+          let mut polls = 0u64;
+          for _ in 0..3 {
+            YieldOnce(false).await;
+            polls += 1;
+          }
+          assert_eq!(std::thread::current().id(), submitter);
+          polls
+        }),
+      )
+      .unwrap();
+    assert!(handle.is_finished());
+    assert_eq!(executors.join(handle).unwrap(), 3);
+    assert_eq!(
+      run_inline(Box::pin(async_work(5, Workload::Yielding, 1, 1))),
+      5 + 36
+    );
+    assert!(warm_async_workers(&executors, ExecutorKind::Inline, 4).is_ok());
+  }
+
+  #[test]
+  fn inline_executor_runs_paced_and_capacity_lanes() {
+    for workload in ["ready", "yielding", "mixed", "head-of-line"] {
+      let mut args = vec![
+        "--lane",
+        "async",
+        "--executor",
+        "inline",
+        "--workload",
+        workload,
+        "--jobs",
+        "32",
+        "--arrival-rate",
+        "200000",
+      ];
+      if workload == "head-of-line" {
+        args.extend(["--block-us", "10"]);
+      }
+      let paced = parse(&args).unwrap();
+      run_async("test", &paced, 0).unwrap();
+      let capacity: Vec<_> = args
+        .iter()
+        .copied()
+        .filter(|arg| !matches!(*arg, "--arrival-rate" | "200000"))
+        .chain(["--mode", "capacity", "--window", "4"])
+        .collect();
+      run_async_capacity("test", &parse(&capacity).unwrap()).unwrap();
+    }
+  }
+
+  #[cfg(target_os = "linux")]
+  fn allowed_cpus() -> Vec<usize> {
+    let set = rustix::thread::sched_getaffinity(None).unwrap();
+    (0..rustix::thread::CpuSet::MAX_CPU)
+      .filter(|&cpu| set.is_set(cpu))
+      .collect()
+  }
+
+  /// The single CPU the calling thread is pinned to, or `u64::MAX`.
+  #[cfg(target_os = "linux")]
+  fn pinned_cpu() -> u64 {
+    match allowed_cpus().as_slice() {
+      &[cpu] => cpu as u64,
+      _ => u64::MAX,
+    }
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn pin_current_thread_restricts_only_the_calling_thread() {
+    let cpus = allowed_cpus();
+    let target = *cpus.last().unwrap();
+    let before = cpus.len();
+    std::thread::spawn(move || {
+      pin_current_thread(target).unwrap();
+      assert_eq!(pinned_cpu(), target as u64);
+    })
+    .join()
+    .unwrap();
+    assert_eq!(allowed_cpus().len(), before);
+    if !cpus.contains(&(MAX_PIN_CPU - 1)) {
+      assert!(pin_current_thread(MAX_PIN_CPU - 1).is_err());
+    }
+    assert!(pin_current_thread(usize::MAX).is_err());
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn executor_threads_pin_to_their_indexed_cpus() {
+    let cpus = allowed_cpus();
+    let pins: Arc<[usize]> = Arc::from([cpus[0], cpus[cpus.len() - 1]]);
+    for kind in [ExecutorKind::Bounded, ExecutorKind::Tokio] {
+      let executors = AsyncExecutors::with_pinning(
+        kind,
+        2,
+        4,
+        0,
+        SpinPolicy::default(),
+        None,
+        None,
+        Some(Arc::clone(&pins)),
+      )
+      .unwrap();
+      warm_async_workers(&executors, kind, 2).unwrap();
+      executors.check_pins().unwrap();
+      let mut observed = Vec::new();
+      for _ in 0..8 {
+        let handle = executors
+          .submit(kind, Box::pin(async { pinned_cpu() }))
+          .unwrap();
+        observed.push(executors.join(handle).unwrap());
+      }
+      for cpu in observed {
+        assert!(pins.contains(&(cpu as usize)), "{kind:?} ran on CPU {cpu}");
+      }
+    }
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn pinned_lanes_run_end_to_end_and_report_pin_failures() {
+    let cpus = allowed_cpus();
+    let first = cpus[0].to_string();
+    let last = cpus[cpus.len() - 1].to_string();
+    let harness = format!("{first},{last}");
+    for (executor, workers) in [("bounded", "1-1"), ("tokio", "1-1"), ("inline", "")] {
+      let mut args = vec![
+        "--lane",
+        "async",
+        "--executor",
+        executor,
+        "--workload",
+        "yielding",
+        "--jobs",
+        "32",
+        "--pin-harness",
+        &harness,
+      ];
+      let worker_pins = format!("{first},{last}");
+      if !workers.is_empty() {
+        args.extend(["--workers", "2", "--pin-workers", &worker_pins]);
+      }
+      let paced: Vec<_> = args
+        .iter()
+        .copied()
+        .chain(["--arrival-rate", "200000"])
+        .collect();
+      run_async("test", &parse(&paced).unwrap(), 0).unwrap();
+      let capacity: Vec<_> = args
+        .iter()
+        .copied()
+        .chain(["--mode", "capacity", "--window", "4"])
+        .collect();
+      run_async_capacity("test", &parse(&capacity).unwrap()).unwrap();
+    }
+    if cpus.contains(&(MAX_PIN_CPU - 1)) {
+      return;
+    }
+    let missing = (MAX_PIN_CPU - 1).to_string();
+    let bad_producer = format!("{missing},{first}");
+    let bad_observer = format!("{first},{missing}");
+    for (mode_args, pins, expected) in [
+      (&[][..], &bad_producer, "producer"),
+      (&[], &bad_observer, "cannot pin to CPU"),
+      (&["--mode", "capacity"], &bad_producer, "producer"),
+      (&["--mode", "capacity"], &bad_observer, "cannot pin to CPU"),
+    ] {
+      let args: Vec<_> = ["--lane", "async", "--executor", "inline", "--jobs", "4"]
+        .into_iter()
+        .chain(mode_args.iter().copied())
+        .chain(["--pin-harness", pins])
+        .collect();
+      let options = parse(&args).unwrap();
+      let error = if options.mode == Mode::Capacity {
+        run_async_capacity("test", &options).unwrap_err()
+      } else {
+        run_async("test", &options, 0).unwrap_err()
+      };
+      assert!(error.contains(expected), "{args:?}: {error}");
+    }
+    let missing_workers = format!("{first},{missing}");
+    for executor in ["bounded", "tokio"] {
+      let options = parse(&[
+        "--lane",
+        "async",
+        "--executor",
+        executor,
+        "--mode",
+        "capacity",
+        "--jobs",
+        "8",
+        "--workers",
+        "2",
+        "--pin-workers",
+        &missing_workers,
+      ])
+      .unwrap();
+      let error = run_async_capacity("test", &options).unwrap_err();
+      assert!(error.contains("executor thread 1"), "{executor}: {error}");
     }
   }
 }
