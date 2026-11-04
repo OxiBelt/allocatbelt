@@ -1011,10 +1011,13 @@ scans up to `ceil(max_outstanding / 64)` bitmap words, so lookup cost grows
 with the configured outstanding-task bound.
 
 The executor appends newly ready, self-woken, requeued and quota-released
-tasks to a lane chosen by a round-robin counter and the parked mask. Dead
-seats are excluded; among live seats it skips parked dispatchers unless all
-are parked. A dispatcher takes its own front entry, then searches other
-lanes in a pseudo-random order, then takes one shared overflow entry.
+tasks to a lane chosen by the inserting thread's rotating start index and the
+parked mask. Each thread keeps its own index, starts at a different value and
+advances it once per insertion, so producers and dispatchers do not share a
+counter. Dead seats are excluded; among live seats it skips parked
+dispatchers unless all are parked. A dispatcher takes its own front entry,
+then searches other lanes in a pseudo-random order, then takes one shared
+overflow entry.
 Searching and spinning admit a fixed number of dispatchers at once (see
 `max_searching_dispatchers` below). An idle dispatcher can take a busy
 lane's oldest entries, including a single remaining one. A steal takes the

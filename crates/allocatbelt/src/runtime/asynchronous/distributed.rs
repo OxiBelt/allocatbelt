@@ -16,6 +16,71 @@ use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
 
+thread_local! {
+  /// This thread's rotating start index for lane choice.
+  static LANE_CURSOR: std::cell::Cell<usize> = const { std::cell::Cell::new(UNSEEDED_CURSOR) };
+}
+
+/// Spreads the first lane choice of each thread; read once per thread.
+static LANE_CURSOR_SEED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const UNSEEDED_CURSOR: usize = usize::MAX;
+
+/// Returns this thread's lane start index and, when `advance` is set, moves
+/// the next call on this thread to the following lane.
+fn lane_cursor(advance: bool) -> usize {
+  LANE_CURSOR.with(|cursor| {
+    let mut start = cursor.get();
+    if start == UNSEEDED_CURSOR {
+      start = LANE_CURSOR_SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    cursor.set(if advance {
+      start.wrapping_add(1)
+    } else {
+      start
+    });
+    start
+  })
+}
+
+/// A shared start index that a test sets (`store`) to choose lanes
+/// deterministically. Until then, and after `use_thread_cursor`, lane choice
+/// uses the calling thread's cursor as outside tests.
+#[cfg(all(test, not(loom)))]
+struct LaneStartOverride {
+  armed: AtomicBool,
+  next: AtomicUsize,
+}
+
+#[cfg(all(test, not(loom)))]
+impl LaneStartOverride {
+  fn new() -> Self {
+    Self {
+      armed: AtomicBool::new(false),
+      next: AtomicUsize::new(0),
+    }
+  }
+
+  fn store(&self, next: usize, order: Ordering) {
+    self.next.store(next, order);
+    self.armed.store(true, Ordering::Release);
+  }
+
+  fn use_thread_cursor(&self) {
+    self.armed.store(false, Ordering::Release);
+  }
+
+  fn start(&self, advance: bool) -> Option<usize> {
+    if !self.armed.load(Ordering::Acquire) {
+      return None;
+    }
+    Some(if advance {
+      self.next.fetch_add(1, Ordering::Relaxed)
+    } else {
+      self.next.load(Ordering::Relaxed)
+    })
+  }
+}
+
 #[cfg(all(test, not(loom)))]
 thread_local! {
   static SPIN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
@@ -163,7 +228,8 @@ pub(super) struct Distributed {
   links: Vec<QueueLink>,
   lanes: Vec<Lane>,
   parked: ParkedMask,
-  next_lane: Padded<AtomicUsize>,
+  #[cfg(all(test, not(loom)))]
+  next_lane: LaneStartOverride,
   overflow: Padded<Mutex<LaneQueue>>,
   seats: Mutex<SeatTable>,
   seat_cv: Condvar,
@@ -320,7 +386,8 @@ impl Distributed {
         cv: Condvar::new(),
       })?,
       parked: ParkedMask::try_new(config.workers).map_err(|_| AsyncError::OutOfMemory)?,
-      next_lane: Padded(AtomicUsize::new(0)),
+      #[cfg(all(test, not(loom)))]
+      next_lane: LaneStartOverride::new(),
       overflow: Padded(Mutex::new(LaneQueue::new())),
       seats: Mutex::new(
         SeatTable::try_new(config.workers, max_handoffs).map_err(|_| AsyncError::OutOfMemory)?,
@@ -411,8 +478,18 @@ impl Distributed {
       .store(queue.len(), Ordering::SeqCst);
   }
 
+  /// The start index for lane choice: the calling thread's own rotating
+  /// cursor, independent of which dispatcher runs on the thread.
+  fn lane_start(&self, advance: bool) -> usize {
+    #[cfg(all(test, not(loom)))]
+    if let Some(start) = self.next_lane.start(advance) {
+      return start;
+    }
+    lane_cursor(advance)
+  }
+
   fn push_ready(&self, shared: &Shared, index: usize, insertion: ReadyInsertion) {
-    let next = self.next_lane.fetch_add(1, Ordering::Relaxed);
+    let next = self.lane_start(true);
     #[cfg(all(test, not(loom)))]
     let (seat, claimed_parked) = if self.round_robin.load(Ordering::Relaxed) {
       super::super::lane::choose_lane_round_robin(next, &self.parked)
@@ -483,21 +560,19 @@ impl Distributed {
     #[cfg(all(test, not(loom)))]
     self.wake_searches.fetch_add(1, Ordering::Relaxed);
     let mut notify = false;
-    let claimed = self
-      .parked
-      .claim_any_with(self.next_lane.load(Ordering::Relaxed), |seat| {
-        let mut queue = self.lane(seat);
-        if self.parked.is_dead(seat) || !self.parked.claim(seat) {
-          return false;
-        }
-        // Advertisement and receipt installation share the lane lock, so a
-        // seat cannot be claimed twice before acknowledging its prior kick.
-        debug_assert!(!queue.search_kick);
-        self.searching.kicked();
-        queue.search_kick = true;
-        notify = queue.request_recheck();
-        true
-      });
+    let claimed = self.parked.claim_any_with(self.lane_start(false), |seat| {
+      let mut queue = self.lane(seat);
+      if self.parked.is_dead(seat) || !self.parked.claim(seat) {
+        return false;
+      }
+      // Advertisement and receipt installation share the lane lock, so a
+      // seat cannot be claimed twice before acknowledging its prior kick.
+      debug_assert!(!queue.search_kick);
+      self.searching.kicked();
+      queue.search_kick = true;
+      notify = queue.request_recheck();
+      true
+    });
     if let Some(seat) = claimed
       && notify
     {

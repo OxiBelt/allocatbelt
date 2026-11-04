@@ -484,6 +484,8 @@ fn one_spawn_into_four_parked_lanes_wakes_only_its_dispatcher() {
 
 fn one_spawn_into_four_parked_lanes_wakes_only_its_dispatcher_case() {
   let (shared, root) = shared(config(4, 1));
+  // Lane order below assumes the shared start index from lane 0.
+  engine(&shared).next_lane.store(0, Ordering::Relaxed);
   let d = engine(&shared);
   // Model all four parked dispatchers without racing their next search.
   for seat in 0..4 {
@@ -500,6 +502,35 @@ fn one_spawn_into_four_parked_lanes_wakes_only_its_dispatcher_case() {
   run(&shared, selected(&shared, 0).unwrap());
   finish(job).unwrap();
   check_distributed(&shared);
+}
+
+#[test]
+fn spawn_uses_the_calling_threads_rotating_lane_cursor() {
+  let (shared, root) = shared(config(4, 2));
+  let d = engine(&shared);
+  d.next_lane.use_thread_cursor();
+  let start = lane_cursor(false);
+  let first = shared.spawn(root, async {}).unwrap();
+  let second = shared.spawn(root, async {}).unwrap();
+  assert_eq!(lane_cursor(false), start.wrapping_add(2));
+  // With no parked dispatcher, each insertion takes the next lane from this
+  // thread's start.
+  let seats = [start % 4, start.wrapping_add(1) % 4];
+  assert!((0..4).all(|seat| (d.lane(seat).len() == 1) == seats.contains(&seat)));
+  for seat in seats {
+    run(&shared, selected(&shared, seat).unwrap());
+  }
+  finish(first).unwrap();
+  finish(second).unwrap();
+  check_distributed(&shared);
+}
+
+#[test]
+fn lane_cursors_start_apart_on_new_threads() {
+  let starts: Vec<usize> = (0..2)
+    .map(|_| std::thread::spawn(|| lane_cursor(true)).join().unwrap())
+    .collect();
+  assert_ne!(starts[0], starts[1]);
 }
 
 #[test]
@@ -1378,6 +1409,8 @@ fn abort_racing_a_reserved_transfer_returns_every_permit() {
 fn abort_racing_a_reserved_transfer_returns_every_permit_case() {
   for _ in 0..200 {
     let (shared, _) = shared(config(2, 2));
+    // Lane order below assumes the shared start index from lane 0.
+    engine(&shared).next_lane.store(0, Ordering::Relaxed);
     let scope = shared.new_scope(1, None).unwrap();
     let first = scope.spawn(async {}).unwrap();
     let second = scope.spawn(async {}).unwrap();
@@ -1487,6 +1520,8 @@ fn idle_workers_drain_ready_entries_behind_a_long_poll() {
 
 fn idle_workers_drain_ready_entries_behind_a_long_poll_case() {
   let (shared, root) = shared(config(4, 17));
+  // Lane order below assumes the shared start index from lane 0.
+  engine(&shared).next_lane.store(0, Ordering::Relaxed);
   let (entered, arrival) = mpsc::channel();
   let (release, resume) = mpsc::channel();
   let holder = shared
@@ -1814,6 +1849,8 @@ fn cleanup_is_quota_free_and_slot_reuse_ignores_stale_wakes_case() {
     }
   }
   let (shared, _) = shared(config(2, 2));
+  // Lane order below assumes the shared start index from lane 0.
+  engine(&shared).next_lane.store(0, Ordering::Relaxed);
   let scope = shared.new_scope(1, None).unwrap();
   let first = scope.spawn(async {}).unwrap();
   let dropped = Arc::new(AtomicUsize::new(0));
@@ -2017,6 +2054,8 @@ fn abort_of_stolen_blocked_task_cleans_up_during_another_poll_case() {
       }
     }),
   );
+  // Lane order below assumes the shared start index from lane 0.
+  engine(&shared).next_lane.store(0, Ordering::Relaxed);
   let scope = shared.new_scope(1, None).unwrap();
   let (entered, arrival) = mpsc::channel();
   let (release, resume) = mpsc::channel();
