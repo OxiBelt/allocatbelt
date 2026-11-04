@@ -66,7 +66,9 @@ the `Pin`. The pin
 guarantee of `Arc::pin` therefore holds for the future from its first poll
 until `Drop` runs in place, for any safe caller and any call order. The
 bookkeeping is reached only by shared reference (`header`); a `Waker` built
-from the allocation (`waker`) shares it without another allocation. Unsizing
+from one owner of the allocation (`into_waker`, which takes that owner over,
+or the test-only `waker`, which clones one) shares it without another
+allocation. Unsizing
 the handle to `Pin<Arc<dyn Trait>>` keeps all of this, and the runtime's
 erased task, join and abort handles are such pinned `Arc`s.
 
@@ -101,7 +103,7 @@ this cell.
 | Location | Kind | Operation | Why it is sound |
 |---|---|---|---|
 | `TaskCell` | `unsafe impl Sync` (for `H: Sync`, `F: Send`) | — | The value is reached only through `poll_future` and `drop_future`/`Drop`, each of which first claims the cell with an acquire read-modify-write that at most one caller wins (`POLLING` and `ABSENT` accept no further claim), so two threads never hold references to it at once; the atomic is shared freely and the header is a plain shared field. The same reasoning makes `Mutex<F>` `Sync`. |
-| `TaskCell::unpinned` | block | `Pin::into_inner_unchecked` of a clone of the pinned `Arc` | Private. The unpinned `Arc` goes only to `Waker::from`, whose vtable hands it back solely to this module's `Wake` implementation (which reads the header and never moves out of the `Arc`) and otherwise drops it in place like any owner, or to a strong count in tests; no unpinned `Arc` or `Weak` reaches a caller, so the allocation stays pinned until its last owner drops it in place. |
+| `TaskCell::unpinned` | block | `Pin::into_inner_unchecked` of one owner of the pinned `Arc` (the caller's own, or a clone) | Private. The unpinned `Arc` goes only to `Waker::from`, whose vtable hands it back solely to this module's `Wake` implementation (which reads the header and never moves out of the `Arc`) and otherwise drops it in place like any owner, or to a strong count in tests; no unpinned `Arc` or `Weak` reaches a caller, so the allocation stays pinned until its last owner drops it in place. |
 | `TaskCell::poll_future` | block | `&mut *pointer` into the `UnsafeCell<ManuallyDrop<F>>` | The `PRESENT` → `POLLING` claim succeeded, so no other reference exists while it is held; both wrappers are `repr(transparent)`, so the cast pointer is the initialized, aligned `F` the cell was built with, not yet dropped (`drop_future` refuses `POLLING` and only ever succeeds once, into the final `ABSENT`, which the claim rejects). |
 | `TaskCell::poll_future` | block | `Pin::new_unchecked(&mut F)` | Structural pinning: `self` is `Pin<&Self>` of a `!Unpin` cell that is reachable only through shared references, has no method that moves or replaces the value and destroys it in place in `Drop`, so the cell's pin guarantee extends to the field. Its memory stays valid and unmoved until `drop_future` or `Drop`, both of which need the claim this reference holds to be released first. |
 | `TaskCell::drop_in_place` | block | `ptr::drop_in_place` of the stored `F` | The claim into `ABSENT` succeeded exactly once, from a state in which the value is initialized and not being polled, and `ABSENT` is final, so no reference to the value exists now or later; only the pinned `drop_future` and the in-place `Drop` reach it, so the value is at the address it was polled at. A destructor that panics still counts as having run once. |

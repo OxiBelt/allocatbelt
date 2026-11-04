@@ -145,11 +145,22 @@ impl<H, F> TaskCell<H, F> {
   /// The number of `Pin<Arc<Self>>` and `Waker` owners of the allocation.
   #[cfg(test)]
   pub(crate) fn strong_count(this: &Pin<Arc<Self>>) -> usize {
-    Arc::strong_count(&Self::unpinned(this)) - 1
+    Arc::strong_count(&Self::unpinned(Pin::clone(this))) - 1
   }
 
   /// A `Waker` that shares this allocation instead of allocating its own.
+  #[cfg(test)]
   pub(crate) fn waker(this: &Pin<Arc<Self>>) -> Waker
+  where
+    H: TaskHeader,
+    F: Send + 'static,
+  {
+    Self::into_waker(Pin::clone(this))
+  }
+
+  /// A `Waker` that takes over this owner of the allocation, so a caller
+  /// that already holds a clone pays no further reference-count update.
+  pub(crate) fn into_waker(this: Pin<Arc<Self>>) -> Waker
   where
     H: TaskHeader,
     F: Send + 'static,
@@ -157,10 +168,10 @@ impl<H, F> TaskCell<H, F> {
     Waker::from(Self::unpinned(this))
   }
 
-  /// A new owner of the allocation without the `Pin` wrapper, for APIs that
-  /// take `Arc<Self>`. Never leaves this module: the pin guarantee is kept
-  /// by this module never moving out of, or giving out, such an `Arc`.
-  fn unpinned(this: &Pin<Arc<Self>>) -> Arc<Self> {
+  /// The given owner of the allocation without the `Pin` wrapper, for APIs
+  /// that take `Arc<Self>`. Never leaves this module: the pin guarantee is
+  /// kept by this module never moving out of, or giving out, such an `Arc`.
+  fn unpinned(this: Pin<Arc<Self>>) -> Arc<Self> {
     // SAFETY: the unpinned `Arc` does not escape this module's control.
     // Its only uses are `Waker::from`, whose vtable hands the `Arc` back
     // solely to the `Wake` implementation below (which reads the header
@@ -170,7 +181,7 @@ impl<H, F> TaskCell<H, F> {
     // last owner drops it in place.
     #[expect(unsafe_code, reason = "shares the pinned allocation with a `Waker`")]
     unsafe {
-      Pin::into_inner_unchecked(Pin::clone(this))
+      Pin::into_inner_unchecked(this)
     }
   }
 

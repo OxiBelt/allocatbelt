@@ -272,10 +272,7 @@ where
       TaskContextGuard::enter_with_resource(Some(this.join.id()), this.resources.clone());
     this.release_waiter();
     this.release_task_admission();
-    let staged = this.join.take_staged();
-    if let Some(outcome) = staged
-      && let Some(unclaimed) = this.join.publish(outcome)
-    {
+    if let Some(unclaimed) = this.join.publish_staged() {
       drop_contained(unclaimed);
     }
   }
@@ -313,7 +310,8 @@ where
   }
 
   fn task_waker(self: Pin<Arc<Self>>) -> Waker {
-    TaskCell::waker(&self)
+    // The waker takes over this owner; no second clone of the allocation.
+    TaskCell::into_waker(self)
   }
 
   fn poll_word(&self) -> &PollWord {
@@ -403,9 +401,10 @@ where
       },
       future,
     );
-    let abort: Pin<Arc<dyn AbortMetadata>> = task.clone();
+    // One clone serves the job's join and abort sides; an abort handle
+    // clones the same allocation again only when it is requested.
     let merged: Pin<Arc<dyn MergedJoin<F::Output>>> = task.clone();
-    let job = AsyncJob::merged(merged, abort);
+    let job = AsyncJob::merged(merged);
     (task, job)
   }
 }
@@ -504,12 +503,12 @@ mod loom_cell {
       Arc::strong_count(&Pin::into_inner(Pin::clone(this))) - 1
     }
 
-    pub(crate) fn waker(this: &Pin<Arc<Self>>) -> Waker
+    pub(crate) fn into_waker(this: Pin<Arc<Self>>) -> Waker
     where
       H: TaskHeader,
       F: Send + 'static,
     {
-      Waker::from(Pin::into_inner(Pin::clone(this)))
+      Waker::from(Pin::into_inner(this))
     }
 
     fn try_claim(&self) -> Option<MutexGuard<'_, Slot<F>>> {

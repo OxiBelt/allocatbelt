@@ -87,8 +87,24 @@ struct SlotCell {
 struct SlotState {
   protocol: PollProtocol,
   task: Option<Pin<Arc<dyn ErasedTask>>>,
-  scope: Option<(ScopeRef, Arc<ScopeCell>)>,
+  scope: Option<ScopeRef>,
+  /// The admitted task's retained scope owner. Root-scope tasks leave it
+  /// `None` and reach the root cell through `Shared::root`; other scopes
+  /// install the spawn's one clone together with the task.
+  cell: Option<Arc<ScopeCell>>,
   reserved_permit: bool,
+}
+
+impl SlotState {
+  /// The scope cell of an installed task. The scope, the task and the
+  /// owner are installed together at publication and cleared together on
+  /// release; before publication the spawner holds the owner.
+  fn scope_cell<'a>(&'a self, shared: &'a Shared) -> Option<&'a Arc<ScopeCell>> {
+    debug_assert_eq!(self.scope.is_some(), self.task.is_some());
+    self
+      .scope
+      .map(|_| self.cell.as_ref().unwrap_or(&shared.root))
+  }
 }
 #[repr(align(128))]
 struct Lane {
@@ -175,25 +191,34 @@ pub(super) struct Distributed {
   unwind_seat: AtomicUsize,
 }
 
+/// A slot taken from the free bitmap and counted in `admitted`, with no
+/// generation consumed and nothing installed: close scans skip it, and only
+/// publication admits it. Dropping an unpublished reservation returns the
+/// slot and the scope's task count under the admission lock alone.
 struct SpawnReservation<'a> {
   distributed: &'a Distributed,
   shared: &'a Shared,
-  reference: Option<TaskRef>,
+  index: Option<usize>,
+  scope: ScopeRef,
+  /// Cleared only when the slot's generations ran out at publication.
+  reusable: bool,
+  /// The scope owner until publication installs it in the slot; `None` for
+  /// the root scope.
+  cell: Option<Arc<ScopeCell>>,
 }
 
 impl Drop for SpawnReservation<'_> {
   fn drop(&mut self) {
-    if let Some(reference) = self.reference.take() {
-      let mut slot = self.distributed.slot(reference.index);
-      debug_assert!(slot.protocol.matches(reference.generation));
-      debug_assert!(slot.task.is_none());
-      slot.protocol.rollback_reservation();
-      let reusable = slot.protocol.next_generation().is_some();
-      let scope = slot.scope.take();
-      drop(slot);
-      self
-        .distributed
-        .complete(self.shared, reference.index, reusable, None, scope);
+    if let Some(index) = self.index.take() {
+      let cell = self.cell.take();
+      self.distributed.complete(
+        self.shared,
+        index,
+        self.reusable,
+        None,
+        Some(self.scope),
+        cell,
+      );
     }
   }
 }
@@ -285,6 +310,7 @@ impl Distributed {
           protocol: PollProtocol::new(),
           task: None,
           scope: None,
+          cell: None,
           reserved_permit: false,
         }),
       })?,
@@ -499,47 +525,46 @@ impl Distributed {
   {
     #[cfg(all(test, not(loom)))]
     shared.before_spawn_admission_for_test();
-    let (scope_cell, task_ref) = {
+    let (owner, index) = {
       let mut state = self.admission(shared);
       if state.closed {
         return Err(AsyncSpawnError::new(AsyncError::Closed, future));
       }
-      let Some(scope_cell) = get_scope(&state, scope).cloned() else {
+      let Some(scope_cell) = get_scope(&state, scope) else {
         return Err(AsyncSpawnError::new(AsyncError::Closed, future));
       };
       if scope_cell.protocol.is_closed() {
         return Err(AsyncSpawnError::new(AsyncError::Closed, future));
       }
+      // The bitmap holds only released slots with a generation to spare, so
+      // this is the whole capacity decision; the slot is first locked at
+      // publication, outside the admission lock.
       let Some(index) = state.free_tasks.first() else {
         return Err(AsyncSpawnError::new(AsyncError::Full, future));
       };
-      let mut slot = self.slot(index);
-      let Some(generation) = (slot.task.is_none() && !slot.protocol.admitted())
-        .then(|| slot.protocol.next_generation())
-        .flatten()
-      else {
-        return Err(AsyncSpawnError::new(AsyncError::Full, future));
-      };
-      state.free_tasks.remove(index);
-      self.links[index].cleanup.store(false, Ordering::SeqCst);
-      slot.protocol.admit(generation);
-      slot.scope = Some((scope, Arc::clone(&scope_cell)));
       scope_cell.protocol.add_task();
+      // The root cell outlives every slot and is reached through
+      // `shared.root`; any other scope is retained once, first by the
+      // reservation and then by the slot.
+      let owner = (!Arc::ptr_eq(scope_cell, &shared.root)).then(|| Arc::clone(scope_cell));
+      state.free_tasks.remove(index);
+      // `admitted` counts the reservation until publication or rollback and
+      // is also the alive-task metric; it is read under this lock.
       state.admitted += 1;
-      shared
-        .metrics
-        .inner()
-        .alive_tasks
-        .store(state.admitted, Ordering::Relaxed);
-      (scope_cell, TaskRef { index, generation })
+      (owner, index)
     };
-    // Until publication, close can mark this slot for cleanup but cannot
-    // enqueue it. Any failure returns the reserved slot through this guard.
+    // Until publication the slot is not admitted: close cannot mark it, and
+    // the publication recheck returns the original future when close won.
+    // Any failure returns the reserved slot through this guard.
     let mut reservation = SpawnReservation {
       distributed: self,
       shared,
-      reference: Some(task_ref),
+      index: Some(index),
+      scope,
+      reusable: true,
+      cell: owner,
     };
+    let scope_cell: &ScopeCell = reservation.cell.as_deref().unwrap_or(&shared.root);
     // On unwind, drop the uninstalled future before returning its admission.
     let future = future;
     let tenant = scope_cell.tenant.as_ref();
@@ -585,20 +610,27 @@ impl Distributed {
     #[cfg(all(test, not(loom)))]
     shared.after_spawn_reservation_for_test();
     let job = {
-      let mut slot = self.slot(task_ref.index);
-      debug_assert!(slot.protocol.matches(task_ref.generation));
-      debug_assert!(slot.task.is_none());
+      // The one slot lock of a spawn: generation, admission, installation.
+      let mut slot = self.slot(index);
+      debug_assert!(slot.task.is_none() && !slot.protocol.admitted());
+      debug_assert!(slot.scope.is_none() && slot.cell.is_none());
+      let Some(generation) = slot.protocol.next_generation() else {
+        // Unreachable through the bitmap, which never offers an exhausted
+        // slot; retire the slot instead of returning it.
+        drop(slot);
+        drop(domain);
+        reservation.reusable = false;
+        return Err(AsyncSpawnError::new(AsyncError::Full, future));
+      };
       // Publication wins only while both runtime and scope remain open.
       // Keep F movable until this check, and serialize installation with
       // close's slot scan. Allocation holds no admission lock.
-      if self.closing.load(Ordering::Acquire)
-        || scope_cell.protocol.is_closed()
-        || slot.protocol.aborting_queued()
-      {
+      if self.closing.load(Ordering::Acquire) || scope_cell.protocol.is_closed() {
         drop(slot);
         drop(domain);
         return Err(AsyncSpawnError::new(AsyncError::Closed, future));
       }
+      let task_ref = TaskRef { index, generation };
       let (task, job) = Task::create(
         future,
         task_id,
@@ -607,13 +639,22 @@ impl Distributed {
         Arc::downgrade(shared),
         task_ref,
       );
+      // Relaxed: every store to this flag runs under this slot lock, so the
+      // reset precedes any abort of this generation in modification order,
+      // and every load for this generation, including the lock-free steal
+      // check, follows the entry's push under the lane lock, which follows
+      // this reset. The abort/cleanup pairing keeps its SeqCst accesses.
+      self.links[index].cleanup.store(false, Ordering::Relaxed);
+      slot.protocol.admit(generation);
+      slot.scope = Some(scope);
       slot.task = Some(task);
+      slot.cell = reservation.cell.take();
       let inserted = slot.protocol.queue();
       debug_assert!(inserted);
       job
     };
-    reservation.reference = None;
-    self.push_ready(shared, task_ref.index, ReadyInsertion::Publish);
+    reservation.index = None;
+    self.push_ready(shared, index, ReadyInsertion::Publish);
     Ok(job)
   }
 
@@ -651,19 +692,20 @@ impl Distributed {
       let mut slot = self.slot(index);
       if !slot.protocol.admitted()
         || generation.is_some_and(|g| !slot.protocol.matches(g))
-        || scope.is_some_and(|s| slot.scope.as_ref().is_none_or(|(r, _)| *r != s))
+        || scope.is_some_and(|s| slot.scope.is_none_or(|r| r != s))
       {
         return;
       }
       self.links[index].cleanup.store(true, Ordering::SeqCst);
       let inserted = slot.protocol.abort();
       if slot.task.is_none() {
-        // The reserving spawner owns publication, including cleanup routing.
+        // Publication installs the task with the admission; only a fixture
+        // admits a slot without one, and it has nothing to route.
         return;
       }
       let unlinked = if !inserted
         && slot.protocol.aborting_queued()
-        && let Some((_, cell)) = &slot.scope
+        && let Some(cell) = slot.scope_cell(shared)
         && cell.binding
       {
         self.scope(cell).unlink_blocked(&self.links, index)
@@ -774,7 +816,7 @@ impl Distributed {
     let reserved = std::mem::take(&mut slot.reserved_permit);
     if slot.protocol.aborting_queued() {
       let cell = if reserved {
-        Some(Arc::clone(&slot.scope.as_ref()?.1))
+        Some(Arc::clone(slot.scope_cell(shared)?))
       } else {
         None
       };
@@ -786,7 +828,7 @@ impl Distributed {
       }
       return Some(Selected::Cancel(task_ref, task));
     }
-    let (_, cell) = slot.scope.as_ref()?;
+    let cell = slot.scope_cell(shared)?;
     let release = if cell.binding {
       if !reserved {
         let mut dispatch = self.scope(cell);
@@ -842,9 +884,10 @@ impl Distributed {
       PollFinish::Complete => {
         let task = slot.task.take();
         let scope = slot.scope.take();
+        let cell = slot.cell.take();
         let reusable = slot.protocol.next_generation().is_some();
         drop(slot);
-        self.complete(shared, task_ref.index, reusable, task, scope);
+        self.complete(shared, task_ref.index, reusable, task, scope, cell);
       }
       PollFinish::CancelCleanup => {
         let task = slot.task.clone();
@@ -869,10 +912,11 @@ impl Distributed {
     }
     let slot_task = slot.task.take();
     let scope = slot.scope.take();
+    let cell = slot.cell.take();
     slot.protocol.finish_cancel();
     let reusable = slot.protocol.next_generation().is_some();
     drop(slot);
-    self.complete(shared, task_ref.index, reusable, slot_task, scope);
+    self.complete(shared, task_ref.index, reusable, slot_task, scope, cell);
     drop(task);
   }
 
@@ -882,7 +926,8 @@ impl Distributed {
     index: usize,
     reusable: bool,
     task: Option<Pin<Arc<dyn ErasedTask>>>,
-    scope: Option<(ScopeRef, Arc<ScopeCell>)>,
+    scope: Option<ScopeRef>,
+    cell: Option<Arc<ScopeCell>>,
   ) {
     let empty_after_close = {
       let mut state = self.admission(shared);
@@ -890,18 +935,16 @@ impl Distributed {
         state.free_tasks.insert(index);
       }
       state.admitted -= 1;
-      shared
-        .metrics
-        .inner()
-        .alive_tasks
-        .store(state.admitted, Ordering::Relaxed);
       state.closed && state.admitted == 0
     };
     if let Some(task) = task {
       task.publish();
     }
-    if let Some((_, cell)) = scope {
-      cell.completed();
+    if let Some(scope) = scope {
+      debug_assert!(cell.is_some() || scope == ScopeRef::ROOT);
+      // The root scope's last task never reclaims it, so completion only
+      // decrements its count; owned scopes release their retained cell here.
+      cell.as_deref().unwrap_or(&shared.root).completed();
     }
     if empty_after_close {
       self.closed_empty.store(true, Ordering::Release);

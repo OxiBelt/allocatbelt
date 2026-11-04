@@ -993,16 +993,22 @@ guaranteed. A future that never returns from `poll` cannot be preempted.
 An in-progress spawn reserves its task slot and scope unfinished-task count
 before domain admission and task construction. Such reservations count toward
 `max_outstanding` and the alive-task gauge immediately, so concurrent spawns can
-observe `Full` earlier and close waits for publication or rollback. Successful
-spawn takes the admission mutex once; tenant domain reservations still run
-outside scheduler locks. Construction and publication use the slot mutex and
-recheck runtime/scope closure before consuming the future. If close wins that
-check, rejection returns the original unpolled, undropped future. Rollback
-releases admission and scope accounting and restores the unpublished generation;
+observe `Full` earlier and close waits for publication or rollback. Reservation
+takes the admission mutex once and only clears the slot's free bit and updates
+the admitted and scope task counts; it consumes no slot generation and locks
+no slot, so a reserved slot is not admitted and close's slot scan skips it.
+Tenant domain reservations still run outside scheduler locks. Construction
+and publication take the slot mutex once, the spawn's only slot lock: that
+lock consumes the generation, rechecks runtime/scope closure, and installs
+the task. If close wins that check, rejection returns the original unpolled,
+undropped future. Rollback returns the free bit and the admitted and scope
+task counts under the admission mutex alone; no generation was consumed, so
 failed spawns cannot exhaust slot generations. Free slots are kept in one bitmap
 under the admission mutex and scanned from the lowest word and bit, preserving
-lowest-index reuse. Each spawn scans up to `ceil(max_outstanding / 64)` bitmap
-words, so lookup cost grows with the configured outstanding-task bound.
+lowest-index reuse. The bitmap's first word is stored inline with the admission
+state, so reuse among the first 64 slots touches no separate table. Each spawn
+scans up to `ceil(max_outstanding / 64)` bitmap words, so lookup cost grows
+with the configured outstanding-task bound.
 
 The executor appends newly ready, self-woken, requeued and quota-released
 tasks to a lane chosen by a round-robin counter and the parked mask. Dead
@@ -1078,7 +1084,11 @@ barrier waits, managed-pipe, Unix-pipe and blocking-stream I/O polls,
 `Sleep`, `Timeout` and interval tick polls, and asynchronous or blocking job
 result polls. Job polls gate before cloning a waker, examining the completion
 slot or consuming its output; an exhausted poll preserves an already-published
-result for a later poll. Synchronous job observers remain unchanged.
+result for a later poll. An asynchronous job poll clones its waker only on its
+first registration or when the stored waker would not wake the caller
+(`Waker::will_wake`), and never once the outcome is published; a repeated poll
+with the same waker touches the join lock once and stores nothing.
+Synchronous job observers remain unchanged.
 Concrete TCP/Unix stream reads and writes, socket shutdown/flush, listener
 accepts, UDP/Unix datagram send/receive operations and UDP peeks also gate
 readiness and syscall attempts. An interrupted syscall spends its unit;
@@ -1141,7 +1151,9 @@ not on current resource limits.
 `AsyncJob::abort_handle` returns a clonable thread-safe control handle,
 including for local jobs whose outputs are `!Send`. For native worker tasks,
 abort handles and scheduler wakers retain the shared task bookkeeping allocation
-and its `Control` charge. It contains one inline output slot: the result remains
+and its `Control` charge; the job itself holds one reference to that allocation
+for both its join and its abort side, and an abort handle adds one only when
+requested. It contains one inline output slot: the result remains
 there until the join consumes it or is dropped; a detached result is discarded
 by the publishing worker. Completion drops the inline user future in place
 before publication; its storage is part of the one task allocation and stays
@@ -2042,7 +2054,10 @@ Hooks receive stable physical worker/helper identities and run outside runtime
 locks and TLS borrows. Hook panics are contained and counted. Park attempts
 that skip a condition wait still pair callbacks; metrics count actual waits.
 `RuntimeMetrics` remains readable after shutdown and distinguishes primary
-dispatch capacity from physical helper threads. Each physical thread timestamps
+dispatch capacity from physical helper threads. A retained metrics handle holds
+only a weak reference to the scheduler, which the scheduler clears when its
+last owner drops, so the handle keeps no scheduler state or storage alive after
+shutdown. Each physical thread timestamps
 busy time at the start of its first dispatched turn after installation or a
 condition wait, and after successful handoff restoration. The period stays
 open across consecutive turns, including cleanup, queue searches and spinning
@@ -2056,11 +2071,13 @@ waits are excluded, as is the initial search after a wait until a turn starts.
 Reads may lag by up to 64 consecutive turns of an open busy period.
 This remains solely a per-thread wall-time diagnostic; it never feeds spin,
 park, wake or quota decisions.
-The alive-task gauge is stored from the admitted count under the admission
-mutex after reservation and release. It includes in-progress spawns before
-domain admission or task construction and stays charged through future cleanup;
-release precedes join publication. Relaxed readers may see adjacent moments.
-Scalar and per-thread reads allocate nothing;
+The alive-task gauge is the scheduler's admitted count, read under the
+admission mutex, so each read is exact at that instant rather than a lagging
+copy. It includes reserved spawns until publication or rollback, including
+in-progress spawns before domain admission or task construction, and a
+published task stays counted through future cleanup until its slot is
+released, which precedes join publication. It reads zero once the scheduler's
+last owner has dropped. Scalar and per-thread reads allocate nothing;
 `try_snapshot` reports reservation failure, while the convenience snapshot
 allocates ordinary metadata. Fields are sampled independently rather than
 transactionally. Counter updates and monotonic timestamps are present even

@@ -1,9 +1,10 @@
 //! Retained, point-in-time diagnostics for an asynchronous runtime.
 
 use std::ops::Deref;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
+use super::scheduler::Shared;
 use super::thread_options::AsyncThreadContext;
 use crate::runtime::resource_domain::{ControlCharge, DomainError, TenantDomain, payload_bytes};
 
@@ -31,7 +32,15 @@ pub(super) type PaddedCounter = Padded<AtomicUsize>;
 
 pub(super) struct RuntimeMetricsInner {
   pub(super) workers: usize,
-  pub(super) alive_tasks: Padded<AtomicUsize>,
+  /// The scheduler whose admission count is the alive-task metric. Spawn
+  /// and completion keep no separate copy, so neither writes a metrics line.
+  /// The scheduler binds it once at construction and clears it from its
+  /// `Drop`, so a retained metrics handle never keeps the scheduler's
+  /// allocation, which its `Weak` would otherwise pin, alive past the
+  /// scheduler's last owner; once the scheduler is gone every task slot has
+  /// been released. Only the diagnostic read and those two lifetime events
+  /// take this lock.
+  admission: Mutex<Option<Weak<Shared>>>,
   pub(super) lane_depth: Vec<PaddedCounter>,
   pub(super) blocked_depth: Padded<AtomicUsize>,
   pub(super) overflow_depth: Padded<AtomicUsize>,
@@ -90,8 +99,9 @@ impl ThreadMetrics {
 /// Scalar and per-thread getters allocate nothing;
 /// [`snapshot`](Self::snapshot) allocates a vector, while
 /// [`try_snapshot`](Self::try_snapshot) reports reservation failure. Every
-/// counter is sampled independently with relaxed ordering; these reads do not
-/// form a transactional snapshot across fields or threads.
+/// counter is sampled independently, the alive-task count under the
+/// scheduler's admission mutex and the others with relaxed loads; these
+/// reads do not form a transactional snapshot across fields or threads.
 #[derive(Clone)]
 pub struct RuntimeMetrics(Arc<RuntimeMetricsInner>);
 
@@ -135,7 +145,7 @@ impl RuntimeMetrics {
       .map_err(MetricsBuildError::ResourceDomain)?;
     Ok(Self(Arc::new(RuntimeMetricsInner {
       workers,
-      alive_tasks: Padded(AtomicUsize::new(0)),
+      admission: Mutex::new(None),
       lane_depth,
       blocked_depth: Padded(AtomicUsize::new(0)),
       overflow_depth: Padded(AtomicUsize::new(0)),
@@ -147,6 +157,43 @@ impl RuntimeMetrics {
 
   pub(super) fn inner(&self) -> &Arc<RuntimeMetricsInner> {
     &self.0
+  }
+
+  /// Names the scheduler whose admission count this view reports. Called
+  /// once, by the scheduler that owns this view, before any task is admitted.
+  pub(super) fn bind_admission(&self, shared: Weak<Shared>) {
+    let previous = self
+      .0
+      .admission
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .replace(shared);
+    debug_assert!(previous.is_none(), "metrics already bound to a scheduler");
+  }
+
+  /// Whether a scheduler is bound: a retained handle stops pinning the
+  /// scheduler's allocation once this is false.
+  #[cfg(all(test, not(loom)))]
+  pub(super) fn admission_bound(&self) -> bool {
+    self
+      .0
+      .admission
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .is_some()
+  }
+
+  /// Forgets the scheduler, releasing the metrics' hold on its allocation.
+  /// Called from the scheduler's `Drop`, so no upgrade can succeed from here
+  /// on and the count reads as zero.
+  pub(super) fn unbind_admission(&self) {
+    let unbound = self
+      .0
+      .admission
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .take();
+    drop(unbound);
   }
 
   /// Returns the configured primary worker count.
@@ -163,11 +210,25 @@ impl RuntimeMetrics {
 
   /// Returns the current number of reserved task slots, including in-progress
   /// spawns before domain admission/construction and cancellation cleanup.
-  /// The admission mutex serializes stores after reservation and release; reads
-  /// remain relaxed and can observe an adjacent moment.
+  /// The count is the scheduler's admission count, read under its admission
+  /// mutex, so it is exact at that instant; it includes a reserved spawn
+  /// until publication or rollback, and a published task until its slot is
+  /// released, which precedes join publication. The read holds the scheduler
+  /// alive for its duration. Once the scheduler's last owner has dropped,
+  /// no slot remains reserved and the count is zero.
   #[must_use]
   pub fn num_alive_tasks(&self) -> usize {
-    self.0.alive_tasks.load(Ordering::Relaxed)
+    // Release the handle lock before the scheduler is used or dropped: if
+    // this upgrade produced the last owner, dropping it runs the scheduler's
+    // `Drop`, which takes the same lock to unbind.
+    let shared = self
+      .0
+      .admission
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .as_ref()
+      .and_then(Weak::upgrade);
+    shared.map_or(0, |shared| shared.alive_tasks())
   }
 
   /// Returns the current number of queued tasks, including scope poll waiters.
@@ -229,7 +290,7 @@ impl RuntimeMetrics {
     RuntimeMetricsSnapshot {
       num_workers: self.0.workers,
       dispatch_ceiling: self.0.workers,
-      num_alive_tasks: self.0.alive_tasks.load(Ordering::Relaxed),
+      num_alive_tasks: self.num_alive_tasks(),
       global_queue_depth: self.global_queue_depth(),
       hook_panics: self.0.hook_panics.load(Ordering::Relaxed),
       threads: self

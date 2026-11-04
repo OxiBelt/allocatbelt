@@ -21,7 +21,7 @@ use super::handoff;
 use super::handoff_protocol::{DispatchTurn, HandoffLoan};
 use super::identity;
 use super::join::AsyncJob;
-use super::metrics::RuntimeMetrics;
+use super::metrics::{Padded, RuntimeMetrics};
 use super::protocol::{PollFinish, PollProtocol, PollWord, ScopeProtocol};
 use super::task::{DomainCpuAdmission, ErasedTask, PollResult, Task};
 use super::thread_options::AsyncThreadContext;
@@ -47,6 +47,15 @@ static NEXT_RUNTIME: AtomicU64 = AtomicU64::new(1);
 pub(super) struct ScopeRef {
   index: usize,
   generation: u64,
+}
+
+impl ScopeRef {
+  /// The root scope occupies the first scope slot for the runtime's whole
+  /// lifetime, so its cell is reachable without the scope table.
+  pub(super) const ROOT: Self = Self {
+    index: 0,
+    generation: 1,
+  };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,10 +85,15 @@ impl ScopeSlot {
   }
 }
 
+// Declaration order is layout order: the fields every spawn and completion
+// write (`admitted`, the inline free-slot word) and the flag they only read
+// (`closed`) follow the lock word within one cache line; the scope table
+// header is only read.
+#[repr(C)]
 struct State {
-  closed: bool,
   admitted: usize,
   free_tasks: FreeSlots,
+  closed: bool,
   scopes: Vec<ScopeSlot>,
 }
 
@@ -89,7 +103,12 @@ pub(super) struct Shared {
   workers: usize,
   pub(super) metrics: RuntimeMetrics,
   thread_options: super::ControlledThreadOptions,
-  state: Mutex<State>,
+  /// Admission bookkeeping on its own line pair, so the lock word, the
+  /// admitted count and the first free-slot word arrive with the lock.
+  state: Padded<Mutex<State>>,
+  /// The root scope's cell, also held by the first scope slot. Tasks of the
+  /// root scope reach it here instead of retaining their own owner.
+  pub(super) root: Arc<ScopeCell>,
   distributed: Distributed,
   /// Deterministic admission interleavings; absent from non-test builds.
   #[cfg(all(test, not(loom)))]
@@ -122,6 +141,9 @@ impl Drop for Shared {
     // No dispatcher can still be running when its last Shared owner drops.
     // Retained join/abort handles and wakers must not retain admitted futures.
     self.distributed.cancel_remaining();
+    // Every slot is released now; retained metrics handles read zero and
+    // stop pinning this allocation through their weak owner.
+    self.metrics.unbind_admission();
   }
 }
 
@@ -242,11 +264,8 @@ impl Shared {
       root_waiters,
       None,
     ));
-    scopes[0] = ScopeSlot::new(1, Some(root_scope));
-    let root = ScopeRef {
-      index: 0,
-      generation: 1,
-    };
+    let root = ScopeRef::ROOT;
+    scopes[root.index] = ScopeSlot::new(root.generation, Some(Arc::clone(&root_scope)));
     let distributed = Distributed::new(config, max_handoffs, park_spin)?;
     let mut actual_control = std::mem::size_of::<Shared>();
     for bytes in [
@@ -264,30 +283,35 @@ impl Shared {
     control
       .try_resize(actual_control)
       .map_err(AsyncError::ResourceDomain)?;
-    Ok((
-      Arc::new(Self {
-        id,
-        max_handoffs,
-        workers: config.workers,
-        metrics,
-        thread_options,
-        distributed,
-        state: Mutex::new(State {
-          closed: false,
-          admitted: 0,
-          free_tasks,
-          scopes,
-        }),
-        #[cfg(all(test, not(loom)))]
-        spawn_admission_test_hook: Mutex::new(None),
-        #[cfg(all(test, not(loom)))]
-        spawn_reserved_test_hook: Mutex::new(None),
-        #[cfg(all(test, not(loom)))]
-        lock_acquisitions: AtomicUsize::new(0),
-        _control: control,
-      }),
-      root,
-    ))
+    let shared = Arc::new(Self {
+      id,
+      max_handoffs,
+      workers: config.workers,
+      metrics,
+      thread_options,
+      distributed,
+      state: Padded(Mutex::new(State {
+        closed: false,
+        admitted: 0,
+        free_tasks,
+        scopes,
+      })),
+      root: root_scope,
+      #[cfg(all(test, not(loom)))]
+      spawn_admission_test_hook: Mutex::new(None),
+      #[cfg(all(test, not(loom)))]
+      spawn_reserved_test_hook: Mutex::new(None),
+      #[cfg(all(test, not(loom)))]
+      lock_acquisitions: AtomicUsize::new(0),
+      _control: control,
+    });
+    shared.metrics.bind_admission(Arc::downgrade(&shared));
+    Ok((shared, root))
+  }
+
+  /// The admitted, unfinished task count, read under the admission mutex.
+  pub(super) fn alive_tasks(&self) -> usize {
+    self.lock().admitted
   }
 
   fn lock(&self) -> MutexGuard<'_, State> {

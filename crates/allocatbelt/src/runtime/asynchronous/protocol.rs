@@ -208,14 +208,6 @@ impl PollProtocol {
     self.abort = false;
   }
 
-  pub(super) fn rollback_reservation(&mut self) {
-    // No task or handle was published with this generation. Reuse it so
-    // failed spawns cannot exhaust the slot's generation counter.
-    debug_assert!(self.admitted && !self.running && self.generation > 0);
-    self.generation -= 1;
-    self.release();
-  }
-
   pub(super) fn admitted(&self) -> bool {
     self.admitted
   }
@@ -1225,7 +1217,8 @@ mod loom_tests {
     for close_kind in 0..3 {
       for publish in [false, true] {
         bounded_model(move || {
-          // The admission count includes reserved, not yet published slots.
+          // The admission count includes reserved, not yet published slots;
+          // such a slot is not admitted, so close scans skip it.
           let admission = Arc::new(Mutex::new((false, 0usize)));
           let mut protocol = PollProtocol::new();
           protocol.admit(u64::MAX - 1);
@@ -1244,25 +1237,23 @@ mod loom_tests {
                 if state.0 || scope.is_closed() {
                   return false;
                 }
-                lock(&slot).0.admit(u64::MAX);
                 scope.add_task();
                 state.1 += 1;
               }
-              // Fallible domain reservations hold neither scheduler lock.
+              // Fallible domain reservations hold neither scheduler lock. The
+              // one slot lock of the spawn admits only when close has not won.
               {
                 let mut slot = lock(&slot);
-                if publish
-                  && !closing.load(super::Ordering::Acquire)
-                  && !scope.is_closed()
-                  && !slot.0.aborting_queued()
-                {
+                assert!(!slot.0.admitted());
+                if publish && !closing.load(super::Ordering::Acquire) && !scope.is_closed() {
+                  slot.0.admit(u64::MAX);
                   assert!(slot.0.queue());
                   slot.1 = true;
                   return true;
                 }
               }
-              // Return the still-movable original future, with no publication.
-              lock(&slot).0.rollback_reservation();
+              // Return the still-movable original future: nothing was
+              // admitted and no generation was consumed.
               lock(&admission).1 -= 1;
               assert!(scope.complete_one());
               false
@@ -1291,8 +1282,12 @@ mod loom_tests {
               if close_kind != 0 {
                 let mut slot = lock(&slot);
                 if slot.0.admitted() {
+                  // Published: the queued entry is aborted in place.
                   let _ = slot.0.abort();
-                  // No physical queue entry until the spawner publishes.
+                } else {
+                  // Reserved or free: nothing to abort; a later publication
+                  // sees the close flag under this same slot lock.
+                  assert!(!slot.1);
                 }
               }
             })

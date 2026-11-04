@@ -65,6 +65,21 @@ fn shared(config: AsyncConfig) -> (Arc<Shared>, ScopeRef) {
   shared_with_handoffs(config, 0)
 }
 fn shared_with_handoffs(config: AsyncConfig, handoffs: usize) -> (Arc<Shared>, ScopeRef) {
+  shared_with(config, handoffs, AsyncThreadOptions::new())
+}
+// The metrics view holds a weak owner of the scheduler, so thread options
+// are supplied at construction rather than through `Arc::get_mut`.
+fn shared_with_options(
+  config: AsyncConfig,
+  options: AsyncThreadOptions,
+) -> (Arc<Shared>, ScopeRef) {
+  shared_with(config, 0, options)
+}
+fn shared_with(
+  config: AsyncConfig,
+  handoffs: usize,
+  options: AsyncThreadOptions,
+) -> (Arc<Shared>, ScopeRef) {
   let metrics = RuntimeMetrics::try_new(
     config.workers,
     super::super::super::thread_contexts(config.workers, handoffs),
@@ -76,7 +91,7 @@ fn shared_with_handoffs(config: AsyncConfig, handoffs: usize) -> (Arc<Shared>, S
     config,
     handoffs,
     None,
-    super::super::super::ControlledThreadOptions::unbounded(AsyncThreadOptions::new()),
+    super::super::super::ControlledThreadOptions::unbounded(options),
     metrics,
     TEST_SPIN_POLICY.get(),
   )
@@ -374,17 +389,16 @@ fn work_arriving_during_spin_runs_without_a_park() {
 }
 
 fn work_arriving_during_spin_runs_without_a_park_case() {
-  let (mut shared, root) = shared(config(2, 1));
   let park_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
   let attempts = Arc::clone(&park_attempts);
-  Arc::get_mut(&mut shared).unwrap().thread_options =
-    super::super::super::ControlledThreadOptions::unbounded(
-      AsyncThreadOptions::new().on_thread_park(move |context| {
-        if context.role == AsyncThreadRole::Worker && context.index == 0 {
-          attempts.fetch_add(1, Ordering::SeqCst);
-        }
-      }),
-    );
+  let (shared, root) = shared_with_options(
+    config(2, 1),
+    AsyncThreadOptions::new().on_thread_park(move |context| {
+      if context.role == AsyncThreadRole::Worker && context.index == 0 {
+        attempts.fetch_add(1, Ordering::SeqCst);
+      }
+    }),
+  );
   let job = Arc::new(Mutex::new(None));
   let completed = Arc::new(AtomicBool::new(false));
   let thread = {
@@ -1026,9 +1040,8 @@ fn check_distributed(shared: &Shared) {
           .filter(|slot| {
             let slot = slot.state.lock().unwrap();
             slot
-              .scope
-              .as_ref()
-              .is_some_and(|(_, owner)| Arc::ptr_eq(owner, cell))
+              .scope_cell(shared)
+              .is_some_and(|owner| Arc::ptr_eq(owner, cell))
               && (slot.reserved_permit || slot.protocol.is_running())
           })
           .count();
@@ -1056,6 +1069,8 @@ fn check_distributed(shared: &Shared) {
   let bitmap: Vec<_> = state.free_tasks.iter().collect();
   assert_eq!(free, bitmap);
   assert_eq!(state.admitted, admitted);
+  // The metric reads the admission count under the admission lock.
+  drop(state);
   assert_eq!(shared.metrics.num_alive_tasks(), admitted);
 }
 
@@ -1196,13 +1211,14 @@ fn spawn_wake_completion_and_steal_lock_counts_case() {
     d.lane_locks.load(Ordering::Relaxed),
   );
   let job = shared.spawn(root, std::future::pending::<()>()).unwrap();
+  // One admission lock to reserve, one slot lock to admit and install.
   assert_eq!(
     (
       shared.lock_acquisitions.load(Ordering::Relaxed) - before.0,
       d.slot_locks.load(Ordering::Relaxed) - before.1,
       d.lane_locks.load(Ordering::Relaxed) - before.2
     ),
-    (1, 2, 1)
+    (1, 1, 1)
   );
   let work = selected(&shared, 0).unwrap();
   let reference = match &work {
@@ -1965,23 +1981,22 @@ fn abort_of_stolen_blocked_task_cleans_up_during_another_poll() {
 }
 
 fn abort_of_stolen_blocked_task_cleans_up_during_another_poll_case() {
-  let (mut shared, _) = shared(config(2, 3));
   let (parked, park_attempt) = mpsc::channel();
   let (unpark, continue_park) = mpsc::channel();
   let continue_park = Mutex::new(Some(continue_park));
   // Hold the searcher just before it advertises parking, keeping its parked
   // bit clear while the foreign abort inserts at the next rotating position.
-  Arc::get_mut(&mut shared).unwrap().thread_options =
-    super::super::super::ControlledThreadOptions::unbounded(
-      AsyncThreadOptions::new().on_thread_park(move |context| {
-        if context.index == 1
-          && let Some(resume) = continue_park.lock().unwrap().take()
-        {
-          parked.send(()).unwrap();
-          resume.recv_timeout(Duration::from_secs(30)).unwrap();
-        }
-      }),
-    );
+  let (shared, _) = shared_with_options(
+    config(2, 3),
+    AsyncThreadOptions::new().on_thread_park(move |context| {
+      if context.index == 1
+        && let Some(resume) = continue_park.lock().unwrap().take()
+      {
+        parked.send(()).unwrap();
+        resume.recv_timeout(Duration::from_secs(30)).unwrap();
+      }
+    }),
+  );
   let scope = shared.new_scope(1, None).unwrap();
   let (entered, arrival) = mpsc::channel();
   let (release, resume) = mpsc::channel();
@@ -2113,21 +2128,20 @@ fn park_rescan_finds_work_published_before_park_advertisement() {
 }
 
 fn park_rescan_finds_work_published_before_park_advertisement_case() {
-  let (mut shared, root) = shared(config(2, 2));
   let (attempt, attempted) = mpsc::channel();
   let (resume, resumed) = mpsc::channel();
   let resumed = Mutex::new(Some(resumed));
-  Arc::get_mut(&mut shared).unwrap().thread_options =
-    super::super::super::ControlledThreadOptions::unbounded(
-      AsyncThreadOptions::new().on_thread_park(move |context| {
-        if context.index == 1
-          && let Some(resumed) = resumed.lock().unwrap().take()
-        {
-          attempt.send(()).unwrap();
-          resumed.recv_timeout(Duration::from_secs(30)).unwrap();
-        }
-      }),
-    );
+  let (shared, root) = shared_with_options(
+    config(2, 2),
+    AsyncThreadOptions::new().on_thread_park(move |context| {
+      if context.index == 1
+        && let Some(resumed) = resumed.lock().unwrap().take()
+      {
+        attempt.send(()).unwrap();
+        resumed.recv_timeout(Duration::from_secs(30)).unwrap();
+      }
+    }),
+  );
   let (entered, arrival) = mpsc::channel();
   let (release, released) = mpsc::channel();
   let holder = shared
@@ -3243,4 +3257,24 @@ fn woken_recheck_and_denied_overflow_pop_keep_last_searcher_coverage() {
   run(&shared, selected(&shared, 2).unwrap());
   assert!(matches!(finish(cleanup), Err(AsyncJoinError::Cancelled)));
   finish(other).unwrap();
+}
+
+#[test]
+fn metrics_handle_reads_the_admission_count_and_unbinds_with_the_scheduler() {
+  let (shared, root) = shared(config(1, 2));
+  let metrics = shared.metrics.clone();
+  assert!(metrics.admission_bound());
+  assert_eq!(metrics.num_alive_tasks(), 0);
+  let job = shared.spawn(root, async {}).unwrap();
+  assert_eq!(metrics.num_alive_tasks(), 1);
+  run(&shared, selected(&shared, 0).unwrap());
+  finish(job).unwrap();
+  assert_eq!(metrics.num_alive_tasks(), 0);
+  shared.close(false);
+  check_distributed(&shared);
+  // The scheduler's `Drop` unbinds the handle, so a retained handle neither
+  // pins the scheduler's allocation nor reads anything but zero.
+  drop(shared);
+  assert!(!metrics.admission_bound());
+  assert_eq!(metrics.num_alive_tasks(), 0);
 }
