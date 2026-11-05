@@ -18,10 +18,11 @@ use crate::runtime::resource_domain::{
 };
 #[cfg(not(loom))]
 pub(super) use crate::sys::runtime_task_cell::{
-  CellPoll, JoinSide, PollNotify, TaskCell, TaskHeader, TaskJoin, TaskWord,
+  CellPoll, JoinSide, Lease, PollNotify, TaskCell, TaskHeader, TaskJoin, TaskLend, TaskSlot,
+  TaskWord,
 };
 #[cfg(loom)]
-pub(super) use loom_cell::{CellPoll, JoinSide, TaskCell, TaskHeader};
+pub(super) use loom_cell::{CellPoll, JoinSide, Lease, TaskCell, TaskHeader, TaskLend, TaskSlot};
 #[cfg(loom)]
 pub(super) use word::{PollNotify, PollWord, TaskJoin, TaskWord};
 
@@ -53,7 +54,7 @@ pub(super) enum PollResult {
 /// A native task, reached only through its pinned allocation. The methods
 /// that may touch the stored future take `Pin<&Self>`, which is all the
 /// pinned `Arc` hands out.
-pub(super) trait ErasedTask: Send + Sync {
+pub(super) trait ErasedTask: TaskLend {
   /// Polls once without a scheduler lock. The scheduler protocol serializes
   /// polling and cancellation cleanup; the future cell's claim serializes
   /// access to the stored future even without it.
@@ -80,7 +81,8 @@ pub(super) trait ErasedTask: Send + Sync {
   fn acquire_cpu(&self, waker: &Waker) -> DomainCpuAdmission;
 
   /// Returns a waker backed by the task allocation, without another
-  /// allocation.
+  /// allocation. A turn uses the waker its lease borrows instead.
+  #[cfg(test)]
   fn task_waker(self: Pin<Arc<Self>>) -> Waker;
 
   /// The scheduling face of the task-owned word, never shared with a later
@@ -293,6 +295,7 @@ where
     }
   }
 
+  #[cfg(test)]
   fn task_waker(self: Pin<Arc<Self>>) -> Waker {
     // The waker takes over this owner; no second clone of the allocation.
     TaskCell::into_waker(self)
@@ -437,7 +440,9 @@ where
 /// Miri-checked unit tests do.
 #[cfg(loom)]
 mod loom_cell {
-  use super::word::{self, JoinCells, JoinWakers, Publication, TaskJoin, TaskWord, WakerSlot};
+  use super::word::{
+    self, JoinCells, JoinWakers, PollWord, Publication, TaskJoin, TaskWord, WakerSlot,
+  };
   use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
   use std::any::Any;
   use std::future::Future;
@@ -720,6 +725,124 @@ mod loom_cell {
 
     fn join_detach(&self, _key: word::JoinKey) -> (Option<O>, word::JoinWakers) {
       word::join_detach(self.word.inner(), self)
+    }
+  }
+
+  pub(crate) trait TaskLend: word::Sealed + Send + Sync {
+    fn lend_word(&self) -> &PollWord;
+    fn lend_waker(self: Pin<Arc<Self>>) -> Waker;
+  }
+
+  impl<H: TaskHeader, F: Send + 'static, O: Send + 'static> TaskLend for TaskCell<H, F, O> {
+    fn lend_word(&self) -> &PollWord {
+      self.word.inner()
+    }
+
+    fn lend_waker(self: Pin<Arc<Self>>) -> Waker {
+      Self::into_waker(self)
+    }
+  }
+
+  /// The slot container; the stand-in lease holds its own clone, so Loom
+  /// models the word transitions, not the borrowed owner.
+  pub(crate) struct TaskSlot<T: ?Sized + TaskLend> {
+    task: Option<Pin<Arc<T>>>,
+  }
+
+  impl<T: ?Sized + TaskLend> TaskSlot<T> {
+    pub(crate) const fn empty() -> Self {
+      Self { task: None }
+    }
+
+    pub(crate) fn is_occupied(&self) -> bool {
+      self.task.is_some()
+    }
+
+    pub(crate) fn get(&self) -> Option<&Pin<Arc<T>>> {
+      self.task.as_ref()
+    }
+
+    pub(crate) fn install(&mut self, task: Pin<Arc<T>>) {
+      assert!(self.task.is_none(), "task slot already occupied");
+      self.task = Some(task);
+    }
+
+    pub(crate) fn lend(&mut self) -> Option<Lease<T>> {
+      let task = self.task.as_ref()?;
+      if !task.lend_word().begin() {
+        return None;
+      }
+      Some(Lease {
+        task: Some(Pin::clone(task)),
+      })
+    }
+
+    pub(crate) fn take(&mut self, mut lease: Lease<T>) -> Pin<Arc<T>> {
+      let lent = lease.task.take();
+      let task = self.task.take();
+      match (task, lent) {
+        (Some(task), Some(lent)) if std::ptr::addr_eq(&*task, &*lent) => task,
+        _ => panic!("lease returned to another task slot"),
+      }
+    }
+
+    pub(crate) fn take_idle(&mut self) -> Option<Pin<Arc<T>>> {
+      if self.task.as_ref()?.lend_word().is_running() {
+        return None;
+      }
+      self.task.take()
+    }
+  }
+
+  pub(crate) struct Lease<T: ?Sized + TaskLend> {
+    task: Option<Pin<Arc<T>>>,
+  }
+
+  impl<T: ?Sized + TaskLend> Lease<T> {
+    pub(crate) fn task(&self) -> Pin<&T> {
+      match &self.task {
+        Some(task) => task.as_ref(),
+        None => unreachable!("a live lease holds its task"),
+      }
+    }
+
+    pub(crate) fn waker(&self) -> WakerRef<'_> {
+      let task = match &self.task {
+        Some(task) => Pin::clone(task),
+        None => unreachable!("a live lease holds its task"),
+      };
+      WakerRef {
+        waker: T::lend_waker(task),
+        _lease: std::marker::PhantomData,
+      }
+    }
+
+    pub(crate) fn finish_pending(mut self) -> bool {
+      match self.task.take() {
+        Some(task) => task.lend_word().finish_pending(),
+        None => unreachable!("a live lease holds its task"),
+      }
+    }
+  }
+
+  impl<T: ?Sized + TaskLend> Drop for Lease<T> {
+    fn drop(&mut self) {
+      if let Some(task) = self.task.take() {
+        let _ = task.lend_word().finish_pending();
+      }
+    }
+  }
+
+  pub(crate) struct WakerRef<'a> {
+    waker: Waker,
+    _lease: std::marker::PhantomData<&'a ()>,
+  }
+
+  impl std::ops::Deref for WakerRef<'_> {
+    type Target = Waker;
+
+    fn deref(&self) -> &Waker {
+      &self.waker
     }
   }
 

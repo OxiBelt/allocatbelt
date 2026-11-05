@@ -151,7 +151,8 @@ struct SlotCell {
 }
 struct SlotState {
   protocol: SlotProtocol,
-  task: Option<Pin<Arc<dyn ErasedTask>>>,
+  /// The scheduler's owner of the admitted task, lent to each turn.
+  task: TaskSlot<dyn ErasedTask>,
   scope: Option<ScopeRef>,
   /// The admitted task's retained scope owner. Root-scope tasks leave it
   /// `None` and reach the root cell through `Shared::root`; other scopes
@@ -165,7 +166,7 @@ impl SlotState {
   /// owner are installed together at publication and cleared together on
   /// release; before publication the spawner holds the owner.
   fn scope_cell<'a>(&'a self, shared: &'a Shared) -> Option<&'a Arc<ScopeCell>> {
-    debug_assert_eq!(self.scope.is_some(), self.task.is_some());
+    debug_assert_eq!(self.scope.is_some(), self.task.is_occupied());
     self
       .scope
       .map(|_| self.cell.as_ref().unwrap_or(&shared.root))
@@ -374,7 +375,7 @@ impl Distributed {
       slots: table(config.max_outstanding, || SlotCell {
         state: Mutex::new(SlotState {
           protocol: SlotProtocol::new(),
-          task: None,
+          task: TaskSlot::empty(),
           scope: None,
           cell: None,
           reserved_permit: false,
@@ -420,12 +421,13 @@ impl Distributed {
 
   pub(super) fn cancel_remaining(&mut self) {
     for cell in &mut self.slots {
+      // No dispatcher remains, so no turn holds a task.
       let task = cell
         .state
         .get_mut()
         .unwrap_or_else(PoisonError::into_inner)
         .task
-        .take();
+        .take_idle();
       if let Some(task) = task {
         // Final-owner cleanup runs without any scheduler mutex held.
         task.as_ref().cancel();
@@ -687,7 +689,7 @@ impl Distributed {
     let job = {
       // The one slot lock of a spawn: generation, admission, installation.
       let mut slot = self.slot(index);
-      debug_assert!(slot.task.is_none() && !slot.protocol.admitted());
+      debug_assert!(!slot.task.is_occupied() && !slot.protocol.admitted());
       debug_assert!(slot.scope.is_none() && slot.cell.is_none());
       let Some(generation) = slot.protocol.next_generation() else {
         // Unreachable through the bitmap, which never offers an exhausted
@@ -726,7 +728,7 @@ impl Distributed {
       let queued = task.poll_word().notify();
       debug_assert_eq!(queued, PollNotify::Enqueue);
       slot.scope = Some(scope);
-      slot.task = Some(task);
+      slot.task.install(task);
       slot.cell = reservation.cell.take();
       job
     };
@@ -758,7 +760,7 @@ impl Distributed {
       if !slot.protocol.matches(task_ref.generation) {
         return;
       }
-      slot.task.clone()
+      slot.task.get().cloned()
     };
     if let Some(task) = task
       && task.poll_word().notify() == PollNotify::Enqueue
@@ -791,7 +793,7 @@ impl Distributed {
       }
       self.links[index].cleanup.store(true, Ordering::SeqCst);
       slot.protocol.abort();
-      let Some(task) = slot.task.as_ref() else {
+      let Some(task) = slot.task.get() else {
         // Publication installs the task with the admission; only a fixture
         // admits a slot without one, and it has nothing to route.
         return;
@@ -906,7 +908,9 @@ impl Distributed {
 
   fn dispatch_decision(&self, shared: &Arc<Shared>, index: usize) -> Option<Selected> {
     let mut slot = self.slot(index);
-    let task = Pin::clone(slot.task.as_ref()?);
+    if !slot.task.is_occupied() {
+      return None;
+    }
     let task_ref = TaskRef {
       index,
       generation: slot.protocol.generation(),
@@ -918,12 +922,16 @@ impl Distributed {
       } else {
         None
       };
-      task.poll_word().begin();
+      // The dequeued entry becomes this cleanup turn, which borrows the
+      // slot's owner of the task.
+      let lease = slot.task.lend();
+      debug_assert!(lease.is_some(), "turn began without a queue entry");
+      let lease = lease?;
       drop(slot);
       if let Some(cell) = cell {
         self.release_permit(shared, &cell);
       }
-      return Some(Selected::Cancel(task_ref, task));
+      return Some(Selected::Cancel(task_ref, lease));
     }
     let cell = slot.scope_cell(shared)?;
     let release = if cell.binding {
@@ -952,56 +960,52 @@ impl Distributed {
       PermitRelease::Free
     };
     // The dequeued entry becomes this poll; wakes from here on set
-    // `NOTIFIED` on the running word.
-    task.poll_word().begin();
-    Some(Selected::Poll(task_ref, task, PollPermit { release }))
+    // `NOTIFIED` on the running word. The slot keeps owning the task: it
+    // releases it only to this lease, in the final turn, so the poll
+    // borrows it without a reference-count update.
+    let lease = slot.task.lend();
+    debug_assert!(lease.is_some(), "turn began without a queue entry");
+    Some(Selected::Poll(task_ref, lease?, PollPermit { release }))
   }
 
   /// Ends a poll. A pending poll changes only the task's word: it goes idle,
   /// or, when woken or aborted during the poll, keeps the queue entry this
   /// finish then inserts; dispatch reads any abort under the slot mutex. A
-  /// completed poll releases the slot under its mutex.
+  /// completed poll releases the slot under its mutex and takes the slot's
+  /// owner of the task over from the lease for publication.
   fn finish_poll(
     &self,
     shared: &Arc<Shared>,
     task_ref: TaskRef,
-    task: &Pin<Arc<dyn ErasedTask>>,
+    lease: Lease<dyn ErasedTask>,
     ready: bool,
   ) {
     if !ready {
-      if task.poll_word().finish_pending() {
+      if lease.finish_pending() {
         self.push_ready(shared, task_ref.index, ReadyInsertion::PollRequeue);
       }
       return;
     }
-    let mut slot = self.slot(task_ref.index);
-    if !slot.protocol.matches(task_ref.generation) || slot.task.is_none() {
-      return;
-    }
-    // The word stays `RUNNING` until publication sets `COMPLETE`, so wakes
-    // from here on queue nothing.
-    slot.protocol.release();
-    let task = slot.task.take();
-    let scope = slot.scope.take();
-    let cell = slot.cell.take();
-    let reusable = slot.protocol.next_generation().is_some();
-    drop(slot);
-    self.complete(shared, task_ref.index, reusable, task, scope, cell);
+    self.finish_turn(shared, task_ref, lease);
   }
 
-  fn finish_cancel(&self, shared: &Arc<Shared>, task_ref: TaskRef, task: Pin<Arc<dyn ErasedTask>>) {
+  fn finish_cancel(&self, shared: &Arc<Shared>, task_ref: TaskRef, lease: Lease<dyn ErasedTask>) {
+    self.finish_turn(shared, task_ref, lease);
+  }
+
+  /// The final turn: releases the slot under its mutex, then publishes
+  /// without it. The word stays `RUNNING` until publication sets
+  /// `COMPLETE`, so wakes from here on queue nothing.
+  fn finish_turn(&self, shared: &Arc<Shared>, task_ref: TaskRef, lease: Lease<dyn ErasedTask>) {
     let mut slot = self.slot(task_ref.index);
-    if !slot.protocol.matches(task_ref.generation) || slot.task.is_none() {
-      return;
-    }
-    let slot_task = slot.task.take();
+    debug_assert!(slot.protocol.matches(task_ref.generation));
+    let task = slot.task.take(lease);
     let scope = slot.scope.take();
     let cell = slot.cell.take();
     slot.protocol.release();
     let reusable = slot.protocol.next_generation().is_some();
     drop(slot);
-    self.complete(shared, task_ref.index, reusable, slot_task, scope, cell);
-    drop(task);
+    self.complete(shared, task_ref.index, reusable, Some(task), scope, cell);
   }
 
   fn complete(
@@ -1645,35 +1649,36 @@ impl Distributed {
       };
       handoff::enter_turn(seat.take());
       match selected {
-        Selected::Cancel(task_ref, task) => {
-          task.as_ref().cancel();
-          self.finish_cancel(shared, task_ref, task);
+        Selected::Cancel(task_ref, lease) => {
+          lease.task().cancel();
+          self.finish_cancel(shared, task_ref, lease);
         }
-        Selected::Poll(task_ref, task, permit) => {
+        Selected::Poll(task_ref, lease, permit) => {
           super::super::entry::reset_budget();
-          let waker = task.clone().task_waker();
+          let task = lease.task();
+          // Borrowed from the lease: no reference count unless user code
+          // keeps a clone.
+          let waker = lease.waker();
           let mut context = Context::from_waker(&waker);
           // Unbounded polls carry no ticket. A pending poll drops its ticket
           // before the permit; a ready poll drops both, permit first.
           let mut cpu_ticket = None;
           let (result, permit) = match task.acquire_cpu(&waker) {
-            DomainCpuAdmission::Unbounded => {
-              task.as_ref().poll(&mut context, permit, &mut cpu_ticket)
-            }
+            DomainCpuAdmission::Unbounded => task.poll(&mut context, permit, &mut cpu_ticket),
             DomainCpuAdmission::Acquired(ticket) => {
               cpu_ticket = Some(ticket);
-              task.as_ref().poll(&mut context, permit, &mut cpu_ticket)
+              task.poll(&mut context, permit, &mut cpu_ticket)
             }
             DomainCpuAdmission::Waiting => (PollResult::Pending, Some(permit)),
             DomainCpuAdmission::Rejected(error) => {
               drop(permit);
-              task.as_ref().fail_resource(error);
+              task.fail_resource(error);
               (PollResult::Ready, None)
             }
           };
           drop(cpu_ticket);
           drop(permit);
-          self.finish_poll(shared, task_ref, &task, matches!(result, PollResult::Ready));
+          self.finish_poll(shared, task_ref, lease, matches!(result, PollResult::Ready));
         }
       }
       seat.turn = Some(match handoff::leave_turn() {

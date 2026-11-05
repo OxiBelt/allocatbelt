@@ -94,16 +94,22 @@ impl PollWord {
   }
 
   /// Begins a poll or cleanup turn for the entry the caller dequeued: one
-  /// RMW that sets `RUNNING` and clears `NOTIFIED`, keeping the join bits.
-  /// Wakes cannot change a queued word, so this is the only transition out
-  /// of it.
-  pub(crate) fn begin(&self) {
-    let previous = self.0.fetch_xor(RUNNING | NOTIFIED, Ordering::AcqRel);
-    debug_assert_eq!(
-      previous & (RUNNING | NOTIFIED | COMPLETE),
-      NOTIFIED,
-      "turn began without a queue entry"
-    );
+  /// compare-and-swap that sets `RUNNING` and clears `NOTIFIED`, keeping the
+  /// join bits. Wakes cannot change a queued word, so this is the only
+  /// transition out of it; it fails, changing nothing, unless the word is
+  /// queued (`NOTIFIED`, neither `RUNNING` nor `COMPLETE`). Only one turn can
+  /// therefore hold `RUNNING`.
+  pub(crate) fn begin(&self) -> bool {
+    self
+      .update(|word| {
+        (word & (RUNNING | NOTIFIED | COMPLETE) == NOTIFIED).then_some(word ^ (RUNNING | NOTIFIED))
+      })
+      .is_ok()
+  }
+
+  /// Whether a turn holds the word.
+  pub(crate) fn is_running(&self) -> bool {
+    self.load() & RUNNING != 0
   }
 
   /// Ends a pending poll in one RMW: `RUNNING` becomes idle, and
@@ -227,9 +233,9 @@ impl PollWord {
   }
 }
 
-/// The scheduling face of a task's word that the runtime may use: wakes,
-/// turn begin and pending finish, which touch only `RUNNING` and
-/// `NOTIFIED`.
+/// The face of a task's word that the runtime may use: wakes, which set
+/// only `NOTIFIED`, and reads. Turns begin and end through the slot
+/// container's lease, which owns `RUNNING`.
 pub(crate) struct TaskWord(PollWord);
 
 impl TaskWord {
@@ -240,16 +246,6 @@ impl TaskWord {
   /// See [`PollWord::notify`].
   pub(crate) fn notify(&self) -> PollNotify {
     self.0.notify()
-  }
-
-  /// See [`PollWord::begin`].
-  pub(crate) fn begin(&self) {
-    self.0.begin();
-  }
-
-  /// See [`PollWord::finish_pending`].
-  pub(crate) fn finish_pending(&self) -> bool {
-    self.0.finish_pending()
   }
 
   /// Whether the outcome was published.

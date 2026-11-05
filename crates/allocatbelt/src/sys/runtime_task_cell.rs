@@ -55,19 +55,30 @@
 //! still existed at publication and to the publisher otherwise; the join
 //! waker cell is written only by that one handle while `JOIN_WAKER` is clear
 //! and the task is not complete, and only read while it is set. The runtime
-//! sees the word only through [`TaskWord`], whose operations change the
-//! scheduling bits alone.
+//! sees the word only through [`TaskWord`], whose operations set
+//! `NOTIFIED` alone.
+//!
+//! A [`TaskSlot`] holds the scheduler's owner of a task and lends it to one
+//! turn at a time without a reference-count update: [`TaskSlot::lend`] wins
+//! `RUNNING` with one compare-and-swap and returns a [`Lease`], the only way
+//! to end it (a pending finish, or [`TaskSlot::take`] for the final turn).
+//! While `RUNNING` is set no slot drops or gives up its owner except to that
+//! lease, so the lease's pointer stays valid; [`Lease::waker`] borrows a
+//! `Waker` from it that clones into an owned one only when user code keeps
+//! it.
 
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::future::Future;
-use std::marker::PhantomPinned;
+use std::marker::{PhantomData, PhantomPinned};
 use std::mem::ManuallyDrop;
+use std::ops::Deref;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker};
 
 #[path = "runtime_task_word.rs"]
 mod word;
@@ -248,6 +259,7 @@ impl<H, F, O> TaskCell<H, F, O> {
 
   /// A `Waker` that takes over this owner of the allocation, so a caller
   /// that already holds a clone pays no further reference-count update.
+  #[cfg(test)]
   pub(crate) fn into_waker(this: Pin<Arc<Self>>) -> Waker
   where
     H: TaskHeader,
@@ -260,6 +272,7 @@ impl<H, F, O> TaskCell<H, F, O> {
   /// The given owner of the allocation without the `Pin` wrapper, for APIs
   /// that take `Arc<Self>`. Never leaves this module: the pin guarantee is
   /// kept by this module never moving out of, or giving out, such an `Arc`.
+  #[cfg(test)]
   fn unpinned(this: Pin<Arc<Self>>) -> Arc<Self> {
     // SAFETY: the unpinned `Arc` does not escape this module's control.
     // Its only uses are `Waker::from`, whose vtable hands the `Arc` back
@@ -506,6 +519,291 @@ impl<H: Sync + Send, F: Send, O: Send> JoinSide for TaskCell<H, F, O> {
 
   fn join_detach(&self, _key: word::JoinKey) -> (Option<O>, word::JoinWakers) {
     word::join_detach(self.word.inner(), self)
+  }
+}
+
+/// Proof that a lending operation comes from this module.
+pub(crate) struct LendKey(());
+
+/// The task's own word and borrowed waker, for [`TaskSlot`] and [`Lease`].
+/// Sealed: only the cell implements it, so the word is always the cell's
+/// own.
+pub(crate) trait TaskLend: word::Sealed + Send + Sync {
+  fn lend_word(&self, key: LendKey) -> &word::PollWord;
+  /// A waker borrowing the allocation that `data` points into; `data` is
+  /// the lease's pointer, taken from the owning `Arc`.
+  fn lend_waker(&self, key: LendKey, data: NonNull<()>) -> WakerRef<'_>;
+}
+
+impl<H: TaskHeader, F: Send + 'static, O: Send + 'static> TaskLend for TaskCell<H, F, O> {
+  fn lend_word(&self, _key: LendKey) -> &word::PollWord {
+    self.word.inner()
+  }
+
+  fn lend_waker(&self, _key: LendKey, data: NonNull<()>) -> WakerRef<'_> {
+    debug_assert!(std::ptr::addr_eq(data.as_ptr(), std::ptr::from_ref(self)));
+    Self::waker_ref(data)
+  }
+}
+
+/// The scheduler's owner of one task, lent to one turn at a time.
+pub(crate) struct TaskSlot<T: ?Sized + TaskLend> {
+  task: Option<Pin<Arc<T>>>,
+}
+
+impl<T: ?Sized + TaskLend> TaskSlot<T> {
+  pub(crate) const fn empty() -> Self {
+    Self { task: None }
+  }
+
+  pub(crate) fn is_occupied(&self) -> bool {
+    self.task.is_some()
+  }
+
+  /// The installed owner, by shared reference.
+  pub(crate) fn get(&self) -> Option<&Pin<Arc<T>>> {
+    self.task.as_ref()
+  }
+
+  /// Installs an owner into an empty slot.
+  pub(crate) fn install(&mut self, task: Pin<Arc<T>>) {
+    assert!(self.task.is_none(), "task slot already occupied");
+    self.task = Some(task);
+  }
+
+  /// Begins a turn for the installed task's queue entry and lends it to
+  /// that turn. `None` when the slot is empty or the word is not queued.
+  pub(crate) fn lend(&mut self) -> Option<Lease<T>> {
+    let task = self.task.as_ref()?;
+    if !task.lend_word(LendKey(())).begin() {
+      return None;
+    }
+    Some(Lease {
+      task: arc_pointer(task),
+    })
+  }
+
+  /// Ends the final turn: hands the lent owner to it. The word stays
+  /// `RUNNING` (publication then sets `COMPLETE`).
+  ///
+  /// # Panics
+  ///
+  /// When the lease is not for the task in this slot.
+  pub(crate) fn take(&mut self, lease: Lease<T>) -> Pin<Arc<T>> {
+    let lent = lease.task.as_ptr().cast_const();
+    let task = self
+      .task
+      .take_if(|task| std::ptr::addr_eq(std::ptr::from_ref::<T>(task), lent));
+    let Some(task) = task else {
+      panic!("lease returned to another task slot");
+    };
+    std::mem::forget(lease);
+    task
+  }
+
+  /// Takes the owner of a task that no turn holds; `None` when empty or
+  /// while a lease is out.
+  pub(crate) fn take_idle(&mut self) -> Option<Pin<Arc<T>>> {
+    if self.task.as_ref()?.lend_word(LendKey(())).is_running() {
+      return None;
+    }
+    self.task.take()
+  }
+}
+
+impl<T: ?Sized + TaskLend> Drop for TaskSlot<T> {
+  fn drop(&mut self) {
+    if let Some(task) = self.task.take()
+      && task.lend_word(LendKey(())).is_running()
+    {
+      // A lease may still point into the allocation: keep it alive.
+      std::mem::forget(task);
+    }
+  }
+}
+
+/// The pointer `Arc::as_ptr` returns for a pinned owner: it may reach the
+/// whole allocation, including the reference counts a waker updates.
+fn arc_pointer<T: ?Sized>(task: &Pin<Arc<T>>) -> NonNull<T> {
+  // SAFETY: `Pin<Arc<T>>` is `repr(transparent)` over `Arc<T>`, so the
+  // cast reference is a valid `&Arc<T>` for the same borrow. It is used only
+  // for `Arc::as_ptr`, which neither moves the value nor gives out an
+  // unpinned owner.
+  #[expect(unsafe_code, reason = "reads the pinned owner's pointer")]
+  let arc: &Arc<T> = unsafe { &*std::ptr::from_ref(task).cast::<Arc<T>>() };
+  let pointer = Arc::as_ptr(arc).cast_mut();
+  match NonNull::new(pointer) {
+    Some(pointer) => pointer,
+    None => unreachable!("an `Arc` never points at null"),
+  }
+}
+
+/// One turn's use of a task that a [`TaskSlot`] owns, without a reference
+/// count of its own. Ends with [`Lease::finish_pending`], with
+/// [`TaskSlot::take`], or, if dropped, as a pending finish whose requeue is
+/// discarded.
+pub(crate) struct Lease<T: ?Sized + TaskLend> {
+  task: NonNull<T>,
+}
+
+impl<T: ?Sized + TaskLend> Lease<T> {
+  /// The lent task, pinned.
+  pub(crate) fn task(&self) -> Pin<&T> {
+    // SAFETY: the pointer came from a `Pin<Arc<T>>` that a `TaskSlot`
+    // held when `lend` won `RUNNING` for this lease, and `RUNNING` is
+    // cleared only by this lease (its pending finish or its drop) or kept
+    // when `take` hands that owner to the turn; until then no slot drops or
+    // gives up the owner (`take_idle` and `Drop` refuse while `RUNNING`,
+    // `install` refuses an occupied slot, and `take` needs this lease), so
+    // the allocation is alive for the lease, and with it for this borrow.
+    #[expect(unsafe_code, reason = "borrows the slot-owned task for its turn")]
+    let task: &T = unsafe { self.task.as_ref() };
+    // SAFETY: the value lives in a `Pin<Arc<T>>` allocation and is only
+    // reached by shared reference, so it is pinned for this borrow.
+    #[expect(unsafe_code, reason = "the allocation is pinned")]
+    unsafe {
+      Pin::new_unchecked(task)
+    }
+  }
+
+  /// A `Waker` borrowed from the lent task, without a reference count.
+  pub(crate) fn waker(&self) -> WakerRef<'_> {
+    self
+      .task()
+      .get_ref()
+      .lend_waker(LendKey(()), self.task.cast::<()>())
+  }
+
+  /// Ends a pending turn (see `finish_pending` on the word). Returns true
+  /// when the task was woken during the turn: the caller then owns its new
+  /// queue entry and must insert it.
+  pub(crate) fn finish_pending(self) -> bool {
+    let notified = self
+      .task()
+      .get_ref()
+      .lend_word(LendKey(()))
+      .finish_pending();
+    std::mem::forget(self);
+    notified
+  }
+}
+
+impl<T: ?Sized + TaskLend> Drop for Lease<T> {
+  fn drop(&mut self) {
+    // An abandoned turn (an unwinding dispatcher) still releases `RUNNING`,
+    // so the slot can drop or cancel the task later.
+    let _ = self
+      .task()
+      .get_ref()
+      .lend_word(LendKey(()))
+      .finish_pending();
+  }
+}
+
+/// A `Waker` borrowed from a task allocation for `'a`: it holds no
+/// reference count, and its clones hold their own.
+pub(crate) struct WakerRef<'a> {
+  waker: ManuallyDrop<Waker>,
+  _task: PhantomData<&'a ()>,
+}
+
+impl Deref for WakerRef<'_> {
+  type Target = Waker;
+
+  fn deref(&self) -> &Waker {
+    &self.waker
+  }
+}
+
+impl<H: TaskHeader, F: Send + 'static, O: Send + 'static> TaskCell<H, F, O> {
+  const VTABLE: RawWakerVTable = RawWakerVTable::new(
+    Self::clone_raw,
+    Self::wake_raw,
+    Self::wake_by_ref_raw,
+    Self::drop_raw,
+  );
+
+  /// The one vtable of this cell type's wakers, so a clone and the
+  /// borrowed waker it came from compare equal in `Waker::will_wake`. Not
+  /// inlined: each inlined copy may promote its own vtable. Still a
+  /// best-effort check (Miri does not deduplicate the promoted constant).
+  #[inline(never)]
+  fn vtable() -> &'static RawWakerVTable {
+    &Self::VTABLE
+  }
+
+  /// A `Waker` borrowing the allocation `data` points into, for as long as
+  /// the caller's borrow of a lease that keeps the allocation alive.
+  fn waker_ref<'a>(data: NonNull<()>) -> WakerRef<'a> {
+    // SAFETY: `data` is a lease's pointer, which `Arc::as_ptr` returned
+    // for the slot's owner of this cell, so it may reach the whole
+    // allocation, and the lease keeps that owner alive for the borrow this
+    // `WakerRef` carries. The vtable's functions treat `data` as such a
+    // pointer: `clone` adds a strong count, `wake` and `drop` give one
+    // back, and `wake_by_ref` only reads the header and word. This waker
+    // is never dropped (`ManuallyDrop`) and cannot be woken by value, so
+    // it gives back no count it did not take.
+    #[expect(unsafe_code, reason = "a waker that borrows the task allocation")]
+    let waker =
+      unsafe { Waker::from_raw(RawWaker::new(data.as_ptr().cast_const(), Self::vtable())) };
+    WakerRef {
+      waker: ManuallyDrop::new(waker),
+      _task: PhantomData,
+    }
+  }
+
+  /// # Safety
+  ///
+  /// `data` is `Arc::as_ptr` of a cell in a live `Arc` allocation.
+  #[expect(unsafe_code, reason = "an entry of the borrowed waker's vtable")]
+  unsafe fn clone_raw(data: *const ()) -> RawWaker {
+    // SAFETY: by this function's contract the allocation is live, so its
+    // strong count is at least one; the new count is the clone's.
+    #[expect(unsafe_code, reason = "the cloned waker's reference count")]
+    unsafe {
+      Arc::increment_strong_count(data.cast::<Self>());
+    }
+    RawWaker::new(data, Self::vtable())
+  }
+
+  /// # Safety
+  ///
+  /// `data` points at a cell in a live `Arc` allocation and carries one
+  /// strong count, which this call consumes.
+  #[expect(unsafe_code, reason = "an entry of the borrowed waker's vtable")]
+  unsafe fn wake_raw(data: *const ()) {
+    // SAFETY: an owned waker (a clone) holds one strong count of the
+    // allocation `data` points into, which this takes over and drops.
+    #[expect(unsafe_code, reason = "takes over the waker's count")]
+    let task = unsafe { Arc::from_raw(data.cast::<Self>()) };
+    task.header.wake_by_ref(&task.word);
+  }
+
+  /// # Safety
+  ///
+  /// `data` points at a cell in a live `Arc` allocation.
+  #[expect(unsafe_code, reason = "an entry of the borrowed waker's vtable")]
+  unsafe fn wake_by_ref_raw(data: *const ()) {
+    // SAFETY: the waker this call reaches through keeps the allocation
+    // alive (by its count or, for a `WakerRef`, by its borrow); the cell
+    // is only read.
+    #[expect(unsafe_code, reason = "reads the woken task")]
+    let task = unsafe { &*data.cast::<Self>() };
+    task.header.wake_by_ref(&task.word);
+  }
+
+  /// # Safety
+  ///
+  /// `data` points at a cell in a live `Arc` allocation and carries one
+  /// strong count, which this call consumes.
+  #[expect(unsafe_code, reason = "an entry of the borrowed waker's vtable")]
+  unsafe fn drop_raw(data: *const ()) {
+    // SAFETY: an owned waker (a clone) holds one strong count, given back
+    // here; a `WakerRef` is never dropped.
+    #[expect(unsafe_code, reason = "gives back the waker's count")]
+    unsafe {
+      drop(Arc::from_raw(data.cast::<Self>()));
+    }
   }
 }
 
@@ -1546,6 +1844,110 @@ mod tests {
       assert!(output_seen.load(Ordering::Relaxed) <= 1);
       assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
+  }
+
+  struct CountHeader(AtomicUsize);
+
+  impl TaskHeader for CountHeader {
+    fn wake_by_ref(&self, word: &TaskWord) {
+      self.0.fetch_add(1, Ordering::SeqCst);
+      let _ = word.notify();
+    }
+  }
+
+  type Counted = TaskCell<CountHeader, Countdown, ()>;
+
+  fn queued_slot(remaining: u32) -> (TaskSlot<Counted>, Pin<Arc<Counted>>, Arc<AtomicBool>) {
+    let (future, dropped) = countdown(remaining);
+    let task = TaskCell::new(CountHeader(AtomicUsize::new(0)), future);
+    assert_eq!(task.word().notify(), PollNotify::Enqueue);
+    let mut slot = TaskSlot::empty();
+    slot.install(Pin::clone(&task));
+    (slot, task, dropped)
+  }
+
+  #[test]
+  fn a_lease_borrows_the_slot_owner_and_ends_its_turn() {
+    let (mut slot, task, dropped) = queued_slot(1);
+    assert_eq!(TaskCell::strong_count(&task), 2);
+    let lease = slot.lend().unwrap();
+    assert_eq!(TaskCell::strong_count(&task), 2);
+    // One turn at a time, and no owner leaves the slot during it.
+    assert!(slot.lend().is_none());
+    assert!(slot.take_idle().is_none());
+    let waker = lease.waker();
+    assert_eq!(TaskCell::strong_count(&task), 2);
+    let mut cx = Context::from_waker(&waker);
+    assert!(matches!(
+      lease.task().poll_future(&mut cx),
+      CellPoll::Pending
+    ));
+    waker.wake_by_ref();
+    assert_eq!(task.header().0.load(Ordering::SeqCst), 1);
+    let kept = (*waker).clone();
+    // Vtable identity is a best-effort hint; Miri does not deduplicate the
+    // promoted vtable.
+    if !cfg!(miri) {
+      assert!(kept.will_wake(&waker));
+    }
+    assert_eq!(TaskCell::strong_count(&task), 3);
+    // Woken during the turn: the finish hands back a queue entry.
+    assert!(lease.finish_pending());
+    assert!(task.word().is_queued());
+    kept.wake();
+    assert_eq!(TaskCell::strong_count(&task), 2);
+    let lease = slot.lend().unwrap();
+    let waker = lease.waker();
+    assert!(matches!(
+      lease.task().poll_future(&mut Context::from_waker(&waker)),
+      CellPoll::Ready(7)
+    ));
+    let owner = slot.take(lease);
+    assert!(!slot.is_occupied());
+    assert!(owner.as_ref().drop_future());
+    assert!(dropped.load(Ordering::SeqCst));
+    drop(owner);
+    assert_eq!(TaskCell::strong_count(&task), 1);
+  }
+
+  #[test]
+  fn a_dropped_lease_lets_the_slot_give_up_its_owner() {
+    let (mut slot, task, dropped) = queued_slot(3);
+    let lease = slot.lend().unwrap();
+    assert!(matches!(
+      lease.task().poll_future(&mut context()),
+      CellPoll::Pending
+    ));
+    drop(lease);
+    let owner = slot.take_idle().unwrap();
+    drop(owner);
+    drop(slot);
+    drop(task);
+    assert!(dropped.load(Ordering::SeqCst));
+  }
+
+  #[test]
+  #[should_panic(expected = "lease returned to another task slot")]
+  fn a_lease_cannot_take_another_slots_task() {
+    let (mut first, _first_task, _) = queued_slot(1);
+    let (mut second, _second_task, _) = queued_slot(1);
+    let lease = first.lend().unwrap();
+    let _ = second.take(lease);
+  }
+
+  #[test]
+  fn an_owned_waker_from_the_borrowed_one_outlives_the_turn() {
+    let (mut slot, task, _) = queued_slot(1);
+    let lease = slot.lend().unwrap();
+    let kept = (*lease.waker()).clone();
+    assert!(!lease.finish_pending());
+    let owner = slot.take_idle().unwrap();
+    drop(owner);
+    drop(task);
+    // The clone is now the last owner; waking it by reference and then by
+    // value reads the header and frees the allocation.
+    kept.wake_by_ref();
+    kept.wake();
   }
 
   const ROUNDS: usize = if cfg!(miri) { 8 } else { 1000 };

@@ -7,7 +7,6 @@
 
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Waker};
@@ -26,7 +25,9 @@ use super::identity;
 use super::join::AsyncJob;
 use super::metrics::{Padded, RuntimeMetrics};
 use super::protocol::{ScopeProtocol, SlotProtocol};
-use super::task::{DomainCpuAdmission, ErasedTask, PollNotify, PollResult, Task, TaskWord};
+use super::task::{
+  DomainCpuAdmission, ErasedTask, Lease, PollNotify, PollResult, Task, TaskSlot, TaskWord,
+};
 use super::thread_options::AsyncThreadContext;
 #[cfg(all(test, not(loom)))]
 use super::thread_options::AsyncThreadOptions;
@@ -827,9 +828,11 @@ fn get_scope(state: &State, scope: ScopeRef) -> Option<&Arc<ScopeCell>> {
 }
 
 /// Adds an admitted task to its scope's ready list at most once.
+/// A dispatched turn: the slot's owner of the task, lent to the turn
+/// without a reference-count update, ends with the turn.
 enum Selected {
-  Poll(TaskRef, Pin<Arc<dyn ErasedTask>>, PollPermit),
-  Cancel(TaskRef, Pin<Arc<dyn ErasedTask>>),
+  Poll(TaskRef, Lease<dyn ErasedTask>, PollPermit),
+  Cancel(TaskRef, Lease<dyn ErasedTask>),
 }
 
 /// Releases one scope's active-poll reservation on every exit path before

@@ -165,20 +165,20 @@ fn selected(shared: &Arc<Shared>, seat: usize) -> Option<Selected> {
 fn run(shared: &Arc<Shared>, work: Selected) {
   let d = engine(shared);
   match work {
-    Selected::Cancel(reference, task) => {
-      task.as_ref().cancel();
-      d.finish_cancel(shared, reference, task);
+    Selected::Cancel(reference, lease) => {
+      lease.task().cancel();
+      d.finish_cancel(shared, reference, lease);
     }
-    Selected::Poll(reference, task, permit) => {
+    Selected::Poll(reference, lease, permit) => {
       let (result, permit) =
-        task
-          .as_ref()
+        lease
+          .task()
           .poll(&mut Context::from_waker(Waker::noop()), permit, &mut None);
       drop(permit);
       d.finish_poll(
         shared,
         reference,
-        &task,
+        lease,
         matches!(result, PollResult::Ready),
       );
     }
@@ -1083,7 +1083,7 @@ fn check_distributed(shared: &Shared) {
               && (slot.reserved_permit
                 || slot
                   .task
-                  .as_ref()
+                  .get()
                   .is_some_and(|task| task.poll_word().flags().0))
           })
           .count();
@@ -1106,7 +1106,7 @@ fn check_distributed(shared: &Shared) {
         slot.protocol.admitted()
           && slot
             .task
-            .as_ref()
+            .get()
             .is_some_and(|task| task.poll_word().is_queued())
       )
     );
@@ -1274,7 +1274,7 @@ fn spawn_wake_completion_and_steal_lock_counts_case() {
     _ => panic!(),
   };
   run(&shared, work);
-  let task = d.slot(reference.index).task.clone().unwrap();
+  let task = d.slot(reference.index).task.get().cloned().unwrap();
   let before = (
     shared.lock_acquisitions.load(Ordering::Relaxed),
     d.slot_locks.load(Ordering::Relaxed),
@@ -2853,7 +2853,7 @@ fn running_wakes_coalesce_and_stale_generations_do_not_wake_reused_slots_case() 
   let (shared, root) = shared(config(1, 1));
   let d = engine(&shared);
   let old_job = shared.spawn(root, std::future::pending::<()>()).unwrap();
-  let old_task = d.slot(0).task.clone().unwrap();
+  let old_task = d.slot(0).task.get().cloned().unwrap();
   let old = TaskRef {
     index: 0,
     generation: 1,
@@ -2868,10 +2868,8 @@ fn running_wakes_coalesce_and_stale_generations_do_not_wake_reused_slots_case() 
     Selected::Poll(reference, ..) => *reference,
     _ => panic!("expected a poll"),
   };
-  let task = match &work {
-    Selected::Poll(_, task, _) => task.clone(),
-    _ => panic!(),
-  };
+  // The slot's owner, which the turn's lease borrows.
+  let task = d.slot(current.index).task.get().cloned().unwrap();
   let wake = |task: &Pin<Arc<dyn ErasedTask>>, reference| {
     Shared::wake_task(&Arc::downgrade(&shared), task.poll_word(), reference)
   };
@@ -3197,7 +3195,7 @@ fn final_shared_drop_cleans_admitted_future_with_retained_handles() {
     .spawn(root, PendingDrop(Arc::clone(&dropped)))
     .unwrap();
   let abort = job.abort_handle();
-  let task = engine(&shared).slot(0).task.as_ref().unwrap().clone();
+  let task = engine(&shared).slot(0).task.get().unwrap().clone();
   let waker = task.clone().task_waker();
   assert!(!dropped.load(Ordering::SeqCst));
   drop(shared);
@@ -3353,9 +3351,14 @@ fn gated(open: &Arc<AtomicBool>) -> impl Future<Output = ()> + Send + 'static {
   })
 }
 
-fn poll_reference(work: &Selected) -> (TaskRef, Pin<Arc<dyn ErasedTask>>) {
+/// The polled reference and a clone of the slot's owner, which the turn's
+/// lease borrows.
+fn poll_reference(shared: &Arc<Shared>, work: &Selected) -> (TaskRef, Pin<Arc<dyn ErasedTask>>) {
   match work {
-    Selected::Poll(reference, task, _) => (*reference, task.clone()),
+    Selected::Poll(reference, ..) => {
+      let task = engine(shared).slot(reference.index).task.get().cloned();
+      (*reference, task.unwrap())
+    }
     Selected::Cancel(..) => panic!("expected a poll"),
   }
 }
@@ -3367,7 +3370,7 @@ fn wakes_racing_a_pending_finish_leave_exactly_one_entry() {
     let open = Arc::new(AtomicBool::new(false));
     let job = shared.spawn(root, gated(&open)).unwrap();
     let work = selected(&shared, 0).unwrap();
-    let (reference, task) = poll_reference(&work);
+    let (reference, task) = poll_reference(&shared, &work);
     let waker = {
       let shared = Arc::downgrade(&shared);
       let task = task.clone();
@@ -3447,7 +3450,7 @@ fn abort_while_running_requeues_to_cleanup_and_cancels_on_dispatch() {
   let open = Arc::new(AtomicBool::new(false));
   let job = shared.spawn(root, gated(&open)).unwrap();
   let work = selected(&shared, 0).unwrap();
-  let (reference, task) = poll_reference(&work);
+  let (reference, task) = poll_reference(&shared, &work);
   shared.abort(reference);
   // Abort only marked the running word; the slot stays admitted.
   assert_eq!(task.poll_word().flags(), (true, true));
@@ -3476,7 +3479,7 @@ fn abort_of_idle_task_racing_wake_inserts_one_entry_and_cancels() {
     let open = Arc::new(AtomicBool::new(false));
     let job = shared.spawn(root, gated(&open)).unwrap();
     let work = selected(&shared, 0).unwrap();
-    let (reference, task) = poll_reference(&work);
+    let (reference, task) = poll_reference(&shared, &work);
     run(&shared, work);
     assert_eq!(task.poll_word().flags(), (false, false));
     let start = Arc::new(std::sync::Barrier::new(2));
@@ -3511,7 +3514,7 @@ fn drain_close_counts_notified_tasks_that_have_not_begun() {
   let open = Arc::new(AtomicBool::new(false));
   let woken = shared.spawn(root, gated(&open)).unwrap();
   let work = selected(&shared, 0).unwrap();
-  let (reference, task) = poll_reference(&work);
+  let (reference, task) = poll_reference(&shared, &work);
   run(&shared, work);
   // One task woken after an idle finish, one never dispatched.
   Shared::wake_task(&Arc::downgrade(&shared), task.poll_word(), reference);
@@ -3537,7 +3540,7 @@ fn cancel_close_cancels_notified_tasks_that_have_not_begun() {
   let open = Arc::new(AtomicBool::new(false));
   let woken = shared.spawn(root, gated(&open)).unwrap();
   let work = selected(&shared, 0).unwrap();
-  let (reference, task) = poll_reference(&work);
+  let (reference, task) = poll_reference(&shared, &work);
   run(&shared, work);
   Shared::wake_task(&Arc::downgrade(&shared), task.poll_word(), reference);
   let fresh = shared.spawn(root, async { 7 }).unwrap();
@@ -3553,4 +3556,85 @@ fn cancel_close_cancels_notified_tasks_that_have_not_begun() {
   assert!(matches!(finish(fresh), Err(AsyncJoinError::Cancelled)));
   assert!(d.closed_empty.load(Ordering::Acquire));
   check_distributed(&shared);
+}
+
+#[test]
+fn a_turn_borrows_the_slot_owner_without_a_reference_count() {
+  let (shared, root) = shared(config(1, 1));
+  let d = engine(&shared);
+  let job = shared.spawn(root, std::future::pending::<()>()).unwrap();
+  let owner = d.slot(0).task.get().cloned().unwrap();
+  // Owners besides the consumed clone: the slot, the job and `owner`.
+  let count = |owner: &Pin<Arc<dyn ErasedTask>>| Pin::clone(owner).strong_count();
+  let idle = count(&owner);
+  assert_eq!(idle, 3);
+  let Some(Selected::Poll(reference, lease, permit)) = selected(&shared, 0) else {
+    panic!("expected a poll");
+  };
+  // Dispatch lent the slot's owner: no count for the turn or its waker.
+  assert_eq!(count(&owner), idle);
+  let waker = lease.waker();
+  assert_eq!(count(&owner), idle);
+  let (result, permit) = lease
+    .task()
+    .poll(&mut Context::from_waker(&waker), permit, &mut None);
+  assert!(matches!(result, PollResult::Pending));
+  drop(permit);
+  // A kept clone holds its own count; waking it by value gives it back.
+  let kept = (*waker).clone();
+  assert_eq!(count(&owner), idle + 1);
+  kept.wake();
+  assert_eq!(count(&owner), idle);
+  waker.wake_by_ref();
+  assert_eq!(owner.poll_word().flags(), (true, true));
+  d.finish_poll(&shared, reference, lease, false);
+  // The pending finish requeued the woken task; the slot still owns it.
+  assert!(owner.poll_word().is_queued());
+  assert_eq!(count(&owner), idle);
+  shared.abort(reference);
+  run(&shared, selected(&shared, 0).unwrap());
+  // The final turn took the slot's owner over and publication dropped it.
+  assert_eq!(count(&owner), idle - 1);
+  assert!(matches!(finish(job), Err(AsyncJoinError::Cancelled)));
+  assert_eq!(count(&owner), idle - 2);
+  check_distributed(&shared);
+}
+
+#[test]
+fn a_dropped_lease_releases_the_turn_for_later_cancellation() {
+  struct PendingDrop(Arc<AtomicBool>);
+  impl Future for PendingDrop {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+      Poll::Pending
+    }
+  }
+  impl Drop for PendingDrop {
+    fn drop(&mut self) {
+      self.0.store(true, Ordering::SeqCst);
+    }
+  }
+  let (shared, root) = shared(config(1, 1));
+  let d = engine(&shared);
+  let dropped = Arc::new(AtomicBool::new(false));
+  let mut job = shared
+    .spawn(root, PendingDrop(Arc::clone(&dropped)))
+    .unwrap();
+  let owner = d.slot(0).task.get().cloned().unwrap();
+  let Some(Selected::Poll(_, lease, permit)) = selected(&shared, 0) else {
+    panic!("expected a poll");
+  };
+  assert_eq!(owner.poll_word().flags(), (true, false));
+  // An abandoned turn (as when its dispatcher unwinds) ends like a pending
+  // finish, so the slot may give the task up again.
+  drop(permit);
+  drop(lease);
+  assert_eq!(owner.poll_word().flags(), (false, false));
+  drop(owner);
+  drop(shared);
+  assert!(dropped.load(Ordering::SeqCst));
+  assert!(matches!(
+    Pin::new(&mut job).poll(&mut Context::from_waker(Waker::noop())),
+    Poll::Ready(Err(AsyncJoinError::Cancelled))
+  ));
 }

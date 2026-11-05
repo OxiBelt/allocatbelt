@@ -761,7 +761,7 @@ mod loom_tests {
       // Publication queues the task.
       assert_eq!(word.notify(), PollNotify::Enqueue);
       if running || idle {
-        word.begin();
+        assert!(word.begin());
       }
       if idle {
         assert!(!word.finish_pending());
@@ -812,7 +812,7 @@ mod loom_tests {
       let entry = lock(&self.queue).pop()?;
       let locked = lock(&self.locked);
       assert!(locked.admitted(), "{entry:?} outlived its task");
-      self.word.begin();
+      assert!(self.word.begin());
       Some(if locked.aborting() {
         Turn::Cancel
       } else {
@@ -1007,7 +1007,7 @@ mod loom_tests {
       // index is reused by the running replacement.
       let stale = Arc::new(PollWord::new(true));
       assert_eq!(stale.notify(), PollNotify::Enqueue);
-      stale.begin();
+      assert!(stale.begin());
       stale.complete();
       let slot = WordSlot::new(true, false);
       let waker = {

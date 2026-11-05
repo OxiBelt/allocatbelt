@@ -66,10 +66,10 @@ never holds, so no other code can write one, and safe code has no way out of
 the `Pin`. The pin
 guarantee of `Arc::pin` therefore holds for the future from its first poll
 until `Drop` runs in place, for any safe caller and any call order. The
-bookkeeping is reached only by shared reference (`header`); a `Waker` built
-from one owner of the allocation (`into_waker`, which takes that owner over,
-or the test-only `waker`, which clones one) shares it without another
-allocation. Unsizing
+bookkeeping is reached only by shared reference (`header`); a turn's `Waker`
+is borrowed from the slot's owner through its lease (below), and the
+test-only `into_waker` and `waker` build one from an owner. Either shares
+the allocation without another allocation. Unsizing
 the handle to `Pin<Arc<dyn Trait>>` keeps all of this, and the runtime's
 erased task, join and abort handles are such pinned `Arc`s.
 
@@ -131,10 +131,28 @@ registration (including a join registration racing publication with a
 completion-only waiter stored) or detach on one thread racing publication on
 another.
 
+`TaskSlot` holds the scheduler's one owner of a task and lends it to one
+turn at a time. `TaskSlot::lend` begins the turn with a compare-and-swap that
+sets `RUNNING` only from the queued state, and returns a `Lease` holding the
+pointer `Arc::as_ptr` gives for that owner. `RUNNING` is cleared only by the
+lease (its pending finish, or its `Drop` if the turn is abandoned) or kept
+when `TaskSlot::take` hands the owner to the final turn; until then no slot
+drops or releases the owner (`take_idle` and `Drop` refuse while `RUNNING`,
+`Drop` then keeps the allocation alive, `install` refuses an occupied slot,
+and `take` needs the lease), and the word is reached only through the sealed
+`TaskLend`, so it is the cell's own. The lease's pointer is therefore valid
+for every borrow of the lease. `Lease::waker` builds a `Waker` from that
+pointer with a vtable whose `clone` adds a strong count and whose `wake` and
+`drop` give one back; the borrowed waker itself is never dropped and cannot
+be woken by value. Miri-checked tests cover lending, refusal of a second
+lease and of `take_idle` during a turn, borrowed and cloned wakers (wake by
+reference and by value, the last owner being a clone), a dropped lease, and a
+lease returned to another slot (rejected).
+
 | Location | Kind | Operation | Why it is sound |
 |---|---|---|---|
 | `TaskCell` | `unsafe impl Sync` (for `H: Sync`, `F: Send`, `O: Send`) | — | The value is reached only through `poll_future`, `finish` and `drop_future`/`Drop`, each of which first claims the cell with an acquire read-modify-write that at most one caller wins (`POLLING`, `ABSENT`, `STORING` and `STORED` accept no further claim of the value), so two threads never hold references to it at once. The outcome is written once under `STORING` and later reached by exactly one party chosen by publication's word update; the join waker is written only by the one join handle while the word gives it the cell and otherwise only read. The atomics are shared freely and the header is a plain shared field. The same reasoning makes `Mutex<(F, O)>` `Sync`. |
-| `TaskCell::unpinned` | block | `Pin::into_inner_unchecked` of one owner of the pinned `Arc` (the caller's own, or a clone) | Private. The unpinned `Arc` goes only to `Waker::from`, whose vtable hands it back solely to this module's `Wake` implementation (which reads the header and never moves out of the `Arc`) and otherwise drops it in place like any owner, or to a strong count in tests; no unpinned `Arc` or `Weak` reaches a caller, so the allocation stays pinned until its last owner drops it in place. |
+| `TaskCell::unpinned` (test only) | block | `Pin::into_inner_unchecked` of one owner of the pinned `Arc` (the caller's own, or a clone) | Private. The unpinned `Arc` goes only to `Waker::from`, whose vtable hands it back solely to this module's `Wake` implementation (which reads the header and never moves out of the `Arc`) and otherwise drops it in place like any owner, or to a strong count in tests; no unpinned `Arc` or `Weak` reaches a caller, so the allocation stays pinned until its last owner drops it in place. |
 | `TaskCell::poll_future` | block | `&mut *pointer` into the `UnsafeCell<ManuallyDrop<F>>` | The `PRESENT` → `POLLING` claim succeeded, so no other reference exists while it is held; both wrappers are `repr(transparent)`, so the cast pointer is the initialized, aligned `F` the cell was built with, not yet dropped (`drop_future` and `finish` refuse `POLLING`, and a value they dropped never returns to `PRESENT`, which the claim requires). |
 | `TaskCell::poll_future` | block | `Pin::new_unchecked(&mut F)` | Structural pinning: `self` is `Pin<&Self>` of a `!Unpin` cell that is reachable only through shared references, has no method that moves or replaces the value and destroys it in place in `Drop`, so the cell's pin guarantee extends to the field. Its memory stays valid and unmoved until `drop_future`, `finish` or `Drop`, all of which need the claim this reference holds to be released first. |
 | `TaskCell::destroy_value` | block | `ptr::drop_in_place` of the stored `F` | Reached after a claim into `ABSENT` (`drop_future`, `Drop`) or `STORING` (`finish`) that succeeded exactly once, from a state in which the value is initialized and not being polled; neither state is accepted by any later claim of the value, so no reference to it exists now or later; only the pinned `drop_future` and `finish` and the in-place `Drop` reach it, so the value is at the address it was polled at. A destructor that panics still counts as having run once. |
@@ -142,6 +160,10 @@ another.
 | `JoinCells::waker_will_wake`, `JoinCells::wake_join` | block ×2 | shared reference into the join waker cell | Called only while `JOIN_WAKER` is set (the handle) or by the publication that observed it set when completing (the publisher); in that state neither side writes the cell, since the handle cannot clear `JOIN_WAKER` once complete and its detach leaves the cell to publication. `Waker` is `Sync`. |
 | `JoinCells::update_join_wakers` | block | exclusive reference into the join waker cell | Called by the one join handle while `JOIN_WAKER` is clear and the word was not complete at its last check (publication reads the cell only if `JOIN_WAKER` was set when it completed), by the detaching handle after publication cleared `JOIN_WAKER`, or by publication after its clearing of `JOIN_WAKER` showed the handle gone; each follows the other side's last access through an acquire-release read-modify-write on the word. |
 | `JoinCells::take_output` | block | exclusive reference into the outcome cell | Called only after `COMPLETE`, which follows the one write; by the join handle when `JOIN_INTEREST` was set at publication (publication never touches the cell then), or by publication when it was not (the handle detached and never touches it again). The handle is one non-shared owner, so its takes are sequential. |
+| `arc_pointer` | block | reads `&Pin<Arc<T>>` as `&Arc<T>` | `Pin` is `repr(transparent)` over its pointer; the reference is used only for `Arc::as_ptr` within the same borrow, which neither moves the value nor gives out an unpinned owner. |
+| `Lease::task` | block ×2 | `NonNull::as_ref` of the lent task; `Pin::new_unchecked` of it | The pointer is `Arc::as_ptr` of the owner a `TaskSlot` held when `lend` won `RUNNING` for this lease; until the lease ends, no slot drops or releases that owner (see above), so the allocation is alive for the borrow. The value lives in a pinned `Arc` allocation and is only reached by shared reference. |
+| `TaskCell::waker_ref` | block | `Waker::from_raw` with the cell's waker vtable | `data` is a lease's `Arc::as_ptr` pointer, so it may reach the reference counts, and the lease keeps the allocation alive for the `WakerRef`'s borrow. The waker is held in `ManuallyDrop` and cannot be woken by value, so it gives back no count it did not take. |
+| `TaskCell::clone_raw`, `wake_raw`, `wake_by_ref_raw`, `drop_raw` | `unsafe fn` ×4, block ×4 | vtable entries: `Arc::increment_strong_count`; `Arc::from_raw` (wake); a shared reference to the cell (wake by reference); `Arc::from_raw` (drop) | Only the vtable calls them, with the `data` pointer of a waker built by `waker_ref` or `clone_raw`: an `Arc::as_ptr` pointer into a live allocation. `clone` adds the count the clone owns; an owned clone's `wake` and `drop` give back its own count; `wake_by_ref` only reads the header and word through a waker that keeps the allocation alive by its count or its borrow. |
 | `runtime_task_cell.rs` tests (test only) | block ×3 | `Pin::get_unchecked_mut` and a field read of the node being polled, one write through a registered pointer | The intrusive-registration test: a pinned future publishes its own address and withdraws it in `Drop`; the write happens only while the registration is in place, under the registry lock that excludes the withdrawal. Miri checks the test. |
 
 ### `sys/runtime_net_options.rs` (optional `runtime`)

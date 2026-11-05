@@ -2,8 +2,8 @@
 //! publication waking it once, the outcome taken once, and detaching
 //! before or after publication.
 
-use super::super::AsyncJoinError;
 use super::super::identity::TaskId;
+use super::super::{AbortHandle, AsyncJoinError};
 use super::*;
 use std::future::Future;
 use std::pin::Pin;
@@ -260,6 +260,99 @@ fn detach_racing_publication_drops_output_and_waker_once() {
     publisher.join().unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert_eq!(waker_drops.load(Ordering::SeqCst), 1);
+  }
+}
+
+/// Polls that run long enough for aborts and a cancelling close to land
+/// while dispatchers hold their turns: each task is cleaned up once, every
+/// join resolves, and no turn outlives the runtime.
+#[test]
+fn abort_and_close_during_running_polls_clean_up_each_task_once() {
+  use super::super::{AsyncConfig, AsyncRuntime, AsyncShutdown};
+
+  struct Spin {
+    polls: usize,
+    drops: Arc<AtomicUsize>,
+    running: Arc<AtomicUsize>,
+  }
+
+  impl Future for Spin {
+    type Output = usize;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {
+      self.running.fetch_add(1, Ordering::SeqCst);
+      for _ in 0..200 {
+        std::hint::spin_loop();
+      }
+      self.polls += 1;
+      if self.polls == 400 {
+        return Poll::Ready(self.polls);
+      }
+      cx.waker().wake_by_ref();
+      Poll::Pending
+    }
+  }
+
+  impl Drop for Spin {
+    fn drop(&mut self) {
+      self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+  }
+
+  const TASKS: usize = 16;
+  for round in 0..40 {
+    let runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 4,
+      max_outstanding: TASKS,
+      max_scopes: 1,
+    })
+    .unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let running = Arc::new(AtomicUsize::new(0));
+    let mut jobs: Vec<_> = (0..TASKS)
+      .map(|_| {
+        runtime
+          .handle()
+          .spawn(Spin {
+            polls: 0,
+            drops: Arc::clone(&drops),
+            running: Arc::clone(&running),
+          })
+          .unwrap()
+      })
+      .collect();
+    let aborts: Vec<_> = jobs
+      .iter()
+      .enumerate()
+      .filter(|(index, _)| (index + round) % 2 == 0)
+      .map(|(_, job)| job.abort_handle())
+      .collect();
+    let aborter = {
+      let running = Arc::clone(&running);
+      std::thread::spawn(move || {
+        while running.load(Ordering::SeqCst) < TASKS {
+          std::thread::yield_now();
+        }
+        for abort in &aborts {
+          abort.abort();
+        }
+        aborts
+      })
+    };
+    while running.load(Ordering::SeqCst) < TASKS * 2 {
+      std::thread::yield_now();
+    }
+    runtime.shutdown(AsyncShutdown::CancelPending).unwrap();
+    let aborts = aborter.join().unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), TASKS);
+    for job in &mut jobs {
+      assert!(job.is_finished());
+      match poll(job, Waker::noop()) {
+        Poll::Ready(Ok(400) | Err(AsyncJoinError::Cancelled)) => {}
+        other => panic!("unexpected outcome {:?}", other.map(|r| r.map(drop))),
+      }
+    }
+    assert!(aborts.iter().all(AbortHandle::is_finished));
   }
 }
 

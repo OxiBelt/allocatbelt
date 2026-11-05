@@ -1174,6 +1174,15 @@ completion-only waiter and then the join waiter, once each. If publication
 lands while the handle is replacing one slot, the handle wakes the other
 slot's waiter itself, since publication found no waker to wake. No scheduler lock is held while outcomes or wakers are
 dropped.
+Each slot owns its task through one reference, and dispatch lends that
+reference to the turn without a reference-count update: beginning the turn
+sets the running bit with one compare-and-swap, and while it is set the slot
+neither drops nor gives up its reference except to that turn. A pending poll
+ends the loan with its one word operation; the final turn takes the slot's
+reference over for publication, so no dispatcher keeps a reference after its
+turn. The poll's `Context` carries a waker borrowed from that reference; only
+a clone that user code keeps holds its own reference count. Requeues still go
+through the usual lane choice, and queue entries remain slot indices.
 The task allocation is a pinned `sys` cell (`Pin<Arc<TaskCell>>`) that
 stores the user future inline next to the runtime's bookkeeping; its atomic
 claim serializes polling and in-place destruction, and its pinned-only API is
