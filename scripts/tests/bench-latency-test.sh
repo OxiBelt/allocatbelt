@@ -44,12 +44,13 @@ reject_schedule --lane async --workload mixed --jobs 64 --window 33 --bytes 2097
 mkdir -p "$tmp/bin"
 cat >"$tmp/bin/fake" <<'FAKE'
 #!/usr/bin/env bash
-lane="" workload=local mode=latency executor=NA workers=4 rate=10000 bytes=256 count=0 window=""
+lane="" workload=local mode=latency executor=NA workers=4 rate=10000 bytes=256 count=0 window="" spin=0
 while (($#)); do
   case "$1" in
     --lane) lane="$2" ;; --workload) workload="$2" ;; --mode) mode="$2" ;;
     --executor) executor="$2" ;; --workers) workers="$2" ;; --arrival-rate) rate="$2" ;;
     --ops|--jobs) count="$2" ;; --bytes) bytes="$2" ;; --window) window="$2" ;;
+    --harness-observer-spin) spin="$2" ;;
     *) exit 2 ;;
   esac
   shift 2
@@ -91,6 +92,8 @@ else
 fi
 printf -v checksum_hex '0x%016x' "$checksum"
 fields=("$allocator" "$lane" "$workload" "$mode" "$executor" "$workers" "$window" "$rate" "$bytes" "$count" "$count" "$count" 0 "$checksum_hex" 100 1000 1 10 20 30 0 0)
+# Observer spin raises bounded throughput so the summary has a separated case.
+[[ "$executor" != bounded* ]] || fields[15]=$((1000 + spin))
 if [[ "$mode" != latency ]]; then fields[17]=NA; fields[18]=NA; fields[19]=NA; fi
 if [[ "$mode" == capacity ]]; then fields[7]=NA; fields[16]=NA; fields[20]=NA; fields[21]=NA; fi
 case "${BENCH_LATENCY_FAKE_MODE:-ok}" in
@@ -218,4 +221,41 @@ for bad_check in wrong-window:configuration wrong-bytes:configuration wrong-exec
   [[ "$(tail -1 "$out/results.csv" | cut -d, -f6)" == "$expected_check" ]] \
     || fail "$bad capacity result classified as $(tail -1 "$out/results.csv" | cut -d, -f6), expected $expected_check"
 done
+
+# --observer-spin runs every executor at every spin value as its own variant.
+reject_schedule --lane allocator --observer-spin 0
+reject_schedule --lane async --observer-spin 0,0
+reject_schedule --lane async --observer-spin 01
+reject_schedule --lane async --observer-spin -1
+reject_schedule --lane async --observer-spin 0,,16
+spin_schedule="$("$script" --lane async --mode capacity --allocs system --executors bounded,tokio --observer-spin 0,16 --reps 4 --print-schedule)"
+[[ "$(awk '{print NF}' <<<"$spin_schedule" | sort -u)" == 4 ]] || fail "spin schedule variant count"
+spin_positions="$(awk '{for (i=1;i<=NF;i++) print i,$i}' <<<"$spin_schedule" | sort | uniq -c | awk '{print $1}' | sort -u | tr '\n' ' ')"
+[[ "$spin_positions" == '1 ' ]] || fail "spin schedule positions are not balanced: $spin_positions"
+[[ "$("$script" --lane async --mode capacity --allocs system --observer-spin 0,16 --reps 4 --print-schedule)" == "$spin_schedule" ]] \
+  || fail "spin schedule is not deterministic"
+"$script" --lane async --mode capacity --allocs system --executors bounded,tokio --observer-spin 0,16 --reps 4 --jobs 8 --workers 2 --window 4 --bin-dir "$tmp/bin" --out "$tmp/spin"
+[[ "$(tail -n +2 "$tmp/spin/results.csv" | cut -d, -f6 | sort -u)" == ok ]] || fail "spin run validation"
+[[ "$(awk -F, '{print NF}' "$tmp/spin/results.csv" | sort -u)" == 30 ]] || fail "spin column missing"
+[[ "$(head -1 "$tmp/spin/results.csv" | cut -d, -f30)" == harness_observer_spin ]] || fail "spin column header"
+[[ "$(tail -n +2 "$tmp/spin/results.csv" | cut -d, -f4,30 | sort | uniq -c | awk '{print $1}' | sort -u)" == 4 ]] || fail "spin variants were not each run once per repetition"
+[[ "$(cat "$tmp/spin"/runs/r*-system-bounded-spin16.argv)" == *"--harness-observer-spin 16"* ]] || fail "spin argv"
+grep -q '^harness_observer_spin=0,16$' "$tmp/spin/environment.txt" || fail "spin list not recorded"
+[[ "$(sed -n 2p "$tmp/spin/summary.tsv")" == "$(printf 'system\tready\t2\t4\t0\t1000\t1000\t1.000\t1000-1000\t1000-1000\tno\t4+4')" ]] \
+  || fail "spin 0 summary: $(sed -n 2p "$tmp/spin/summary.tsv")"
+[[ "$(sed -n 3p "$tmp/spin/summary.tsv")" == "$(printf 'system\tready\t2\t4\t16\t1016\t1000\t1.016\t1016-1016\t1000-1000\tyes\t4+4')" ]] \
+  || fail "spin 16 summary: $(sed -n 3p "$tmp/spin/summary.tsv")"
+[[ ! -e "$tmp/blocking/summary.tsv" ]] || fail "default run wrote a spin summary"
+
+# The executor comparison combines one bench-latency run per load.
+compare="$repo/scripts/bench-executor-compare.sh"
+if "$compare" --loads ready:4 --print-schedule >"$tmp/log" 2>&1; then fail "accepted malformed load"; fi
+if "$compare" --loads ready:4:2 --print-schedule >"$tmp/log" 2>&1; then fail "accepted window below workers"; fi
+if "$compare" --loads ready:1:4,ready:1:4 --print-schedule >"$tmp/log" 2>&1; then fail "accepted duplicate load"; fi
+"$compare" --loads ready:1:4,yielding:2:4 --reps 4 --jobs 8 --bin-dir "$tmp/bin" --out "$tmp/compare" >"$tmp/compare.log" 2>&1 \
+  || { cat "$tmp/compare.log" >&2; fail "comparison run failed"; }
+[[ "$(wc -l <"$tmp/compare/summary.tsv")" == 5 ]] || fail "comparison summary rows"
+[[ "$(cut -f2-5 "$tmp/compare/summary.tsv" | tail -n +2 | tr '\t\n' ': ')" == 'ready:1:4:0 ready:1:4:16 yielding:2:4:0 yielding:2:4:16 ' ]] \
+  || fail "comparison summary order"
+[[ "$(wc -l <"$tmp/compare/summary.txt")" == 5 ]] || fail "comparison table rows"
 echo "bench-latency runner tests passed"

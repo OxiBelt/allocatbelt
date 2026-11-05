@@ -1645,6 +1645,16 @@ even when functional validation passes. Capacity tests and small process
 smokes verify accounting and cleanup, including cleanup before window refill;
 they are not native performance qualification.
 
+`scripts/bench-latency.sh --observer-spin 0,16` runs each executor at each
+listed `--harness-observer-spin` value as interleaved variants, adds a
+`harness_observer_spin` column and writes `summary.tsv` with median tasks/s,
+the bounded/Tokio ratio and interquartile ranges per spin value.
+`scripts/bench-executor-compare.sh` repeats this over several
+workload/worker/window loads in async capacity mode and combines one table.
+Its spin 0 rows measure end to end, including the observer's sleep and wake;
+its spin 16 rows compare the executors without that harness cost. Multi-worker
+results depend on the harness condition, so report both rows.
+
 ## Bounded original-thread blocking handoff
 
 `AsyncRuntime::new_with_handoffs(AsyncConfig, HandoffConfig)` prestarts a fixed

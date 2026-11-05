@@ -2,26 +2,35 @@
 # Balanced fresh-process allocator and blocking/async executor comparisons.
 # `--bin-dir` executes unverified prebuilt artifacts and marks their rows
 # nonqualifying. Normal runs build all selected variants from this checkout.
+# `--observer-spin LIST` runs each executor once per harness observer spin
+# value as separate interleaved variants and writes summary.tsv.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 lane="" workload=local mode=latency allocs=mimalloc,standard,allocatbelt executors=bounded,tokio
 reps=36 out="" bin_dir="" ops="" workers="" arrival_rate="" bytes="" window="" print_schedule=0 workload_explicit=0
+observer_spin=""
 die() { echo "bench-latency.sh: $*" >&2; exit 2; }
 positive() {
   if [[ ! "$2" =~ ^[1-9][0-9]*$ ]] || ((${#2} >= 10)); then die "$1 needs a positive decimal integer"; fi
 }
 while (($#)); do
   case "$1" in
-    --lane|--workload|--mode|--allocs|--executors|--reps|--ops|--jobs|--workers|--arrival-rate|--bytes|--window|--out|--bin-dir)
+    --lane|--workload|--mode|--allocs|--executors|--reps|--ops|--jobs|--workers|--arrival-rate|--bytes|--window|--out|--bin-dir|--observer-spin)
       [[ -n "${2:-}" ]] || die "$1 needs a value"
       case "$1" in
         --lane) lane="$2" ;; --workload) workload="$2"; workload_explicit=1 ;; --mode) mode="$2" ;;
         --allocs) allocs="$2" ;; --executors) executors="$2" ;; --reps) reps="$2" ;;
         --ops|--jobs) ops="$2" ;; --workers) workers="$2" ;; --arrival-rate) arrival_rate="$2" ;;
         --bytes) bytes="$2" ;; --window) window="$2" ;; --out) out="$2" ;; --bin-dir) bin_dir="$2" ;;
+        --observer-spin) observer_spin="$2" ;;
       esac
       shift 2 ;;
-    -h|--help) echo "usage: bench-latency.sh --lane allocator|blocking|async [--workload local|aligned|mixed|ready|yielding] [--mode latency|throughput|capacity] [--allocs system,mimalloc,standard,allocatbelt] [--executors bounded,tokio] [--reps N] [--ops N|--jobs N] [--workers N] [--window N] [--arrival-rate N] [--bytes N] --out DIR [--bin-dir DIR]"; exit 0 ;;
+    -h|--help) echo "usage: bench-latency.sh --lane allocator|blocking|async [--workload local|aligned|mixed|ready|yielding] [--mode latency|throughput|capacity] [--allocs system,mimalloc,standard,allocatbelt] [--executors bounded,tokio] [--reps N] [--ops N|--jobs N] [--workers N] [--window N] [--arrival-rate N] [--bytes N] [--observer-spin N,N] --out DIR [--bin-dir DIR]"
+      echo "  --observer-spin LIST  blocking/async lanes: run each executor at each --harness-observer-spin value"
+      echo "                        (comma list of distinct non-negative integers) as interleaved variants;"
+      echo "                        adds a harness_observer_spin column to results.csv and writes summary.tsv"
+      echo "                        with bounded and tokio median tasks/s, their ratio and interquartile ranges"
+      exit 0 ;;
     --print-schedule) print_schedule=1; shift ;;
     *) die "unknown argument $1" ;;
   esac
@@ -86,8 +95,26 @@ alloc_list=("${values[@]}")
 parse_list --executors "$executors" bounded,tokio
 exec_list=("${values[@]}")
 [[ "$lane" != allocator ]] || exec_list=(allocator)
+spin_list=()
+if [[ -n "$observer_spin" ]]; then
+  [[ "$lane" != allocator ]] || die "--observer-spin requires the blocking or async lane"
+  [[ "$observer_spin" =~ ^(0|[1-9][0-9]{0,8})(,(0|[1-9][0-9]{0,8}))*$ ]] \
+    || die "--observer-spin needs comma-separated non-negative decimal integers"
+  IFS=, read -r -a spin_list <<<"$observer_spin"
+  seen=" "
+  for s in "${spin_list[@]}"; do
+    [[ "$seen" != *" $s "* ]] || die "--observer-spin: duplicate $s"
+    seen+="$s "
+  done
+fi
 pairs=()
-for a in "${alloc_list[@]}"; do for e in "${exec_list[@]}"; do pairs+=("$a:$e"); done; done
+for a in "${alloc_list[@]}"; do for e in "${exec_list[@]}"; do
+  if ((${#spin_list[@]})); then
+    for s in "${spin_list[@]}"; do pairs+=("$a:$e:spin$s"); done
+  else
+    pairs+=("$a:$e")
+  fi
+done; done
 n=${#pairs[@]}; cycle=$((n % 2 == 1 && n > 1 ? 2 * n : n))
 schedule_index() {
   local rep=$(($1 % cycle)) pos="$2" k seq
@@ -134,7 +161,7 @@ if [[ -z "$bin_dir" ]]; then
     cargo build --manifest-path bench/standard-mimalloc/Cargo.toml --target-dir bench/standard-mimalloc/target --release --locked --bin bench-latency-standard
     standard_dir=bench/standard-mimalloc/target/release
   fi
-  bin_dir=target/release
+  bin_dir="${CARGO_TARGET_DIR:-target}/release"
 else
   standard_dir="$bin_dir"
 fi
@@ -203,13 +230,18 @@ mkdir -p "$out/runs"
   echo "lane=$lane workload=$workload mode=$mode reps=$reps allocs=$allocs executors=$executors"
   echo "effective_count=$effective_count workers=$effective_workers admission_window=$effective_window arrival_rate=$effective_rate bytes=$effective_bytes"
   echo "expected_checksum=$expected_checksum_hex evidence_status=$evidence_status"
+  [[ -z "$observer_spin" ]] || echo "harness_observer_spin=$observer_spin"
   for a in "${alloc_list[@]}"; do
     bin="$(binary_for "$a")"
     sha256sum "$bin"
   done
 } >"$out/environment.txt"
 expected_header=allocator,lane,workload,mode,executor,workers,admission_window,arrival_rate,bytes,requested,attempted,completed,dropped,checksum,elapsed_ns,throughput_per_s,timer_overhead_ns,p50_ns,p95_ns,p99_ns,arrival_lateness_mean_ns,arrival_lateness_max_ns
-echo 'repetition,position,allocator,executor,exit_code,check,evidence_status,allocator_name,lane,workload,mode,executor_name,workers,admission_window,arrival_rate,bytes,requested,attempted,completed,dropped,checksum,elapsed_ns,throughput_per_s,timer_overhead_ns,p50_ns,p95_ns,p99_ns,arrival_lateness_mean_ns,arrival_lateness_max_ns' >"$out/results.csv"
+results_header='repetition,position,allocator,executor,exit_code,check,evidence_status,allocator_name,lane,workload,mode,executor_name,workers,admission_window,arrival_rate,bytes,requested,attempted,completed,dropped,checksum,elapsed_ns,throughput_per_s,timer_overhead_ns,p50_ns,p95_ns,p99_ns,arrival_lateness_mean_ns,arrival_lateness_max_ns'
+# The spin column is appended only with --observer-spin, so default output
+# keeps its 29 fields.
+[[ -z "$observer_spin" ]] || results_header+=,harness_observer_spin
+echo "$results_header" >"$out/results.csv"
 # Read a field into a local first so malformed/missing CSV cannot trigger
 # nounset or feed an unchecked value to Bash arithmetic.
 unsigned_field() {
@@ -220,16 +252,19 @@ failed=0
 for ((r=0; r<reps; r++)); do
   for ((p=0; p<n; p++)); do
     pair="${pairs[$(schedule_index "$r" "$p")]}"; a="${pair%%:*}"; e="${pair#*:}"
+    spin="" variant="$e"
+    if [[ "$e" == *:spin* ]]; then spin="${e##*:spin}"; e="${e%%:*}"; variant="$e-spin$spin"; fi
     bin="$(binary_for "$a")"
     args=(--lane "$lane" --workload "$workload" --mode "$mode")
     if [[ "$lane" != allocator ]]; then
       args+=(--jobs "$effective_count" --workers "$effective_workers" --bytes "$effective_bytes" --executor "$e")
       [[ "$effective_rate" == NA ]] || args+=(--arrival-rate "$effective_rate")
       if [[ "$lane" == async || "$mode" == capacity ]]; then args+=(--window "$effective_window"); fi
+      [[ -z "$spin" ]] || args+=(--harness-observer-spin "$spin")
     else
       args+=(--ops "$effective_count" --bytes "$effective_bytes")
     fi
-    raw="$out/runs/r${r}-p${p}-${a}-${e}.csv"
+    raw="$out/runs/r${r}-p${p}-${a}-${variant}.csv"
     printf '%q ' "$bin" "${args[@]}" >"${raw%.csv}.argv"
     printf '\n' >>"${raw%.csv}.argv"
     code=0; "$bin" "${args[@]}" >"$raw" 2>"${raw%.csv}.stderr" || code=$?
@@ -277,8 +312,36 @@ for ((r=0; r<reps; r++)); do
       fi
     fi
     [[ "${#fields[@]}" == 22 ]] || check=field-count
-    printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$r" "$p" "$a" "$e" "$code" "$check" "$evidence_status" "$row" >>"$out/results.csv"
+    printf '%s,%s,%s,%s,%s,%s,%s,%s%s\n' "$r" "$p" "$a" "$e" "$code" "$check" "$evidence_status" "$row" "${spin:+,$spin}" >>"$out/results.csv"
     [[ "$check" == ok ]] || failed=1
   done
 done
 ((failed == 0)) || exit 1
+[[ -n "$observer_spin" ]] || exit 0
+# Per allocator and spin value: median and interquartile range (linear
+# interpolation between order statistics) of throughput_per_s for each
+# executor, the bounded/tokio median ratio, and whether the ranges overlap.
+awk -F, -v spins="$observer_spin" -v workload="$workload" -v workers="$effective_workers" -v window="$effective_window" '
+function sortv(a, k,   i, j, t) { for (i = 2; i <= k; i++) { t = a[i]; for (j = i - 1; j >= 1 && a[j] > t; j--) a[j + 1] = a[j]; a[j + 1] = t } }
+function q(a, k, p,   h, l) { h = (k - 1) * p + 1; l = int(h); return l >= k ? a[k] : a[l] + (h - l) * (a[l + 1] - a[l]) }
+function stats(key, out,   k, i, v) {
+  k = count[key]; if (k == 0) { out["med"] = "NA"; out["lo"] = "NA"; out["hi"] = "NA"; return 0 }
+  for (i = 1; i <= k; i++) v[i] = value[key, i]
+  sortv(v, k); out["med"] = q(v, k, 0.5); out["lo"] = q(v, k, 0.25); out["hi"] = q(v, k, 0.75); return k
+}
+NR > 1 && $6 == "ok" { key = $3 SUBSEP $30 SUBSEP $4; value[key, ++count[key]] = $23; if (!($3 in seen)) { seen[$3] = 1; allocs[++na] = $3 } }
+END {
+  print "allocator	workload	workers	window	observer_spin	bounded_median	tokio_median	bounded/tokio	bounded_iqr	tokio_iqr	iqr_separated	runs"
+  ns = split(spins, sl, ",")
+  for (i = 1; i <= na; i++) for (j = 1; j <= ns; j++) {
+    nb = stats(allocs[i] SUBSEP sl[j] SUBSEP "bounded", b); nt = stats(allocs[i] SUBSEP sl[j] SUBSEP "tokio", t)
+    ratio = "NA"; sep = "NA"
+    if (nb && nt) {
+      if (t["med"] > 0) ratio = sprintf("%.3f", b["med"] / t["med"])
+      sep = (b["lo"] > t["hi"] || b["hi"] < t["lo"]) ? "yes" : "no"
+    }
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d+%d\n", allocs[i], workload, workers, window, sl[j],
+      nb ? sprintf("%.0f", b["med"]) : "NA", nt ? sprintf("%.0f", t["med"]) : "NA", ratio,
+      nb ? sprintf("%.0f-%.0f", b["lo"], b["hi"]) : "NA", nt ? sprintf("%.0f-%.0f", t["lo"], t["hi"]) : "NA", sep, nb, nt
+  }
+}' "$out/results.csv" >"$out/summary.tsv"
