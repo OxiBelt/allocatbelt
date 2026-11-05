@@ -16,14 +16,17 @@ use std::task::{Context, Waker};
 mod distributed;
 #[path = "free_slots.rs"]
 mod free_slots;
+#[cfg(all(test, not(loom)))]
+#[path = "join_word_tests.rs"]
+mod join_word_tests;
 
 use super::handoff;
 use super::handoff_protocol::{DispatchTurn, HandoffLoan};
 use super::identity;
 use super::join::AsyncJob;
 use super::metrics::{Padded, RuntimeMetrics};
-use super::protocol::{PollNotify, PollWord, ScopeProtocol, SlotProtocol};
-use super::task::{DomainCpuAdmission, ErasedTask, PollResult, Task};
+use super::protocol::{ScopeProtocol, SlotProtocol};
+use super::task::{DomainCpuAdmission, ErasedTask, PollNotify, PollResult, Task, TaskWord};
 use super::thread_options::AsyncThreadContext;
 #[cfg(all(test, not(loom)))]
 use super::thread_options::AsyncThreadOptions;
@@ -675,7 +678,7 @@ impl Shared {
   /// The task waker: one RMW on the task's word, and a queue insertion only
   /// when that RMW found the task idle. No slot mutex. A wake that won the
   /// entry after the runtime was dropped has nothing left to queue.
-  pub(super) fn wake_task(shared: &Weak<Self>, word: &PollWord, task_ref: TaskRef) {
+  pub(super) fn wake_task(shared: &Weak<Self>, word: &TaskWord, task_ref: TaskRef) {
     if word.notify() == PollNotify::Enqueue
       && let Some(shared) = shared.upgrade()
     {

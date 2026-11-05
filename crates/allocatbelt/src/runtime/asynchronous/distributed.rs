@@ -736,10 +736,11 @@ impl Distributed {
   }
 
   /// Inserts the queue entry a wake won from an idle task word, without the
-  /// slot mutex. The word belongs to the task object, and the slot is not
-  /// released while the word holds a queue entry or a turn, so the index
-  /// still names that task here; a finished task's word is `COMPLETE` and
-  /// never wins an entry again.
+  /// slot mutex. The word belongs to the task object, and the slot is
+  /// released only by the task's final turn, whose word stays `RUNNING`
+  /// until publication sets `COMPLETE`, so an idle word means the index
+  /// still names that task here; a finished task's word never wins an entry
+  /// again.
   pub(super) fn enqueue_woken(&self, shared: &Shared, task_ref: TaskRef) {
     if task_ref.index < self.slots.len() {
       self.push_ready(shared, task_ref.index, ReadyInsertion::Publish);
@@ -977,7 +978,8 @@ impl Distributed {
     if !slot.protocol.matches(task_ref.generation) || slot.task.is_none() {
       return;
     }
-    task.poll_word().complete();
+    // The word stays `RUNNING` until publication sets `COMPLETE`, so wakes
+    // from here on queue nothing.
     slot.protocol.release();
     let task = slot.task.take();
     let scope = slot.scope.take();
@@ -995,7 +997,6 @@ impl Distributed {
     let slot_task = slot.task.take();
     let scope = slot.scope.take();
     let cell = slot.cell.take();
-    task.poll_word().complete();
     slot.protocol.release();
     let reusable = slot.protocol.next_generation().is_some();
     drop(slot);

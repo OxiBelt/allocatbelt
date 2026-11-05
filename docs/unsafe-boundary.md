@@ -53,11 +53,12 @@ handler replacement has the registry's installation-race limitations.
 
 ### `sys/runtime_task_cell.rs` (optional `runtime`)
 
-A native async task is one `Arc`: `TaskCell<H, F>` stores the runtime's
+A native async task is one `Arc`: `TaskCell<H, F, O>` stores the runtime's
 bookkeeping `H` next to the user future `F` instead of boxing the future a
-second time. Soundness rests on structural pinning, not on a check: the cell
-exists only as the `Pin<Arc<TaskCell<H, F>>>` that its sole constructor
-`TaskCell::new` returns, no API gives out the cell by value, by `&mut` or as
+second time, together with the task's atomic word, its outcome `O` and its
+one join waker. Soundness of the future rests on structural pinning, not on a
+check: the cell exists only as the `Pin<Arc<TaskCell<H, F, O>>>` that its
+constructors `TaskCell::new` and `TaskCell::new_with_join` return, no API gives out the cell by value, by `&mut` or as
 an unpinned `Arc` or `Weak`, the methods that touch the future
 (`poll_future`, `drop_future`) take `self: Pin<&Self>`, and the cell is never
 `Unpin`: the module holds the cell's one `Unpin` impl behind a bound that
@@ -78,7 +79,29 @@ with one acquire compare-and-swap and releases with one release store
 unwinds); `drop_future` and `Drop` move `PRESENT`/`COMPLETE`/`POISONED` →
 `ABSENT` with an acquire-release compare-and-swap loop (a failed
 compare-and-swap reads the latest state, unlike the plain load that
-`fetch_update` starts with) and drop in place exactly once. Any other state,
+`fetch_update` starts with) and drop in place exactly once. `finish` moves
+any of those states or `ABSENT` → `STORING` the same way, drops a value still
+present in place, writes the outcome once and releases into the final
+`STORED`, even when the destructor or the outcome builder panics.
+
+The outcome and the join waker are handed between threads by the task word,
+whose transitions are the safe `sys/runtime_task_word.rs` (a private module
+of the cell; Loom compiles the same file into the runtime's stand-in, so the
+models exercise it). The runtime sees only the word's scheduling operations
+(`TaskWord`: notify, begin, pending finish), which never touch the complete
+or join bits. `publish` loads `STORED` with acquire ordering before it sets
+`COMPLETE`, so the one write happens before any read; afterwards the outcome
+belongs to the join handle if `JOIN_INTEREST` was set at publication and to
+the publisher otherwise. The join handle (`TaskJoin`) is created once, with
+the cell, and its operations need a key only the word module builds, on a
+sealed trait only the cell implements, so the join side is one non-shared
+owner. The waker cell holds two fixed slots (join and completion-only), both
+written only by that handle. It writes the cell only while `JOIN_WAKER` is clear and the word
+was not complete, then sets `JOIN_WAKER` with a compare-and-swap that fails
+once complete; while `JOIN_WAKER` is set both sides only read the cell, and
+the side that last leaves it (publication after clearing `JOIN_WAKER`, or the
+handle after it cleared `JOIN_INTEREST`) drops the waker, decided by one
+read-modify-write each on the word. Any other state,
 including a poll already in progress on another thread or reentrantly from
 the future itself, is rejected without touching the value. The release store
 and the acquire claims are the only synchronization the cell needs: a poll on
@@ -98,15 +121,27 @@ never `Unpin`. Moving a polled cell out of its allocation, for example out
 of a box or an `Arc`, cannot be written against this API; the sound forms of
 those cases (drop in place) are tests. Loom compiles the runtime without `sys` and models a boxed stand-in
 with the same state machine and pinned-handle API, so Loom does not cover
-this cell.
+this cell's unsafe code; it does run the shared word and join transitions,
+with stand-in cells that fail on any access overlapping an exclusive one.
+Further Miri-checked tests cover `finish` (once, refused during a poll, a
+panicking destructor), publication before and after a store, waker keep,
+replace and single wake for both waker slots, publication without a join
+handle, a join handle built from another allocation (rejected), and
+registration (including a join registration racing publication with a
+completion-only waiter stored) or detach on one thread racing publication on
+another.
 
 | Location | Kind | Operation | Why it is sound |
 |---|---|---|---|
-| `TaskCell` | `unsafe impl Sync` (for `H: Sync`, `F: Send`) | — | The value is reached only through `poll_future` and `drop_future`/`Drop`, each of which first claims the cell with an acquire read-modify-write that at most one caller wins (`POLLING` and `ABSENT` accept no further claim), so two threads never hold references to it at once; the atomic is shared freely and the header is a plain shared field. The same reasoning makes `Mutex<F>` `Sync`. |
+| `TaskCell` | `unsafe impl Sync` (for `H: Sync`, `F: Send`, `O: Send`) | — | The value is reached only through `poll_future`, `finish` and `drop_future`/`Drop`, each of which first claims the cell with an acquire read-modify-write that at most one caller wins (`POLLING`, `ABSENT`, `STORING` and `STORED` accept no further claim of the value), so two threads never hold references to it at once. The outcome is written once under `STORING` and later reached by exactly one party chosen by publication's word update; the join waker is written only by the one join handle while the word gives it the cell and otherwise only read. The atomics are shared freely and the header is a plain shared field. The same reasoning makes `Mutex<(F, O)>` `Sync`. |
 | `TaskCell::unpinned` | block | `Pin::into_inner_unchecked` of one owner of the pinned `Arc` (the caller's own, or a clone) | Private. The unpinned `Arc` goes only to `Waker::from`, whose vtable hands it back solely to this module's `Wake` implementation (which reads the header and never moves out of the `Arc`) and otherwise drops it in place like any owner, or to a strong count in tests; no unpinned `Arc` or `Weak` reaches a caller, so the allocation stays pinned until its last owner drops it in place. |
-| `TaskCell::poll_future` | block | `&mut *pointer` into the `UnsafeCell<ManuallyDrop<F>>` | The `PRESENT` → `POLLING` claim succeeded, so no other reference exists while it is held; both wrappers are `repr(transparent)`, so the cast pointer is the initialized, aligned `F` the cell was built with, not yet dropped (`drop_future` refuses `POLLING` and only ever succeeds once, into the final `ABSENT`, which the claim rejects). |
-| `TaskCell::poll_future` | block | `Pin::new_unchecked(&mut F)` | Structural pinning: `self` is `Pin<&Self>` of a `!Unpin` cell that is reachable only through shared references, has no method that moves or replaces the value and destroys it in place in `Drop`, so the cell's pin guarantee extends to the field. Its memory stays valid and unmoved until `drop_future` or `Drop`, both of which need the claim this reference holds to be released first. |
-| `TaskCell::drop_in_place` | block | `ptr::drop_in_place` of the stored `F` | The claim into `ABSENT` succeeded exactly once, from a state in which the value is initialized and not being polled, and `ABSENT` is final, so no reference to the value exists now or later; only the pinned `drop_future` and the in-place `Drop` reach it, so the value is at the address it was polled at. A destructor that panics still counts as having run once. |
+| `TaskCell::poll_future` | block | `&mut *pointer` into the `UnsafeCell<ManuallyDrop<F>>` | The `PRESENT` → `POLLING` claim succeeded, so no other reference exists while it is held; both wrappers are `repr(transparent)`, so the cast pointer is the initialized, aligned `F` the cell was built with, not yet dropped (`drop_future` and `finish` refuse `POLLING`, and a value they dropped never returns to `PRESENT`, which the claim requires). |
+| `TaskCell::poll_future` | block | `Pin::new_unchecked(&mut F)` | Structural pinning: `self` is `Pin<&Self>` of a `!Unpin` cell that is reachable only through shared references, has no method that moves or replaces the value and destroys it in place in `Drop`, so the cell's pin guarantee extends to the field. Its memory stays valid and unmoved until `drop_future`, `finish` or `Drop`, all of which need the claim this reference holds to be released first. |
+| `TaskCell::destroy_value` | block | `ptr::drop_in_place` of the stored `F` | Reached after a claim into `ABSENT` (`drop_future`, `Drop`) or `STORING` (`finish`) that succeeded exactly once, from a state in which the value is initialized and not being polled; neither state is accepted by any later claim of the value, so no reference to it exists now or later; only the pinned `drop_future` and `finish` and the in-place `Drop` reach it, so the value is at the address it was polled at. A destructor that panics still counts as having run once. |
+| `TaskCell::finish` | block | the one write of `Some(outcome)` into the `UnsafeCell<Option<O>>` | Holds the `STORING` claim, won once (no claim leaves `STORED`); nothing reads the cell before `STORED` is released, because `publish` loads `STORED` with acquire ordering before it sets `COMPLETE`, and both readers of the outcome require `COMPLETE`. |
+| `JoinCells::waker_will_wake`, `JoinCells::wake_join` | block ×2 | shared reference into the join waker cell | Called only while `JOIN_WAKER` is set (the handle) or by the publication that observed it set when completing (the publisher); in that state neither side writes the cell, since the handle cannot clear `JOIN_WAKER` once complete and its detach leaves the cell to publication. `Waker` is `Sync`. |
+| `JoinCells::update_join_wakers` | block | exclusive reference into the join waker cell | Called by the one join handle while `JOIN_WAKER` is clear and the word was not complete at its last check (publication reads the cell only if `JOIN_WAKER` was set when it completed), by the detaching handle after publication cleared `JOIN_WAKER`, or by publication after its clearing of `JOIN_WAKER` showed the handle gone; each follows the other side's last access through an acquire-release read-modify-write on the word. |
+| `JoinCells::take_output` | block | exclusive reference into the outcome cell | Called only after `COMPLETE`, which follows the one write; by the join handle when `JOIN_INTEREST` was set at publication (publication never touches the cell then), or by publication when it was not (the handle detached and never touches it again). The handle is one non-shared owner, so its takes are sequential. |
 | `runtime_task_cell.rs` tests (test only) | block ×3 | `Pin::get_unchecked_mut` and a field read of the node being polled, one write through a registered pointer | The intrusive-registration test: a pinned future publishes its own address and withdraws it in `Drop`; the write happens only while the registration is in place, under the registry lock that excludes the withdrawal. Miri checks the test. |
 
 ### `sys/runtime_net_options.rs` (optional `runtime`)

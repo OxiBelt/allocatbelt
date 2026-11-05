@@ -2,19 +2,24 @@
 //!
 //! A native async task is one `Arc`: a [`TaskCell`] that stores the
 //! runtime's bookkeeping (`H`) next to the user future (`F`) instead of
-//! boxing the future a second time. Pinning a future that never leaves its
-//! allocation needs `unsafe`, so this module is the one place that creates
-//! the pinned reference, drops the value in place and builds a `Waker` from
-//! the allocation. The runtime, which keeps `#![forbid(unsafe_code)]`,
-//! only calls the safe API below; its soundness does not depend on how the
-//! runtime orders or interleaves those calls.
+//! boxing the future a second time, together with the task's atomic word,
+//! its outcome (`O`) and its one join waker. Pinning a future that never
+//! leaves its allocation, and handing the outcome and the join waker between
+//! threads under the word, need `unsafe`, so this module is the one place
+//! that creates the pinned reference, drops the value in place, reaches the
+//! outcome and waker cells and builds a `Waker` from the allocation. The
+//! runtime, which keeps `#![forbid(unsafe_code)]`, only calls the safe API
+//! below; its soundness does not depend on how the runtime orders or
+//! interleaves those calls.
 //!
 //! # Contract
 //!
-//! The cell exists only inside a `Pin<Arc<TaskCell<H, F>>>`: [`TaskCell::new`]
-//! is the sole constructor, and no API returns the cell by value, by `&mut`
-//! or as an unpinned `Arc` or `Weak`. Everything that touches the stored
-//! future ([`TaskCell::poll_future`], [`TaskCell::drop_future`]) takes
+//! The cell exists only inside a `Pin<Arc<TaskCell<H, F, O>>>`:
+//! [`TaskCell::new`] and [`TaskCell::new_with_join`] are the only
+//! constructors, and no API returns the cell by value, by `&mut` or as an
+//! unpinned `Arc` or `Weak`. Everything that touches the stored
+//! future ([`TaskCell::poll_future`], [`TaskCell::drop_future`],
+//! [`TaskCell::finish`]) takes
 //! `self: Pin<&Self>`, which safe code can only obtain through that pinned
 //! `Arc`, and the cell is never `Unpin` (it holds the one `Unpin` impl it can
 //! have, behind a bound that never holds, so no other impl can be written),
@@ -22,7 +27,7 @@
 //! therefore holds for the future from its first poll until `Drop` runs in
 //! place: it is never moved, and its memory is not reused before its
 //! destructor ran. The bookkeeping is reachable only by shared reference
-//! ([`TaskCell::header`]). Unsizing a `Pin<Arc<TaskCell<H, F>>>` to a
+//! ([`TaskCell::header`]). Unsizing a `Pin<Arc<TaskCell<H, F, O>>>` to a
 //! `Pin<Arc<dyn Trait>>` keeps all of this.
 //!
 //! The cell starts with a future (`PRESENT`). `poll_future` claims the
@@ -36,19 +41,39 @@
 //! claims the value with one compare-and-swap (`PRESENT`, `COMPLETE` or
 //! `POISONED` → `ABSENT`) and drops it exactly once; it refuses while a poll
 //! is in progress, and the cell's own `Drop` drops a value that is still
-//! present. Every claim is an acquire read-modify-write that observes the
-//! release of the previous claim, so the value is only ever reached through
-//! one exclusive reference at a time, and everything a poll wrote is visible
-//! to the next poll or to the destructor on any thread.
+//! present. `finish` claims the cell from any of those states or `ABSENT`
+//! into `STORING`, drops a value still present in place, writes the outcome
+//! once and releases into the final `STORED`. Every claim is an acquire
+//! read-modify-write that observes the release of the previous claim, so the
+//! value and the outcome are only ever reached through one exclusive
+//! reference at a time, and everything a poll wrote is visible to the next
+//! poll or to the destructor on any thread.
+//!
+//! The outcome and the join waker are governed by the task word (see
+//! `runtime_task_word.rs`): `publish` sets `COMPLETE` only after it observed
+//! `STORED`, after which the outcome belongs to the one [`TaskJoin`] if it
+//! still existed at publication and to the publisher otherwise; the join
+//! waker cell is written only by that one handle while `JOIN_WAKER` is clear
+//! and the task is not complete, and only read while it is set. The runtime
+//! sees the word only through [`TaskWord`], whose operations change the
+//! scheduling bits alone.
 
+use std::any::Any;
 use std::cell::UnsafeCell;
 use std::future::Future;
 use std::marker::PhantomPinned;
 use std::mem::ManuallyDrop;
+use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
+
+#[path = "runtime_task_word.rs"]
+mod word;
+
+use word::{JoinCells, JoinWakers, WakerSlot};
+pub(crate) use word::{JoinSide, PollNotify, Publication, TaskJoin, TaskWord};
 
 /// A future is stored and may be polled.
 const PRESENT: u8 = 0;
@@ -60,6 +85,10 @@ const COMPLETE: u8 = 2;
 const POISONED: u8 = 3;
 /// The value was dropped in place.
 const ABSENT: u8 = 4;
+/// `finish` holds the claim: it drops the value and writes the outcome.
+const STORING: u8 = 5;
+/// The value is gone and the outcome was written; final.
+const STORED: u8 = 6;
 
 /// The result of one [`TaskCell::poll_future`].
 #[derive(Debug)]
@@ -75,17 +104,22 @@ pub(crate) enum CellPoll<T> {
 
 /// The bookkeeping half of a task allocation, which also serves its wakers.
 pub(crate) trait TaskHeader: Send + Sync + 'static {
-  /// Wakes the task; called by every `Waker` built from its allocation.
-  fn wake_by_ref(&self);
+  /// Wakes the task; called by every `Waker` built from its allocation,
+  /// with the task's word.
+  fn wake_by_ref(&self, word: &TaskWord);
 }
 
-/// One task allocation: bookkeeping and the user future, pinned together.
+/// One task allocation: bookkeeping, word, user future, outcome and join
+/// waker, pinned together.
 ///
 /// See the module documentation for the contract.
-pub(crate) struct TaskCell<H, F> {
+pub(crate) struct TaskCell<H, F, O = ()> {
   header: H,
   state: AtomicU8,
+  word: TaskWord,
   future: UnsafeCell<ManuallyDrop<F>>,
+  output: UnsafeCell<Option<O>>,
+  join_waker: UnsafeCell<JoinWakers>,
   _pin: PhantomPinned,
 }
 
@@ -93,18 +127,21 @@ pub(crate) struct TaskCell<H, F> {
 /// and its bound never holds, so no other code can make the cell `Unpin`.
 struct NeverUnpin<'a>(std::marker::PhantomData<&'a ()>, PhantomPinned);
 
-impl<'a, H, F> Unpin for TaskCell<H, F> where NeverUnpin<'a>: Unpin {}
+impl<'a, H, F, O> Unpin for TaskCell<H, F, O> where NeverUnpin<'a>: Unpin {}
 
-// SAFETY: the stored value is reached only through `poll_future` and
-// `drop_future`, each of which first claims the cell with an acquire
-// read-modify-write on `state` that succeeds for at most one caller at a
-// time (`POLLING` and `ABSENT` are claimed states no other claim accepts),
-// so two threads never hold references to the value at once; the atomic is
-// shared freely and the header is a plain shared field. Like `Mutex<F>`,
-// the cell is therefore `Sync` whenever `F` may be moved between threads
-// and `H` may be shared.
+// SAFETY: the stored future is reached only through `poll_future`,
+// `drop_future` and `finish`, each of which first claims the cell with an
+// acquire read-modify-write on `state` that succeeds for at most one caller
+// at a time (`POLLING`, `ABSENT`, `STORING` and `STORED` are states no other
+// claim of the value accepts), so two threads never hold references to it at
+// once. The outcome is written once under the `STORING` claim and afterwards
+// reached by exactly one party chosen by the word's publication RMW; the
+// join waker is written only by the one `TaskJoin` while the word gives it
+// the cell, and otherwise only read (`Waker` is `Sync`). Outcome and waker
+// move between threads, so the cell is `Sync` whenever `F` and `O` may be
+// moved between threads and `H` may be shared, like `Mutex<(F, O)>`.
 #[expect(unsafe_code, reason = "`UnsafeCell` opts out of `Sync`")]
-unsafe impl<H: Sync, F: Send> Sync for TaskCell<H, F> {}
+unsafe impl<H: Sync, F: Send, O: Send> Sync for TaskCell<H, F, O> {}
 
 /// Releases the poll claim, as `POISONED` when the poll unwinds.
 struct PollClaim<'a> {
@@ -118,16 +155,47 @@ impl Drop for PollClaim<'_> {
   }
 }
 
-impl<H, F> TaskCell<H, F> {
-  /// Allocates the task and pins it. This is the only constructor, and the
-  /// returned `Pin<Arc<Self>>` is the only form in which the cell exists.
-  pub(crate) fn new(header: H, future: F) -> Pin<Arc<Self>> {
+impl<H, F, O> TaskCell<H, F, O> {
+  fn build(header: H, future: F, join_interest: bool) -> Pin<Arc<Self>> {
     Arc::pin(Self {
       header,
       state: AtomicU8::new(PRESENT),
+      word: TaskWord::new(join_interest),
       future: UnsafeCell::new(ManuallyDrop::new(future)),
+      output: UnsafeCell::new(None),
+      join_waker: UnsafeCell::new(JoinWakers::default()),
       _pin: PhantomPinned,
     })
+  }
+
+  /// Allocates the task without a join handle and pins it; a published
+  /// outcome goes back to the publisher.
+  #[cfg(test)]
+  pub(crate) fn new(header: H, future: F) -> Pin<Arc<Self>> {
+    Self::build(header, future, false)
+  }
+
+  /// Allocates the task and its one join handle. `erase` converts a clone
+  /// of the allocation to the handle's (usually unsized) form and must
+  /// return that same allocation.
+  pub(crate) fn new_with_join<J>(
+    header: H,
+    future: F,
+    erase: impl FnOnce(Pin<Arc<Self>>) -> Pin<Arc<J>>,
+  ) -> (Pin<Arc<Self>>, TaskJoin<J>)
+  where
+    J: ?Sized + JoinSide<Output = O>,
+  {
+    let task = Self::build(header, future, true);
+    let join = erase(Pin::clone(&task));
+    assert!(
+      std::ptr::addr_eq(
+        std::ptr::from_ref::<J>(&join),
+        std::ptr::from_ref::<Self>(&task)
+      ),
+      "the join handle must share the task allocation"
+    );
+    (task, TaskJoin::new(join))
   }
 
   /// The bookkeeping stored next to the future.
@@ -135,11 +203,30 @@ impl<H, F> TaskCell<H, F> {
     &self.header
   }
 
+  /// The scheduling face of the task word.
+  pub(crate) fn word(&self) -> &TaskWord {
+    &self.word
+  }
+
+  /// Whether the outcome was published.
+  pub(crate) fn is_complete(&self) -> bool {
+    self.word.is_complete()
+  }
+
+  /// Whether `finish` claimed the cell (the outcome is being or was
+  /// stored).
+  pub(crate) fn is_finished(&self) -> bool {
+    matches!(self.state.load(Ordering::Acquire), STORING | STORED)
+  }
+
   /// Whether a value is still stored (pollable, complete, poisoned or
   /// being polled). `false` once it was dropped.
   #[cfg(test)]
   pub(crate) fn holds_value(&self) -> bool {
-    self.state.load(Ordering::Acquire) != ABSENT
+    !matches!(
+      self.state.load(Ordering::Acquire),
+      ABSENT | STORING | STORED
+    )
   }
 
   /// The number of `Pin<Arc<Self>>` and `Waker` owners of the allocation.
@@ -154,6 +241,7 @@ impl<H, F> TaskCell<H, F> {
   where
     H: TaskHeader,
     F: Send + 'static,
+    O: Send + 'static,
   {
     Self::into_waker(Pin::clone(this))
   }
@@ -164,6 +252,7 @@ impl<H, F> TaskCell<H, F> {
   where
     H: TaskHeader,
     F: Send + 'static,
+    O: Send + 'static,
   {
     Waker::from(Self::unpinned(this))
   }
@@ -210,8 +299,9 @@ impl<H, F> TaskCell<H, F> {
     // is `POLLING`, so no other reference to it exists; `UnsafeCell` and
     // `ManuallyDrop` are `repr(transparent)`, so the cast pointer is the
     // initialized, aligned `F` this cell was constructed with, which has
-    // not been dropped (`drop_future` refuses `POLLING` and only ever
-    // succeeds once, moving to `ABSENT`, which the entry claim rejects).
+    // not been dropped (`drop_future` and `finish` refuse `POLLING`, and a
+    // value they dropped never returns to `PRESENT`, which the entry claim
+    // requires).
     #[expect(unsafe_code, reason = "exclusive reference into the claimed cell")]
     let future: &mut F = unsafe { &mut *pointer };
     // SAFETY: the value never moves again. This cell is pinned (`self` is
@@ -219,8 +309,8 @@ impl<H, F> TaskCell<H, F> {
     // shared references and has no method that moves or replaces the
     // value, and `Drop` destroys the value in place, so the pin guarantee
     // of the cell extends to the field: its memory stays valid and
-    // unmoved until `drop_future` or `Drop`, both of which need the claim
-    // this reference holds to be released first.
+    // unmoved until `drop_future`, `finish` or `Drop`, all of which need
+    // the claim this reference holds to be released first.
     #[expect(unsafe_code, reason = "structural pinning of the stored future")]
     let pinned: Pin<&mut F> = unsafe { Pin::new_unchecked(future) };
     let result = pinned.poll(cx);
@@ -236,6 +326,7 @@ impl<H, F> TaskCell<H, F> {
   /// call dropped it; `false` when it was dropped before or is being
   /// polled. A panicking destructor unwinds out of this call after the
   /// value counts as dropped.
+  #[cfg(test)]
   pub(crate) fn drop_future(self: Pin<&Self>) -> bool {
     self.get_ref().drop_in_place()
   }
@@ -257,37 +348,184 @@ impl<H, F> TaskCell<H, F> {
         Err(_) => return false,
       }
     }
-    // SAFETY: the transition to `ABSENT` above succeeded exactly once for
-    // this value, from a state in which it is initialized and not being
-    // polled, and `ABSENT` is final, so no other reference to the value
-    // exists now or later; the cast pointer is the aligned `F` behind the
-    // transparent `UnsafeCell<ManuallyDrop<F>>`, at the address the value
-    // was polled at, since only the pinned `drop_future` and the in-place
-    // `Drop` call this function.
+    self.destroy_value();
+    true
+  }
+
+  /// Destroys the value after a claim that took it from a state in which
+  /// it is initialized and not being polled.
+  fn destroy_value(&self) {
+    // SAFETY: the caller's claim succeeded exactly once for this value,
+    // from `PRESENT`, `COMPLETE` or `POISONED`, into `ABSENT` or
+    // `STORING`, neither of which any claim of the value accepts again, so
+    // no other reference to the value exists now or later; the cast
+    // pointer is the aligned `F` behind the transparent
+    // `UnsafeCell<ManuallyDrop<F>>`, at the address the value was polled
+    // at, since only the pinned `drop_future` and `finish` and the
+    // in-place `Drop` claim it.
     #[expect(unsafe_code, reason = "in-place destruction of the claimed value")]
     unsafe {
       std::ptr::drop_in_place(self.future.get().cast::<F>());
     }
+  }
+
+  /// Ends the task's execution once: drops a future that is still stored
+  /// (and not being polled) in place, then stores the outcome that `make`
+  /// builds from the destructor's panic payload, if any. Returns false,
+  /// without calling `make`, while a poll is in progress or once an
+  /// outcome was stored. A panic in `make` stores no outcome.
+  pub(crate) fn finish(
+    self: Pin<&Self>,
+    make: impl FnOnce(Option<Box<dyn Any + Send>>) -> O,
+  ) -> bool {
+    let mut expected = PRESENT;
+    let present = loop {
+      match self
+        .state
+        .compare_exchange(expected, STORING, Ordering::AcqRel, Ordering::Acquire)
+      {
+        Ok(previous) => break previous != ABSENT,
+        Err(observed @ (PRESENT | COMPLETE | POISONED | ABSENT)) => expected = observed,
+        Err(_) => return false,
+      }
+    };
+    // Released as `STORED` on every exit, so publication can follow even
+    // when the value's destructor or `make` panics.
+    let claim = PollClaim {
+      state: &self.state,
+      next: STORED,
+    };
+    let payload = if present {
+      panic::catch_unwind(AssertUnwindSafe(|| self.get_ref().destroy_value())).err()
+    } else {
+      None
+    };
+    let outcome = make(payload);
+    // SAFETY: this call holds the `STORING` claim, which it won exactly
+    // once (no claim leaves `STORED`, and `STORING` is accepted by none),
+    // and nothing reaches the outcome cell before `STORED` is released
+    // below: publication first loads `STORED` with acquire ordering.
+    #[expect(unsafe_code, reason = "the one write of the outcome")]
+    unsafe {
+      *self.output.get() = Some(outcome);
+    }
+    drop(claim);
     true
+  }
+
+  /// Publishes a stored outcome once: sets `COMPLETE`, wakes the join
+  /// waker, and returns what the caller drops outside every lock. Refuses
+  /// before an outcome was stored, and after the first publication.
+  pub(crate) fn publish(&self) -> Publication<O> {
+    if self.state.load(Ordering::Acquire) != STORED {
+      return Publication::refused();
+    }
+    word::publish(self.word.inner(), self)
   }
 }
 
-impl<H, F> Drop for TaskCell<H, F> {
+impl<H, F, O> JoinCells for TaskCell<H, F, O> {
+  type Output = O;
+
+  fn waker_will_wake(&self, slot: WakerSlot, waker: &Waker) -> bool {
+    // SAFETY: called only while `JOIN_WAKER` is set and the task word gives
+    // both sides read access only: the one join handle (here) and
+    // publication (`wake_join`) read; the cell is written only by the join
+    // handle after it cleared `JOIN_WAKER`, or by publication after its own
+    // release of `JOIN_WAKER` showed the handle gone.
+    #[expect(unsafe_code, reason = "shared read of the join waker cell")]
+    let stored = unsafe { &*self.join_waker.get() };
+    stored
+      .get(slot)
+      .is_some_and(|stored| stored.will_wake(waker))
+  }
+
+  fn wake_join(&self, slot: WakerSlot) {
+    // SAFETY: called by the one publication that set `COMPLETE` while
+    // `JOIN_INTEREST` and `JOIN_WAKER` were set; until it clears
+    // `JOIN_WAKER`, the join handle may only read the cell (it cannot clear
+    // `JOIN_WAKER` once complete, and its detach leaves the cell to this
+    // publication), so shared access is exclusive of every write.
+    #[expect(unsafe_code, reason = "shared read of the join waker cell")]
+    let stored = unsafe { &*self.join_waker.get() };
+    if let Some(waker) = stored.get(slot) {
+      waker.wake_by_ref();
+    }
+  }
+
+  fn update_join_wakers<R>(&self, update: impl FnOnce(&mut JoinWakers) -> R) -> R {
+    // SAFETY: called only by the party the word gives the cell: the one
+    // join handle while `JOIN_WAKER` is clear and the word was not complete
+    // when it last checked (publication reads the cell only if
+    // `JOIN_WAKER` was set when it completed), the detaching handle once
+    // publication cleared `JOIN_WAKER`, or publication after its own
+    // release of `JOIN_WAKER` showed the handle gone. Each of these follows
+    // the other side's last access through an acquire-release RMW on the
+    // word. The update only moves wakers in and out; it runs no waker code
+    // and cannot reach this cell again.
+    #[expect(unsafe_code, reason = "exclusive access to the join waker cell")]
+    let stored = unsafe { &mut *self.join_waker.get() };
+    update(stored)
+  }
+
+  fn take_output(&self) -> Option<O> {
+    // SAFETY: called only after the word is `COMPLETE`, which publication
+    // sets after it observed `STORED` (the one write is finished), by the
+    // one party publication chose: the join handle when `JOIN_INTEREST`
+    // was set then (publication never touches the cell), or publication
+    // when it was not (the handle detached and never touches it again).
+    // The one join handle is not shared, so its takes are sequential.
+    #[expect(unsafe_code, reason = "exclusive access to the published outcome")]
+    let stored = unsafe { &mut *self.output.get() };
+    stored.take()
+  }
+}
+
+impl<H, F, O> word::Sealed for TaskCell<H, F, O> {}
+
+impl<H: Sync + Send, F: Send, O: Send> JoinSide for TaskCell<H, F, O> {
+  type Output = O;
+
+  fn join_complete(&self) -> bool {
+    self.word.is_complete()
+  }
+
+  fn join_poll(
+    &self,
+    _key: word::JoinKey,
+    slot: word::WakerSlot,
+    waker: &Waker,
+    take: bool,
+  ) -> Poll<Option<O>> {
+    word::join_poll(self.word.inner(), self, slot, waker, take)
+  }
+
+  fn join_take(&self, _key: word::JoinKey) -> Option<Option<O>> {
+    word::join_take(self.word.inner(), self)
+  }
+
+  fn join_detach(&self, _key: word::JoinKey) -> (Option<O>, word::JoinWakers) {
+    word::join_detach(self.word.inner(), self)
+  }
+}
+
+impl<H, F, O> Drop for TaskCell<H, F, O> {
   fn drop(&mut self) {
     // A value still present is dropped once; one that was dropped before
     // or (unreachably, since `&mut self` excludes a running poll) is
-    // being polled is left alone.
+    // being polled is left alone. The outcome and the join waker are plain
+    // fields and drop with the cell.
     self.drop_in_place();
   }
 }
 
-impl<H: TaskHeader, F: Send + 'static> Wake for TaskCell<H, F> {
+impl<H: TaskHeader, F: Send + 'static, O: Send + 'static> Wake for TaskCell<H, F, O> {
   fn wake(self: Arc<Self>) {
-    self.header.wake_by_ref();
+    self.header.wake_by_ref(&self.word);
   }
 
   fn wake_by_ref(self: &Arc<Self>) {
-    self.header.wake_by_ref();
+    self.header.wake_by_ref(&self.word);
   }
 }
 
@@ -458,7 +696,7 @@ mod tests {
     }
     let drops = Arc::new(AtomicUsize::new(0));
     let (future, dropped) = countdown(0);
-    let cell = TaskCell::new(Header(Arc::clone(&drops)), future);
+    let cell = TaskCell::<_, _>::new(Header(Arc::clone(&drops)), future);
     assert_eq!(Arc::strong_count(&cell.header().0), 2);
     let other = Pin::clone(&cell);
     assert_eq!(TaskCell::strong_count(&cell), 2);
@@ -473,12 +711,12 @@ mod tests {
   fn waker_shares_the_allocation_and_wakes_through_the_header() {
     struct Header(AtomicUsize);
     impl TaskHeader for Header {
-      fn wake_by_ref(&self) {
+      fn wake_by_ref(&self, _word: &TaskWord) {
         self.0.fetch_add(1, Ordering::SeqCst);
       }
     }
     let (future, dropped) = countdown(0);
-    let cell = TaskCell::new(Header(AtomicUsize::new(0)), future);
+    let cell = TaskCell::<_, _>::new(Header(AtomicUsize::new(0)), future);
     let waker = TaskCell::waker(&cell);
     let other = TaskCell::waker(&cell);
     assert!(waker.will_wake(&other));
@@ -1069,4 +1307,246 @@ mod tests {
     send::<TaskCell<(), SendNotSync>>();
     sync::<TaskCell<Mutex<u8>, SendNotSync>>();
   }
+
+  type Joined<F> = Pin<Arc<TaskCell<(), F, u64>>>;
+
+  fn joined<F>(future: F) -> (Joined<F>, TaskJoin<TaskCell<(), F, u64>>)
+  where
+    F: Send,
+  {
+    TaskCell::new_with_join((), future, |task| task)
+  }
+
+  /// A waker that records its wakes and drops in `Relaxed` counters, so only
+  /// the cell's own protocol orders it with the other thread.
+  struct Probe {
+    wakes: AtomicUsize,
+    drops: Arc<AtomicUsize>,
+  }
+
+  impl Wake for Probe {
+    fn wake(self: Arc<Self>) {
+      self.wakes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+      self.wakes.fetch_add(1, Ordering::Relaxed);
+    }
+  }
+
+  impl Drop for Probe {
+    fn drop(&mut self) {
+      self.drops.fetch_add(1, Ordering::Relaxed);
+    }
+  }
+
+  fn probe() -> (Arc<Probe>, Arc<AtomicUsize>, Waker) {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let probe = Arc::new(Probe {
+      wakes: AtomicUsize::new(0),
+      drops: Arc::clone(&drops),
+    });
+    let waker = Waker::from(Arc::clone(&probe));
+    (probe, drops, waker)
+  }
+
+  #[test]
+  fn finish_drops_the_future_stores_once_and_publication_follows() {
+    let (future, dropped) = countdown(5);
+    let (task, mut join) = joined(future);
+    assert!(!task.publish().published);
+    assert!(task.as_ref().finish(|payload| {
+      assert!(payload.is_none());
+      9
+    }));
+    assert!(dropped.load(Ordering::SeqCst));
+    assert!(!task.holds_value());
+    assert!(!task.as_ref().finish(|_| unreachable!("stored twice")));
+    assert!(matches!(
+      task.as_ref().poll_future(&mut context()),
+      CellPoll::Rejected
+    ));
+    assert!(join.take().is_none());
+    let publication = task.publish();
+    assert!(publication.published && publication.output.is_none());
+    assert!(!task.publish().published);
+    assert_eq!(join.take(), Some(Some(9)));
+    assert_eq!(join.take(), Some(None));
+  }
+
+  #[test]
+  fn finish_refuses_while_a_poll_holds_the_value_and_reports_a_panicking_drop() {
+    struct FinishWhilePolling(Arc<Mutex<Option<Cell<Self>>>>);
+    impl Future for FinishWhilePolling {
+      type Output = ();
+      fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        let cell = self.0.lock().unwrap().clone().unwrap();
+        assert!(!cell.as_ref().finish(|_| unreachable!("finished mid-poll")));
+        Poll::Pending
+      }
+    }
+    let slot: SelfSlot<FinishWhilePolling> = Arc::new(Mutex::new(None));
+    let cell = cell(FinishWhilePolling(Arc::clone(&slot)));
+    *slot.lock().unwrap() = Some(Pin::clone(&cell));
+    assert!(matches!(
+      cell.as_ref().poll_future(&mut context()),
+      CellPoll::Pending
+    ));
+    slot.lock().unwrap().take();
+
+    struct PanicOnDrop;
+    impl Future for PanicOnDrop {
+      type Output = ();
+      fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        Poll::Pending
+      }
+    }
+    impl Drop for PanicOnDrop {
+      fn drop(&mut self) {
+        panic!("destructor");
+      }
+    }
+    let (task, mut join) = joined(PanicOnDrop);
+    assert!(task.as_ref().finish(|payload| u64::from(payload.is_some())));
+    assert!(task.publish().published);
+    assert_eq!(join.take(), Some(Some(1)));
+  }
+
+  #[test]
+  fn join_and_finished_wakers_are_kept_replaced_and_each_woken_once() {
+    let (task, mut join) = joined(std::future::pending::<()>());
+    let (first, first_drops, first_waker) = probe();
+    let (second, second_drops, second_waker) = probe();
+    let (third, third_drops, third_waker) = probe();
+    assert!(join.poll(&first_waker).is_pending());
+    assert!(join.poll(&first_waker).is_pending());
+    assert_eq!(Arc::strong_count(&first), 3);
+    // The completion-only waiter has its own slot: the join waker stays.
+    assert!(join.poll_complete(&second_waker).is_pending());
+    assert_eq!(Arc::strong_count(&first), 3);
+    assert_eq!(Arc::strong_count(&second), 3);
+    // Re-registering one slot replaces only that slot's waker.
+    assert!(join.poll_complete(&third_waker).is_pending());
+    assert_eq!(Arc::strong_count(&second), 2);
+    assert_eq!(Arc::strong_count(&first), 3);
+    assert!(task.as_ref().finish(|_| 4));
+    let publication = task.publish();
+    assert!(publication.output.is_none());
+    assert!(publication.wakers.join.is_none() && publication.wakers.finished.is_none());
+    assert_eq!(first.wakes.load(Ordering::Relaxed), 1);
+    assert_eq!(second.wakes.load(Ordering::Relaxed), 0);
+    assert_eq!(third.wakes.load(Ordering::Relaxed), 1);
+    assert!(join.poll_complete(&second_waker).is_ready());
+    assert_eq!(join.poll(&first_waker), Poll::Ready(Some(4)));
+    drop(join);
+    drop((first_waker, second_waker, third_waker, first, second, third));
+    assert_eq!(first_drops.load(Ordering::Relaxed), 1);
+    assert_eq!(second_drops.load(Ordering::Relaxed), 1);
+    assert_eq!(third_drops.load(Ordering::Relaxed), 1);
+  }
+
+  #[test]
+  fn completion_while_the_handle_holds_the_wakers_wakes_the_other_waiter() {
+    // The handle replaces its join waker after publication began from a
+    // word without `JOIN_WAKER`: modelled by publishing between a
+    // completion-only registration and a join registration on another
+    // thread, many times.
+    for _ in 0..ROUNDS {
+      let (task, mut join) = joined(std::future::pending::<()>());
+      let (finished, _, finished_waker) = probe();
+      let (joiner, _, join_waker) = probe();
+      assert!(join.poll_complete(&finished_waker).is_pending());
+      let publisher = std::thread::spawn(move || {
+        assert!(task.as_ref().finish(|_| 5));
+        drop(task.publish());
+      });
+      let polled = join.poll(&join_waker);
+      publisher.join().unwrap();
+      // The completion-only waiter is woken exactly once either way.
+      assert_eq!(finished.wakes.load(Ordering::Relaxed), 1);
+      match polled {
+        Poll::Pending => assert_eq!(joiner.wakes.load(Ordering::Relaxed), 1),
+        Poll::Ready(output) => {
+          assert_eq!(output, Some(5));
+          assert_eq!(joiner.wakes.load(Ordering::Relaxed), 0);
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn publication_without_a_join_returns_the_outcome() {
+    let (task, join) = joined(std::future::pending::<()>());
+    let (probe, drops, waker) = probe();
+    let mut join = join;
+    assert!(join.poll(&waker).is_pending());
+    drop(waker);
+    drop(probe);
+    drop(join);
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+    assert!(task.as_ref().finish(|_| 6));
+    let publication = task.publish();
+    assert_eq!(publication.output, Some(6));
+    assert!(publication.wakers.join.is_none() && publication.wakers.finished.is_none());
+  }
+
+  #[test]
+  #[should_panic(expected = "share the task allocation")]
+  fn join_must_share_the_task_allocation() {
+    let other: Joined<std::future::Pending<()>> = TaskCell::new((), std::future::pending());
+    let _ = TaskCell::<(), std::future::Pending<()>, u64>::new_with_join(
+      (),
+      std::future::pending(),
+      move |_| other,
+    );
+  }
+
+  #[test]
+  fn registration_on_one_thread_races_publication_on_another() {
+    for _ in 0..ROUNDS {
+      let (task, mut join) = joined(std::future::pending::<()>());
+      let (probe, drops, waker) = probe();
+      let publisher = std::thread::spawn(move || {
+        assert!(task.as_ref().finish(|_| 11));
+        let publication = task.publish();
+        assert!(publication.published && publication.output.is_none());
+        drop(publication);
+      });
+      let first = join.poll(&waker);
+      publisher.join().unwrap();
+      if first.is_pending() {
+        assert_eq!(probe.wakes.load(Ordering::Relaxed), 1);
+      }
+      assert_eq!(join.poll(&waker).map(|_| ()), Poll::Ready(()));
+      drop(join);
+      drop((waker, probe));
+      assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+  }
+
+  #[test]
+  fn detach_on_one_thread_races_publication_on_another() {
+    for _ in 0..ROUNDS {
+      let (task, mut join) = joined(std::future::pending::<()>());
+      let (probe, drops, waker) = probe();
+      assert!(join.poll(&waker).is_pending());
+      drop(waker);
+      drop(probe);
+      let output_seen = Arc::new(AtomicUsize::new(0));
+      let seen = Arc::clone(&output_seen);
+      let publisher = std::thread::spawn(move || {
+        assert!(task.as_ref().finish(|_| 12));
+        let publication = task.publish();
+        if publication.output.is_some() {
+          seen.fetch_add(1, Ordering::Relaxed);
+        }
+      });
+      drop(join);
+      publisher.join().unwrap();
+      assert!(output_seen.load(Ordering::Relaxed) <= 1);
+      assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+  }
+
+  const ROUNDS: usize = if cfg!(miri) { 8 } else { 1000 };
 }

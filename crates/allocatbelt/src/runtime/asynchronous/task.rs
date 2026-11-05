@@ -3,14 +3,12 @@
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::task::{Context, Waker};
 
 use super::entry::TaskContextGuard;
 use super::identity::TaskId;
-use super::join::{AbortMetadata, AsyncJob, AsyncJoinError, JoinState, MergedJoin};
-use super::protocol::PollWord;
+use super::join::{AbortMetadata, AsyncJob, AsyncJoinError, MergedJoin};
 use super::scheduler::{PollPermit, Shared, TaskRef};
 use crate::runtime::cpu_execution::CpuExecutionGuard;
 use crate::runtime::managed::ResourceScope;
@@ -19,9 +17,19 @@ use crate::runtime::resource_domain::{
   TenantDomain,
 };
 #[cfg(not(loom))]
-use crate::sys::runtime_task_cell::{CellPoll, TaskCell, TaskHeader};
+pub(super) use crate::sys::runtime_task_cell::{
+  CellPoll, JoinSide, PollNotify, TaskCell, TaskHeader, TaskJoin, TaskWord,
+};
 #[cfg(loom)]
-use loom_cell::{CellPoll, TaskCell, TaskHeader};
+pub(super) use loom_cell::{CellPoll, JoinSide, TaskCell, TaskHeader};
+#[cfg(loom)]
+pub(super) use word::{PollNotify, PollWord, TaskJoin, TaskWord};
+
+/// The task word and join protocol, compiled from the cell's own source so
+/// the Loom models exercise the same transitions.
+#[cfg(loom)]
+#[path = "../../sys/runtime_task_word.rs"]
+mod word;
 
 pub(super) enum DomainCpuAdmission {
   Unbounded,
@@ -60,11 +68,11 @@ pub(super) trait ErasedTask: Send + Sync {
     cpu_ticket: &mut Option<DomainReservation>,
   ) -> (PollResult, Option<PollPermit>);
 
-  /// Drops a cancelled future and stages its terminal outcome, with no
+  /// Drops a cancelled future and stores its terminal outcome, with no
   /// scheduler lock held.
   fn cancel(self: Pin<&Self>);
 
-  /// Publishes the staged outcome after scheduler admission has been
+  /// Publishes the stored outcome after scheduler admission has been
   /// released.
   fn publish(&self);
 
@@ -75,19 +83,16 @@ pub(super) trait ErasedTask: Send + Sync {
   /// allocation.
   fn task_waker(self: Pin<Arc<Self>>) -> Waker;
 
-  /// Task-owned flags, never shared with a later occupant of the slot.
-  fn poll_word(&self) -> &PollWord;
+  /// The scheduling face of the task-owned word, never shared with a later
+  /// occupant of the slot.
+  fn poll_word(&self) -> &TaskWord;
 
-  /// Stages a typed resource failure without polling user code.
+  /// Stores a typed resource failure without polling user code.
   fn fail_resource(self: Pin<&Self>, error: DomainError);
 
   /// The owners of the allocation besides this consumed handle.
   #[cfg(test)]
   fn strong_count(self: Pin<Arc<Self>>) -> usize;
-}
-
-struct TaskState {
-  staged: bool,
 }
 
 // Taking a waiter for domain admission must not undo concurrent cleanup.
@@ -99,18 +104,12 @@ enum WaiterState {
 }
 
 /// The bookkeeping half of a task allocation, shared by the scheduler, join,
-/// abort handles and wakers. It lives next to the user future in the one
-/// pinned [`TaskCell`]; terminal paths drop the future in place before
-/// publishing, even when stale handles retain the allocation, whose size
-/// (and `Control` charge) does not change.
-pub(super) struct TaskBookkeeping<F: Future> {
-  state: Mutex<TaskState>,
-  /// Mirrors `TaskState::staged` for the pending-poll check, which reads it
-  /// without the mutex. It only records that an outcome was staged. Like
-  /// the mutex beside it, it is a `std` type under Loom too.
-  staged: AtomicBool,
-  word: PollWord,
-  pub(super) join: JoinState<F::Output>,
+/// abort handles and wakers. It lives next to the user future, the task
+/// word and the outcome in the one pinned [`TaskCell`]; terminal paths drop
+/// the future in place before publishing, even when stale handles retain
+/// the allocation, whose size (and `Control` charge) does not change.
+pub(super) struct TaskBookkeeping {
+  id: TaskId,
   resources: Option<ResourceScope>,
   // Fixed at construction; only absence permits skipping tenant cleanup locks.
   tenant: Option<TenantDomain>,
@@ -122,46 +121,14 @@ pub(super) struct TaskBookkeeping<F: Future> {
   _task_control: ControlCharge,
 }
 
-/// One allocation: the bookkeeping and the user future, pinned together.
-pub(super) type Task<F> = TaskCell<TaskBookkeeping<F>, F>;
+/// The terminal outcome a join handle receives.
+pub(super) type Outcome<T> = Result<T, AsyncJoinError>;
 
-impl<F> TaskBookkeeping<F>
-where
-  F: Future + Send + 'static,
-  F::Output: Send + 'static,
-{
-  fn lock_state(&self) -> MutexGuard<'_, TaskState> {
-    self.state.lock().unwrap_or_else(PoisonError::into_inner)
-  }
+/// One allocation: the bookkeeping, the word, the user future and its
+/// outcome, pinned together.
+pub(super) type Task<F> = TaskCell<TaskBookkeeping, F, Outcome<<F as Future>::Output>>;
 
-  fn stage(&self, outcome: Result<F::Output, AsyncJoinError>) {
-    self.join.stage(outcome);
-    let mut state = self.lock_state();
-    state.staged = true;
-    // Written while the mutex is held, after the outcome is staged, so the
-    // mirror never reports an outcome the join state does not hold yet.
-    self.staged.store(true, Ordering::Release);
-  }
-
-  /// Whether a terminal outcome was staged, read without the task-state
-  /// mutex.
-  ///
-  /// The flag only moves from false to true. The pending path needs to see
-  /// any `stage` that happens before its check: a cancellation or resource
-  /// failure that ran before this poll began, ordered through the scheduler
-  /// lock or the cell claim that serialized it with the poll. A load that
-  /// happens after the store observes it (write-read coherence), exactly
-  /// as the mutex-protected read did. A `stage` that is concurrent with the
-  /// check has no such order with either form; both forms then return
-  /// Pending and leave the outcome to the staging path, which owns the
-  /// future's cleanup. Acquire pairs with the Release store, so a true load
-  /// also makes the staged join value visible before
-  /// `finish_future_after_staging` takes it, although the join state's own
-  /// lock orders that access too.
-  fn is_staged(&self) -> bool {
-    self.staged.load(Ordering::Acquire)
-  }
-
+impl TaskBookkeeping {
   fn release_waiter(&self) {
     if self.tenant.is_none() {
       return;
@@ -186,45 +153,38 @@ where
   }
 }
 
+/// The outcome of a future whose destructor may have panicked after it
+/// produced `outcome`: the original poll panic wins over a second panic
+/// from `Drop`; any other outcome is replaced by the destructor's panic.
+fn after_drop<T>(
+  outcome: Outcome<T>,
+  payload: Option<Box<dyn std::any::Any + Send>>,
+) -> Outcome<T> {
+  let Some(payload) = payload else {
+    return outcome;
+  };
+  if matches!(outcome, Err(AsyncJoinError::Panicked(_))) {
+    drop_contained(payload);
+    outcome
+  } else {
+    drop_contained(outcome);
+    Err(AsyncJoinError::Panicked(payload))
+  }
+}
+
 impl<F> Task<F>
 where
   F: Future + Send + 'static,
   F::Output: Send + 'static,
 {
-  /// Drops the future in place; returns the payload of a panicking
-  /// destructor.
-  fn finish_future(self: Pin<&Self>) -> Option<Box<dyn std::any::Any + Send>> {
-    panic::catch_unwind(AssertUnwindSafe(|| self.drop_future())).err()
-  }
-
-  /// Drops the future after its outcome was staged. A panicking destructor
-  /// replaces the staged outcome unless that outcome is already a panic:
-  /// the original poll panic wins over a second panic from `Drop`.
-  fn finish_future_after_staging(self: Pin<&Self>) {
-    let Some(payload) = self.finish_future() else {
-      return;
-    };
+  /// Drops the future in place and stores `error`, or the destructor's
+  /// panic, as the outcome.
+  fn drop_future_and_store(self: Pin<&Self>, error: AsyncJoinError) {
+    let stored = self.finish(|payload| after_drop(Err(error), payload));
+    // The scheduler runs cleanup only inside the task's own turn or as the
+    // final owner, so no poll can hold the future here.
+    debug_assert!(stored || self.is_finished(), "cleanup raced a poll");
     let this = self.header();
-    let outcome = this.join.take_staged();
-    if matches!(outcome, Some(Err(AsyncJoinError::Panicked(_)))) {
-      drop_contained(payload);
-      if let Some(outcome) = outcome {
-        this.stage(outcome);
-      }
-    } else {
-      drop_contained(outcome);
-      this.stage(Err(AsyncJoinError::Panicked(payload)));
-    }
-  }
-
-  fn drop_future_and_stage(self: Pin<&Self>, error: AsyncJoinError) {
-    let payload = self.finish_future();
-    let this = self.header();
-    if let Some(payload) = payload {
-      this.stage(Err(AsyncJoinError::Panicked(payload)));
-    } else {
-      this.stage(Err(error));
-    }
     this.release_waiter();
     this.release_task_admission();
   }
@@ -243,9 +203,8 @@ where
   ) -> (PollResult, Option<PollPermit>) {
     let this = self.header();
     let _task_context =
-      TaskContextGuard::enter_with_resource(Some(this.join.id()), this.resources.clone());
-    // The cell claims the future before calling user code. The task-state
-    // mutex is never held while polling or dropping the future.
+      TaskContextGuard::enter_with_resource(Some(this.id), this.resources.clone());
+    // The cell claims the future before calling user code.
     let cpu_execution =
       CpuExecutionGuard::enter(cpu_ticket.as_ref().map(DomainReservation::domain_identity));
     let result = {
@@ -254,35 +213,25 @@ where
     };
     drop(cpu_execution);
     let outcome = match result {
-      Ok(CellPoll::Pending) => {
-        if !this.is_staged() {
-          return (PollResult::Pending, Some(permit));
-        }
-        // A terminal outcome was staged meanwhile; it owns the result.
-        None
-      }
-      Ok(CellPoll::Ready(output)) => Some(Ok(output)),
+      Ok(CellPoll::Pending) => return (PollResult::Pending, Some(permit)),
+      Ok(CellPoll::Ready(output)) => Ok(output),
       Ok(CellPoll::Rejected) => {
-        // No future to poll: it already completed, was cancelled or failed.
-        debug_assert!(
-          this.lock_state().staged && this.is_staged(),
-          "rejected poll without a staged outcome"
-        );
+        // No future to poll: it completed, was cancelled or failed, and
+        // that path stored the outcome.
+        debug_assert!(self.is_finished(), "rejected poll without an outcome");
         this.release_waiter();
         this.release_task_admission();
         drop(permit);
         drop(cpu_ticket.take());
         return (PollResult::Ready, None);
       }
-      Err(payload) => Some(Err(AsyncJoinError::Panicked(payload))),
+      Err(payload) => Err(AsyncJoinError::Panicked(payload)),
     };
-    if let Some(outcome) = outcome {
-      this.stage(outcome);
-    }
     // Release before user destructors or cleanup.
     drop(permit);
     drop(cpu_ticket.take());
-    self.finish_future_after_staging();
+    let stored = self.finish(|payload| after_drop(outcome, payload));
+    debug_assert!(stored, "a completed poll holds the cell's only claim");
     this.release_waiter();
     this.release_task_admission();
     (PollResult::Ready, None)
@@ -291,26 +240,25 @@ where
   fn cancel(self: Pin<&Self>) {
     let this = self.header();
     let _task_context =
-      TaskContextGuard::enter_with_resource(Some(this.join.id()), this.resources.clone());
-    let panic = self.finish_future();
-    let outcome = match panic {
-      Some(payload) => Err(AsyncJoinError::Panicked(payload)),
-      None => Err(AsyncJoinError::Cancelled),
-    };
-    this.stage(outcome);
-    this.release_waiter();
-    this.release_task_admission();
+      TaskContextGuard::enter_with_resource(Some(this.id), this.resources.clone());
+    self.drop_future_and_store(AsyncJoinError::Cancelled);
   }
 
   fn publish(&self) {
     let this = self.header();
     let _task_context =
-      TaskContextGuard::enter_with_resource(Some(this.join.id()), this.resources.clone());
+      TaskContextGuard::enter_with_resource(Some(this.id), this.resources.clone());
     this.release_waiter();
     this.release_task_admission();
-    if let Some(unclaimed) = this.join.publish_staged() {
-      drop_contained(unclaimed);
-    }
+    let publication = TaskCell::publish(self);
+    debug_assert!(publication.published, "published before an outcome");
+    // An unobserved outcome, a waker whose handle detached meanwhile, or a
+    // panicking wake: dropped here, without any scheduler lock.
+    let [first, second] = publication.wake_panics;
+    drop_contained(first);
+    drop_contained(second);
+    drop_contained(publication.wakers);
+    drop_contained(publication.output);
   }
 
   fn acquire_cpu(&self, waker: &Waker) -> DomainCpuAdmission {
@@ -350,12 +298,12 @@ where
     TaskCell::into_waker(self)
   }
 
-  fn poll_word(&self) -> &PollWord {
-    &self.header().word
+  fn poll_word(&self) -> &TaskWord {
+    self.word()
   }
 
   fn fail_resource(self: Pin<&Self>, error: DomainError) {
-    self.drop_future_and_stage(AsyncJoinError::ResourceDomain(error));
+    self.drop_future_and_store(AsyncJoinError::ResourceDomain(error));
   }
 
   #[cfg(test)]
@@ -378,8 +326,9 @@ where
   F::Output: Send + 'static,
 {
   /// Reserves the task count and the `Control` charge of the one task
-  /// allocation, which stores the future inline. `F` can itself be a
-  /// `Pin<Box<dyn Future>>`; moving that value in does not box it again.
+  /// allocation, which stores the future and its outcome inline. `F` can
+  /// itself be a `Pin<Box<dyn Future>>`; moving that value in does not box
+  /// it again.
   pub(super) fn reserve_domain_admission(
     tenant: Option<&TenantDomain>,
   ) -> Result<TaskDomainAdmission, DomainError> {
@@ -422,12 +371,11 @@ where
     debug_assert_eq!(task_control.bytes(), std::mem::size_of::<Self>());
     #[cfg(all(test, not(loom)))]
     super::allocation_tests::record();
-    let task = TaskCell::new(
+    // The one join handle shares the allocation; an abort handle clones the
+    // same allocation again only when it is requested.
+    let (task, join) = TaskCell::new_with_join(
       TaskBookkeeping {
-        state: Mutex::new(TaskState { staged: false }),
-        staged: AtomicBool::new(false),
-        word: PollWord::new(),
-        join: JoinState::embedded(id, ControlCharge::unbounded(0), None),
+        id,
         resources,
         tenant,
         waiter: Mutex::new(waiter.map_or(WaiterState::Released, WaiterState::Available)),
@@ -437,12 +385,9 @@ where
         _task_control: task_control,
       },
       future,
+      |task| -> Pin<Arc<dyn MergedJoin<F::Output>>> { task },
     );
-    // One clone serves the job's join and abort sides; an abort handle
-    // clones the same allocation again only when it is requested.
-    let merged: Pin<Arc<dyn MergedJoin<F::Output>>> = task.clone();
-    let job = AsyncJob::merged(merged);
-    (task, job)
+    (task, AsyncJob::merged(join))
   }
 }
 
@@ -451,18 +396,14 @@ where
   F: Future + Send + 'static,
   F::Output: Send + 'static,
 {
-  fn join_state(&self) -> &JoinState<F::Output> {
-    &self.header().join
+  fn task_id(&self) -> TaskId {
+    self.header().id
   }
 }
 
-impl<F> TaskHeader for TaskBookkeeping<F>
-where
-  F: Future + Send + 'static,
-  F::Output: Send + 'static,
-{
-  fn wake_by_ref(&self) {
-    Shared::wake_task(&self.shared, &self.word, self.reference);
+impl TaskHeader for TaskBookkeeping {
+  fn wake_by_ref(&self, word: &TaskWord) {
+    Shared::wake_task(&self.shared, word, self.reference);
   }
 }
 
@@ -479,24 +420,33 @@ where
   }
 
   fn is_finished(&self) -> bool {
-    self.header().join.is_finished()
+    self.is_complete()
   }
 
   fn set_finished(&self) {
-    self.header().join.set_finished();
+    // Publication sets the word's `COMPLETE`; nothing else may.
   }
 }
 
 /// Loom compiles the runtime source in the unpublished façade, without
 /// `crate::sys`, so a boxed future stands in for the inline cell with the
-/// same state machine and the same pinned-handle API. Loom models therefore
-/// do not cover the unsafe cell; its own Miri-checked unit tests do.
+/// same state machine and the same pinned-handle API, and mutex cells with
+/// an overlap witness stand in for the outcome and join waker cells. The
+/// task word and the join protocol are the cell's own source (`word`), so
+/// the models cover them; they do not cover the unsafe cell, which its own
+/// Miri-checked unit tests do.
 #[cfg(loom)]
 mod loom_cell {
+  use super::word::{self, JoinCells, JoinWakers, Publication, TaskJoin, TaskWord, WakerSlot};
+  use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+  use std::any::Any;
   use std::future::Future;
+  use std::panic::{self, AssertUnwindSafe};
   use std::pin::Pin;
-  use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+  use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, TryLockError};
   use std::task::{Context, Poll, Wake, Waker};
+
+  pub(crate) use super::word::JoinSide;
 
   pub(crate) enum CellPoll<T> {
     Ready(T),
@@ -505,34 +455,139 @@ mod loom_cell {
   }
 
   pub(crate) trait TaskHeader: Send + Sync + 'static {
-    fn wake_by_ref(&self);
+    fn wake_by_ref(&self, word: &TaskWord);
   }
 
   struct Slot<F> {
     future: Option<Pin<Box<F>>>,
     pollable: bool,
+    finished: bool,
+  }
+
+  /// A cell whose exclusive accesses must never overlap any other access;
+  /// each access is a Loom atomic step, so the model explores overlaps.
+  struct Witnessed<T> {
+    writing: AtomicBool,
+    readers: AtomicUsize,
+    value: RwLock<T>,
+  }
+
+  impl<T> Witnessed<T> {
+    fn new(value: T) -> Self {
+      Self {
+        writing: AtomicBool::new(false),
+        readers: AtomicUsize::new(0),
+        value: RwLock::new(value),
+      }
+    }
+
+    fn write<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+      assert!(
+        !self.writing.swap(true, Ordering::Relaxed),
+        "overlapping exclusive accesses"
+      );
+      assert_eq!(
+        self.readers.load(Ordering::Relaxed),
+        0,
+        "write during a read"
+      );
+      let result = f(&mut self.value.write().unwrap_or_else(PoisonError::into_inner));
+      self.writing.store(false, Ordering::Relaxed);
+      result
+    }
+
+    fn read<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+      self.readers.fetch_add(1, Ordering::Relaxed);
+      assert!(!self.writing.load(Ordering::Relaxed), "read during a write");
+      let result = f(&self.value.read().unwrap_or_else(PoisonError::into_inner));
+      self.readers.fetch_sub(1, Ordering::Relaxed);
+      result
+    }
+  }
+
+  /// The outcome cell: exclusive accesses only, which must never overlap.
+  struct Exclusive<T> {
+    writing: AtomicBool,
+    value: Mutex<T>,
+  }
+
+  impl<T> Exclusive<T> {
+    fn new(value: T) -> Self {
+      Self {
+        writing: AtomicBool::new(false),
+        value: Mutex::new(value),
+      }
+    }
+
+    fn write<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+      assert!(
+        !self.writing.swap(true, Ordering::Relaxed),
+        "overlapping exclusive accesses"
+      );
+      let result = f(&mut self.value.lock().unwrap_or_else(PoisonError::into_inner));
+      self.writing.store(false, Ordering::Relaxed);
+      result
+    }
   }
 
   /// Boxes both halves, so the stand-in is `Unpin` whatever `H` and `F`
   /// are and `Pin::into_inner` recovers the `Arc` for its wakers.
-  pub(crate) struct TaskCell<H, F> {
+  pub(crate) struct TaskCell<H, F, O> {
     header: Box<H>,
+    word: TaskWord,
     slot: Mutex<Slot<F>>,
+    stored: AtomicBool,
+    output: Box<Exclusive<Option<O>>>,
+    join_waker: Witnessed<JoinWakers>,
   }
 
-  impl<H, F> TaskCell<H, F> {
-    pub(crate) fn new(header: H, future: F) -> Pin<Arc<Self>> {
+  impl<H, F, O> TaskCell<H, F, O> {
+    fn build(header: H, future: F, join_interest: bool) -> Pin<Arc<Self>> {
       Arc::pin(Self {
         header: Box::new(header),
+        word: TaskWord::new(join_interest),
         slot: Mutex::new(Slot {
           future: Some(Box::pin(future)),
           pollable: true,
+          finished: false,
         }),
+        stored: AtomicBool::new(false),
+        output: Box::new(Exclusive::new(None)),
+        join_waker: Witnessed::new(JoinWakers::default()),
       })
+    }
+
+    pub(crate) fn new_with_join<J>(
+      header: H,
+      future: F,
+      erase: impl FnOnce(Pin<Arc<Self>>) -> Pin<Arc<J>>,
+    ) -> (Pin<Arc<Self>>, TaskJoin<J>)
+    where
+      J: ?Sized + JoinSide<Output = O>,
+    {
+      let task = Self::build(header, future, true);
+      let join = erase(Pin::clone(&task));
+      (task, TaskJoin::new(join))
     }
 
     pub(crate) fn header(&self) -> &H {
       &self.header
+    }
+
+    pub(crate) fn word(&self) -> &TaskWord {
+      &self.word
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+      self.word.is_complete()
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+      self
+        .slot
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .finished
     }
 
     #[cfg(test)]
@@ -544,6 +599,7 @@ mod loom_cell {
     where
       H: TaskHeader,
       F: Send + 'static,
+      O: Send + 'static,
     {
       Waker::from(Pin::into_inner(this))
     }
@@ -582,25 +638,98 @@ mod loom_cell {
       }
     }
 
-    pub(crate) fn drop_future(self: Pin<&Self>) -> bool {
+    pub(crate) fn finish(
+      self: Pin<&Self>,
+      make: impl FnOnce(Option<Box<dyn Any + Send>>) -> O,
+    ) -> bool {
       let Some(mut slot) = self.try_claim() else {
         return false;
       };
+      if slot.finished {
+        return false;
+      }
+      slot.finished = true;
+      slot.pollable = false;
       let taken = slot.future.take();
       drop(slot);
-      let dropped = taken.is_some();
-      drop(taken);
-      dropped
+      let payload = panic::catch_unwind(AssertUnwindSafe(|| drop(taken))).err();
+      let outcome = make(payload);
+      self.output.write(|output| *output = Some(outcome));
+      self.stored.store(true, Ordering::Release);
+      true
+    }
+
+    pub(crate) fn publish(&self) -> Publication<O> {
+      if !self.stored.load(Ordering::Acquire) {
+        return Publication::refused();
+      }
+      word::publish(self.word.inner(), self)
     }
   }
 
-  impl<H: TaskHeader, F: Send + 'static> Wake for TaskCell<H, F> {
+  impl<H, F, O> JoinCells for TaskCell<H, F, O> {
+    type Output = O;
+
+    fn waker_will_wake(&self, slot: WakerSlot, waker: &Waker) -> bool {
+      self.join_waker.read(|stored| {
+        stored
+          .get(slot)
+          .is_some_and(|stored| stored.will_wake(waker))
+      })
+    }
+
+    fn wake_join(&self, slot: WakerSlot) {
+      self.join_waker.read(|stored| {
+        if let Some(waker) = stored.get(slot) {
+          waker.wake_by_ref();
+        }
+      });
+    }
+
+    fn update_join_wakers<R>(&self, update: impl FnOnce(&mut JoinWakers) -> R) -> R {
+      self.join_waker.write(update)
+    }
+
+    fn take_output(&self) -> Option<O> {
+      self.output.write(Option::take)
+    }
+  }
+
+  impl<H, F, O> word::Sealed for TaskCell<H, F, O> {}
+
+  impl<H: Send + Sync, F: Send, O: Send> JoinSide for TaskCell<H, F, O> {
+    type Output = O;
+
+    fn join_complete(&self) -> bool {
+      self.word.is_complete()
+    }
+
+    fn join_poll(
+      &self,
+      _key: word::JoinKey,
+      slot: word::WakerSlot,
+      waker: &Waker,
+      take: bool,
+    ) -> Poll<Option<O>> {
+      word::join_poll(self.word.inner(), self, slot, waker, take)
+    }
+
+    fn join_take(&self, _key: word::JoinKey) -> Option<Option<O>> {
+      word::join_take(self.word.inner(), self)
+    }
+
+    fn join_detach(&self, _key: word::JoinKey) -> (Option<O>, word::JoinWakers) {
+      word::join_detach(self.word.inner(), self)
+    }
+  }
+
+  impl<H: TaskHeader, F: Send + 'static, O: Send + 'static> Wake for TaskCell<H, F, O> {
     fn wake(self: Arc<Self>) {
-      self.header.wake_by_ref();
+      self.header.wake_by_ref(&self.word);
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-      self.header.wake_by_ref();
+      self.header.wake_by_ref(&self.word);
     }
   }
 }

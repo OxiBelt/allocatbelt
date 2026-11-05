@@ -17,6 +17,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
 use super::identity::TaskId;
+use super::task::{JoinSide, TaskJoin};
 use crate::runtime::resource_domain::{ControlCharge, DomainError};
 
 pub(super) trait AbortAction: Send + Sync {
@@ -167,10 +168,6 @@ struct PendingWakers {
 
 enum Slot<T> {
   Pending(PendingWakers),
-  Staged {
-    outcome: Result<T, AsyncJoinError>,
-    wakers: Option<PendingWakers>,
-  },
   Ready(Option<Result<T, AsyncJoinError>>),
   Taken,
 }
@@ -227,10 +224,6 @@ impl<T> JoinState<T> {
     )
   }
 
-  pub(super) fn id(&self) -> TaskId {
-    self.id
-  }
-
   pub(super) fn is_finished(&self) -> bool {
     self.finished.as_ref().map_or_else(
       || self.completed.load(Ordering::Acquire),
@@ -250,76 +243,6 @@ impl<T> JoinState<T> {
     self.slot.lock().unwrap_or_else(PoisonError::into_inner)
   }
 
-  /// Stores the driver's outcome without making it visible to observers.
-  /// A detached join leaves producer-side cleanup to the publishing worker.
-  pub(super) fn stage(&self, outcome: Result<T, AsyncJoinError>) {
-    let old = {
-      let mut slot = self.lock();
-      let (wakers, old) = match std::mem::replace(&mut *slot, Slot::Taken) {
-        Slot::Pending(wakers) => (Some(wakers), None),
-        Slot::Staged { outcome, wakers } => (wakers, Some(outcome)),
-        Slot::Taken => (None, None),
-        Slot::Ready(_) => unreachable!("cannot stage after publication"),
-      };
-      *slot = Slot::Staged { outcome, wakers };
-      old
-    };
-    drop_contained(old);
-  }
-
-  #[cfg(all(test, loom))]
-  pub(super) fn has_staged(&self) -> bool {
-    matches!(*self.lock(), Slot::Staged { .. })
-  }
-
-  pub(super) fn take_staged(&self) -> Option<Result<T, AsyncJoinError>> {
-    let mut slot = self.lock();
-    match std::mem::replace(&mut *slot, Slot::Taken) {
-      Slot::Staged { outcome, wakers } => {
-        *slot = wakers.map_or(Slot::Taken, Slot::Pending);
-        Some(outcome)
-      }
-      other => {
-        *slot = other;
-        None
-      }
-    }
-  }
-
-  /// Publishes the staged outcome, if any, under one lock: the same result
-  /// as [`take_staged`](Self::take_staged) followed by
-  /// [`publish`](Self::publish). Returns an unobserved output for
-  /// destruction by the worker after the join-state lock has been released.
-  pub(super) fn publish_staged(&self) -> Option<Result<T, AsyncJoinError>> {
-    let mut slot = self.lock();
-    match std::mem::replace(&mut *slot, Slot::Taken) {
-      Slot::Staged {
-        outcome,
-        wakers: Some(wakers),
-      } => {
-        *slot = Slot::Ready(Some(outcome));
-        self.set_finished();
-        drop(slot);
-        wake_contained(wakers);
-        None
-      }
-      Slot::Staged {
-        outcome,
-        wakers: None,
-      } => {
-        // Detached: the slot stays `Taken` and the worker drops the output.
-        self.set_finished();
-        drop(slot);
-        Some(outcome)
-      }
-      other => {
-        *slot = other;
-        drop(slot);
-        None
-      }
-    }
-  }
-
   /// Publishes once. Returns an unobserved output for destruction by the
   /// worker after the join-state lock has been released.
   pub(super) fn publish(
@@ -334,11 +257,6 @@ impl<T> JoinState<T> {
         drop(slot);
         wake_contained(wakers);
         None
-      }
-      staged @ Slot::Staged { .. } => {
-        *slot = staged;
-        drop(slot);
-        Some(result)
       }
       Slot::Ready(ready) => {
         *slot = Slot::Ready(ready);
@@ -378,50 +296,58 @@ fn wake_contained(wakers: PendingWakers) {
   }
 }
 
-/// A task allocation that embeds its join state and its abort metadata. The
-/// erased handle keeps the job independent of the task's future type, and
-/// one owning handle serves both the join and the abort side.
-pub(super) trait MergedJoin<T>: AbortMetadata {
-  fn join_state(&self) -> &JoinState<T>;
+/// A distributed task allocation that stores its outcome and its one join
+/// waker next to the future, under the task word, and serves as its own
+/// abort metadata. The erased handle keeps the job independent of the
+/// task's future type, and one owning handle serves both the join and the
+/// abort side.
+pub(super) trait MergedJoin<T>:
+  AbortMetadata + JoinSide<Output = Result<T, AsyncJoinError>>
+{
+  fn task_id(&self) -> TaskId;
 }
 
-/// The join and abort owners of a job. A separate join carries its own
-/// abort metadata allocation; a merged join is one task allocation that
-/// provides both, so building the job clones that `Arc` once.
+/// The join and abort owners of a job. A separate join (the local executor)
+/// carries its own join state and abort metadata allocation; a merged join
+/// is one task allocation that provides both, so building the job clones
+/// that `Arc` once.
 enum JobState<T> {
   Separate {
     state: Arc<JoinState<T>>,
     abort: Pin<Arc<dyn AbortMetadata>>,
   },
-  Merged(Pin<Arc<dyn MergedJoin<T>>>),
+  Merged(TaskJoin<dyn MergedJoin<T>>),
 }
 
 impl<T> JobState<T> {
   fn abort_metadata(&self) -> &dyn AbortMetadata {
     match self {
       Self::Separate { abort, .. } => &**abort,
-      Self::Merged(task) => &**task,
+      Self::Merged(join) => &**join.task(),
     }
   }
 
   fn clone_abort_metadata(&self) -> Pin<Arc<dyn AbortMetadata>> {
     match self {
       Self::Separate { abort, .. } => Pin::clone(abort),
-      Self::Merged(task) => {
-        let abort: Pin<Arc<dyn MergedJoin<T>>> = Pin::clone(task);
+      Self::Merged(join) => {
+        let abort: Pin<Arc<dyn MergedJoin<T>>> = Pin::clone(join.task());
         abort
       }
     }
   }
-}
 
-impl<T> std::ops::Deref for JobState<T> {
-  type Target = JoinState<T>;
-
-  fn deref(&self) -> &Self::Target {
+  fn id(&self) -> TaskId {
     match self {
-      Self::Separate { state, .. } => state,
-      Self::Merged(task) => task.join_state(),
+      Self::Separate { state, .. } => state.id,
+      Self::Merged(join) => join.task().task_id(),
+    }
+  }
+
+  fn is_finished(&self) -> bool {
+    match self {
+      Self::Separate { state, .. } => state.is_finished(),
+      Self::Merged(join) => join.is_complete(),
     }
   }
 }
@@ -450,9 +376,9 @@ impl<T> AsyncJob<T> {
     }
   }
 
-  pub(super) fn merged(task: Pin<Arc<dyn MergedJoin<T>>>) -> Self {
+  pub(super) fn merged(join: TaskJoin<dyn MergedJoin<T>>) -> Self {
     Self {
-      state: JobState::Merged(task),
+      state: JobState::Merged(join),
       finished: false,
       registered: false,
     }
@@ -476,7 +402,7 @@ impl<T> AsyncJob<T> {
   /// The process-wide identity assigned when this task was admitted.
   #[must_use]
   pub fn id(&self) -> TaskId {
-    self.state.id
+    self.state.id()
   }
 
   /// Returns a clonable cancellation handle independent of the output type.
@@ -487,7 +413,7 @@ impl<T> AsyncJob<T> {
   pub fn abort_handle(&self) -> AbortHandle {
     AbortHandle {
       abort: self.state.clone_abort_metadata(),
-      id: self.state.id,
+      id: self.state.id(),
     }
   }
 
@@ -501,26 +427,28 @@ impl<T> AsyncJob<T> {
   ///
   /// This is intended for completion-order collections that need a separate
   /// notification before they consume this join handle.
+  ///
+  /// The job keeps one waker for this method and one for joining; each
+  /// registration replaces only its own, and publication wakes both.
   pub fn poll_finished(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
     let this = self.get_mut();
-    if this.state.is_finished() {
+    let state = match &mut this.state {
+      JobState::Merged(join) => return join.poll_complete(cx.waker()),
+      JobState::Separate { state, .. } => state,
+    };
+    if state.is_finished() {
       return Poll::Ready(());
     }
 
     let replacement = cx.waker().clone();
     let old = {
-      let mut slot = this.state.lock();
-      let (Slot::Pending(wakers)
-      | Slot::Staged {
-        wakers: Some(wakers),
-        ..
-      }) = &mut *slot
-      else {
+      let mut slot = state.lock();
+      let Slot::Pending(wakers) = &mut *slot else {
         drop(slot);
         drop(replacement);
         return Poll::Ready(());
       };
-      if this.state.is_finished() {
+      if state.is_finished() {
         drop(slot);
         drop(replacement);
         return Poll::Ready(());
@@ -534,15 +462,23 @@ impl<T> AsyncJob<T> {
   /// Takes an outcome already announced by `poll_finished`, without cloning a
   /// caller waker while consuming a completion notification.
   pub(super) fn take_finished(&mut self) -> Option<Result<T, AsyncJoinError>> {
-    if !self.state.is_finished() {
+    let state = match &mut self.state {
+      JobState::Merged(join) => {
+        let outcome = join.take()?;
+        self.finished = true;
+        return Some(outcome.unwrap_or(Err(AsyncJoinError::Cancelled)));
+      }
+      JobState::Separate { state, .. } => state,
+    };
+    if !state.is_finished() {
       return None;
     }
     let outcome = {
-      let mut slot = self.state.lock();
+      let mut slot = state.lock();
       match std::mem::replace(&mut *slot, Slot::Taken) {
         Slot::Ready(outcome) => outcome.unwrap_or(Err(AsyncJoinError::Cancelled)),
         Slot::Taken => Err(AsyncJoinError::Cancelled),
-        pending @ (Slot::Pending(_) | Slot::Staged { .. }) => {
+        pending @ Slot::Pending(_) => {
           *slot = pending;
           return None;
         }
@@ -595,41 +531,55 @@ impl<T> Future for AsyncJob<T> {
   type Output = Result<T, AsyncJoinError>;
 
   fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    let Self {
+      state,
+      finished,
+      registered,
+    } = &mut *self;
+    let state = match state {
+      JobState::Merged(join) => {
+        // The word protocol: a published outcome is taken once, otherwise
+        // the one join waker is registered (kept when it will wake this
+        // task).
+        return super::poll_cooperative(cx, |cx| {
+          join.poll(cx.waker()).map(|outcome| {
+            *finished = true;
+            outcome.unwrap_or(Err(AsyncJoinError::Cancelled))
+          })
+        });
+      }
+      JobState::Separate { state, .. } => &**state,
+    };
     super::poll_cooperative(cx, |cx| {
       // Gate before custom waker code and before reading or consuming the
       // task's terminal slot. A published outcome needs no waker, and a
       // stored waker that will wake this one is kept; the first registration
       // clones before locking, as custom waker code never runs under the
       // join lock.
-      let mut replacement =
-        (!self.registered && !self.state.is_finished()).then(|| cx.waker().clone());
+      let mut replacement = (!*registered && !state.is_finished()).then(|| cx.waker().clone());
       loop {
-        let mut slot = self.state.lock();
+        let mut slot = state.lock();
         let wakers = match &mut *slot {
-          Slot::Pending(wakers)
-          | Slot::Staged {
-            wakers: Some(wakers),
-            ..
-          } => wakers,
+          Slot::Pending(wakers) => wakers,
           Slot::Ready(outcome) => {
             let result = outcome.take();
             *slot = Slot::Taken;
             drop(slot);
             drop(replacement);
-            self.finished = true;
+            *finished = true;
             return Poll::Ready(result.unwrap_or(Err(AsyncJoinError::Cancelled)));
           }
-          Slot::Taken | Slot::Staged { wakers: None, .. } => {
+          Slot::Taken => {
             drop(slot);
             drop(replacement);
-            self.finished = true;
+            *finished = true;
             return Poll::Ready(Err(AsyncJoinError::Cancelled));
           }
         };
         if let Some(waker) = replacement.take() {
           let old = wakers.join.replace(waker);
           drop(slot);
-          self.registered = true;
+          *registered = true;
           drop(old);
           return Poll::Pending;
         }
@@ -652,20 +602,12 @@ impl<T> Future for AsyncJob<T> {
 
 impl<T> Drop for AsyncJob<T> {
   fn drop(&mut self) {
-    if !self.finished {
-      let outcome = {
-        let mut slot = self.state.lock();
-        match std::mem::replace(&mut *slot, Slot::Taken) {
-          Slot::Staged { outcome, wakers } => {
-            *slot = Slot::Staged {
-              outcome,
-              wakers: None,
-            };
-            wakers.map(Slot::Pending)
-          }
-          other => Some(other),
-        }
-      };
+    // A merged job detaches through its `TaskJoin`, which clears
+    // `JOIN_INTEREST` and drops a published outcome.
+    if let JobState::Separate { state, .. } = &self.state
+      && !self.finished
+    {
+      let outcome = std::mem::replace(&mut *state.lock(), Slot::Taken);
       // Results and wakers may run user code from Drop; do so without the
       // join mutex held.
       drop(outcome);
@@ -1019,7 +961,9 @@ mod tests {
 
 #[cfg(all(test, loom))]
 mod model {
-  // This models JoinState's observer registration/publication lock and flag.
+  // This models the local executor's JoinState observer registration and
+  // publication lock and flag; distributed tasks use the task word
+  // (`task::model`, `protocol::loom_tests`).
   // It does not model scheduler cleanup, executor ordering, or user waker code.
   use super::{AsyncJob, JoinState};
   use loom::sync::Arc;
@@ -1038,7 +982,7 @@ mod model {
   }
 
   #[test]
-  fn staging_and_publication_racing_detach_drop_output_once() {
+  fn publication_racing_detach_drops_output_once() {
     loom::model(|| {
       struct Output(Arc<loom::sync::atomic::AtomicUsize>);
       impl Drop for Output {
@@ -1051,16 +995,9 @@ mod model {
       let job = AsyncJob::new(StdArc::clone(&state), StdArc::new(|| {}));
       let output = Output(Arc::clone(&drops));
       let producer = thread::spawn(move || {
-        state.stage(Ok(output));
-        assert!(state.has_staged());
-        assert!(!state.is_finished());
-        // The worker re-stages after dropping the future, then publishes
-        // the staged outcome under one lock.
-        let outcome = state.take_staged().unwrap();
-        state.stage(outcome);
-        drop(state.publish_staged());
+        // A detached join hands the output back to the publisher.
+        drop(state.publish(Ok(output)));
         assert!(state.is_finished());
-        assert!(state.publish_staged().is_none());
       });
       let consumer = thread::spawn(move || drop(job));
       producer.join().unwrap();

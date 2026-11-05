@@ -1,14 +1,15 @@
 //! Per-task dispatch, wake, abort, and generation transitions. The local
 //! executor holds `PollProtocol` under its state mutex; the distributed
-//! executor holds `SlotProtocol` under each slot mutex and keeps queued and
-//! running state in the task's `PollWord`, which wakes and pending poll
-//! finishes change without that mutex. Loom uses the same helpers under its
+//! executor holds `SlotProtocol` under each slot mutex and keeps queued,
+//! running, complete and join state in the task's word (the task cell's
+//! `runtime_task_word.rs`), which wakes, pending poll finishes, publication
+//! and the join handle change without that mutex. Loom uses the same helpers under its
 //! mutexes to explore operation orderings.
 
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PollFinish {
@@ -312,7 +313,7 @@ impl PollProtocol {
 /// The distributed executor's per-slot admission state, held under the
 /// slot mutex: the generation that names the occupant, whether the slot is
 /// admitted, and whether cancellation was requested. Whether the occupant
-/// is queued or running lives in its [`PollWord`], which belongs to the
+/// is queued or running lives in the task's word, which belongs to the
 /// task object rather than the slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) struct SlotProtocol {
@@ -372,121 +373,6 @@ impl SlotProtocol {
   pub(super) fn release(&mut self) {
     self.admitted = false;
     self.abort = false;
-  }
-}
-
-const RUNNING: u64 = 1;
-const NOTIFIED: u64 = 1 << 1;
-const COMPLETE: u64 = 1 << 2;
-
-/// What a [`PollWord::notify`] found, and so what its caller must do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PollNotify {
-  /// The task was idle: the caller now owns its one queue entry and must
-  /// insert it.
-  Enqueue,
-  /// The task already has a queue entry that no dispatch has begun.
-  Queued,
-  /// A poll or cleanup turn is in progress; its finish requeues the task.
-  Running,
-  /// The task finished; nothing may queue it again.
-  Complete,
-}
-
-/// A task object's scheduling word. The object is never reused for another
-/// task, even when its scheduler slot is reused, so a stale waker can only
-/// reach the finished word of its own task. Slot generation, admission and
-/// abort live only in [`SlotProtocol`], under the slot mutex.
-///
-/// States, with the queue entry each one implies:
-/// - `0`: idle, admitted, no queue entry.
-/// - `NOTIFIED`: exactly one queue entry (a lane, the overflow queue or a
-///   scope's blocked list), not yet dispatched.
-/// - `RUNNING`: one dispatcher holds the task; no queue entry.
-/// - `RUNNING | NOTIFIED`: as `RUNNING`, and the finish requeues it.
-/// - `COMPLETE` (possibly with `NOTIFIED` from a late wake): terminal.
-///
-/// Wakes and pending finishes change the word without the slot mutex.
-/// Beginning a turn and completing the task happen under the slot mutex.
-pub(super) struct PollWord(AtomicU64);
-
-impl PollWord {
-  pub(super) fn new() -> Self {
-    Self(AtomicU64::new(0))
-  }
-
-  /// Records a wake with one RMW and reports which state it found. Only an
-  /// idle word moves to `NOTIFIED` with a new queue entry; a running word
-  /// gains `NOTIFIED`, and a queued or complete word keeps its state.
-  ///
-  /// The RMW reads the latest word value, so a wake can never act on a
-  /// state that a finish already left: either the finish takes the
-  /// `NOTIFIED` this sets, or this finds the word idle and enqueues. The
-  /// release half publishes the waker's prior writes to the turn that
-  /// begins or finishes after it; the acquire half pairs with a finish's
-  /// release, so the caller's queue insertion follows that poll.
-  pub(super) fn notify(&self) -> PollNotify {
-    let previous = self.0.fetch_or(NOTIFIED, Ordering::AcqRel);
-    if previous & COMPLETE != 0 {
-      PollNotify::Complete
-    } else if previous & RUNNING != 0 {
-      PollNotify::Running
-    } else if previous & NOTIFIED != 0 {
-      PollNotify::Queued
-    } else {
-      PollNotify::Enqueue
-    }
-  }
-
-  /// Begins a poll or cleanup turn for the entry the caller dequeued, under
-  /// the slot mutex. Wakes cannot change a queued word, so this is the only
-  /// transition out of it.
-  pub(super) fn begin(&self) {
-    let previous = self.0.swap(RUNNING, Ordering::AcqRel);
-    debug_assert_eq!(previous, NOTIFIED, "turn began without a queue entry");
-  }
-
-  /// Ends a pending poll without the slot mutex, in one RMW: `RUNNING`
-  /// becomes idle, and `RUNNING | NOTIFIED` becomes `NOTIFIED`, in which
-  /// case the caller owns the new queue entry and must insert it.
-  pub(super) fn finish_pending(&self) -> bool {
-    let previous = self.0.fetch_and(!RUNNING, Ordering::AcqRel);
-    debug_assert_eq!(
-      previous & (RUNNING | COMPLETE),
-      RUNNING,
-      "pending finish without a running turn"
-    );
-    previous & NOTIFIED != 0
-  }
-
-  /// Marks the task finished under the slot mutex, before the slot is
-  /// released for reuse. Wakes recorded during the final turn are dropped.
-  pub(super) fn complete(&self) {
-    let previous = self.0.swap(COMPLETE, Ordering::AcqRel);
-    debug_assert_eq!(
-      previous & (RUNNING | COMPLETE),
-      RUNNING,
-      "completion without a running turn"
-    );
-  }
-
-  /// Whether the word holds a queue entry that no turn has begun. Stable
-  /// under the slot mutex: only `begin`, which needs that mutex, leaves it.
-  #[cfg(test)]
-  pub(super) fn is_queued(&self) -> bool {
-    self.0.load(Ordering::Acquire) & (RUNNING | NOTIFIED | COMPLETE) == NOTIFIED
-  }
-
-  /// Returns the `RUNNING` and `NOTIFIED` flags.
-  #[cfg(test)]
-  pub(super) fn flags(&self) -> (bool, bool) {
-    let word = self.0.load(Ordering::Acquire);
-    (word & RUNNING != 0, word & NOTIFIED != 0)
-  }
-
-  #[cfg(test)]
-  pub(super) fn is_complete(&self) -> bool {
-    self.0.load(Ordering::Acquire) & COMPLETE != 0
   }
 }
 
@@ -553,9 +439,8 @@ mod loom_tests {
   use loom::sync::{Arc, Mutex};
   use loom::thread;
 
-  use super::{
-    PollFinish, PollNotify, PollProtocol, PollQuota, PollWord, ScopeProtocol, SlotProtocol,
-  };
+  use super::super::task::{PollNotify, PollWord};
+  use super::{PollFinish, PollProtocol, PollQuota, ScopeProtocol, SlotProtocol};
 
   fn lock<T>(mutex: &Mutex<T>) -> loom::sync::MutexGuard<'_, T> {
     mutex
@@ -872,7 +757,7 @@ mod loom_tests {
     fn new(running: bool, idle: bool) -> Arc<Self> {
       let mut protocol = SlotProtocol::new();
       protocol.admit(1);
-      let word = PollWord::new();
+      let word = PollWord::new(true);
       // Publication queues the task.
       assert_eq!(word.notify(), PollNotify::Enqueue);
       if running || idle {
@@ -942,12 +827,16 @@ mod loom_tests {
       }
     }
 
-    /// Completion and cancellation cleanup release the slot under its mutex.
+    /// Completion and cancellation cleanup release the slot under its
+    /// mutex; publication then sets `COMPLETE` without it. Wakes in between
+    /// find the word running and queue nothing.
     fn release(&self, turn: Turn) {
-      let mut locked = lock(&self.locked);
-      assert!(locked.admitted());
+      {
+        let mut locked = lock(&self.locked);
+        assert!(locked.admitted());
+        locked.release();
+      }
       self.word.complete();
-      locked.release();
       if turn == Turn::Cancel {
         *lock(&self.cancelled) += 1;
       }
@@ -1116,7 +1005,7 @@ mod loom_tests {
     bounded_model(|| {
       // A retained stale waker reaches its own finished word; only the slot
       // index is reused by the running replacement.
-      let stale = Arc::new(PollWord::new());
+      let stale = Arc::new(PollWord::new(true));
       assert_eq!(stale.notify(), PollNotify::Enqueue);
       stale.begin();
       stale.complete();
@@ -1646,6 +1535,240 @@ mod loom_tests {
       assert_eq!(popped, [1, 2]);
       assert!(victim.check(&model.links).is_empty());
     });
+  }
+
+  /// The distributed task's join protocol on its word, through the Loom
+  /// stand-in of the task cell (the word and the join transitions are the
+  /// cell's own source; the outcome and waker cells assert that no access
+  /// overlaps an exclusive one).
+  mod join_word {
+    use super::super::super::task::{TaskCell, TaskJoin, TaskWord};
+    use super::bounded_model;
+    use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicUsize, Ordering};
+    use loom::thread;
+    use std::pin::Pin;
+    use std::sync::Arc as StdArc;
+    use std::task::{Poll, Wake, Waker};
+
+    type Cell = TaskCell<(), std::future::Pending<()>, Output>;
+
+    /// Counts its drops: the outcome must be dropped exactly once.
+    struct Output(Arc<AtomicUsize>);
+
+    impl Drop for Output {
+      fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+      }
+    }
+
+    struct Counters {
+      wakes: AtomicUsize,
+      drops: Arc<AtomicUsize>,
+    }
+
+    struct CountWake(Arc<Counters>);
+
+    impl Wake for CountWake {
+      fn wake(self: StdArc<Self>) {
+        self.0.wakes.fetch_add(1, Ordering::SeqCst);
+      }
+
+      fn wake_by_ref(self: &StdArc<Self>) {
+        self.0.wakes.fetch_add(1, Ordering::SeqCst);
+      }
+    }
+
+    impl Drop for CountWake {
+      fn drop(&mut self) {
+        self.0.drops.fetch_add(1, Ordering::SeqCst);
+      }
+    }
+
+    fn waker() -> (Arc<Counters>, Waker) {
+      let counters = Arc::new(Counters {
+        wakes: AtomicUsize::new(0),
+        drops: Arc::new(AtomicUsize::new(0)),
+      });
+      let waker = Waker::from(StdArc::new(CountWake(Arc::clone(&counters))));
+      (counters, waker)
+    }
+
+    fn task() -> (Pin<std::sync::Arc<Cell>>, TaskJoin<Cell>, Arc<AtomicUsize>) {
+      let (task, join) = TaskCell::new_with_join((), std::future::pending(), |task| task);
+      (task, join, Arc::new(AtomicUsize::new(0)))
+    }
+
+    /// The final turn: store the outcome, then publish it outside every
+    /// lock, dropping what publication hands back.
+    fn publish(task: &Pin<std::sync::Arc<Cell>>, drops: &Arc<AtomicUsize>) {
+      let output = Output(Arc::clone(drops));
+      assert!(task.as_ref().finish(move |_| output));
+      let publication = task.publish();
+      assert!(publication.published);
+      drop(publication);
+    }
+
+    #[test]
+    fn loom_join_registration_racing_publication_wakes_once_or_returns() {
+      bounded_model(|| {
+        let (task, mut join, drops) = task();
+        let publisher = {
+          let drops = Arc::clone(&drops);
+          thread::spawn(move || publish(&task, &drops))
+        };
+        let (counters, waker) = waker();
+        let first = join.poll(&waker);
+        publisher.join().unwrap();
+        let output = match first {
+          Poll::Ready(output) => output,
+          Poll::Pending => {
+            assert_eq!(counters.wakes.load(Ordering::SeqCst), 1);
+            match join.poll(&waker) {
+              Poll::Ready(output) => output,
+              Poll::Pending => panic!("woken without a published outcome"),
+            }
+          }
+        };
+        assert!(output.is_some());
+        // Taken exactly once.
+        assert!(matches!(join.poll(&waker), Poll::Ready(None)));
+        drop(output);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(counters.wakes.load(Ordering::SeqCst) <= 1);
+        drop(join);
+        drop(waker);
+        assert_eq!(counters.drops.load(Ordering::SeqCst), 1);
+      });
+    }
+
+    #[test]
+    fn loom_join_reregistration_racing_publication_wakes_the_latest_waker() {
+      bounded_model(|| {
+        let (task, mut join, drops) = task();
+        let (first, first_waker) = waker();
+        let (second, second_waker) = waker();
+        assert!(join.poll(&first_waker).is_pending());
+        let publisher = {
+          let drops = Arc::clone(&drops);
+          thread::spawn(move || publish(&task, &drops))
+        };
+        let again = join.poll(&second_waker);
+        publisher.join().unwrap();
+        let first_wakes = first.wakes.load(Ordering::SeqCst);
+        let second_wakes = second.wakes.load(Ordering::SeqCst);
+        assert!(first_wakes + second_wakes <= 1, "woken twice");
+        if again.is_pending() {
+          // Registered before publication: the replacement is the one woken.
+          assert_eq!((first_wakes, second_wakes), (0, 1));
+        } else {
+          assert_eq!(second_wakes, 0);
+        }
+        drop((again, join, first_waker, second_waker));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(first.drops.load(Ordering::SeqCst), 1);
+        assert_eq!(second.drops.load(Ordering::SeqCst), 1);
+      });
+    }
+
+    #[test]
+    fn loom_join_detach_racing_publication_drops_outcome_and_waker_once() {
+      bounded_model(|| {
+        let (task, mut join, drops) = task();
+        let (counters, waker) = waker();
+        assert!(join.poll(&waker).is_pending());
+        drop(waker);
+        let publisher = {
+          let drops = Arc::clone(&drops);
+          thread::spawn(move || publish(&task, &drops))
+        };
+        drop(join);
+        publisher.join().unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.drops.load(Ordering::SeqCst), 1);
+        assert!(counters.wakes.load(Ordering::SeqCst) <= 1);
+      });
+    }
+
+    /// Publication races a completion-only registration, a join
+    /// registration and a move of the completion-only waiter: every waiter
+    /// whose poll stayed pending is woken once, none twice.
+    #[test]
+    fn loom_join_and_finished_registrations_racing_publication_wake_each_once() {
+      bounded_model(|| {
+        let (task, mut join, drops) = task();
+        let (finished_counters, finished_waker) = waker();
+        let (joiner, join_waker) = waker();
+        let (moved, moved_waker) = waker();
+        let publisher = {
+          let drops = Arc::clone(&drops);
+          thread::spawn(move || publish(&task, &drops))
+        };
+        let _registered = join.poll_complete(&finished_waker);
+        let second = join.poll(&join_waker);
+        let third = join.poll_complete(&moved_waker).is_pending();
+        publisher.join().unwrap();
+        let finished = finished_counters.wakes.load(Ordering::SeqCst);
+        let joined = joiner.wakes.load(Ordering::SeqCst);
+        let moved_wakes = moved.wakes.load(Ordering::SeqCst);
+        assert!(
+          finished <= 1 && joined <= 1 && moved_wakes <= 1,
+          "woken twice"
+        );
+        if second.is_pending() {
+          assert_eq!(joined, 1, "pending join waiter not woken");
+        }
+        // The completion-only role is one waiter: its latest pending
+        // registration is woken; a re-registration that returned ready has
+        // already observed completion. Never more than one wake for it.
+        assert!(
+          finished + moved_wakes <= 1,
+          "completion-only waiter woken twice"
+        );
+        if third {
+          assert_eq!(moved_wakes, 1, "pending completion-only waiter not woken");
+        }
+        drop(second);
+        drop(join);
+        drop((finished_waker, join_waker, moved_waker));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(finished_counters.drops.load(Ordering::SeqCst), 1);
+        assert_eq!(joiner.drops.load(Ordering::SeqCst), 1);
+        assert_eq!(moved.drops.load(Ordering::SeqCst), 1);
+      });
+    }
+
+    /// Cancellation requests only notify the scheduling bits: the join bits,
+    /// the waker and the outcome change only at publication, which here
+    /// publishes the cancelled outcome while the handle registers and then
+    /// detaches.
+    #[test]
+    fn loom_cancellation_publication_racing_register_and_detach() {
+      bounded_model(|| {
+        let (task, mut join, drops) = task();
+        let word_owner = Pin::clone(&task);
+        let abort = thread::spawn(move || {
+          let word: &TaskWord = word_owner.word();
+          // `abort_slot`: one wake RMW on the word, under the slot mutex in
+          // production; it never reads or writes the join bits.
+          let _ = word.notify();
+        });
+        let publisher = {
+          let drops = Arc::clone(&drops);
+          thread::spawn(move || publish(&task, &drops))
+        };
+        let (counters, waker) = waker();
+        let polled = join.poll(&waker);
+        drop(join);
+        drop(waker);
+        abort.join().unwrap();
+        publisher.join().unwrap();
+        drop(polled);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.drops.load(Ordering::SeqCst), 1);
+        assert!(counters.wakes.load(Ordering::SeqCst) <= 1);
+      });
+    }
   }
 }
 

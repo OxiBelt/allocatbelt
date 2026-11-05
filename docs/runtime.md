@@ -1090,7 +1090,9 @@ slot or consuming its output; an exhausted poll preserves an already-published
 result for a later poll. An asynchronous job poll clones its waker only on its
 first registration or when the stored waker would not wake the caller
 (`Waker::will_wake`), and never once the outcome is published; a repeated poll
-with the same waker touches the join lock once and stores nothing.
+with the same waker stores nothing. For a distributed task that check is one
+load of the task word and a read of the stored waker; local jobs take their
+join lock once.
 Synchronous job observers remain unchanged.
 Concrete TCP/Unix stream reads and writes, socket shutdown/flush, listener
 accepts, UDP/Unix datagram send/receive operations and UDP peeks also gate
@@ -1136,7 +1138,8 @@ Future cleanup and admission release precede join publication. Scheduler locks
 never cover user polling, destructors or completion callbacks. Generation tags
 make retained stale abort handles harmless without retaining completed futures.
 Each task object has one atomic word with running, notified and complete
-bits; a notified task that is not running owns exactly one queue entry. A
+bits and two join bits; a notified task that is not running owns exactly one
+queue entry. A
 wake is one read-modify-write on that word and takes no slot mutex: if it
 finds the task idle it inserts the queue entry; if the task is running it
 leaves the notified bit for the poll's finish; a queued or complete task is
@@ -1146,16 +1149,39 @@ task through the usual lane choice. Dispatch, completion and cancellation
 cleanup take the slot mutex, where the generation, admission and abort
 state live; abort marks the word like a wake, so a running task is requeued
 by its finish and the next dispatch selects cleanup. The task object is
-never reused, and completion marks its word complete before the slot is
-released, so a retained stale waker cannot queue a reused slot.
+never reused, and its final turn keeps the word running from the slot's
+release until publication marks it complete, so a retained stale waker
+cannot queue a reused slot.
+The join handle of a distributed task works on the same word. The outcome
+(the output, or the cancelled, panicked or resource error) is stored once in
+the task allocation by the final turn, before the slot is released;
+publication, after admission release, sets the complete bit with one
+read-modify-write. Join interest is set while the one join handle exists;
+dropping the handle clears it. The join-waker bit says that the join waker
+cell holds the wakers that publication will wake: the handle writes the
+cell only while that bit is clear and the task is not complete, and
+publication only reads it. Publication therefore wakes each registered waker
+exactly once, for every outcome, and returns the outcome to the publishing
+worker for destruction when the handle was dropped before publication; a
+handle dropped after publication destroys the outcome itself, and the waker is
+dropped by whichever side finishes with it last. Abort and scope or runtime
+cancellation change only the slot's abort state and the scheduling bits; they
+never read or write the join bits or call the join waker. As for local jobs,
+the handle has two fixed waker slots, one for joining and one for
+`poll_finished`, both written only by the handle behind the join-waker bit;
+each registration replaces only its own slot, and publication wakes the
+completion-only waiter and then the join waiter, once each. If publication
+lands while the handle is replacing one slot, the handle wakes the other
+slot's waiter itself, since publication found no waker to wake. No scheduler lock is held while outcomes or wakers are
+dropped.
 The task allocation is a pinned `sys` cell (`Pin<Arc<TaskCell>>`) that
 stores the user future inline next to the runtime's bookkeeping; its atomic
 claim serializes polling and in-place destruction, and its pinned-only API is
 what makes polling the inline future sound (see
-[the unsafe inventory](unsafe-boundary.md)). The staged-status flag is written
-under a task-state mutex that is never held during user polling or
-destruction, together with an atomic copy that a pending poll reads without
-that mutex. Tasks constructed without a tenant
+[the unsafe inventory](unsafe-boundary.md)). The same claim covers storing the
+outcome: the final turn drops the future and writes the outcome under one
+claim, and publication requires that claim to be released first. A pending
+poll reads no task state after the future returns. Tasks constructed without a tenant
 skip tenant-only cleanup locks; this choice depends only on tenant absence,
 not on current resource limits.
 
@@ -1164,9 +1190,9 @@ including for local jobs whose outputs are `!Send`. For native worker tasks,
 abort handles and scheduler wakers retain the shared task bookkeeping allocation
 and its `Control` charge; the job itself holds one reference to that allocation
 for both its join and its abort side, and an abort handle adds one only when
-requested. It contains one inline output slot: the result remains
-there until the join consumes it or is dropped; a detached result is discarded
-by the publishing worker. Completion drops the inline user future in place
+requested. It contains one inline outcome slot and one join waker slot: the
+result remains there until the join consumes it or is dropped; a result
+detached before publication is discarded by the publishing worker. Completion drops the inline user future in place
 before publication; its storage is part of the one task allocation and stays
 charged with it. Retained handles keep the empty slot's and future's storage
 and the bookkeeping charged, without keeping a consumed or discarded result
@@ -1190,8 +1216,11 @@ tokens. Four native identity tests and independent detached-cleanup cases
 verify this contract; existing Loom models do not prove numeric uniqueness
 or counter exhaustion.
 The completion flag has native publication and cross-thread cancellation tests.
-A Loom model races completion-observer registration against join publication;
-it does not model the executor's entire cleanup and scope-close sequence.
+Loom models race join-waker and completion-only registrations,
+re-registration, handle drop and a cancellation request against publication through the task word's own
+transitions, checking one wake, one outcome destruction and one waker
+destruction; they do not model the executor's entire cleanup and scope-close
+sequence. Local jobs keep their join state and its own Loom models.
 
 The blocking pool's `Job` is also a future, so an asynchronous caller can await
 blocking work without blocking an executor worker. Its existing consuming
