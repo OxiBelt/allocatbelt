@@ -168,6 +168,25 @@ impl PollWord {
     previous & NOTIFIED != 0
   }
 
+  /// Ends a turn that ran nothing and keeps its queue entry: one RMW that
+  /// takes `RUNNING` or `RUNNING | NOTIFIED` back to the queued `NOTIFIED`
+  /// that a dequeued entry has before its turn begins. A wake during the
+  /// turn left `NOTIFIED` without inserting an entry, so the caller's entry
+  /// stays the only one, and wakes from here on find the word queued.
+  pub(crate) fn return_queued(&self) {
+    let returned = self.update(|word| {
+      debug_assert_eq!(
+        word & (RUNNING | COMPLETE),
+        RUNNING,
+        "returned entry without a running turn"
+      );
+      Some((word & !RUNNING) | NOTIFIED)
+    });
+    if returned.is_err() {
+      unreachable!("the return transition always applies");
+    }
+  }
+
   /// Sets `COMPLETE` once. Returns the previous word, or `None` when an
   /// earlier publication already set it. The release half publishes the
   /// stored outcome (and the claim that stored it) to the join side; the

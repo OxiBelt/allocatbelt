@@ -278,7 +278,21 @@ pub(super) struct Distributed {
   round_robin: AtomicBool,
   #[cfg(all(test, not(loom)))]
   unwind_seat: AtomicUsize,
+  /// A test's fault for a turn begun on the task word; see `BEGUN_FAULT_*`.
+  #[cfg(all(test, not(loom)))]
+  begun_fault: std::sync::atomic::AtomicU8,
 }
+
+/// No fault: a begun turn reaching the locked decision keeps its invariant.
+#[cfg(all(test, not(loom)))]
+const BEGUN_FAULT_NONE: u8 = 0;
+/// A begun turn may reach a binding or counted scope (its debug assertion
+/// is waived), so the decision's fallbacks can be forced.
+#[cfg(all(test, not(loom)))]
+const BEGUN_FAULT_WAIVE: u8 = 1;
+/// As `BEGUN_FAULT_WAIVE`, and the next begun turn finds no scope cell.
+#[cfg(all(test, not(loom)))]
+const BEGUN_FAULT_MISSING_CELL: u8 = 2;
 
 /// A slot taken from the free bitmap and counted in `admitted`, with no
 /// generation consumed and nothing installed: close scans skip it, and only
@@ -439,6 +453,8 @@ impl Distributed {
       round_robin: AtomicBool::new(false),
       #[cfg(all(test, not(loom)))]
       unwind_seat: AtomicUsize::new(usize::MAX),
+      #[cfg(all(test, not(loom)))]
+      begun_fault: std::sync::atomic::AtomicU8::new(BEGUN_FAULT_NONE),
     })
   }
 
@@ -996,6 +1012,11 @@ impl Distributed {
   ) -> Option<Selected> {
     let mut slot = self.slot(index);
     if !slot.task.is_occupied() {
+      // A begun lease keeps the slot occupied: the slot gives its owner up
+      // only to that lease (`take`) or while no turn holds the word
+      // (`take_idle`). An empty slot owes no queue entry, so a lease here
+      // could only end idle, which its drop does.
+      debug_assert!(begun.is_none(), "begun turn on an empty slot");
       return None;
     }
     let task_ref = TaskRef {
@@ -1005,7 +1026,10 @@ impl Distributed {
     let reserved = std::mem::take(&mut slot.reserved_permit);
     if slot.protocol.aborting() {
       let cell = if reserved {
-        Some(Arc::clone(slot.scope_cell(shared)?))
+        let Some(cell) = self.decision_cell(&slot, shared, begun.is_some()) else {
+          return self.requeue_begun(shared, index, slot, begun, reserved);
+        };
+        Some(Arc::clone(cell))
       } else {
         None
       };
@@ -1020,10 +1044,16 @@ impl Distributed {
       }
       return Some(Selected::Cancel(task_ref, lease));
     }
-    let cell = slot.scope_cell(shared)?;
+    let Some(cell) = self.decision_cell(&slot, shared, begun.is_some()) else {
+      return self.requeue_begun(shared, index, slot, begun, reserved);
+    };
     // A turn begun without the mutex is only a permit-free occupant's,
     // which never blocks on a quota below.
-    debug_assert!(begun.is_none() || (!cell.binding && cell.reference.is_none()));
+    debug_assert!(
+      begun.is_none()
+        || self.begun_invariant_waived()
+        || (!cell.binding && cell.reference.is_none())
+    );
     let release = if cell.binding {
       if !reserved {
         let mut dispatch = self.scope(cell);
@@ -1034,6 +1064,17 @@ impl Distributed {
             .inner()
             .blocked_depth
             .fetch_add(1, Ordering::Relaxed);
+          if let Some(lease) = begun {
+            // The blocked list holds the dequeued entry, as after a locked
+            // decision, which begins no turn first: the word returns to
+            // that queued state, so a wake or an abort finds it queued and
+            // the permit transfer dispatches it. The occupant takes a
+            // permit, so its later turns decide under the slot lock; this
+            // dispatcher holds its only entry, whose next dispatch the
+            // scope lock orders after the store.
+            self.slots[index].begin.set_permit_free(false);
+            lease.return_queued();
+          }
           return None;
         }
       }
@@ -1056,6 +1097,69 @@ impl Distributed {
     let lease = begun.or_else(|| slot.task.lend());
     debug_assert!(lease.is_some(), "turn began without a queue entry");
     Some(Selected::Poll(task_ref, lease?, PollPermit { release }))
+  }
+
+  /// The slot's scope cell for the locked decision; tests can make a begun
+  /// turn find none.
+  fn decision_cell<'a>(
+    &self,
+    slot: &'a SlotState,
+    shared: &'a Shared,
+    begun: bool,
+  ) -> Option<&'a Arc<ScopeCell>> {
+    let cell = slot.scope_cell(shared);
+    #[cfg(all(test, not(loom)))]
+    let cell = cell.filter(|_| {
+      !begun
+        || self
+          .begun_fault
+          .compare_exchange(
+            BEGUN_FAULT_MISSING_CELL,
+            BEGUN_FAULT_WAIVE,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+          )
+          .is_err()
+    });
+    #[cfg(any(not(test), loom))]
+    let _ = begun;
+    cell
+  }
+
+  /// Whether a test waived a begun turn's invariants to force a fallback.
+  fn begun_invariant_waived(&self) -> bool {
+    #[cfg(all(test, not(loom)))]
+    let waived = self.begun_fault.load(Ordering::Relaxed) != BEGUN_FAULT_NONE;
+    #[cfg(any(not(test), loom))]
+    let waived = false;
+    waived
+  }
+
+  /// Leaves the dequeued entry to a later dispatch when the occupied slot
+  /// has no scope cell to decide with. A turn begun on the task word
+  /// returns to the queued word and its entry is inserted again (to the
+  /// cleanup queue once an abort marked the slot), so the task keeps its
+  /// one entry instead of losing it with the lease; a reserved permit
+  /// stays with the slot for that dispatch.
+  fn requeue_begun(
+    &self,
+    shared: &Shared,
+    index: usize,
+    mut slot: Guard<'_, SlotState>,
+    begun: Option<Lease<dyn ErasedTask>>,
+    reserved: bool,
+  ) -> Option<Selected> {
+    debug_assert!(
+      begun.is_none() || self.begun_invariant_waived(),
+      "begun turn without a scope cell"
+    );
+    let lease = begun?;
+    slot.reserved_permit = reserved;
+    // Under the slot lock, so an abort's wake reads the queued word.
+    lease.return_queued();
+    drop(slot);
+    self.push_ready(shared, index, ReadyInsertion::PollRequeue);
+    None
   }
 
   /// Ends a poll. A pending poll changes only the task's word: it goes idle,

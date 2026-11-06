@@ -154,7 +154,8 @@ another.
 turn at a time. `TaskSlot::lend` begins the turn with a compare-and-swap that
 sets `RUNNING` only from the queued state, and returns a `Lease` holding the
 pointer `Arc::as_ptr` gives for that owner. `RUNNING` is cleared only by the
-lease (its pending finish, or its `Drop` if the turn is abandoned) or kept
+lease (its pending finish, its return of an unrun turn to the queued word,
+or its `Drop` if the turn is abandoned) or kept
 when `TaskSlot::take` hands the owner to the final turn; until then no slot
 drops or releases the owner (`take_idle` and `Drop` refuse while `RUNNING`,
 `Drop` then keeps the allocation alive, `install` refuses an occupied slot,

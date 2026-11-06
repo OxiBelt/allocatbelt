@@ -928,8 +928,8 @@ fn arc_pointer<T: ?Sized>(task: &Pin<Arc<T>>) -> NonNull<T> {
 
 /// One turn's use of a task that a [`TaskSlot`] owns, without a reference
 /// count of its own. Ends with [`Lease::finish_pending`], with
-/// [`TaskSlot::take`], or, if dropped, as a pending finish whose requeue is
-/// discarded.
+/// [`Lease::return_queued`], with [`TaskSlot::take`], or, if dropped, as a
+/// pending finish whose requeue is discarded.
 pub(crate) struct Lease<T: ?Sized + TaskLend> {
   task: NonNull<T>,
 }
@@ -939,11 +939,12 @@ impl<T: ?Sized + TaskLend> Lease<T> {
   pub(crate) fn task(&self) -> Pin<&T> {
     // SAFETY: the pointer came from a `Pin<Arc<T>>` that a `TaskSlot`
     // held when `lend` won `RUNNING` for this lease, and `RUNNING` is
-    // cleared only by this lease (its pending finish or its drop) or kept
-    // when `take` hands that owner to the turn; until then no slot drops or
-    // gives up the owner (`take_idle` and `Drop` refuse while `RUNNING`,
-    // `install` refuses an occupied slot, and `take` needs this lease), so
-    // the allocation is alive for the lease, and with it for this borrow.
+    // cleared only by this lease (its pending finish, its return to the
+    // queue or its drop) or kept when `take` hands that owner to the turn;
+    // until then no slot drops or gives up the owner (`take_idle` and
+    // `Drop` refuse while `RUNNING`, `install` refuses an occupied slot, and
+    // `take` needs this lease), so the allocation is alive for the lease,
+    // and with it for this borrow.
     #[expect(unsafe_code, reason = "borrows the slot-owned task for its turn")]
     let task: &T = unsafe { self.task.as_ref() };
     // SAFETY: the value lives in a `Pin<Arc<T>>` allocation and is only
@@ -979,6 +980,15 @@ impl<T: ?Sized + TaskLend> Lease<T> {
       .finish_pending();
     std::mem::forget(self);
     notified
+  }
+
+  /// Ends a turn that ran nothing and gives its queue entry back (see
+  /// `return_queued` on the word): the task is queued again, and the entry
+  /// the caller dequeued stays its only one. The caller must insert that
+  /// entry or keep it where a later dispatch finds it.
+  pub(crate) fn return_queued(self) {
+    self.task().get_ref().lend_word(LendKey(())).return_queued();
+    std::mem::forget(self);
   }
 }
 
@@ -2257,6 +2267,57 @@ mod tests {
     assert!(dropped.load(Ordering::SeqCst));
     drop(owner);
     assert_eq!(TaskCell::strong_count(&task), 1);
+  }
+
+  /// Runs a queued slot's task to completion in one turn and releases it.
+  fn complete_in_one_turn(mut slot: TaskSlot<Counted>, published: &PublishedTask<Counted>) {
+    let lease = slot.lend().unwrap();
+    assert!(matches!(
+      lease.task().poll_future(&lease.key(), &mut context()),
+      CellPoll::Ready(7)
+    ));
+    assert!(lease.task().drop_future(&lease.key()));
+    drop(slot.take(lease, published));
+    assert!(published.lend().is_none());
+  }
+
+  #[test]
+  fn a_returned_lease_queues_the_task_again_and_absorbs_a_wake() {
+    let published = PublishedTask::empty();
+    let (slot, task, dropped) = queued_slot(0, &published);
+    for wake in [false, true] {
+      let lease = published.lend().unwrap();
+      assert_eq!(task.word().flags(), (true, false));
+      if wake {
+        lease.waker().wake_by_ref();
+        assert_eq!(task.word().flags(), (true, true));
+      }
+      lease.return_queued();
+      // The caller's entry is the task's only one: a wake finds it queued.
+      assert!(task.word().is_queued());
+      assert_eq!(task.word().notify(), PollNotify::Queued);
+    }
+    complete_in_one_turn(slot, &published);
+    assert!(dropped.load(Ordering::SeqCst));
+  }
+
+  #[test]
+  fn a_returned_lease_races_a_wake_on_another_thread() {
+    for _ in 0..if cfg!(miri) { 4 } else { 200 } {
+      let published = PublishedTask::empty();
+      let (mut slot, task, dropped) = queued_slot(0, &published);
+      let lease = slot.lend().unwrap();
+      let waker = (*lease.waker()).clone();
+      let wake = std::thread::spawn(move || waker.wake());
+      lease.return_queued();
+      wake.join().unwrap();
+      // The wake found the turn running or the word queued; either way it
+      // added no entry and the task is queued again.
+      assert!(task.word().is_queued());
+      assert_eq!(task.header().0.load(Ordering::SeqCst), 1);
+      complete_in_one_turn(slot, &published);
+      assert!(dropped.load(Ordering::SeqCst));
+    }
   }
 
   #[test]

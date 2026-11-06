@@ -1117,6 +1117,13 @@ mod loom_cell {
         None => unreachable!("a live lease holds its task"),
       }
     }
+
+    pub(crate) fn return_queued(mut self) {
+      match self.task.take() {
+        Some(task) => task.lend_word().return_queued(),
+        None => unreachable!("a live lease holds its task"),
+      }
+    }
   }
 
   impl<T: ?Sized + TaskLend> Drop for Lease<T> {

@@ -1441,6 +1441,135 @@ fn abort_racing_a_reserved_transfer_returns_every_permit_case() {
   }
 }
 
+/// Dequeues one entry from any lane without dispatching it.
+fn dequeue(shared: &Arc<Shared>) -> usize {
+  let d = engine(shared);
+  let mut random = 1;
+  loop {
+    for seat in 0..d.lanes.len() {
+      let mut guard = None;
+      if let Search::Got(index) = d.search(shared, seat, &mut random, &mut guard) {
+        return index;
+      }
+    }
+  }
+}
+
+fn reference(shared: &Shared, index: usize) -> TaskRef {
+  TaskRef {
+    index,
+    generation: engine(shared).slot(index).protocol.generation(),
+  }
+}
+
+#[test]
+fn begun_turn_blocked_on_a_quota_returns_its_entry_queued() {
+  for wake in [false, true] {
+    let (shared, _) = shared(config(2, 4));
+    let d = engine(&shared);
+    // Only a permit-free occupant begins on the word; a binding scope's turn
+    // begun here forces the quota fallback.
+    d.begun_fault.store(BEGUN_FAULT_WAIVE, Ordering::Relaxed);
+    let scope = shared.new_scope(1, None).unwrap();
+    let first = scope.spawn(async { 1 }).unwrap();
+    let second = scope.spawn(async { 2 }).unwrap();
+    let holder = selected(&shared, 0).unwrap();
+    let index = dequeue(&shared);
+    let lease = d.slot(index).task.lend().unwrap();
+    if wake {
+      // A wake during the begun turn adds no entry.
+      d.wake(&shared, reference(&shared, index));
+    }
+    assert!(d.dispatch_locked(&shared, index, Some(lease)).is_none());
+    assert_eq!(d.scope(&scope.cell).check(&d.links()), vec![index]);
+    {
+      let slot = d.slot(index);
+      assert!(slot.task.get().unwrap().poll_word().is_queued());
+    }
+    check_distributed(&shared);
+    d.begun_fault.store(BEGUN_FAULT_NONE, Ordering::Relaxed);
+    // The holder's permit transfers to the returned entry, which then runs.
+    run(&shared, holder);
+    let work = selected(&shared, 0)
+      .or_else(|| selected(&shared, 1))
+      .unwrap();
+    assert!(matches!(&work, Selected::Poll(r, ..) if r.index == index));
+    run(&shared, work);
+    assert_eq!(finish(first).unwrap(), 1);
+    assert_eq!(finish(second).unwrap(), 2);
+    assert_eq!(scope.snapshot().active_polls, 0);
+    check_distributed(&shared);
+    drop(scope.close());
+  }
+}
+
+#[test]
+fn begun_turn_blocked_on_a_quota_and_aborted_is_cancelled() {
+  let (shared, _) = shared(config(2, 4));
+  let d = engine(&shared);
+  d.begun_fault.store(BEGUN_FAULT_WAIVE, Ordering::Relaxed);
+  // The holder below is the first task's entry, on lane 0.
+  d.next_lane.store(0, Ordering::Relaxed);
+  let scope = shared.new_scope(1, None).unwrap();
+  let first = scope.spawn(async {}).unwrap();
+  let second = scope.spawn(async {}).unwrap();
+  let holder = selected(&shared, 0).unwrap();
+  let index = dequeue(&shared);
+  let lease = d.slot(index).task.lend().unwrap();
+  assert!(d.dispatch_locked(&shared, index, Some(lease)).is_none());
+  // The returned word is queued, so the abort unlinks the blocked entry.
+  shared.abort(reference(&shared, index));
+  assert_eq!(d.scope(&scope.cell).blocked_len(), 0);
+  let work = selected(&shared, 0)
+    .or_else(|| selected(&shared, 1))
+    .unwrap();
+  assert!(matches!(&work, Selected::Cancel(r, ..) if r.index == index));
+  run(&shared, work);
+  run(&shared, holder);
+  finish(first).unwrap();
+  assert!(matches!(finish(second), Err(AsyncJoinError::Cancelled)));
+  check_distributed(&shared);
+  drop(scope.close());
+}
+
+#[test]
+fn begun_turn_without_a_scope_cell_requeues_its_entry() {
+  for (abort, wake) in [(false, false), (false, true), (true, false), (true, true)] {
+    let (shared, root) = shared(config(1, 2));
+    let d = engine(&shared);
+    let job = shared.spawn(root, async { 5 }).unwrap();
+    let index = dequeue(&shared);
+    let Begin::Poll(lease) = d.slots[index].begin.begin(&d.links()[index].cleanup) else {
+      panic!("a root occupant begins on the word");
+    };
+    if wake {
+      d.wake(&shared, reference(&shared, index));
+    }
+    d.begun_fault
+      .store(BEGUN_FAULT_MISSING_CELL, Ordering::Relaxed);
+    assert!(d.dispatch_locked(&shared, index, Some(lease)).is_none());
+    {
+      let slot = d.slot(index);
+      assert!(slot.task.get().unwrap().poll_word().is_queued());
+    }
+    check_distributed(&shared);
+    d.begun_fault.store(BEGUN_FAULT_NONE, Ordering::Relaxed);
+    if abort {
+      // The requeued entry is moved to cleanup and cancelled.
+      shared.abort(reference(&shared, index));
+      let work = selected(&shared, 0).unwrap();
+      assert!(matches!(work, Selected::Cancel(..)));
+      run(&shared, work);
+      assert!(matches!(finish(job), Err(AsyncJoinError::Cancelled)));
+    } else {
+      run(&shared, selected(&shared, 0).unwrap());
+      assert_eq!(finish(job).unwrap(), 5);
+    }
+    assert!(selected(&shared, 0).is_none());
+    check_distributed(&shared);
+  }
+}
+
 #[test]
 fn nonbinding_boundary_uses_no_quota_lock() {
   each_spin_configuration(nonbinding_boundary_uses_no_quota_lock_case);

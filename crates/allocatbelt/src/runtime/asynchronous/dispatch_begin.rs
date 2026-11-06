@@ -25,8 +25,9 @@ use super::task::{Lease, PublishedTask, TaskLend};
 /// slot mutex: whether its occupant's polls take no scope permit, and the
 /// occupant's published pointer. Both are written only under the slot lock,
 /// at publication before the first queue entry is inserted and at release
-/// when no entry exists, so the holder of a queue entry reads the values of
-/// the current occupancy.
+/// when no entry exists (the flag is also cleared by the holder of the only
+/// entry before it passes that entry on), so the holder of a queue entry
+/// reads the values of the current occupancy.
 pub(super) struct DispatchBegin<T: ?Sized + TaskLend> {
   permit_free: AtomicBool,
   published: PublishedTask<T>,
@@ -364,6 +365,41 @@ mod model {
       if harness.cancelled.load(Ordering::Relaxed) == 0 {
         assert_ne!(found, ABORT_FOUND_IDLE);
       }
+    });
+  }
+
+  #[test]
+  fn loom_a_begun_turn_returned_to_the_queue_races_an_external_wake() {
+    bounded(|| {
+      let harness = Harness::new();
+      let waker = harness.publish(
+        1,
+        Yielding {
+          remaining: 0,
+          wake: false,
+        },
+      );
+      // A dispatcher begins a turn on the word, decides not to run it and
+      // gives the entry back, while a waker wakes the task once.
+      let dispatcher = {
+        let harness = Arc::clone(&harness);
+        thread::spawn(move || {
+          let serial = harness.entries.lock().unwrap().pop_front().unwrap();
+          let lease = match harness.begin.begin(&harness.cleanup) {
+            Begin::Poll(lease) => lease,
+            _ => panic!("the published entry begins a free turn"),
+          };
+          lease.return_queued();
+          harness.entries.lock().unwrap().push_back(serial);
+        })
+      };
+      let wake = thread::spawn(move || waker.wake());
+      dispatcher.join().unwrap();
+      wake.join().unwrap();
+      // The task holds exactly the returned entry, which runs it.
+      assert_eq!(harness.entries.lock().unwrap().len(), 1);
+      harness.drain();
+      harness.check_released(1);
     });
   }
 
