@@ -1015,7 +1015,10 @@ tasks to a lane chosen by the inserting thread's rotating start index and the
 parked mask. Each thread keeps its own index, starts at a different value and
 advances it once per insertion, so producers and dispatchers do not share a
 counter. Dead seats are excluded; among live seats it skips parked
-dispatchers unless all are parked. A dispatcher takes its own front entry,
+dispatchers unless all are parked. The choice loads each parked-mask word
+once and scans its bits from the start index, in the same cyclic order as a
+lane-by-lane scan; a runtime with a single lane uses it without a scan. A
+dispatcher takes its own front entry,
 then searches other lanes in a pseudo-random order, then takes one shared
 overflow entry.
 Searching and spinning admit a fixed number of dispatchers at once (see
@@ -1032,7 +1035,13 @@ transfers or releases. A task's own end-of-poll requeue wakes nobody; the
 finishing dispatcher continues searching. Work remaining after a pop or
 steal wakes one parked dispatcher, if available. Taking a lane's last entry
 wakes nobody. These wake decisions use the searching state described for
-`max_searching_dispatchers` below. There is no per-task lane affinity or
+`max_searching_dispatchers` below; a wake first checks whether any live
+lane is parked and does nothing more when none is. Each lane publishes its
+depth under its lane lock for the park rescan, the steal pre-check and the
+remaining-work check, which only test whether a lane is empty: a change
+between empty and non-empty is a SeqCst store, a change that stays
+non-empty is a Relaxed store that keeps the metric exact, and an unchanged
+depth is not stored. There is no per-task lane affinity or
 global scope rotation. A larger ready scope can receive proportionally more
 polls, and scope readiness order can change across lanes. Each task still
 polls exclusively, and ready tasks make progress if every poll returns;
@@ -1139,7 +1148,8 @@ never cover user polling, destructors or completion callbacks. Generation tags
 make retained stale abort handles harmless without retaining completed futures.
 Each task object has one atomic word with running, notified and complete
 bits and two join bits; a notified task that is not running owns exactly one
-queue entry. A
+queue entry. A task's word is created notified, holding the first queue
+entry, which publication inserts; spawning needs no separate wake. A
 wake is one read-modify-write on that word and takes no slot mutex: if it
 finds the task idle it inserts the queue entry; if the task is running it
 leaves the notified bit for the poll's finish; a queued or complete task is
@@ -1534,8 +1544,11 @@ slot reuse and cleanup; a same-source Loom model checks poll-slot acquire/releas
 
 The same-source Loom models cover lane park/push, stealing versus owner pop
 and push, search admission versus a denied dispatcher's park, quota gating
-and transfer, abort and close versus spawn. They use the shipped admission
-counter, parked mask and park-advertise/rescan helper, and mirror the
+and transfer, abort and close versus spawn, and lane depth publication
+(pushes and pops, including Relaxed updates of a non-empty lane, versus a
+dispatcher's steal pre-check and park rescan). They use the shipped admission
+counter, parked mask, depth publication and park-advertise/rescan helper,
+and mirror the
 engine's wake decision. They use tiny queues and do not model real condvar
 timing, OS threads, metrics, Control charges or task internals. Native tests
 cover those integration paths. `global_queue_depth` sums lane, blocked and

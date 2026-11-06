@@ -39,6 +39,8 @@ pub(crate) struct CpuExecutionGuard {
 }
 
 impl CpuExecutionGuard {
+  // The unbounded (no domain) case stays inline at the caller.
+  #[inline]
   pub(crate) fn enter(domain: Option<DomainIdentity>) -> Self {
     let Some(domain) = domain else {
       return Self {
@@ -46,6 +48,11 @@ impl CpuExecutionGuard {
         overflow: false,
       };
     };
+    Self::enter_domain(domain)
+  }
+
+  #[cold]
+  fn enter_domain(domain: DomainIdentity) -> Self {
     let entered = ACTIVE.try_with(|active| {
       let mut active = active.borrow_mut();
       if let Some(index) = active.domains.iter().position(Option::is_none) {
@@ -72,10 +79,18 @@ impl CpuExecutionGuard {
 }
 
 impl Drop for CpuExecutionGuard {
+  #[inline]
   fn drop(&mut self) {
     if self.slot.is_none() && !self.overflow {
       return;
     }
+    self.leave();
+  }
+}
+
+impl CpuExecutionGuard {
+  #[cold]
+  fn leave(&mut self) {
     let slot = self.slot;
     let overflow = self.overflow;
     let removed = ACTIVE.try_with(|active| {

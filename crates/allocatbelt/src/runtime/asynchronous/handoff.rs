@@ -334,8 +334,18 @@ fn resume_busy() {}
 
 /// Starts an owned turn on this executor thread.
 pub(super) fn enter_turn(turn: DispatchTurn) {
-  restore_phase(turn);
-  resume_busy();
+  // One thread-local borrow restores the phase and, when the
+  // busy period is closed, reopens it.
+  let _ = DISPATCHER.try_with(|slot| {
+    if let Some(thread) = slot.borrow_mut().as_mut() {
+      thread.phase = Phase::Dispatching(turn);
+      #[cfg(not(loom))]
+      if thread.busy_since.is_none() {
+        thread.busy_since = Some(Instant::now());
+        thread.busy_turns = 0;
+      }
+    }
+  });
 }
 
 /// Ends this thread's owned turn and returns its permit for release under

@@ -145,9 +145,22 @@ fn lock<T>(mutex: &Mutex<T>, level: u8) -> Guard<'_, T> {
   }
 }
 
+// The queue link shares the slot's 128-byte cell (array of structs), so a
+// dispatch's slot lines also hold the entry's link.
 #[repr(align(128))]
 struct SlotCell {
   state: Mutex<SlotState>,
+  link: QueueLink,
+}
+
+#[derive(Clone, Copy)]
+struct SlotLinks<'a>(&'a [SlotCell]);
+
+impl std::ops::Index<usize> for SlotLinks<'_> {
+  type Output = QueueLink;
+  fn index(&self, index: usize) -> &QueueLink {
+    &self.0[index].link
+  }
 }
 struct SlotState {
   protocol: SlotProtocol,
@@ -226,7 +239,6 @@ pub(super) struct Distributed {
   #[cfg(all(test, not(loom)))]
   steal_denials: AtomicUsize,
   slots: Vec<SlotCell>,
-  links: Vec<QueueLink>,
   lanes: Vec<Lane>,
   parked: ParkedMask,
   #[cfg(all(test, not(loom)))]
@@ -327,7 +339,7 @@ impl Distributed {
   pub(super) fn requested_control(config: AsyncConfig) -> Result<usize, AsyncError> {
     control_sizes(
       config.max_outstanding,
-      config.max_outstanding,
+      0,
       config.workers,
       config.workers.div_ceil(64) * 2,
       config.workers,
@@ -339,7 +351,7 @@ impl Distributed {
     let (vacant, helpers) = self.seats().capacities();
     control_sizes(
       self.slots.capacity(),
-      self.links.capacity(),
+      0,
       self.lanes.capacity(),
       self.parked.capacity(),
       vacant,
@@ -380,8 +392,8 @@ impl Distributed {
           cell: None,
           reserved_permit: false,
         }),
+        link: QueueLink::new(),
       })?,
-      links: table(config.max_outstanding, QueueLink::new)?,
       lanes: table(config.workers, || Lane {
         queue: Mutex::new(LaneQueue::new()),
         cv: Condvar::new(),
@@ -436,6 +448,10 @@ impl Distributed {
     }
   }
 
+  fn links(&self) -> SlotLinks<'_> {
+    SlotLinks(&self.slots)
+  }
+
   pub(super) fn slots_len(&self) -> usize {
     self.slots.len()
   }
@@ -474,10 +490,15 @@ impl Distributed {
     lock(&self.lanes[seat].queue, 4)
   }
 
+  /// Every store to a lane's depth runs under that lane's lock, so the
+  /// relaxed load reads the last published value; see
+  /// [`super::super::lane::depth_store`] for the store's ordering.
   fn publish_depth(&self, shared: &Shared, seat: usize, queue: &LaneQueue) {
-    shared.metrics.inner().lane_depth[seat]
-      .0
-      .store(queue.len(), Ordering::SeqCst);
+    let depth = &shared.metrics.inner().lane_depth[seat].0;
+    let len = queue.len();
+    if let Some(order) = super::super::lane::depth_store(depth.load(Ordering::Relaxed), len) {
+      depth.store(len, order);
+    }
   }
 
   /// The start index for lane choice: the calling thread's own rotating
@@ -504,12 +525,12 @@ impl Distributed {
       let mut queue = self.lane(seat);
       // Serialize with abort's lane scan and seat retirement. A publisher or
       // quota transfer that was in flight when abort ran must use overflow.
-      if self.parked.is_dead(seat) || self.links[index].cleanup.load(Ordering::SeqCst) {
+      if self.parked.is_dead(seat) || self.links()[index].cleanup.load(Ordering::SeqCst) {
         drop(queue);
         self.push_cleanup(shared, index);
         return;
       }
-      let notify = queue.push(&self.links, index);
+      let notify = queue.push(&self.links(), index);
       self.publish_depth(shared, seat, &queue);
       // Newly ready work may sit behind a blocked poll, even as a lone entry.
       // A poll-end requeue leaves its finishing dispatcher available to search.
@@ -532,7 +553,7 @@ impl Distributed {
   fn push_cleanup(&self, shared: &Shared, index: usize) {
     {
       let mut queue = lock(&self.overflow, 4);
-      queue.push(&self.links, index);
+      queue.push(&self.links(), index);
       shared
         .metrics
         .inner()
@@ -555,7 +576,17 @@ impl Distributed {
       self.kick(seat);
     }
   }
+  #[inline]
   fn search_wake(&self) {
+    // With no parked lane there is no one to claim (the claim scan below
+    // would find none); skip the gate's counter loads too.
+    if self.parked.any_live_parked() {
+      self.search_wake_parked();
+    }
+  }
+
+  #[inline(never)]
+  fn search_wake_parked(&self) {
     if !self.searching.wake_allowed() {
       return;
     }
@@ -619,11 +650,15 @@ impl Distributed {
       let Some(index) = state.free_tasks.first() else {
         return Err(AsyncSpawnError::new(AsyncError::Full, future));
       };
-      scope_cell.protocol.add_task();
       // The root cell outlives every slot and is reached through
       // `shared.root`; any other scope is retained once, first by the
-      // reservation and then by the slot.
-      let owner = (!Arc::ptr_eq(scope_cell, &shared.root)).then(|| Arc::clone(scope_cell));
+      // reservation and then by the slot. Only owned scopes count their
+      // tasks; the root's count has no reader (runtime occupancy is
+      // `admitted`) and no close future.
+      let owner = (!Arc::ptr_eq(scope_cell, &shared.root)).then(|| {
+        scope_cell.protocol.add_task();
+        Arc::clone(scope_cell)
+      });
       state.free_tasks.remove(index);
       // `admitted` counts the reservation until publication or rollback and
       // is also the alive-task metric; it is read under this lock.
@@ -721,12 +756,12 @@ impl Distributed {
       // and every load for this generation, including the lock-free steal
       // check, follows the entry's push under the lane lock, which follows
       // this reset. The abort/cleanup pairing keeps its SeqCst accesses.
-      self.links[index].cleanup.store(false, Ordering::Relaxed);
+      self.links()[index].cleanup.store(false, Ordering::Relaxed);
       slot.protocol.admit(generation);
-      // No waker or abort handle exists yet, so publication owns the first
-      // queue entry.
-      let queued = task.poll_word().notify();
-      debug_assert_eq!(queued, PollNotify::Enqueue);
+      // No waker or abort handle exists yet; the word was created holding
+      // the first queue entry, which publication inserts below.
+      #[cfg(all(test, not(loom)))]
+      debug_assert!(task.poll_word().is_queued());
       slot.scope = Some(scope);
       slot.task.install(task);
       slot.cell = reservation.cell.take();
@@ -791,7 +826,7 @@ impl Distributed {
       {
         return;
       }
-      self.links[index].cleanup.store(true, Ordering::SeqCst);
+      self.links()[index].cleanup.store(true, Ordering::SeqCst);
       slot.protocol.abort();
       let Some(task) = slot.task.get() else {
         // Publication installs the task with the admission; only a fixture
@@ -808,7 +843,7 @@ impl Distributed {
         && let Some(cell) = slot.scope_cell(shared)
         && cell.binding
       {
-        self.scope(cell).unlink_blocked(&self.links, index)
+        self.scope(cell).unlink_blocked(&self.links(), index)
       } else {
         false
       };
@@ -829,8 +864,8 @@ impl Distributed {
       for seat in 0..self.lanes.len() {
         let removed = {
           let mut queue = self.lane(seat);
-          let removed =
-            self.links[index].cleanup.load(Ordering::SeqCst) && queue.remove(&self.links, index);
+          let removed = self.links()[index].cleanup.load(Ordering::SeqCst)
+            && queue.remove(&self.links(), index);
           self.publish_depth(shared, seat, &queue);
           removed
         };
@@ -889,7 +924,7 @@ impl Distributed {
   pub(super) fn release_permit(&self, shared: &Shared, cell: &ScopeCell) {
     let transfer = {
       let mut dispatch = self.scope(cell);
-      let transfer = dispatch.release_or_transfer(&self.links);
+      let transfer = dispatch.release_or_transfer(&self.links());
       if transfer.is_some() {
         shared
           .metrics
@@ -938,7 +973,7 @@ impl Distributed {
       if !reserved {
         let mut dispatch = self.scope(cell);
         if !dispatch.try_acquire() {
-          dispatch.block(&self.links, index);
+          dispatch.block(&self.links(), index);
           shared
             .metrics
             .inner()
@@ -1030,9 +1065,11 @@ impl Distributed {
     }
     if let Some(scope) = scope {
       debug_assert!(cell.is_some() || scope == ScopeRef::ROOT);
-      // The root scope's last task never reclaims it, so completion only
-      // decrements its count; owned scopes release their retained cell here.
-      cell.as_deref().unwrap_or(&shared.root).completed();
+      // Root tasks are not counted; owned scopes release their retained
+      // cell here.
+      if let Some(cell) = cell.as_deref() {
+        cell.completed();
+      }
     }
     if empty_after_close {
       self.closed_empty.store(true, Ordering::Release);
@@ -1053,7 +1090,7 @@ impl Distributed {
       let (chain, remains) = {
         let mut queue = self.lane(victim);
         let before = queue.len();
-        let Some(chain) = queue.steal_front(&self.links) else {
+        let Some(chain) = queue.steal_front(&self.links()) else {
           continue;
         };
         debug_assert!(before == 1 || queue.len() >= 1);
@@ -1072,7 +1109,7 @@ impl Distributed {
         Ok(index) => {
           #[cfg(all(test, not(loom)))]
           self.steals.fetch_add(1, Ordering::Relaxed);
-          if self.links[index].cleanup.load(Ordering::SeqCst) {
+          if self.links()[index].cleanup.load(Ordering::SeqCst) {
             self.push_cleanup(shared, index);
             return None;
           }
@@ -1082,9 +1119,9 @@ impl Distributed {
       };
       let (first, remains, cleanup) = {
         let mut queue = self.lane(seat);
-        queue.append_chain(&self.links, chain);
-        let cleanup = queue.extract_cleanup(&self.links);
-        let first = queue.pop(&self.links);
+        queue.append_chain(&self.links(), chain);
+        let cleanup = queue.extract_cleanup(&self.links());
+        let first = queue.pop(&self.links());
         self.publish_depth(shared, seat, &queue);
         (first, queue.len() != 0, cleanup)
       };
@@ -1092,7 +1129,7 @@ impl Distributed {
         let count = {
           let mut queue = lock(&self.overflow, 4);
           let before = queue.len();
-          queue.append_chain(&self.links, cleanup);
+          queue.append_chain(&self.links(), cleanup);
           shared
             .metrics
             .inner()
@@ -1161,7 +1198,7 @@ impl Distributed {
   ) -> Search {
     let (first, recheck, remains, woken) = {
       let mut queue = self.lane(seat);
-      let first = queue.pop(&self.links);
+      let first = queue.pop(&self.links());
       let recheck = first.is_none() && queue.take_recheck();
       self.publish_depth(shared, seat, &queue);
       let woken = !recheck && std::mem::take(&mut queue.search_kick);
@@ -1201,7 +1238,7 @@ impl Distributed {
     if shared.metrics.inner().overflow_depth.load(Ordering::SeqCst) != 0 {
       let first = {
         let mut queue = lock(&self.overflow, 4);
-        let first = queue.pop(&self.links);
+        let first = queue.pop(&self.links());
         shared
           .metrics
           .inner()
@@ -1360,7 +1397,7 @@ impl Distributed {
     loop {
       let first = {
         let mut queue = self.lane(seat);
-        let first = queue.pop(&self.links);
+        let first = queue.pop(&self.links());
         self.publish_depth(shared, seat, &queue);
         first
       };

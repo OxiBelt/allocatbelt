@@ -861,7 +861,18 @@ pub(super) struct RootAdmission {
 }
 
 impl Drop for PollPermit {
+  // The root scope's free permit drops inline.
+  #[inline]
   fn drop(&mut self) {
+    if !matches!(self.release, PermitRelease::Free) {
+      self.release_slow();
+    }
+  }
+}
+
+impl PollPermit {
+  #[cold]
+  fn release_slow(&mut self) {
     match &self.release {
       PermitRelease::Scope { shared, cell } => {
         if let Some(shared) = shared.upgrade() {

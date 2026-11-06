@@ -87,7 +87,11 @@ impl ScopeDispatch {
     self.quota.try_acquire()
   }
 
-  pub(super) fn block(&mut self, links: &[super::lane::QueueLink], index: usize) {
+  pub(super) fn block(
+    &mut self,
+    links: &(impl std::ops::Index<usize, Output = super::lane::QueueLink> + ?Sized),
+    index: usize,
+  ) {
     debug_assert!(!links[index].blocked.load(Ordering::Relaxed));
     let nil = super::lane::NIL;
     links[index]
@@ -106,7 +110,11 @@ impl ScopeDispatch {
     links[index].blocked.store(true, Ordering::Relaxed);
   }
 
-  pub(super) fn unlink_blocked(&mut self, links: &[super::lane::QueueLink], index: usize) -> bool {
+  pub(super) fn unlink_blocked(
+    &mut self,
+    links: &(impl std::ops::Index<usize, Output = super::lane::QueueLink> + ?Sized),
+    index: usize,
+  ) -> bool {
     if !links[index].blocked.load(Ordering::Relaxed) {
       return false;
     }
@@ -130,7 +138,10 @@ impl ScopeDispatch {
     true
   }
 
-  pub(super) fn release_or_transfer(&mut self, links: &[super::lane::QueueLink]) -> Option<usize> {
+  pub(super) fn release_or_transfer(
+    &mut self,
+    links: &(impl std::ops::Index<usize, Output = super::lane::QueueLink> + ?Sized),
+  ) -> Option<usize> {
     debug_assert!(self.quota.active() > 0);
     if self.blocked_len != 0 {
       let index = self.blocked_head;
@@ -153,7 +164,10 @@ impl ScopeDispatch {
   }
 
   #[cfg(test)]
-  pub(super) fn check(&self, links: &[super::lane::QueueLink]) -> Vec<usize> {
+  pub(super) fn check(
+    &self,
+    links: &(impl std::ops::Index<usize, Output = super::lane::QueueLink> + ?Sized),
+  ) -> Vec<usize> {
     assert!(self.active() <= self.maximum());
     let mut indices = Vec::new();
     let mut prev = super::lane::NIL;

@@ -80,7 +80,11 @@ impl LaneQueue {
     }
   }
 
-  pub(super) fn push(&mut self, links: &[QueueLink], index: usize) -> bool {
+  pub(super) fn push(
+    &mut self,
+    links: &(impl std::ops::Index<usize, Output = QueueLink> + ?Sized),
+    index: usize,
+  ) -> bool {
     links[index].next.store(NIL, Ordering::Relaxed);
     self.append_chain(
       links,
@@ -92,7 +96,10 @@ impl LaneQueue {
     )
   }
 
-  pub(super) fn pop(&mut self, links: &[QueueLink]) -> Option<usize> {
+  pub(super) fn pop(
+    &mut self,
+    links: &(impl std::ops::Index<usize, Output = QueueLink> + ?Sized),
+  ) -> Option<usize> {
     if self.len == 0 {
       return None;
     }
@@ -108,7 +115,11 @@ impl LaneQueue {
 
   /// Remove an entry without acquiring it for polling. Used only to relocate
   /// cancellation cleanup; ordinary dispatch still pops one FIFO entry.
-  pub(super) fn remove(&mut self, links: &[QueueLink], target: usize) -> bool {
+  pub(super) fn remove(
+    &mut self,
+    links: &(impl std::ops::Index<usize, Output = QueueLink> + ?Sized),
+    target: usize,
+  ) -> bool {
     let mut previous = NIL;
     let mut index = self.head;
     while index != NIL {
@@ -134,7 +145,10 @@ impl LaneQueue {
 
   /// Filter a stolen chain while its receiving lane is locked. An abort may
   /// have scanned that lane while the chain was detached from both queues.
-  pub(super) fn extract_cleanup(&mut self, links: &[QueueLink]) -> Option<Chain> {
+  pub(super) fn extract_cleanup(
+    &mut self,
+    links: &(impl std::ops::Index<usize, Output = QueueLink> + ?Sized),
+  ) -> Option<Chain> {
     let mut cleanup = Self::new();
     let mut index = self.head;
     while index != NIL {
@@ -154,7 +168,10 @@ impl LaneQueue {
   }
 
   /// Takes a single remaining entry or the oldest bounded half of a larger lane.
-  pub(super) fn steal_front(&mut self, links: &[QueueLink]) -> Option<Chain> {
+  pub(super) fn steal_front(
+    &mut self,
+    links: &(impl std::ops::Index<usize, Output = QueueLink> + ?Sized),
+  ) -> Option<Chain> {
     if self.len == 0 {
       return None;
     }
@@ -173,7 +190,11 @@ impl LaneQueue {
     Some(Chain { first, last, len })
   }
 
-  pub(super) fn append_chain(&mut self, links: &[QueueLink], chain: Chain) -> bool {
+  pub(super) fn append_chain(
+    &mut self,
+    links: &(impl std::ops::Index<usize, Output = QueueLink> + ?Sized),
+    chain: Chain,
+  ) -> bool {
     if self.len == 0 {
       self.head = chain.first;
     } else {
@@ -223,7 +244,10 @@ impl LaneQueue {
   }
 
   #[cfg(test)]
-  pub(super) fn check(&self, links: &[QueueLink]) -> Vec<usize> {
+  pub(super) fn check(
+    &self,
+    links: &(impl std::ops::Index<usize, Output = QueueLink> + ?Sized),
+  ) -> Vec<usize> {
     let mut indices = Vec::new();
     let mut last = NIL;
     let mut index = self.head;
@@ -322,30 +346,150 @@ impl ParkedMask {
   ) -> Option<usize> {
     #[cfg(loom)]
     loom::sync::atomic::fence(Ordering::SeqCst);
-    (0..self.lanes)
-      .map(|offset| (start % self.lanes + offset) % self.lanes)
-      .find(|&lane| !self.is_dead(lane) && self.is_set(lane) && claim(lane))
+    // One SeqCst load of each mask word instead of per-lane loads and
+    // divisions; the same candidates in the same cyclic order.
+    self.cyclic_find(
+      start,
+      |word| {
+        let dead = self.dead[word].load(Ordering::SeqCst);
+        !dead & self.words[word].load(Ordering::SeqCst)
+      },
+      &mut claim,
+    )
+  }
+
+  /// Whether any live lane is parked, one SeqCst load of each
+  /// mask word pair. A parker advertises before its rescan, so a waker that
+  /// published work before this load and finds no parked lane leaves the
+  /// rescan to find that work.
+  #[inline]
+  pub(super) fn any_live_parked(&self) -> bool {
+    #[cfg(loom)]
+    loom::sync::atomic::fence(Ordering::SeqCst);
+    (0..self.words.len()).any(|word| {
+      self.words[word].load(Ordering::SeqCst) & !self.dead[word].load(Ordering::SeqCst) != 0
+    })
   }
 
   pub(super) fn first_clear_from(&self, start: usize) -> Option<usize> {
-    (0..self.lanes)
-      .map(|offset| (start % self.lanes + offset) % self.lanes)
-      .find(|&lane| !self.is_set(lane))
+    self.cyclic_find(
+      start,
+      |word| {
+        let dead = self.dead[word].load(Ordering::SeqCst);
+        !(dead | self.words[word].load(Ordering::SeqCst))
+      },
+      |_| true,
+    )
+  }
+
+  /// The first live lane at or after `start`, cyclically.
+  pub(super) fn first_live_from(&self, start: usize) -> Option<usize> {
+    self.cyclic_find(
+      start,
+      |word| !self.dead[word].load(Ordering::SeqCst),
+      |_| true,
+    )
+  }
+
+  /// `cyclic_find` for at most 64 lanes, with the one word's
+  /// candidate bits loaded once: the bits at or above the start lane first,
+  /// then the wrapped low bits. No division for a single lane.
+  #[inline]
+  fn cyclic_find_one(
+    &self,
+    start: usize,
+    bits: u64,
+    mut accept: impl FnMut(usize) -> bool,
+  ) -> Option<usize> {
+    let lanes = self.lanes;
+    debug_assert!((1..=64).contains(&lanes));
+    let start = if lanes == 1 {
+      0
+    } else if start < lanes {
+      start
+    } else {
+      start % lanes
+    };
+    let bits = bits & (u64::MAX >> (64 - lanes));
+    let high = u64::MAX << start;
+    for mut candidates in [bits & high, bits & !high] {
+      while candidates != 0 {
+        let lane = candidates.trailing_zeros() as usize;
+        if accept(lane) {
+          return Some(lane);
+        }
+        candidates &= candidates - 1;
+      }
+    }
+    None
+  }
+
+  /// Visits lanes whose bit `bits(word)` sets, in cyclic order from
+  /// `start % lanes`, until `accept` returns true. Each word is loaded once
+  /// per visit; the start word is visited twice (high bits first, low bits
+  /// last) to close the cycle.
+  fn cyclic_find(
+    &self,
+    start: usize,
+    mut bits: impl FnMut(usize) -> u64,
+    mut accept: impl FnMut(usize) -> bool,
+  ) -> Option<usize> {
+    if self.lanes <= 64 {
+      return self.cyclic_find_one(start, bits(0), accept);
+    }
+    let words = self.lanes.div_ceil(64);
+    let start = start % self.lanes;
+    let (first_word, first_bit) = (start / 64, start % 64);
+    for step in 0..=words {
+      let mut word = first_word + step;
+      if word >= words {
+        word -= words;
+      }
+      let mut mask = if word + 1 == words && !self.lanes.is_multiple_of(64) {
+        (1u64 << (self.lanes % 64)) - 1
+      } else {
+        u64::MAX
+      };
+      if step == 0 {
+        mask &= u64::MAX << first_bit;
+      } else if step == words {
+        mask &= (1u64 << first_bit).wrapping_sub(1);
+      }
+      if mask == 0 {
+        continue;
+      }
+      let mut candidates = bits(word) & mask;
+      while candidates != 0 {
+        let lane = word * 64 + candidates.trailing_zeros() as usize;
+        if accept(lane) {
+          return Some(lane);
+        }
+        candidates &= candidates - 1;
+      }
+    }
+    None
   }
 }
 
 /// Skip parked lanes using only the rotating counter value and parked state.
 /// The caller advances the counter, independent of its identity. Return the
 /// chosen seat and whether its parked bit was cleared by this selection.
+#[inline]
 pub(super) fn choose_lane(next_lane: usize, parked: &ParkedMask) -> (usize, bool) {
+  // A single lane is chosen without a scan: the same result as
+  // the scan (its parked bit, if set, is claimed; dead or not).
+  if parked.lanes == 1 {
+    return (0, parked.is_set(0) && parked.claim(0));
+  }
+  choose_lane_scan(next_lane, parked)
+}
+
+fn choose_lane_scan(next_lane: usize, parked: &ParkedMask) -> (usize, bool) {
   let start = next_lane % parked.lanes;
   if let Some(seat) = parked.first_clear_from(start) {
     return (seat, false);
   }
-  let live = (0..parked.lanes)
-    .map(|offset| (start + offset) % parked.lanes)
-    .find(|&lane| !parked.is_dead(lane))
-    .unwrap_or(start);
+  let live = parked.first_live_from(start).unwrap_or(start);
   (live, parked.claim(live))
 }
 
@@ -504,13 +648,30 @@ impl Drop for SearchGuard<'_> {
   }
 }
 
+/// The store, if any, that publishes a lane's new queue length `len` over
+/// the last published `published`. The caller holds the lane lock, so
+/// `published` is the latest value. Readers that pair with parking test
+/// only `!= 0`: a change between empty and non-empty is a SeqCst store, a
+/// change that stays non-zero keeps the exact metric with a Relaxed store,
+/// and an unchanged length stores nothing.
+pub(super) const fn depth_store(published: usize, len: usize) -> Option<Ordering> {
+  if (published != 0) != (len != 0) {
+    Some(Ordering::SeqCst)
+  } else if len != published {
+    Some(Ordering::Relaxed)
+  } else {
+    None
+  }
+}
+
 /// The final park handshake after own/steal/overflow searches
 /// failed. A true result permits the caller to test `prepare_sleep` under its
 /// lane lock and wait there. A false result requires a fresh full search.
 /// The iterator must load SeqCst lengths lazily, after advertisement, and the
-/// closure must load overflow the same way. Producers publish a SeqCst length
-/// before claiming and kicking a sleeper. A denied dispatcher may ignore
-/// other lanes only while admission is still full after advertisement.
+/// closure must load overflow the same way. Producers publish a length (see
+/// [`depth_store`]) before claiming and kicking a sleeper. A denied
+/// dispatcher may ignore other lanes only while admission is still full after
+/// advertisement.
 pub(super) fn search_or_park(
   seat: usize,
   parked: &ParkedMask,
@@ -539,6 +700,26 @@ pub(super) fn search_or_park(
 #[cfg(all(test, not(loom)))]
 mod tests {
   use super::*;
+
+  #[test]
+  fn depth_store_is_seq_cst_only_across_empty() {
+    for published in 0..4 {
+      for len in 0..4 {
+        let expected = if (published == 0) != (len == 0) {
+          Some(Ordering::SeqCst)
+        } else if published != len {
+          Some(Ordering::Relaxed)
+        } else {
+          None
+        };
+        assert_eq!(
+          depth_store(published, len),
+          expected,
+          "{published} -> {len}"
+        );
+      }
+    }
+  }
 
   #[test]
   fn steal_bounds_oldest_first_and_chain_links() {
@@ -836,8 +1017,8 @@ mod loom_tests {
           while popped.len() < 4 {
             {
               let mut queue = lane.0.lock().unwrap();
-              queue.check(&links);
-              if let Some(index) = queue.pop(&links) {
+              queue.check(&links[..]);
+              if let Some(index) = queue.pop(&links[..]) {
                 popped.push(index);
                 continue;
               }
@@ -867,8 +1048,8 @@ mod loom_tests {
             for index in first..first + 2 {
               let notify = {
                 let mut queue = lane.0.lock().unwrap();
-                let notify = queue.push(&links, index);
-                queue.check(&links);
+                let notify = queue.push(&links[..], index);
+                queue.check(&links[..]);
                 notify
               };
               if notify {
@@ -902,7 +1083,7 @@ mod loom_tests {
           [first, first + 1]
         );
       }
-      assert!(lane.0.lock().unwrap().check(&links).is_empty());
+      assert!(lane.0.lock().unwrap().check(&links[..]).is_empty());
     });
   }
 
@@ -957,7 +1138,7 @@ mod loom_tests {
         let links = Arc::new((0..=count).map(|_| QueueLink::new()).collect::<Vec<_>>());
         let mut initial = LaneQueue::new();
         for index in 0..count {
-          initial.push(&links, index);
+          initial.push(&links[..], index);
         }
         let victim = Arc::new(Mutex::new(initial));
         let owner = {
@@ -967,10 +1148,10 @@ mod loom_tests {
             let mut popped = Vec::new();
             for _ in 0..count {
               let mut queue = victim.lock().unwrap();
-              if let Some(index) = queue.pop(&links) {
+              if let Some(index) = queue.pop(&links[..]) {
                 popped.push(index);
               }
-              queue.check(&links);
+              queue.check(&links[..]);
             }
             popped
           })
@@ -981,13 +1162,13 @@ mod loom_tests {
           thread::spawn(move || {
             let stolen = {
               let mut queue = victim.lock().unwrap();
-              let before = queue.check(&links);
-              queue.steal_front(&links).map(|chain| {
+              let before = queue.check(&links[..]);
+              queue.steal_front(&links[..]).map(|chain| {
                 assert!(before.len() == 1 || queue.len() >= 1);
                 assert_eq!(chain.len, (before.len() / 2).clamp(1, STEAL_MAX));
                 assert_eq!(chain.first, before[0]);
                 assert_eq!(chain.last, before[chain.len - 1]);
-                queue.check(&links);
+                queue.check(&links[..]);
                 let expected = before[..chain.len].to_vec();
                 (chain, expected)
               })
@@ -997,7 +1178,7 @@ mod loom_tests {
             let mut popped = Vec::new();
             let own = Mutex::new(LaneQueue::new());
             let mut own = own.lock().unwrap();
-            own.push(&links, count);
+            own.push(&links[..], count);
             let mut expected = vec![count];
             if let Some((chain, indices)) = stolen {
               match chain.into_single() {
@@ -1007,15 +1188,15 @@ mod loom_tests {
                 }
                 Err(chain) => {
                   expected.extend(indices);
-                  own.append_chain(&links, chain);
+                  own.append_chain(&links[..], chain);
                 }
               }
             }
-            assert_eq!(own.check(&links), expected);
+            assert_eq!(own.check(&links[..]), expected);
             let direct = popped.len();
-            while let Some(index) = own.pop(&links) {
+            while let Some(index) = own.pop(&links[..]) {
               popped.push(index);
-              own.check(&links);
+              own.check(&links[..]);
             }
             assert_eq!(popped[direct..], expected);
             popped
@@ -1025,7 +1206,7 @@ mod loom_tests {
         popped.extend(thief.join().unwrap());
         popped.sort_unstable();
         assert_eq!(popped, (0..=count).collect::<Vec<_>>());
-        assert!(victim.lock().unwrap().check(&links).is_empty());
+        assert!(victim.lock().unwrap().check(&links[..]).is_empty());
       });
     }
   }
@@ -1185,6 +1366,132 @@ mod loom_tests {
     for initial_entry in [false, true] {
       loom::model(move || steal_push_park(true, initial_entry));
     }
+  }
+
+  /// Publishes `queue`'s length the way the scheduler does under the lane
+  /// lock.
+  fn publish(depth: &AtomicUsize, queue: &LaneQueue) {
+    if let Some(order) = depth_store(depth.load(Ordering::Relaxed), queue.len()) {
+      depth.store(queue.len(), order);
+    }
+  }
+
+  /// Lane 1 is shared by `producers` (each pushes one entry and then runs the
+  /// parked-lane check and the claim scan of a search wake) and, when `pop`
+  /// is set, an owner that pops one entry. The dispatcher on seat 0 reads the
+  /// published depth before each steal attempt, then advertises and rescans
+  /// it before sleeping. Pushes onto a non-empty lane and pops that leave it
+  /// non-empty publish with Relaxed stores; the dispatcher may sleep only on
+  /// an empty lane or with a covering kick, and the final depth is exact.
+  /// Loom models the SeqCst order through the fences beside advertisement
+  /// and the parked-lane checks, so this checks which publications may be
+  /// skipped or Relaxed rather than the native store ordering itself.
+  fn depth_publication_park(initial: usize, producers: usize, pop: bool) {
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = Some(3);
+    model.check(move || {
+      let entries = initial + producers;
+      let links = Arc::new((0..entries).map(|_| QueueLink::new()).collect::<Vec<_>>());
+      let mut queue = LaneQueue::new();
+      for index in 0..initial {
+        queue.push(&links[..], index);
+      }
+      let depth = Arc::new(AtomicUsize::new(queue.len()));
+      let lane = Arc::new(Mutex::new(queue));
+      let sleeper = Arc::new(Mutex::new(LaneQueue::new()));
+      let parked = Arc::new(ParkedMask::new(2));
+      let kick = Arc::new(Mutex::new(None));
+      let mut threads: Vec<_> = (initial..entries)
+        .map(|index| {
+          let (links, lane, depth, sleeper, parked, kick) = (
+            Arc::clone(&links),
+            Arc::clone(&lane),
+            Arc::clone(&depth),
+            Arc::clone(&sleeper),
+            Arc::clone(&parked),
+            Arc::clone(&kick),
+          );
+          thread::spawn(move || {
+            let remains = {
+              let mut queue = lane.lock().unwrap();
+              queue.push(&links[..], index);
+              publish(&depth, &queue);
+              queue.len() != 0
+            };
+            if remains
+              && parked.any_live_parked()
+              && let Some(seat) = parked.claim_any(0)
+            {
+              assert_eq!(seat, 0);
+              let mut queue = sleeper.lock().unwrap();
+              let covered = queue.request_recheck() || queue.notified;
+              *kick.lock().unwrap() = Some(covered);
+            }
+            Vec::new()
+          })
+        })
+        .collect();
+      if pop {
+        let (links, lane, depth) = (Arc::clone(&links), Arc::clone(&lane), Arc::clone(&depth));
+        threads.push(thread::spawn(move || {
+          let mut queue = lane.lock().unwrap();
+          let popped = queue.pop(&links[..]);
+          publish(&depth, &queue);
+          popped.into_iter().collect()
+        }));
+      }
+      let mut taken = Vec::new();
+      let asleep = loop {
+        // The steal pre-check skips a lane whose published depth is zero.
+        if depth.load(Ordering::SeqCst) != 0 {
+          let chain = {
+            let mut queue = lane.lock().unwrap();
+            let chain = queue.steal_front(&links[..]);
+            publish(&depth, &queue);
+            chain
+          };
+          if let Some(chain) = chain {
+            taken.push(chain.into_single().unwrap());
+            continue;
+          }
+        }
+        break search_or_park(
+          0,
+          &parked,
+          &Searching::new(1),
+          std::iter::once((0, 0)).chain(std::iter::once_with(|| (1, depth.load(Ordering::SeqCst)))),
+          || 0,
+          true,
+        ) && sleeper.lock().unwrap().prepare_sleep();
+      };
+      for thread in threads {
+        taken.extend(thread.join().unwrap());
+      }
+      let mut queue = lane.lock().unwrap();
+      let remaining = queue.len();
+      assert_eq!(depth.load(Ordering::SeqCst), remaining, "inexact depth");
+      assert!(
+        !asleep || remaining == 0 || kick.lock().unwrap().is_some_and(|covered| covered),
+        "slept beside a non-empty lane without a covering kick"
+      );
+      while let Some(index) = queue.pop(&links[..]) {
+        taken.push(index);
+      }
+      taken.sort_unstable();
+      assert_eq!(taken, (0..entries).collect::<Vec<_>>());
+    });
+  }
+
+  #[test]
+  fn loom_depth_publication_push_and_pop_race_a_parking_dispatcher() {
+    for initial in [0, 1] {
+      depth_publication_park(initial, 1, true);
+    }
+  }
+
+  #[test]
+  fn loom_depth_publication_two_producers_race_a_stealing_parker() {
+    depth_publication_park(0, 2, false);
   }
 
   /// One busy owner keeps an entry queued. The last finder is about to run
@@ -1390,8 +1697,8 @@ mod loom_tests {
           let links = [QueueLink::new()];
           let mut own = LaneQueue::new();
           own.search_kick = true;
-          own.push(&links, 0);
-          assert_eq!(own.pop(&links), Some(0));
+          own.push(&links[..], 0);
+          assert_eq!(own.pop(&links[..]), Some(0));
           let woken = std::mem::take(&mut own.search_kick);
           let uncovered = woken && searching.acknowledge(false);
           if uncovered && depth.load(Ordering::SeqCst) != 0 {
@@ -1451,5 +1758,54 @@ mod loom_tests {
       assert_ne!(first.join().unwrap(), second.join().unwrap());
       assert_eq!(parked.claim_any(0), None);
     });
+  }
+}
+
+#[cfg(all(test, not(loom)))]
+mod cyclic_scan_tests {
+  use super::*;
+
+  #[test]
+  fn cyclic_find_matches_per_lane_scan() {
+    let mut seed = 0x1234_5678_9abc_def1u64;
+    let mut next = || {
+      seed ^= seed << 13;
+      seed ^= seed >> 7;
+      seed ^= seed << 17;
+      seed
+    };
+    for lanes in [1usize, 2, 3, 7, 8, 63, 64, 65, 127, 128, 130] {
+      for _ in 0..200 {
+        let mask = ParkedMask::new(lanes);
+        for lane in 0..lanes {
+          if next() % 3 == 0 {
+            mask.advertise(lane);
+          }
+          if next() % 7 == 0 {
+            mask.mark_dead(lane);
+          }
+        }
+        for start in 0..(2 * lanes + 3) {
+          let clear = (0..lanes)
+            .map(|offset| (start % lanes + offset) % lanes)
+            .find(|&lane| !mask.is_set(lane));
+          assert_eq!(mask.first_clear_from(start), clear, "clear {lanes} {start}");
+          let live = (0..lanes)
+            .map(|offset| (start % lanes + offset) % lanes)
+            .find(|&lane| !mask.is_dead(lane));
+          assert_eq!(mask.first_live_from(start), live, "live {lanes} {start}");
+          let mut seen = Vec::new();
+          let _ = mask.claim_any_with(start, |lane| {
+            seen.push(lane);
+            false
+          });
+          let expected: Vec<_> = (0..lanes)
+            .map(|offset| (start % lanes + offset) % lanes)
+            .filter(|&lane| !mask.is_dead(lane) && mask.is_set(lane))
+            .collect();
+          assert_eq!(seen, expected, "claim order {lanes} {start}");
+        }
+      }
+    }
   }
 }

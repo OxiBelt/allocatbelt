@@ -70,6 +70,14 @@ impl PollWord {
     }))
   }
 
+  /// A fresh word that already holds its first queue entry (`NOTIFIED`),
+  /// which the creator inserts; no wake can reach the task before then, so
+  /// the creator needs no notify of its own.
+  pub(crate) fn new_queued(join_interest: bool) -> Self {
+    let word = Self::new(join_interest);
+    Self(AtomicU64::new(word.load() | NOTIFIED))
+  }
+
   /// Records a wake with one RMW and reports which state it found. Only an
   /// idle word moves to `NOTIFIED` with a new queue entry; a running word
   /// gains `NOTIFIED`, and a queued or complete word keeps its state.
@@ -239,8 +247,14 @@ impl PollWord {
 pub(crate) struct TaskWord(PollWord);
 
 impl TaskWord {
+  #[cfg(any(test, loom))]
   pub(crate) fn new(join_interest: bool) -> Self {
     Self(PollWord::new(join_interest))
+  }
+
+  /// See [`PollWord::new_queued`].
+  pub(crate) fn new_queued(join_interest: bool) -> Self {
+    Self(PollWord::new_queued(join_interest))
   }
 
   /// See [`PollWord::notify`].

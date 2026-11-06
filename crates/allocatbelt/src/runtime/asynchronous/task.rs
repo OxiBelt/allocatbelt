@@ -110,16 +110,27 @@ enum WaiterState {
 /// word and the outcome in the one pinned [`TaskCell`]; terminal paths drop
 /// the future in place before publishing, even when stale handles retain
 /// the allocation, whose size (and `Control` charge) does not change.
+// `repr(C)` keeps the fields every poll reads (identity, reference,
+// resources, tenant presence) first; tenant-only state lives in one boxed
+// allocation that untenanted tasks do not have.
+#[repr(C)]
 pub(super) struct TaskBookkeeping {
   id: TaskId,
+  reference: TaskRef,
   resources: Option<ResourceScope>,
+  shared: Weak<Shared>,
   // Fixed at construction; only absence permits skipping tenant cleanup locks.
-  tenant: Option<TenantDomain>,
+  tenant: Option<Box<TenantTask>>,
+}
+
+/// The tenant-only half of a task's bookkeeping. Its box is charged in the
+/// task's `Control` bytes together with the task allocation.
+struct TenantTask {
+  domain: TenantDomain,
   waiter: Mutex<WaiterState>,
   task_admission: Mutex<Option<DomainReservation>>,
-  shared: Weak<Shared>,
-  reference: TaskRef,
-  // The whole allocation's charge, held until the last handle or waker.
+  // The task allocation's and this box's charge, held until the last
+  // handle or waker.
   _task_control: ControlCharge,
 }
 
@@ -131,22 +142,24 @@ pub(super) type Outcome<T> = Result<T, AsyncJoinError>;
 pub(super) type Task<F> = TaskCell<TaskBookkeeping, F, Outcome<<F as Future>::Output>>;
 
 impl TaskBookkeeping {
+  #[inline]
   fn release_waiter(&self) {
-    if self.tenant.is_none() {
+    let Some(tenant) = &self.tenant else {
       return;
-    }
+    };
     let waiter = std::mem::replace(
-      &mut *self.waiter.lock().unwrap_or_else(PoisonError::into_inner),
+      &mut *tenant.waiter.lock().unwrap_or_else(PoisonError::into_inner),
       WaiterState::Released,
     );
     drop(waiter);
   }
 
+  #[inline]
   fn release_task_admission(&self) {
-    if self.tenant.is_none() {
+    let Some(tenant) = &self.tenant else {
       return;
-    }
-    let admission = self
+    };
+    let admission = tenant
       .task_admission
       .lock()
       .unwrap_or_else(PoisonError::into_inner)
@@ -265,11 +278,15 @@ where
 
   fn acquire_cpu(&self, waker: &Waker) -> DomainCpuAdmission {
     let this = self.header();
-    let Some(tenant) = &this.tenant else {
+    let Some(tenant_task) = &this.tenant else {
       return DomainCpuAdmission::Unbounded;
     };
+    let tenant = &tenant_task.domain;
     let waiter = {
-      let mut state = this.waiter.lock().unwrap_or_else(PoisonError::into_inner);
+      let mut state = tenant_task
+        .waiter
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
       match std::mem::replace(&mut *state, WaiterState::InUse) {
         WaiterState::Available(waiter) => waiter,
         other => {
@@ -279,7 +296,10 @@ where
       }
     };
     let result = waiter.try_acquire_or_register(tenant, waker);
-    let mut state = this.waiter.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut state = tenant_task
+      .waiter
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner);
     if matches!(*state, WaiterState::Released) {
       drop(state);
       drop(waiter);
@@ -328,14 +348,25 @@ where
   F: Future + Send + 'static,
   F::Output: Send + 'static,
 {
+  /// The `Control` bytes of one task: the allocation, plus the boxed
+  /// tenant state of a tenant task.
+  pub(super) fn charged_bytes(tenant: bool) -> usize {
+    std::mem::size_of::<Self>()
+      + if tenant {
+        std::mem::size_of::<TenantTask>()
+      } else {
+        0
+      }
+  }
+
   /// Reserves the task count and the `Control` charge of the one task
-  /// allocation, which stores the future and its outcome inline. `F` can
-  /// itself be a `Pin<Box<dyn Future>>`; moving that value in does not box
-  /// it again.
+  /// allocation, which stores the future and its outcome inline, and of a
+  /// tenant task's boxed tenant state. `F` can itself be a
+  /// `Pin<Box<dyn Future>>`; moving that value in does not box it again.
   pub(super) fn reserve_domain_admission(
     tenant: Option<&TenantDomain>,
   ) -> Result<TaskDomainAdmission, DomainError> {
-    let bytes = std::mem::size_of::<Self>();
+    let bytes = Self::charged_bytes(tenant.is_some());
     let (task, task_control) = if let Some(tenant) = tenant {
       let request = DomainResources::ZERO
         .with(DomainResource::Tasks, 1)
@@ -371,21 +402,25 @@ where
       task: task_admission,
       task_control,
     } = domain;
-    debug_assert_eq!(task_control.bytes(), std::mem::size_of::<Self>());
+    debug_assert_eq!(task_control.bytes(), Self::charged_bytes(tenant.is_some()));
     #[cfg(all(test, not(loom)))]
     super::allocation_tests::record();
     // The one join handle shares the allocation; an abort handle clones the
     // same allocation again only when it is requested.
-    let (task, join) = TaskCell::new_with_join(
+    let (task, join) = TaskCell::new_with_join_queued(
       TaskBookkeeping {
         id,
-        resources,
-        tenant,
-        waiter: Mutex::new(waiter.map_or(WaiterState::Released, WaiterState::Available)),
-        task_admission: Mutex::new(task_admission),
-        shared,
         reference,
-        _task_control: task_control,
+        resources,
+        shared,
+        tenant: tenant.map(|domain| {
+          Box::new(TenantTask {
+            domain,
+            waiter: Mutex::new(waiter.map_or(WaiterState::Released, WaiterState::Available)),
+            task_admission: Mutex::new(task_admission),
+            _task_control: task_control,
+          })
+        }),
       },
       future,
       |task| -> Pin<Arc<dyn MergedJoin<F::Output>>> { task },
@@ -573,6 +608,19 @@ mod loom_cell {
       let task = Self::build(header, future, true);
       let join = erase(Pin::clone(&task));
       (task, TaskJoin::new(join))
+    }
+
+    pub(crate) fn new_with_join_queued<J>(
+      header: H,
+      future: F,
+      erase: impl FnOnce(Pin<Arc<Self>>) -> Pin<Arc<J>>,
+    ) -> (Pin<Arc<Self>>, TaskJoin<J>)
+    where
+      J: ?Sized + JoinSide<Output = O>,
+    {
+      let (task, join) = Self::new_with_join(header, future, erase);
+      assert_eq!(task.word.notify(), super::PollNotify::Enqueue);
+      (task, join)
     }
 
     pub(crate) fn header(&self) -> &H {
@@ -878,7 +926,7 @@ mod control_tests {
     let global_base = domain.snapshot().used.get(DomainResource::Control);
     let tenant_base = tenant.snapshot().unwrap().used.get(DomainResource::Control);
     type F = std::future::Ready<()>;
-    let expected = std::mem::size_of::<Task<F>>();
+    let expected = Task::<F>::charged_bytes(true);
     let admission = Task::<F>::reserve_domain_admission(Some(&tenant)).unwrap();
     assert_eq!(
       domain.snapshot().used.get(DomainResource::Control),
@@ -988,7 +1036,7 @@ mod control_tests {
         tenant_base + bytes
       );
     };
-    let task_bytes = std::mem::size_of::<Task<F>>();
+    let task_bytes = Task::<F>::charged_bytes(true);
     let before = super::super::allocation_tests::count();
     let mut admission = Task::<F>::reserve_domain_admission(Some(&tenant)).unwrap();
     admission.waiter = Some(pool.try_lease().unwrap());

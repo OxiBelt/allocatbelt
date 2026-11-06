@@ -743,10 +743,10 @@ fn stealing_last_entry_does_not_wake_or_lock_a_parked_dispatcher_case() {
     // Only the victim lock, plus the kick of a parked dispatcher while
     // entries remain; the lone stolen entry never enters the thief's lane.
     assert_eq!(locks, if count == 1 { 1 } else { 2 });
-    assert!(d.lane(0).check(&d.links).is_empty());
+    assert!(d.lane(0).check(&d.links()).is_empty());
     assert_eq!(d.parked.is_set(2), count == 1);
     assert_eq!(d.lane(2).take_recheck(), count != 1);
-    assert_eq!(d.lane(1).check(&d.links).len(), count - 1);
+    assert_eq!(d.lane(1).check(&d.links()).len(), count - 1);
     run(&shared, d.dispatch_decision(&shared, index).unwrap());
     for _ in 1..count {
       run(&shared, selected(&shared, 1).unwrap());
@@ -774,15 +774,15 @@ fn single_stolen_entry_is_returned_without_entering_the_thief_lane_case() {
         shared.spawn(root, async {}).unwrap()
       })
       .collect();
-    let queued = d.lane(1).check(&d.links);
+    let queued = d.lane(1).check(&d.links());
     let steals = d.steals.load(Ordering::Relaxed);
     let index = d.try_steal(&shared, 0, &mut 1).unwrap();
     assert_eq!(d.steals.load(Ordering::Relaxed) - steals, 1);
     // The oldest entry is returned; only a multi-entry steal reaches lane 0.
     assert_eq!(index, queued[0]);
     let taken = (count / 2).max(1);
-    assert_eq!(d.lane(0).check(&d.links), queued[1..taken]);
-    assert_eq!(d.lane(1).check(&d.links), queued[taken..]);
+    assert_eq!(d.lane(0).check(&d.links()), queued[1..taken]);
+    assert_eq!(d.lane(1).check(&d.links()), queued[taken..]);
     assert_eq!(
       shared.metrics.inner().lane_depth[0]
         .0
@@ -816,24 +816,24 @@ fn single_stolen_cleanup_entry_moves_to_overflow_and_is_cancelled_case() {
   let d = engine(&shared);
   d.next_lane.store(1, Ordering::Relaxed);
   let job = shared.spawn(root, async {}).unwrap();
-  let index = d.lane(1).check(&d.links)[0];
+  let index = d.lane(1).check(&d.links())[0];
   // An abort whose lane scan ran while the entry was detached by the steal.
   {
     let mut slot = d.slot(index);
-    d.links[index].cleanup.store(true, Ordering::SeqCst);
+    d.links()[index].cleanup.store(true, Ordering::SeqCst);
     // The entry stays queued on the word, so this abort routes nothing.
     assert!(slot.protocol.abort());
   }
   assert_eq!(d.try_steal(&shared, 0, &mut 1), None);
-  assert!(d.lane(0).check(&d.links).is_empty());
-  assert!(d.lane(1).check(&d.links).is_empty());
+  assert!(d.lane(0).check(&d.links()).is_empty());
+  assert!(d.lane(1).check(&d.links()).is_empty());
   assert_eq!(
     shared.metrics.inner().lane_depth[0]
       .0
       .load(Ordering::SeqCst),
     0
   );
-  assert_eq!(lock(&d.overflow, 4).check(&d.links), [index]);
+  assert_eq!(lock(&d.overflow, 4).check(&d.links()), [index]);
   assert_eq!(
     shared.metrics.inner().overflow_depth.load(Ordering::SeqCst),
     1
@@ -1040,7 +1040,7 @@ fn check_distributed(shared: &Shared) {
   let mut locations = vec![0usize; d.slots.len()];
   for seat in 0..d.lanes.len() {
     let queue = d.lane(seat);
-    let indices = queue.check(&d.links);
+    let indices = queue.check(&d.links());
     assert_eq!(
       indices.len(),
       shared.metrics.inner().lane_depth[seat]
@@ -1052,7 +1052,7 @@ fn check_distributed(shared: &Shared) {
     }
   }
   let queue = lock(&d.overflow, 4);
-  let indices = queue.check(&d.links);
+  let indices = queue.check(&d.links());
   assert_eq!(
     indices.len(),
     shared.metrics.inner().overflow_depth.load(Ordering::SeqCst)
@@ -1066,7 +1066,7 @@ fn check_distributed(shared: &Shared) {
   for scope in &state.scopes {
     if let Some(cell) = &scope.scope {
       let dispatch = d.scope(cell);
-      let indices = dispatch.check(&d.links);
+      let indices = dispatch.check(&d.links());
       blocked += indices.len();
       for index in indices {
         locations[index] += 1;
@@ -1359,7 +1359,7 @@ fn blocked_fifo_transfers_without_reblocking_and_abort_bypasses_quota_case() {
     assert!(selected(&shared, seat).is_none(), "quota bypass");
   }
   let d = engine(&shared);
-  let order = d.scope(&scope.cell).check(&d.links);
+  let order = d.scope(&scope.cell).check(&d.links());
   assert_eq!(order.len(), 5);
   check_distributed(&shared);
   // Aborting a blocked entry removes it without waiting for the holder.
@@ -1771,13 +1771,13 @@ fn search_takes_stealable_work_before_one_overflow_entry_case() {
   // Move one existing ready entry into overflow, preserving unique ownership.
   let overflow_index = {
     let mut queue = d.lane(1);
-    let index = queue.pop(&d.links).unwrap();
+    let index = queue.pop(&d.links()).unwrap();
     d.publish_depth(&shared, 1, &queue);
     index
   };
   {
     let mut queue = lock(&d.overflow, 4);
-    queue.push(&d.links, overflow_index);
+    queue.push(&d.links(), overflow_index);
   }
   shared
     .metrics
@@ -3458,8 +3458,8 @@ fn abort_while_running_requeues_to_cleanup_and_cancels_on_dispatch() {
   // Ready output after the abort would win; keep the poll pending.
   run(&shared, work);
   let d = engine(&shared);
-  assert_eq!(lock(&d.overflow, 4).check(&d.links), [reference.index]);
-  assert!(d.lane(0).check(&d.links).is_empty());
+  assert_eq!(lock(&d.overflow, 4).check(&d.links()), [reference.index]);
+  assert!(d.lane(0).check(&d.links()).is_empty());
   check_distributed(&shared);
   match selected(&shared, 0).unwrap() {
     work @ Selected::Cancel(..) => run(&shared, work),

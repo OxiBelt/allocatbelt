@@ -124,10 +124,14 @@ pub(crate) trait TaskHeader: Send + Sync + 'static {
 /// waker, pinned together.
 ///
 /// See the module documentation for the contract.
+// Declaration order is the layout: the poll state byte, the word and the
+// bookkeeping, which every poll reads, sit beside the `Arc` counts, ahead of
+// the future; the outcome and the join waker follow.
+#[repr(C)]
 pub(crate) struct TaskCell<H, F, O = ()> {
-  header: H,
   state: AtomicU8,
   word: TaskWord,
+  header: H,
   future: UnsafeCell<ManuallyDrop<F>>,
   output: UnsafeCell<Option<O>>,
   join_waker: UnsafeCell<JoinWakers>,
@@ -167,11 +171,16 @@ impl Drop for PollClaim<'_> {
 }
 
 impl<H, F, O> TaskCell<H, F, O> {
+  #[cfg(test)]
   fn build(header: H, future: F, join_interest: bool) -> Pin<Arc<Self>> {
+    Self::build_word(header, future, TaskWord::new(join_interest))
+  }
+
+  fn build_word(header: H, future: F, word: TaskWord) -> Pin<Arc<Self>> {
     Arc::pin(Self {
       header,
       state: AtomicU8::new(PRESENT),
-      word: TaskWord::new(join_interest),
+      word,
       future: UnsafeCell::new(ManuallyDrop::new(future)),
       output: UnsafeCell::new(None),
       join_waker: UnsafeCell::new(JoinWakers::default()),
@@ -189,6 +198,7 @@ impl<H, F, O> TaskCell<H, F, O> {
   /// Allocates the task and its one join handle. `erase` converts a clone
   /// of the allocation to the handle's (usually unsized) form and must
   /// return that same allocation.
+  #[cfg(test)]
   pub(crate) fn new_with_join<J>(
     header: H,
     future: F,
@@ -197,7 +207,32 @@ impl<H, F, O> TaskCell<H, F, O> {
   where
     J: ?Sized + JoinSide<Output = O>,
   {
-    let task = Self::build(header, future, true);
+    Self::with_join(Self::build(header, future, true), erase)
+  }
+
+  /// Like [`Self::new_with_join`], with the word already holding the
+  /// task's first queue entry, which the caller inserts.
+  pub(crate) fn new_with_join_queued<J>(
+    header: H,
+    future: F,
+    erase: impl FnOnce(Pin<Arc<Self>>) -> Pin<Arc<J>>,
+  ) -> (Pin<Arc<Self>>, TaskJoin<J>)
+  where
+    J: ?Sized + JoinSide<Output = O>,
+  {
+    Self::with_join(
+      Self::build_word(header, future, TaskWord::new_queued(true)),
+      erase,
+    )
+  }
+
+  fn with_join<J>(
+    task: Pin<Arc<Self>>,
+    erase: impl FnOnce(Pin<Arc<Self>>) -> Pin<Arc<J>>,
+  ) -> (Pin<Arc<Self>>, TaskJoin<J>)
+  where
+    J: ?Sized + JoinSide<Output = O>,
+  {
     let join = erase(Pin::clone(&task));
     assert!(
       std::ptr::addr_eq(

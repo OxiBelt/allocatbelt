@@ -31,8 +31,13 @@ thread_local! {
   static COOPERATIVE_POLL_ACTIVE: Cell<bool> = const { Cell::new(false) };
   static COOPERATIVE_POLL_DEPTH: Cell<u16> = const { Cell::new(0) };
   static LOCAL_EXECUTION: Cell<bool> = const { Cell::new(false) };
+  /// The polled task's identity, in a slot without a destructor
+  /// so each poll reaches it without the lazy-registration check.
+  static TASK_ID: Cell<Option<TaskId>> = const { Cell::new(None) };
+  /// Whether `TASK_CONTEXT.resources` may hold a scope; while
+  /// clear, a poll without resources leaves that slot alone.
+  static TASK_RESOURCES_SET: Cell<bool> = const { Cell::new(false) };
   static TASK_CONTEXT: RefCell<TaskContext> = const { RefCell::new(TaskContext {
-    task_id: Cell::new(None),
     resources: RefCell::new(None),
     #[cfg(debug_assertions)]
     lock_level: Cell::new(0),
@@ -40,7 +45,6 @@ thread_local! {
 }
 
 struct TaskContext {
-  task_id: Cell<Option<TaskId>>,
   resources: RefCell<Option<ResourceScope>>,
   #[cfg(debug_assertions)]
   lock_level: Cell<u8>,
@@ -215,6 +219,8 @@ impl Drop for WorkerContextGuard {
 pub(super) struct TaskContextGuard {
   previous: Option<TaskId>,
   previous_resources: Option<ResourceScope>,
+  /// Whether this guard replaced the resources slot.
+  swapped: bool,
   _not_send: PhantomData<Rc<()>>,
 }
 
@@ -223,36 +229,63 @@ impl TaskContextGuard {
     Self::enter_with_resource(task_id, None)
   }
 
+  #[inline]
   pub(super) fn enter_with_resource(
     task_id: Option<TaskId>,
     resources: Option<ResourceScope>,
   ) -> Self {
+    let previous = TASK_ID.replace(task_id);
+    // A poll without resources, entered while no resources are
+    // ambient, leaves the resources slot (and its borrow) alone.
+    if resources.is_none() && !TASK_RESOURCES_SET.get() {
+      return Self {
+        previous,
+        previous_resources: None,
+        swapped: false,
+        _not_send: PhantomData,
+      };
+    }
+    Self::enter_resources(previous, resources)
+  }
+
+  #[cold]
+  fn enter_resources(previous: Option<TaskId>, resources: Option<ResourceScope>) -> Self {
+    let set = resources.is_some();
     // Final runtime cleanup can run during thread-local destruction, after
-    // these slots are gone; the task then runs without an ambient context.
-    let (previous, previous_resources) = TASK_CONTEXT
-      .try_with(|current| {
-        let current = current.borrow();
-        let previous = current.task_id.replace(task_id);
-        let previous_resources = current.resources.replace(resources);
-        (previous, previous_resources)
-      })
-      .unwrap_or((None, None));
+    // these slots are gone; the task then runs without ambient resources.
+    let (previous_resources, swapped) = TASK_CONTEXT
+      .try_with(|current| (current.borrow().resources.replace(resources), true))
+      .unwrap_or((None, false));
+    if swapped {
+      TASK_RESOURCES_SET.set(set);
+    }
     Self {
       previous,
       previous_resources,
+      swapped,
       _not_send: PhantomData,
     }
   }
 }
 
 impl Drop for TaskContextGuard {
+  #[inline]
   fn drop(&mut self) {
+    TASK_ID.set(self.previous);
+    if self.swapped {
+      self.restore_resources();
+    }
+  }
+}
+
+impl TaskContextGuard {
+  #[cold]
+  fn restore_resources(&mut self) {
+    let previous = self.previous_resources.take();
+    let set = previous.is_some();
     let _ = TASK_CONTEXT.try_with(|current| {
-      let replaced = {
-        let current = current.borrow();
-        current.task_id.set(self.previous);
-        current.resources.replace(self.previous_resources.take())
-      };
+      let replaced = current.borrow().resources.replace(previous);
+      TASK_RESOURCES_SET.set(set);
       drop(replaced);
     });
   }
@@ -380,6 +413,7 @@ pub(super) struct CooperativePollGuard {
 }
 
 impl CooperativePollGuard {
+  #[inline]
   pub(super) fn enter() -> Self {
     let previous_active = COOPERATIVE_POLL_ACTIVE.with(|active| active.replace(true));
     let previous_budget = COOPERATIVE_BUDGET.with(|budget| budget.replace(DEFAULT_BUDGET));
@@ -394,6 +428,7 @@ impl CooperativePollGuard {
 }
 
 impl Drop for CooperativePollGuard {
+  #[inline]
   fn drop(&mut self) {
     let _ = COOPERATIVE_POLL_DEPTH.try_with(|depth| depth.set(self.previous_depth));
     let _ = COOPERATIVE_BUDGET.try_with(|budget| budget.set(self.previous_budget));
@@ -533,9 +568,7 @@ pub(in crate::runtime) fn poll_cooperative_composed<T>(
 /// Returns the identity of the task currently being polled or cleaned up.
 #[must_use]
 pub fn try_task_id() -> Option<TaskId> {
-  TASK_CONTEXT
-    .try_with(|current| current.borrow().task_id.get())
-    .unwrap_or(None)
+  TASK_ID.try_with(Cell::get).unwrap_or(None)
 }
 
 pub(super) fn dispatch_lock_level() -> u8 {
