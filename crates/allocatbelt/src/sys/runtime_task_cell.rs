@@ -9,15 +9,19 @@
 //! that creates the pinned reference, drops the value in place, reaches the
 //! outcome and waker cells and builds a `Waker` from the allocation. The
 //! runtime, which keeps `#![forbid(unsafe_code)]`, only calls the safe API
-//! below; its soundness does not depend on how the runtime orders or
-//! interleaves those calls.
+//! below. Its soundness does not depend on how the runtime orders or
+//! interleaves those calls, with one exception: [`PublishedTask::lend`],
+//! whose caller must hold the task's queue entry (see [`PublishedTask`]).
+//! Claims of the stored future need a [`ValueKey`], which only a turn that
+//! holds the task word's `RUNNING` can present, so their exclusion is a
+//! type-level requirement rather than a convention.
 //!
 //! # Contract
 //!
 //! The cell exists only inside a `Pin<Arc<TaskCell<H, F, O>>>`:
-//! [`TaskCell::new`] and [`TaskCell::new_with_join`] are the only
-//! constructors, and no API returns the cell by value, by `&mut` or as an
-//! unpinned `Arc` or `Weak`. Everything that touches the stored
+//! [`TaskCell::new_with_join_queued`] (and, in tests, `TaskCell::new` and
+//! `TaskCell::new_with_join`) are the only constructors, and no API returns
+//! the cell by value, by `&mut` or as an unpinned `Arc` or `Weak`. Everything that touches the stored
 //! future ([`TaskCell::poll_future`], [`TaskCell::drop_future`],
 //! [`TaskCell::finish`]) takes
 //! `self: Pin<&Self>`, which safe code can only obtain through that pinned
@@ -30,24 +34,34 @@
 //! ([`TaskCell::header`]). Unsizing a `Pin<Arc<TaskCell<H, F, O>>>` to a
 //! `Pin<Arc<dyn Trait>>` keeps all of this.
 //!
-//! The cell starts with a future (`PRESENT`). `poll_future` claims the
-//! cell with one compare-and-swap (`PRESENT` → `POLLING`), pins the future
-//! in place, polls it once and releases the claim with one release store.
-//! A poll that finds any other state, including a poll in progress on
-//! another thread or a reentrant poll from inside the future, is rejected
-//! without touching the future. After the future returns `Ready` the cell
-//! is `COMPLETE`; after its poll unwinds it is `POISONED`; both reject
-//! further polls and keep the value for in-place destruction. `drop_future`
-//! claims the value with one compare-and-swap (`PRESENT`, `COMPLETE` or
-//! `POISONED` → `ABSENT`) and drops it exactly once; it refuses while a poll
-//! is in progress, and the cell's own `Drop` drops a value that is still
-//! present. `finish` claims the cell from any of those states or `ABSENT`
-//! into `STORING`, drops a value still present in place, writes the outcome
-//! once and releases into the final `STORED`. Every claim is an acquire
-//! read-modify-write that observes the release of the previous claim, so the
-//! value and the outcome are only ever reached through one exclusive
-//! reference at a time, and everything a poll wrote is visible to the next
-//! poll or to the destructor on any thread.
+//! The cell starts with a future (`PRESENT`). Every claim of the value takes
+//! a [`ValueKey`]: proof, built only by this module from a [`Lease`] or an
+//! [`IdleTask`], that the caller holds the task word's `RUNNING` for this
+//! allocation. `RUNNING` is won by one compare-and-swap on the word and at
+//! most one turn holds it, and each turn's start reads, with Acquire
+//! ordering, the word the previous turn's end wrote with Release ordering
+//! (both are read-modify-writes on the word), so keyed claims never overlap
+//! and each one follows everything the previous key holder did. The only
+//! other access to the value is the cell's `Drop`, which has exclusive
+//! access.
+//!
+//! `poll_future` therefore claims the cell with a load and a store
+//! (`PRESENT` → `POLLING`) instead of a compare-and-swap, pins the future in
+//! place, polls it once and releases the claim with one release store. A
+//! poll that finds any other state, including a reentrant poll from inside
+//! the future, is rejected without touching the future. After the future
+//! returns `Ready` the cell is `COMPLETE`; after its poll unwinds it is
+//! `POISONED`; both reject further polls and keep the value for in-place
+//! destruction. `drop_future` claims the value with one compare-and-swap
+//! (`PRESENT`, `COMPLETE` or `POISONED` → `ABSENT`) and drops it exactly
+//! once; it refuses while a poll is in progress, and the cell's own `Drop`
+//! drops a value that is still present. `finish` claims the cell from any of
+//! those states or `ABSENT` into `STORING`, drops a value still present in
+//! place, writes the outcome once and releases into the final `STORED`. A
+//! key for another allocation is a caller bug and panics before the value is
+//! touched. Tests that drive a cell without a slot take the same `RUNNING`
+//! with one compare-and-swap (`TaskCell::claim_turn`); no caller reaches a
+//! claim without the word.
 //!
 //! The outcome and the join waker are governed by the task word (see
 //! `runtime_task_word.rs`): `publish` sets `COMPLETE` only after it observed
@@ -65,7 +79,13 @@
 //! While `RUNNING` is set no slot drops or gives up its owner except to that
 //! lease, so the lease's pointer stays valid; [`Lease::waker`] borrows a
 //! `Waker` from it that clones into an owned one only when user code keeps
-//! it.
+//! it. [`TaskSlot::take_idle`] gives the owner up only after it won
+//! `RUNNING` itself, which it never ends, so no lease can begin afterwards.
+//!
+//! The slot also writes the owner's pointer into a [`PublishedTask`] when it
+//! installs the owner, and clears it when it gives the owner up (`take`,
+//! `take_idle`), so a dispatcher that holds the task's queue entry can begin
+//! the turn without the lock that guards the slot.
 
 use std::any::Any;
 use std::cell::UnsafeCell;
@@ -145,11 +165,11 @@ struct NeverUnpin<'a>(std::marker::PhantomData<&'a ()>, PhantomPinned);
 impl<'a, H, F, O> Unpin for TaskCell<H, F, O> where NeverUnpin<'a>: Unpin {}
 
 // SAFETY: the stored future is reached only through `poll_future`,
-// `drop_future` and `finish`, each of which first claims the cell with an
-// acquire read-modify-write on `state` that succeeds for at most one caller
-// at a time (`POLLING`, `ABSENT`, `STORING` and `STORED` are states no other
-// claim of the value accepts), so two threads never hold references to it at
-// once. The outcome is written once under the `STORING` claim and afterwards
+// `drop_future` and `finish`, each of which needs a `ValueKey` for this
+// allocation, which only the one holder of the word's `RUNNING` can build,
+// and then claims the cell on `state` (`POLLING`, `ABSENT`, `STORING` and
+// `STORED` are states no other claim of the value accepts), so two threads
+// never hold references to it at once. The outcome is written once under the `STORING` claim and afterwards
 // reached by exactly one party chosen by the word's publication RMW; the
 // join waker is written only by the one `TaskJoin` while the word gives it
 // the cell, and otherwise only read (`Waker` is `Sync`). Outcome and waker
@@ -322,29 +342,40 @@ impl<H, F, O> TaskCell<H, F, O> {
     }
   }
 
-  /// Polls the stored future once, pinned in place.
+  /// Polls the stored future once, pinned in place, for the turn `key`
+  /// proves.
   ///
   /// Returns [`CellPoll::Rejected`] without touching the future when it is
-  /// not pollable, including while another poll is in progress. A panic in
-  /// the future's `poll` unwinds out of this call and poisons the cell.
-  pub(crate) fn poll_future(self: Pin<&Self>, cx: &mut Context<'_>) -> CellPoll<F::Output>
+  /// not pollable, including during a reentrant poll. A panic in the
+  /// future's `poll` unwinds out of this call and poisons the cell.
+  ///
+  /// # Panics
+  ///
+  /// When `key` was built for another allocation.
+  pub(crate) fn poll_future(
+    self: Pin<&Self>,
+    key: &ValueKey<'_>,
+    cx: &mut Context<'_>,
+  ) -> CellPoll<F::Output>
   where
     F: Future,
   {
-    if self
-      .state
-      .compare_exchange(PRESENT, POLLING, Ordering::Acquire, Ordering::Relaxed)
-      .is_err()
-    {
+    key.check(self.get_ref());
+    // Every claim needs a key, and only the one turn that holds `RUNNING`
+    // has one, so no other claim runs between this load and the store; the
+    // previous key holder's release reaches this load through the word.
+    if self.state.load(Ordering::Acquire) != PRESENT {
       return CellPoll::Rejected;
     }
+    self.state.store(POLLING, Ordering::Relaxed);
     let mut claim = PollClaim {
       state: &self.state,
       next: POISONED,
     };
     let pointer: *mut F = self.future.get().cast::<F>();
     // SAFETY: the claim above is the only path to the value while `state`
-    // is `POLLING`, so no other reference to it exists; `UnsafeCell` and
+    // is `POLLING`: every other claim needs a key that only this turn holds
+    // (a reentrant one finds `POLLING`), so no other reference to it exists; `UnsafeCell` and
     // `ManuallyDrop` are `repr(transparent)`, so the cast pointer is the
     // initialized, aligned `F` this cell was constructed with, which has
     // not been dropped (`drop_future` and `finish` refuse `POLLING`, and a
@@ -370,12 +401,13 @@ impl<H, F, O> TaskCell<H, F, O> {
     }
   }
 
-  /// Drops the stored future in place, exactly once. Returns whether this
-  /// call dropped it; `false` when it was dropped before or is being
-  /// polled. A panicking destructor unwinds out of this call after the
-  /// value counts as dropped.
+  /// Drops the stored future in place, exactly once, for the turn `key`
+  /// proves. Returns whether this call dropped it; `false` when it was
+  /// dropped before or is being polled. A panicking destructor unwinds out
+  /// of this call after the value counts as dropped.
   #[cfg(test)]
-  pub(crate) fn drop_future(self: Pin<&Self>) -> bool {
+  pub(crate) fn drop_future(self: Pin<&Self>, key: &ValueKey<'_>) -> bool {
+    key.check(self.get_ref());
     self.get_ref().drop_in_place()
   }
 
@@ -417,15 +449,22 @@ impl<H, F, O> TaskCell<H, F, O> {
     }
   }
 
-  /// Ends the task's execution once: drops a future that is still stored
-  /// (and not being polled) in place, then stores the outcome that `make`
-  /// builds from the destructor's panic payload, if any. Returns false,
-  /// without calling `make`, while a poll is in progress or once an
-  /// outcome was stored. A panic in `make` stores no outcome.
+  /// Ends the task's execution once, for the turn `key` proves: drops a
+  /// future that is still stored (and not being polled) in place, then
+  /// stores the outcome that `make` builds from the destructor's panic
+  /// payload, if any. Returns false, without calling `make`, while a poll is
+  /// in progress or once an outcome was stored. A panic in `make` stores no
+  /// outcome.
+  ///
+  /// # Panics
+  ///
+  /// When `key` was built for another allocation.
   pub(crate) fn finish(
     self: Pin<&Self>,
+    key: &ValueKey<'_>,
     make: impl FnOnce(Option<Box<dyn Any + Send>>) -> O,
   ) -> bool {
+    key.check(self.get_ref());
     let mut expected = PRESENT;
     let present = loop {
       match self
@@ -459,6 +498,19 @@ impl<H, F, O> TaskCell<H, F, O> {
     }
     drop(claim);
     true
+  }
+
+  /// Takes the task's turn outside the scheduler, for tests that drive a
+  /// cell without a slot: one compare-and-swap that sets `RUNNING` unless a
+  /// turn holds it or the task is complete. The turn ends when the guard
+  /// drops.
+  #[cfg(test)]
+  pub(crate) fn claim_turn(self: Pin<&Self>) -> Option<CellTurn<'_>> {
+    let word = self.get_ref().word.inner();
+    word.claim().then(|| CellTurn {
+      word,
+      cell: std::ptr::from_ref(self.get_ref()).cast::<()>(),
+    })
   }
 
   /// Publishes a stored outcome once: sets `COMPLETE`, wakes the join
@@ -581,7 +633,62 @@ impl<H: TaskHeader, F: Send + 'static, O: Send + 'static> TaskLend for TaskCell<
   }
 }
 
+/// Proof that the holder has a task's turn: the word's `RUNNING`, won by
+/// [`TaskSlot::lend`] (a [`Lease`]), by [`TaskSlot::take_idle`] (an
+/// [`IdleTask`]) or, in tests, by `TaskCell::claim_turn`, and not yet
+/// ended. Only this module builds one, for one allocation, and it borrows
+/// what holds the turn, so it cannot outlive it. Every claim of the stored
+/// value requires one. Neither `Send` nor `Sync`: it stays with the turn.
+pub(crate) struct ValueKey<'a> {
+  cell: *const (),
+  _turn: PhantomData<&'a ()>,
+}
+
+impl ValueKey<'_> {
+  fn new(cell: *const ()) -> Self {
+    Self {
+      cell,
+      _turn: PhantomData,
+    }
+  }
+
+  /// Panics unless the key was built for `cell`'s allocation.
+  #[inline]
+  fn check<C>(&self, cell: &C) {
+    assert!(
+      std::ptr::addr_eq(self.cell, std::ptr::from_ref(cell)),
+      "value key for another task"
+    );
+  }
+}
+
+/// A test's turn on a cell that no slot holds; see [`TaskCell::claim_turn`].
+#[cfg(test)]
+pub(crate) struct CellTurn<'a> {
+  word: &'a word::PollWord,
+  cell: *const (),
+}
+
+#[cfg(test)]
+impl CellTurn<'_> {
+  pub(crate) fn key(&self) -> ValueKey<'_> {
+    ValueKey::new(self.cell)
+  }
+}
+
+#[cfg(test)]
+impl Drop for CellTurn<'_> {
+  fn drop(&mut self) {
+    self.word.release_claim();
+  }
+}
+
 /// The scheduler's owner of one task, lent to one turn at a time.
+///
+/// The slot does not record which [`PublishedTask`] it published into:
+/// `install` requires an empty cell, and `take` and `take_idle` require the
+/// cell to hold the owner's own pointer, so a slot cannot give its owner up
+/// while another cell still names it.
 pub(crate) struct TaskSlot<T: ?Sized + TaskLend> {
   task: Option<Pin<Arc<T>>>,
 }
@@ -600,10 +707,33 @@ impl<T: ?Sized + TaskLend> TaskSlot<T> {
     self.task.as_ref()
   }
 
-  /// Installs an owner into an empty slot.
-  pub(crate) fn install(&mut self, task: Pin<Arc<T>>) {
+  /// Installs an owner into an empty slot and writes its pointer into
+  /// `published`, before the task's first queue entry is inserted (see
+  /// [`PublishedTask`]).
+  ///
+  /// # Panics
+  ///
+  /// When the slot is occupied, or `published` already holds a pointer.
+  pub(crate) fn install(&mut self, task: Pin<Arc<T>>, published: &PublishedTask<T>) {
     assert!(self.task.is_none(), "task slot already occupied");
+    assert!(published.held().is_none(), "task cell already published");
+    published.set(Some(arc_pointer(&task)));
     self.task = Some(task);
+  }
+
+  /// Clears the publication the owner was installed with.
+  fn unpublish(published: &PublishedTask<T>) {
+    published.set(None);
+  }
+
+  /// Panics unless `published` holds the installed owner's pointer (the
+  /// data address; the metadata of a `dyn` pointer is not compared).
+  fn check_publication(&self, published: &PublishedTask<T>) {
+    let matches = match (self.task.as_ref(), published.held()) {
+      (Some(task), Some(held)) => std::ptr::addr_eq(held.as_ptr(), arc_pointer(task).as_ptr()),
+      _ => false,
+    };
+    assert!(matches, "task published through another cell");
   }
 
   /// Begins a turn for the installed task's queue entry and lends it to
@@ -618,31 +748,48 @@ impl<T: ?Sized + TaskLend> TaskSlot<T> {
     })
   }
 
-  /// Ends the final turn: hands the lent owner to it. The word stays
-  /// `RUNNING` (publication then sets `COMPLETE`).
+  /// Ends the final turn: clears the publication and hands the lent owner
+  /// to the turn. The word stays `RUNNING` (publication then sets
+  /// `COMPLETE`).
   ///
   /// # Panics
   ///
-  /// When the lease is not for the task in this slot.
-  pub(crate) fn take(&mut self, lease: Lease<T>) -> Pin<Arc<T>> {
+  /// When the lease is not for the task in this slot, or `published` does
+  /// not hold the owner's pointer.
+  pub(crate) fn take(&mut self, lease: Lease<T>, published: &PublishedTask<T>) -> Pin<Arc<T>> {
     let lent = lease.task.as_ptr().cast_const();
-    let task = self
+    let matches = self
       .task
-      .take_if(|task| std::ptr::addr_eq(std::ptr::from_ref::<T>(task), lent));
-    let Some(task) = task else {
-      panic!("lease returned to another task slot");
+      .as_ref()
+      .is_some_and(|task| std::ptr::addr_eq(std::ptr::from_ref::<T>(task), lent));
+    assert!(matches, "lease returned to another task slot");
+    self.check_publication(published);
+    Self::unpublish(published);
+    let Some(task) = self.task.take() else {
+      unreachable!("checked above");
     };
     std::mem::forget(lease);
     task
   }
 
-  /// Takes the owner of a task that no turn holds; `None` when empty or
-  /// while a lease is out.
-  pub(crate) fn take_idle(&mut self) -> Option<Pin<Arc<T>>> {
-    if self.task.as_ref()?.lend_word(LendKey(())).is_running() {
+  /// Takes the owner of a task that no turn holds, as its final owner:
+  /// wins `RUNNING` for good (no lease can begin afterwards) and clears the
+  /// publication. `None` when empty, while a lease is out, or once complete.
+  ///
+  /// # Panics
+  ///
+  /// When `published` does not hold the owner's pointer.
+  pub(crate) fn take_idle(&mut self, published: &PublishedTask<T>) -> Option<IdleTask<T>> {
+    let task = self.task.as_ref()?;
+    self.check_publication(published);
+    if !task.lend_word(LendKey(())).claim() {
       return None;
     }
-    self.task.take()
+    Self::unpublish(published);
+    self.task.take().map(|task| IdleTask {
+      task,
+      _not_sync: PhantomData,
+    })
   }
 }
 
@@ -654,6 +801,112 @@ impl<T: ?Sized + TaskLend> Drop for TaskSlot<T> {
       // A lease may still point into the allocation: keep it alive.
       std::mem::forget(task);
     }
+  }
+}
+
+/// The final owner of a task that no turn held, from
+/// [`TaskSlot::take_idle`]. It holds the task's `RUNNING` for good, so it
+/// may claim the value ([`IdleTask::key`]) and no lease begins afterwards.
+/// Not `Sync`: like a [`Lease`], its keys stay on the one thread that holds
+/// the turn, so two threads never claim the value through one turn.
+pub(crate) struct IdleTask<T: ?Sized + TaskLend> {
+  task: Pin<Arc<T>>,
+  _not_sync: PhantomData<std::cell::Cell<()>>,
+}
+
+impl<T: ?Sized + TaskLend> IdleTask<T> {
+  pub(crate) fn task(&self) -> Pin<&T> {
+    self.task.as_ref()
+  }
+
+  pub(crate) fn key(&self) -> ValueKey<'_> {
+    ValueKey::new(arc_pointer(&self.task).as_ptr().cast_const().cast::<()>())
+  }
+}
+
+/// A slot's copy of its installed task's pointer, which the dispatcher that
+/// dequeued the task's queue entry reads without the lock guarding the
+/// slot, to begin the turn.
+///
+/// Only [`TaskSlot`] writes it: `install` before the task's first queue
+/// entry is inserted, `take` in the final turn and `take_idle` when no
+/// dispatcher exists. The slot gives its owner up only together with
+/// clearing the pointer, so a published pointer always names a live owner.
+///
+/// [`PublishedTask::lend`] relies on its caller in a way the type system does
+/// not express: its caller holds the task's one queue entry, which it
+/// dequeued after the insertion that followed `install`. While that entry
+/// exists the task is not in a final turn (which consumes the entry), so
+/// none of the writers runs concurrently: the entry's insertion orders
+/// `install`'s write before the read, and `take` follows the read through
+/// the word's `RUNNING`, which the read's `begin` took. The runtime's queues
+/// hold at most one entry per task (the word's `NOTIFIED` decides who
+/// inserts it), so this is the dispatcher's own invariant.
+pub(crate) struct PublishedTask<T: ?Sized + TaskLend> {
+  task: UnsafeCell<Option<NonNull<T>>>,
+}
+
+#[expect(unsafe_code, reason = "dispatchers holding an entry read the pointer")]
+// SAFETY: the cell is written only by `TaskSlot` (`install`, `take`,
+// `take_idle`) while no dispatcher may read it, and read only by the holder
+// of the task's queue entry, ordered after the write by the entry's
+// insertion (see the type's documentation); the pointee is
+// `Send + Sync` (`TaskLend`).
+unsafe impl<T: ?Sized + TaskLend> Sync for PublishedTask<T> {}
+#[expect(unsafe_code, reason = "the published pointer moves with its slot")]
+// SAFETY: the pointer names a `Send + Sync` task (`TaskLend`) and gives no
+// ownership; moving the cell moves only that address.
+unsafe impl<T: ?Sized + TaskLend> Send for PublishedTask<T> {}
+
+impl<T: ?Sized + TaskLend> PublishedTask<T> {
+  pub(crate) const fn empty() -> Self {
+    Self {
+      task: UnsafeCell::new(None),
+    }
+  }
+
+  /// The pointer the cell holds; only `TaskSlot` calls this, just before
+  /// its own write at `install`, `take` and `take_idle`.
+  fn held(&self) -> Option<NonNull<T>> {
+    // SAFETY: the slot reads the cell only where it is about to write it
+    // (see `set`), so no write overlaps this read; a dispatcher's read
+    // could overlap only another read.
+    #[expect(unsafe_code, reason = "the slot's read of the published pointer")]
+    unsafe {
+      *self.task.get()
+    }
+  }
+
+  /// Writes the pointer; only `TaskSlot` calls this, while no dispatcher
+  /// may read the cell.
+  fn set(&self, pointer: Option<NonNull<T>>) {
+    // SAFETY: the slot writes the cell before the first queue entry of its
+    // task is inserted, in the final turn that consumed the only entry, or
+    // when no dispatcher exists, so no read overlaps this write.
+    #[expect(unsafe_code, reason = "the slot's write of the published pointer")]
+    unsafe {
+      *self.task.get() = pointer;
+    }
+  }
+
+  /// Begins a turn for the caller's dequeued queue entry without the slot's
+  /// lock. `None` when nothing is published or the word is not queued.
+  ///
+  /// The caller must hold the task's queue entry (see the type's
+  /// documentation).
+  pub(crate) fn lend(&self) -> Option<Lease<T>> {
+    // SAFETY: the caller holds the task's queue entry, whose insertion
+    // followed the slot's last write, and no writer runs while it exists.
+    #[expect(unsafe_code, reason = "reads the published pointer")]
+    let pointer = unsafe { *self.task.get() }?;
+    // SAFETY: a published pointer names the slot's live owner, and the
+    // slot keeps that owner while the caller's entry exists.
+    #[expect(unsafe_code, reason = "borrows the slot-owned task")]
+    let task = unsafe { pointer.as_ref() };
+    if !task.lend_word(LendKey(())).begin() {
+      return None;
+    }
+    Some(Lease { task: pointer })
   }
 }
 
@@ -699,6 +952,12 @@ impl<T: ?Sized + TaskLend> Lease<T> {
     unsafe {
       Pin::new_unchecked(task)
     }
+  }
+
+  /// The key for claims of the lent task's value during this turn.
+  #[inline]
+  pub(crate) fn key(&self) -> ValueKey<'_> {
+    ValueKey::new(self.task.as_ptr().cast_const().cast::<()>())
   }
 
   /// A `Waker` borrowed from the lent task, without a reference count.
@@ -871,6 +1130,45 @@ mod tests {
   use std::sync::Mutex;
   use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
+  /// A dispatcher's claim, under a turn taken for it: a turn already held
+  /// (a poll in progress on any thread, or a reentrant call) rejects.
+  trait PollTurn {
+    type Output;
+    fn poll_turn(self, cx: &mut Context<'_>) -> CellPoll<Self::Output>;
+  }
+
+  impl<H, F: Future, O> PollTurn for Pin<&TaskCell<H, F, O>> {
+    type Output = F::Output;
+
+    fn poll_turn(self, cx: &mut Context<'_>) -> CellPoll<F::Output> {
+      match self.claim_turn() {
+        Some(turn) => self.poll_future(&turn.key(), cx),
+        None => CellPoll::Rejected,
+      }
+    }
+  }
+
+  /// `drop_future` and `finish` under a turn taken for them; `false` while
+  /// a turn is held.
+  trait ValueTurn<O> {
+    fn drop_turn(self) -> bool;
+    fn finish_turn(self, make: impl FnOnce(Option<Box<dyn Any + Send>>) -> O) -> bool;
+  }
+
+  impl<H, F, O> ValueTurn<O> for Pin<&TaskCell<H, F, O>> {
+    fn drop_turn(self) -> bool {
+      self
+        .claim_turn()
+        .is_some_and(|turn| self.drop_future(&turn.key()))
+    }
+
+    fn finish_turn(self, make: impl FnOnce(Option<Box<dyn Any + Send>>) -> O) -> bool {
+      self
+        .claim_turn()
+        .is_some_and(|turn| self.finish(&turn.key(), make))
+    }
+  }
+
   fn context() -> Context<'static> {
     Context::from_waker(Waker::noop())
   }
@@ -952,29 +1250,29 @@ mod tests {
     let (future, dropped) = countdown(2);
     let cell = cell(future);
     assert!(matches!(
-      cell.as_ref().poll_future(&mut context()),
+      cell.as_ref().poll_turn(&mut context()),
       CellPoll::Pending
     ));
     assert!(matches!(
-      cell.as_ref().poll_future(&mut context()),
+      cell.as_ref().poll_turn(&mut context()),
       CellPoll::Pending
     ));
     assert!(matches!(
-      cell.as_ref().poll_future(&mut context()),
+      cell.as_ref().poll_turn(&mut context()),
       CellPoll::Ready(7)
     ));
     assert!(cell.holds_value());
     assert!(!dropped.load(Ordering::SeqCst));
     assert!(matches!(
-      cell.as_ref().poll_future(&mut context()),
+      cell.as_ref().poll_turn(&mut context()),
       CellPoll::Rejected
     ));
-    assert!(cell.as_ref().drop_future());
+    assert!(cell.as_ref().drop_turn());
     assert!(dropped.load(Ordering::SeqCst));
     assert!(!cell.holds_value());
-    assert!(!cell.as_ref().drop_future());
+    assert!(!cell.as_ref().drop_turn());
     assert!(matches!(
-      cell.as_ref().poll_future(&mut context()),
+      cell.as_ref().poll_turn(&mut context()),
       CellPoll::Rejected
     ));
     drop(cell);
@@ -985,16 +1283,16 @@ mod tests {
     let (future, dropped) = countdown(5);
     let cell = cell(future);
     assert!(matches!(
-      cell.as_ref().poll_future(&mut context()),
+      cell.as_ref().poll_turn(&mut context()),
       CellPoll::Pending
     ));
-    assert!(cell.as_ref().drop_future());
+    assert!(cell.as_ref().drop_turn());
     assert!(dropped.load(Ordering::SeqCst));
     assert!(matches!(
-      cell.as_ref().poll_future(&mut context()),
+      cell.as_ref().poll_turn(&mut context()),
       CellPoll::Rejected
     ));
-    assert!(!cell.as_ref().drop_future());
+    assert!(!cell.as_ref().drop_turn());
   }
 
   #[test]
@@ -1006,7 +1304,7 @@ mod tests {
     let (future, dropped) = countdown(0);
     let complete = cell(future);
     assert!(matches!(
-      complete.as_ref().poll_future(&mut context()),
+      complete.as_ref().poll_turn(&mut context()),
       CellPoll::Ready(7)
     ));
     drop(complete);
@@ -1014,7 +1312,7 @@ mod tests {
 
     let (future, dropped) = countdown(0);
     let absent = cell(future);
-    assert!(absent.as_ref().drop_future());
+    assert!(absent.as_ref().drop_turn());
     drop(absent);
     assert!(dropped.load(Ordering::SeqCst));
   }
@@ -1107,19 +1405,19 @@ mod tests {
       dropped: Arc::clone(&dropped),
     });
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-      cell.as_ref().poll_future(&mut context())
+      cell.as_ref().poll_turn(&mut context())
     }));
     let payload = unwound.expect_err("the poll panic unwinds out of the cell");
     assert_eq!(payload.downcast_ref::<&str>(), Some(&"poll panic"));
     assert!(cell.holds_value());
     assert!(!dropped.load(Ordering::SeqCst));
     assert!(matches!(
-      cell.as_ref().poll_future(&mut context()),
+      cell.as_ref().poll_turn(&mut context()),
       CellPoll::Rejected
     ));
-    assert!(cell.as_ref().drop_future());
+    assert!(cell.as_ref().drop_turn());
     assert!(dropped.load(Ordering::SeqCst));
-    assert!(!cell.as_ref().drop_future());
+    assert!(!cell.as_ref().drop_turn());
   }
 
   #[test]
@@ -1135,20 +1433,20 @@ mod tests {
       panic!("boom");
     });
     assert!(matches!(
-      cell.as_ref().poll_future(&mut context()),
+      cell.as_ref().poll_turn(&mut context()),
       CellPoll::Pending
     ));
     assert!(
       std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cell.as_ref().poll_future(&mut context())
+        cell.as_ref().poll_turn(&mut context())
       }))
       .is_err()
     );
     assert!(matches!(
-      cell.as_ref().poll_future(&mut context()),
+      cell.as_ref().poll_turn(&mut context()),
       CellPoll::Rejected
     ));
-    assert!(cell.as_ref().drop_future());
+    assert!(cell.as_ref().drop_turn());
   }
 
   #[test]
@@ -1167,14 +1465,14 @@ mod tests {
     }
     let cell = cell(PanicOnDrop);
     assert!(matches!(
-      cell.as_ref().poll_future(&mut context()),
+      cell.as_ref().poll_turn(&mut context()),
       CellPoll::Ready(())
     ));
     let unwound =
-      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cell.as_ref().drop_future()));
+      std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cell.as_ref().drop_turn()));
     assert!(unwound.is_err());
     assert!(!cell.holds_value());
-    assert!(!cell.as_ref().drop_future());
+    assert!(!cell.as_ref().drop_turn());
     // The cell's own destructor must not run the destructor again.
     drop(cell);
   }
@@ -1197,7 +1495,7 @@ mod tests {
     let drops = Arc::new(AtomicU64::new(0));
     let cell = cell(PanicOnDrop(Arc::clone(&drops)));
     assert!(matches!(
-      cell.as_ref().poll_future(&mut context()),
+      cell.as_ref().poll_turn(&mut context()),
       CellPoll::Pending
     ));
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(cell)));
@@ -1216,8 +1514,8 @@ mod tests {
       type Output = ();
       fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let cell = self.cell.lock().unwrap().take().expect("cell handed in");
-        assert!(matches!(cell.as_ref().poll_future(cx), CellPoll::Rejected));
-        assert!(!cell.as_ref().drop_future());
+        assert!(matches!(cell.as_ref().poll_turn(cx), CellPoll::Rejected));
+        assert!(!cell.as_ref().drop_turn());
         self.observed.store(true, Ordering::SeqCst);
         Poll::Pending
       }
@@ -1230,11 +1528,11 @@ mod tests {
     });
     *slot.lock().unwrap() = Some(Pin::clone(&reentrant));
     assert!(matches!(
-      reentrant.as_ref().poll_future(&mut context()),
+      reentrant.as_ref().poll_turn(&mut context()),
       CellPoll::Pending
     ));
     assert!(observed.load(Ordering::SeqCst));
-    assert!(reentrant.as_ref().drop_future());
+    assert!(reentrant.as_ref().drop_turn());
 
     // Two threads: the first poll blocks inside the future until the second
     // thread has been rejected.
@@ -1260,19 +1558,19 @@ mod tests {
     });
     let poller = {
       let gate = Pin::clone(&gate);
-      std::thread::spawn(move || gate.as_ref().poll_future(&mut context()))
+      std::thread::spawn(move || gate.as_ref().poll_turn(&mut context()))
     };
     while !entered.load(Ordering::SeqCst) {
       std::thread::yield_now();
     }
     assert!(matches!(
-      gate.as_ref().poll_future(&mut context()),
+      gate.as_ref().poll_turn(&mut context()),
       CellPoll::Rejected
     ));
-    assert!(!gate.as_ref().drop_future());
+    assert!(!gate.as_ref().drop_turn());
     release.store(true, Ordering::SeqCst);
     assert!(matches!(poller.join().unwrap(), CellPoll::Pending));
-    assert!(gate.as_ref().drop_future());
+    assert!(gate.as_ref().drop_turn());
   }
 
   #[test]
@@ -1291,10 +1589,10 @@ mod tests {
       fn drop(&mut self) {
         let cell = self.cell.lock().unwrap().take().expect("cell handed in");
         assert!(matches!(
-          cell.as_ref().poll_future(&mut context()),
+          cell.as_ref().poll_turn(&mut context()),
           CellPoll::Rejected
         ));
-        assert!(!cell.as_ref().drop_future());
+        assert!(!cell.as_ref().drop_turn());
         self.saw.store(true, Ordering::SeqCst);
       }
     }
@@ -1306,10 +1604,10 @@ mod tests {
     });
     *slot.lock().unwrap() = Some(Pin::clone(&reenter));
     assert!(matches!(
-      reenter.as_ref().poll_future(&mut context()),
+      reenter.as_ref().poll_turn(&mut context()),
       CellPoll::Pending
     ));
-    assert!(reenter.as_ref().drop_future());
+    assert!(reenter.as_ref().drop_turn());
     assert!(saw.load(Ordering::SeqCst));
     drop(reenter);
   }
@@ -1350,27 +1648,27 @@ mod tests {
     let suspended = cell(block(DropFlag(witness)));
     for _ in 0..2 {
       assert!(matches!(
-        suspended.as_ref().poll_future(&mut context()),
+        suspended.as_ref().poll_turn(&mut context()),
         CellPoll::Pending
       ));
     }
     assert!(!dropped.load(Ordering::SeqCst));
-    assert!(suspended.as_ref().drop_future());
+    assert!(suspended.as_ref().drop_turn());
     assert!(dropped.load(Ordering::SeqCst));
     // Polled to completion: the output reads through the self-reference.
     let flag = DropFlag(Arc::new(AtomicBool::new(false)));
     let completed = cell(block(flag));
     for _ in 0..3 {
       assert!(matches!(
-        completed.as_ref().poll_future(&mut context()),
+        completed.as_ref().poll_turn(&mut context()),
         CellPoll::Pending
       ));
     }
     assert!(matches!(
-      completed.as_ref().poll_future(&mut context()),
+      completed.as_ref().poll_turn(&mut context()),
       CellPoll::Ready(10)
     ));
-    assert!(completed.as_ref().drop_future());
+    assert!(completed.as_ref().drop_turn());
   }
 
   /// The first reviewer probe in its only expressible form: a future that
@@ -1384,28 +1682,28 @@ mod tests {
   fn suspended_self_borrow_is_dropped_in_place() {
     let last_owner = cell(self_borrowing_block());
     assert!(matches!(
-      last_owner.as_ref().poll_future(&mut context()),
+      last_owner.as_ref().poll_turn(&mut context()),
       CellPoll::Pending
     ));
     drop(last_owner);
 
     let explicit = cell(self_borrowing_block());
     assert!(matches!(
-      explicit.as_ref().poll_future(&mut context()),
+      explicit.as_ref().poll_turn(&mut context()),
       CellPoll::Pending
     ));
-    assert!(explicit.as_ref().drop_future());
+    assert!(explicit.as_ref().drop_turn());
     drop(explicit);
 
     let polled = cell(self_borrowing_block());
     let stale = Pin::clone(&polled);
     assert!(matches!(
-      polled.as_ref().poll_future(&mut context()),
+      polled.as_ref().poll_turn(&mut context()),
       CellPoll::Pending
     ));
     drop(polled);
     assert!(matches!(
-      stale.as_ref().poll_future(&mut context()),
+      stale.as_ref().poll_turn(&mut context()),
       CellPoll::Ready(6)
     ));
   }
@@ -1480,7 +1778,7 @@ mod tests {
     });
     let stale = Pin::clone(&node);
     assert!(matches!(
-      node.as_ref().poll_future(&mut context()),
+      node.as_ref().poll_turn(&mut context()),
       CellPoll::Pending
     ));
     registry.notify();
@@ -1488,7 +1786,7 @@ mod tests {
     // The stale owner keeps the node registered and at its address.
     registry.notify();
     assert_eq!(registry.hits.load(Ordering::SeqCst), 2);
-    assert!(stale.as_ref().drop_future());
+    assert!(stale.as_ref().drop_turn());
     assert!(registry.node.lock().unwrap().is_null());
     registry.notify();
     assert_eq!(registry.hits.load(Ordering::SeqCst), 2);
@@ -1544,7 +1842,7 @@ mod tests {
         std::thread::spawn(move || {
           for _ in 0..3 {
             assert!(matches!(
-              shared.as_ref().poll_future(&mut context()),
+              shared.as_ref().poll_turn(&mut context()),
               CellPoll::Pending
             ));
           }
@@ -1557,7 +1855,7 @@ mod tests {
           while !polled.load(Ordering::Relaxed) {
             std::thread::yield_now();
           }
-          assert!(shared.as_ref().drop_future());
+          assert!(shared.as_ref().drop_turn());
         })
       };
       dropper.join().unwrap();
@@ -1575,7 +1873,7 @@ mod tests {
       std::thread::spawn(move || {
         for _ in 0..2 {
           assert!(matches!(
-            shared.as_ref().poll_future(&mut context()),
+            shared.as_ref().poll_turn(&mut context()),
             CellPoll::Pending
           ));
         }
@@ -1605,7 +1903,7 @@ mod tests {
           let shared = Pin::clone(&shared);
           std::thread::spawn(move || {
             loop {
-              match shared.as_ref().poll_future(&mut context()) {
+              match shared.as_ref().poll_turn(&mut context()) {
                 CellPoll::Pending => break,
                 CellPoll::Ready(polls) => panic!("ready after {polls} polls"),
                 CellPoll::Rejected => std::thread::yield_now(),
@@ -1618,10 +1916,10 @@ mod tests {
         poller.join().unwrap();
       }
       assert!(matches!(
-        shared.as_ref().poll_future(&mut context()),
+        shared.as_ref().poll_turn(&mut context()),
         CellPoll::Ready(4)
       ));
-      assert!(shared.as_ref().drop_future());
+      assert!(shared.as_ref().drop_turn());
     }
   }
 
@@ -1688,15 +1986,15 @@ mod tests {
     let (future, dropped) = countdown(5);
     let (task, mut join) = joined(future);
     assert!(!task.publish().published);
-    assert!(task.as_ref().finish(|payload| {
+    assert!(task.as_ref().finish_turn(|payload| {
       assert!(payload.is_none());
       9
     }));
     assert!(dropped.load(Ordering::SeqCst));
     assert!(!task.holds_value());
-    assert!(!task.as_ref().finish(|_| unreachable!("stored twice")));
+    assert!(!task.as_ref().finish_turn(|_| unreachable!("stored twice")));
     assert!(matches!(
-      task.as_ref().poll_future(&mut context()),
+      task.as_ref().poll_turn(&mut context()),
       CellPoll::Rejected
     ));
     assert!(join.take().is_none());
@@ -1714,7 +2012,11 @@ mod tests {
       type Output = ();
       fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
         let cell = self.0.lock().unwrap().clone().unwrap();
-        assert!(!cell.as_ref().finish(|_| unreachable!("finished mid-poll")));
+        assert!(
+          !cell
+            .as_ref()
+            .finish_turn(|_| unreachable!("finished mid-poll"))
+        );
         Poll::Pending
       }
     }
@@ -1722,7 +2024,7 @@ mod tests {
     let cell = cell(FinishWhilePolling(Arc::clone(&slot)));
     *slot.lock().unwrap() = Some(Pin::clone(&cell));
     assert!(matches!(
-      cell.as_ref().poll_future(&mut context()),
+      cell.as_ref().poll_turn(&mut context()),
       CellPoll::Pending
     ));
     slot.lock().unwrap().take();
@@ -1740,7 +2042,11 @@ mod tests {
       }
     }
     let (task, mut join) = joined(PanicOnDrop);
-    assert!(task.as_ref().finish(|payload| u64::from(payload.is_some())));
+    assert!(
+      task
+        .as_ref()
+        .finish_turn(|payload| u64::from(payload.is_some()))
+    );
     assert!(task.publish().published);
     assert_eq!(join.take(), Some(Some(1)));
   }
@@ -1762,7 +2068,7 @@ mod tests {
     assert!(join.poll_complete(&third_waker).is_pending());
     assert_eq!(Arc::strong_count(&second), 2);
     assert_eq!(Arc::strong_count(&first), 3);
-    assert!(task.as_ref().finish(|_| 4));
+    assert!(task.as_ref().finish_turn(|_| 4));
     let publication = task.publish();
     assert!(publication.output.is_none());
     assert!(publication.wakers.join.is_none() && publication.wakers.finished.is_none());
@@ -1790,7 +2096,7 @@ mod tests {
       let (joiner, _, join_waker) = probe();
       assert!(join.poll_complete(&finished_waker).is_pending());
       let publisher = std::thread::spawn(move || {
-        assert!(task.as_ref().finish(|_| 5));
+        assert!(task.as_ref().finish_turn(|_| 5));
         drop(task.publish());
       });
       let polled = join.poll(&join_waker);
@@ -1817,7 +2123,7 @@ mod tests {
     drop(probe);
     drop(join);
     assert_eq!(drops.load(Ordering::Relaxed), 1);
-    assert!(task.as_ref().finish(|_| 6));
+    assert!(task.as_ref().finish_turn(|_| 6));
     let publication = task.publish();
     assert_eq!(publication.output, Some(6));
     assert!(publication.wakers.join.is_none() && publication.wakers.finished.is_none());
@@ -1840,7 +2146,7 @@ mod tests {
       let (task, mut join) = joined(std::future::pending::<()>());
       let (probe, drops, waker) = probe();
       let publisher = std::thread::spawn(move || {
-        assert!(task.as_ref().finish(|_| 11));
+        assert!(task.as_ref().finish_turn(|_| 11));
         let publication = task.publish();
         assert!(publication.published && publication.output.is_none());
         drop(publication);
@@ -1868,7 +2174,7 @@ mod tests {
       let output_seen = Arc::new(AtomicUsize::new(0));
       let seen = Arc::clone(&output_seen);
       let publisher = std::thread::spawn(move || {
-        assert!(task.as_ref().finish(|_| 12));
+        assert!(task.as_ref().finish_turn(|_| 12));
         let publication = task.publish();
         if publication.output.is_some() {
           seen.fetch_add(1, Ordering::Relaxed);
@@ -1892,29 +2198,34 @@ mod tests {
 
   type Counted = TaskCell<CountHeader, Countdown, ()>;
 
-  fn queued_slot(remaining: u32) -> (TaskSlot<Counted>, Pin<Arc<Counted>>, Arc<AtomicBool>) {
+  type QueuedSlot = (TaskSlot<Counted>, Pin<Arc<Counted>>, Arc<AtomicBool>);
+
+  /// A slot holding a queued task, published into `published`.
+  fn queued_slot(remaining: u32, published: &PublishedTask<Counted>) -> QueuedSlot {
     let (future, dropped) = countdown(remaining);
     let task = TaskCell::new(CountHeader(AtomicUsize::new(0)), future);
     assert_eq!(task.word().notify(), PollNotify::Enqueue);
     let mut slot = TaskSlot::empty();
-    slot.install(Pin::clone(&task));
+    slot.install(Pin::clone(&task), published);
     (slot, task, dropped)
   }
 
   #[test]
   fn a_lease_borrows_the_slot_owner_and_ends_its_turn() {
-    let (mut slot, task, dropped) = queued_slot(1);
+    let published = PublishedTask::empty();
+    let (mut slot, task, dropped) = queued_slot(1, &published);
     assert_eq!(TaskCell::strong_count(&task), 2);
     let lease = slot.lend().unwrap();
     assert_eq!(TaskCell::strong_count(&task), 2);
     // One turn at a time, and no owner leaves the slot during it.
     assert!(slot.lend().is_none());
-    assert!(slot.take_idle().is_none());
+    assert!(published.lend().is_none());
+    assert!(slot.take_idle(&published).is_none());
     let waker = lease.waker();
     assert_eq!(TaskCell::strong_count(&task), 2);
     let mut cx = Context::from_waker(&waker);
     assert!(matches!(
-      lease.task().poll_future(&mut cx),
+      lease.task().poll_future(&lease.key(), &mut cx),
       CellPoll::Pending
     ));
     waker.wake_by_ref();
@@ -1934,12 +2245,15 @@ mod tests {
     let lease = slot.lend().unwrap();
     let waker = lease.waker();
     assert!(matches!(
-      lease.task().poll_future(&mut Context::from_waker(&waker)),
+      lease
+        .task()
+        .poll_future(&lease.key(), &mut Context::from_waker(&waker)),
       CellPoll::Ready(7)
     ));
-    let owner = slot.take(lease);
+    assert!(lease.task().drop_future(&lease.key()));
+    let owner = slot.take(lease, &published);
     assert!(!slot.is_occupied());
-    assert!(owner.as_ref().drop_future());
+    assert!(published.lend().is_none());
     assert!(dropped.load(Ordering::SeqCst));
     drop(owner);
     assert_eq!(TaskCell::strong_count(&task), 1);
@@ -1947,14 +2261,15 @@ mod tests {
 
   #[test]
   fn a_dropped_lease_lets_the_slot_give_up_its_owner() {
-    let (mut slot, task, dropped) = queued_slot(3);
+    let published = PublishedTask::empty();
+    let (mut slot, task, dropped) = queued_slot(3, &published);
     let lease = slot.lend().unwrap();
     assert!(matches!(
-      lease.task().poll_future(&mut context()),
+      lease.task().poll_future(&lease.key(), &mut context()),
       CellPoll::Pending
     ));
     drop(lease);
-    let owner = slot.take_idle().unwrap();
+    let owner = slot.take_idle(&published).unwrap();
     drop(owner);
     drop(slot);
     drop(task);
@@ -1964,25 +2279,386 @@ mod tests {
   #[test]
   #[should_panic(expected = "lease returned to another task slot")]
   fn a_lease_cannot_take_another_slots_task() {
-    let (mut first, _first_task, _) = queued_slot(1);
-    let (mut second, _second_task, _) = queued_slot(1);
+    let first_published = PublishedTask::empty();
+    let (mut first, _first_task, _) = queued_slot(1, &first_published);
+    let second_published = PublishedTask::empty();
+    let (mut second, _second_task, _) = queued_slot(1, &second_published);
     let lease = first.lend().unwrap();
-    let _ = second.take(lease);
+    let _ = second.take(lease, &second_published);
+  }
+
+  #[test]
+  #[should_panic(expected = "task published through another cell")]
+  fn a_slot_clears_only_the_cell_it_published_into() {
+    let published = PublishedTask::empty();
+    let (mut slot, _task, _) = queued_slot(1, &published);
+    let other = PublishedTask::empty();
+    let lease = slot.lend().unwrap();
+    let _ = slot.take(lease, &other);
+  }
+
+  #[test]
+  #[should_panic(expected = "task published through another cell")]
+  fn an_idle_take_clears_only_the_cell_holding_its_owner() {
+    let published = PublishedTask::empty();
+    let (mut slot, _task, _) = queued_slot(1, &published);
+    let other_published = PublishedTask::empty();
+    let (_other, _other_task, _) = queued_slot(1, &other_published);
+    let _ = slot.take_idle(&other_published);
+  }
+
+  #[test]
+  #[should_panic(expected = "task cell already published")]
+  fn a_slot_installs_only_into_an_empty_cell() {
+    let published = PublishedTask::empty();
+    let (_slot, _task, _) = queued_slot(1, &published);
+    let _ = queued_slot(1, &published);
+  }
+
+  #[test]
+  #[should_panic(expected = "value key for another task")]
+  fn a_value_key_for_another_task_is_refused() {
+    let published = PublishedTask::empty();
+    let (mut slot, _task, _) = queued_slot(1, &published);
+    let (other, _) = countdown(1);
+    let other: Pin<Arc<Counted>> = TaskCell::new(CountHeader(AtomicUsize::new(0)), other);
+    let lease = slot.lend().unwrap();
+    let _ = other.as_ref().poll_future(&lease.key(), &mut context());
+  }
+
+  #[test]
+  fn a_reentrant_keyed_claim_finds_the_poll_claim() {
+    // A future that reaches its own cell and presents a second key for it
+    // from inside its poll: the turn's claim, not the key, refuses it.
+    struct Reenter(SelfSlot<Reenter>);
+
+    impl Future for Reenter {
+      type Output = ();
+
+      fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let cell = self.0.lock().unwrap().take().expect("cell handed in");
+        let key = ValueKey::new(std::ptr::from_ref(&*cell).cast::<()>());
+        assert!(matches!(
+          cell.as_ref().poll_future(&key, cx),
+          CellPoll::Rejected
+        ));
+        assert!(!cell.as_ref().drop_future(&key));
+        assert!(
+          !cell
+            .as_ref()
+            .finish(&key, |_| unreachable!("finished mid-poll"))
+        );
+        Poll::Pending
+      }
+    }
+
+    let slot: SelfSlot<Reenter> = Arc::new(Mutex::new(None));
+    let task = cell(Reenter(Arc::clone(&slot)));
+    *slot.lock().unwrap() = Some(Pin::clone(&task));
+    assert!(matches!(
+      task.as_ref().poll_turn(&mut context()),
+      CellPoll::Pending
+    ));
+    assert!(task.as_ref().drop_turn());
+  }
+
+  #[test]
+  fn an_idle_take_holds_the_turn_for_good() {
+    let published = PublishedTask::empty();
+    let (mut slot, task, dropped) = queued_slot(2, &published);
+    // The task still has its queue entry; the idle take wins the turn
+    // anyway and clears the publication, so that entry begins nothing.
+    let idle = slot.take_idle(&published).unwrap();
+    assert!(!slot.is_occupied());
+    assert!(published.lend().is_none());
+    assert!(slot.lend().is_none());
+    assert!(task.as_ref().claim_turn().is_none());
+    assert!(idle.task().finish(&idle.key(), |payload| {
+      assert!(payload.is_none());
+    }));
+    assert!(dropped.load(Ordering::SeqCst));
+    assert!(idle.task().publish().published);
+    assert_eq!(task.word().notify(), PollNotify::Complete);
+    drop(idle);
+    assert_eq!(TaskCell::strong_count(&task), 1);
   }
 
   #[test]
   fn an_owned_waker_from_the_borrowed_one_outlives_the_turn() {
-    let (mut slot, task, _) = queued_slot(1);
+    let published = PublishedTask::empty();
+    let (mut slot, task, _) = queued_slot(1, &published);
     let lease = slot.lend().unwrap();
     let kept = (*lease.waker()).clone();
     assert!(!lease.finish_pending());
-    let owner = slot.take_idle().unwrap();
+    let owner = slot.take_idle(&published).unwrap();
     drop(owner);
     drop(task);
     // The clone is now the last owner; waking it by reference and then by
     // value reads the header and frees the allocation.
     kept.wake_by_ref();
     kept.wake();
+  }
+
+  /// A future that wakes itself and yields `remaining` times, and counts
+  /// its drops.
+  struct Yielding {
+    remaining: u32,
+    drops: Arc<AtomicUsize>,
+  }
+
+  impl Future for Yielding {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+      if self.remaining == 0 {
+        return Poll::Ready(());
+      }
+      self.remaining -= 1;
+      cx.waker().wake_by_ref();
+      Poll::Pending
+    }
+  }
+
+  impl Drop for Yielding {
+    fn drop(&mut self) {
+      self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+  }
+
+  /// Entries name the occupancy they were inserted for.
+  type Entries = Arc<Mutex<std::collections::VecDeque<u32>>>;
+
+  /// Wakes insert the one queue entry that an idle word hands out.
+  struct QueueHeader {
+    serial: u32,
+    entries: Entries,
+  }
+
+  impl TaskHeader for QueueHeader {
+    fn wake_by_ref(&self, word: &TaskWord) {
+      if word.notify() == PollNotify::Enqueue {
+        self.entries.lock().unwrap().push_back(self.serial);
+      }
+    }
+  }
+
+  type Queued = TaskCell<QueueHeader, Yielding, ()>;
+
+  /// What a dispatcher's abort observed on the word: nothing yet, a word
+  /// without a turn (so every later turn must see the abort), or a turn in
+  /// progress (whose finish requeues the task).
+  const ABORT_NONE: u8 = 0;
+  const ABORT_FOUND_IDLE: u8 = 1;
+  const ABORT_FOUND_RUNNING: u8 = 2;
+
+  /// The runtime's slot discipline around one `TaskSlot`: the owner and an
+  /// abort mark under the slot lock, the published pointer and the abort's
+  /// cleanup flag beside it, and one queue of entries. A dispatcher begins
+  /// through the published pointer without the slot lock and takes the
+  /// lock only when the cleanup flag is set, or for the final turn.
+  struct Dispatch {
+    slot: Mutex<(TaskSlot<Queued>, bool)>,
+    published: PublishedTask<Queued>,
+    cleanup: AtomicBool,
+    entries: Entries,
+    aborted: std::sync::atomic::AtomicU8,
+    drops: Arc<AtomicUsize>,
+    finished: AtomicUsize,
+  }
+
+  enum Turn {
+    Empty,
+    Pending,
+    Done,
+  }
+
+  impl Dispatch {
+    fn new() -> Self {
+      Self {
+        slot: Mutex::new((TaskSlot::empty(), false)),
+        published: PublishedTask::empty(),
+        cleanup: AtomicBool::new(false),
+        entries: Arc::default(),
+        aborted: std::sync::atomic::AtomicU8::new(ABORT_NONE),
+        drops: Arc::default(),
+        finished: AtomicUsize::new(0),
+      }
+    }
+
+    /// Publication: installs a task whose word holds its first entry, then
+    /// inserts that entry. The slot keeps the only owner.
+    fn spawn(&self, serial: u32, remaining: u32) {
+      let task = TaskCell::build_word(
+        QueueHeader {
+          serial,
+          entries: Arc::clone(&self.entries),
+        },
+        Yielding {
+          remaining,
+          drops: Arc::clone(&self.drops),
+        },
+        TaskWord::new_queued(false),
+      );
+      {
+        let mut slot = self.slot.lock().unwrap();
+        self.cleanup.store(false, Ordering::Relaxed);
+        slot.1 = false;
+        slot.0.install(task, &self.published);
+      }
+      self.entries.lock().unwrap().push_back(serial);
+    }
+
+    /// The abort: marks the slot and sets the cleanup flag under the slot
+    /// lock, then routes through the word as a wake does.
+    fn abort(&self) {
+      let mut slot = self.slot.lock().unwrap();
+      let Some(task) = slot.0.get() else {
+        return;
+      };
+      let task = Pin::clone(task);
+      self.cleanup.store(true, Ordering::SeqCst);
+      slot.1 = true;
+      let found = task.word().notify();
+      self.aborted.store(
+        if found == PollNotify::Running {
+          ABORT_FOUND_RUNNING
+        } else {
+          ABORT_FOUND_IDLE
+        },
+        Ordering::SeqCst,
+      );
+      drop(slot);
+      if found == PollNotify::Enqueue {
+        self.entries.lock().unwrap().push_back(task.header().serial);
+      }
+    }
+
+    /// One dispatch of one dequeued entry.
+    fn dispatch(&self) -> Turn {
+      let Some(serial) = self.entries.lock().unwrap().pop_front() else {
+        return Turn::Empty;
+      };
+      let lease = self.published.lend().expect("an entry begins its turn");
+      assert_eq!(lease.task().header().serial, serial, "stale publication");
+      let cancel = self.cleanup.load(Ordering::SeqCst) && self.slot.lock().unwrap().1;
+      if !cancel {
+        // An abort whose wake found no turn precedes this turn's begin, so
+        // its cleanup flag was visible above.
+        assert_ne!(self.aborted.load(Ordering::SeqCst), ABORT_FOUND_IDLE);
+        let waker = lease.waker();
+        let polled = lease
+          .task()
+          .poll_future(&lease.key(), &mut Context::from_waker(&waker));
+        if matches!(polled, CellPoll::Pending) {
+          if lease.finish_pending() {
+            self.entries.lock().unwrap().push_back(serial);
+          }
+          return Turn::Pending;
+        }
+      }
+      assert!(lease.task().finish(&lease.key(), |_| ()));
+      let owner = self.slot.lock().unwrap().0.take(lease, &self.published);
+      let _ = owner.publish();
+      drop(owner);
+      self.finished.fetch_add(1, Ordering::SeqCst);
+      Turn::Done
+    }
+
+    /// Dispatches until `done` turns finished a task, yielding while the
+    /// queue is empty.
+    fn run(&self, done: usize) {
+      while self.finished.load(Ordering::SeqCst) < done {
+        if matches!(self.dispatch(), Turn::Empty) {
+          std::thread::yield_now();
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn published_dispatch_ends_with_the_final_turn_and_slot_reuse() {
+    let dispatch = Dispatch::new();
+    dispatch.spawn(1, 2);
+    dispatch.run(1);
+    assert!(dispatch.published.lend().is_none());
+    assert_eq!(dispatch.drops.load(Ordering::SeqCst), 1);
+    // The reused slot publishes its new occupant; the old entry is gone.
+    dispatch.spawn(2, 1);
+    dispatch.run(2);
+    assert!(dispatch.entries.lock().unwrap().is_empty());
+    assert_eq!(dispatch.drops.load(Ordering::SeqCst), 2);
+    assert!(!dispatch.slot.lock().unwrap().0.is_occupied());
+  }
+
+  #[test]
+  fn published_dispatch_on_two_threads_releases_and_reuses_the_slot() {
+    // Each dispatcher may pick up the task's next entry: the pointer is
+    // written on one thread and read on another, the final turn clears
+    // it, and the next occupancy publishes again on the other thread.
+    for _ in 0..if cfg!(miri) { 2 } else { 50 } {
+      let dispatch = Arc::new(Dispatch::new());
+      dispatch.spawn(1, 2);
+      let other = {
+        let dispatch = Arc::clone(&dispatch);
+        std::thread::spawn(move || {
+          dispatch.run(1);
+          dispatch.spawn(2, 2);
+          dispatch.run(2);
+        })
+      };
+      dispatch.run(2);
+      other.join().unwrap();
+      assert!(dispatch.published.lend().is_none());
+      assert_eq!(dispatch.drops.load(Ordering::SeqCst), 2);
+    }
+  }
+
+  #[test]
+  fn idle_take_after_the_dispatchers_left_clears_the_publication() {
+    let dispatch = Arc::new(Dispatch::new());
+    dispatch.spawn(1, 3);
+    {
+      let dispatch = Arc::clone(&dispatch);
+      std::thread::spawn(move || {
+        assert!(matches!(dispatch.dispatch(), Turn::Pending));
+      })
+      .join()
+      .unwrap();
+    }
+    // The pending turn requeued the task; with no dispatcher left the
+    // final owner takes it idle, cancels it and publishes.
+    let idle = {
+      let mut slot = dispatch.slot.lock().unwrap();
+      slot.0.take_idle(&dispatch.published).unwrap()
+    };
+    assert!(idle.task().finish(&idle.key(), |_| ()));
+    let _ = idle.task().publish();
+    drop(idle);
+    assert_eq!(dispatch.drops.load(Ordering::SeqCst), 1);
+    // The leftover entry finds nothing published.
+    assert_eq!(dispatch.entries.lock().unwrap().pop_front(), Some(1));
+    assert!(dispatch.published.lend().is_none());
+  }
+
+  #[test]
+  fn begin_without_the_slot_lock_races_an_abort_on_another_thread() {
+    for _ in 0..if cfg!(miri) { 4 } else { 200 } {
+      let dispatch = Arc::new(Dispatch::new());
+      dispatch.spawn(1, 3);
+      let abort = {
+        let dispatch = Arc::clone(&dispatch);
+        std::thread::spawn(move || dispatch.abort())
+      };
+      dispatch.run(1);
+      abort.join().unwrap();
+      // The abort either found the task done or was decided under the
+      // slot lock; the value is gone either way, once.
+      assert_eq!(dispatch.drops.load(Ordering::SeqCst), 1);
+      assert!(dispatch.published.lend().is_none());
+      // A late entry from a wake that raced the final turn is not
+      // possible: the final turn kept `RUNNING`.
+      assert!(dispatch.entries.lock().unwrap().is_empty());
+    }
   }
 
   const ROUNDS: usize = if cfg!(miri) { 8 } else { 1000 };

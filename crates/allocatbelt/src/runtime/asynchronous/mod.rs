@@ -35,6 +35,7 @@
 
 #[cfg(all(test, not(loom)))]
 mod allocation_tests;
+mod dispatch_begin;
 mod entry;
 mod handoff;
 mod handoff_protocol;

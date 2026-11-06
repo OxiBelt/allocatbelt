@@ -1155,13 +1155,26 @@ finds the task idle it inserts the queue entry; if the task is running it
 leaves the notified bit for the poll's finish; a queued or complete task is
 unchanged. A pending poll's finish is also one word operation without the
 slot mutex: it goes idle, or, when notified during the poll, requeues the
-task through the usual lane choice. Dispatch, completion and cancellation
-cleanup take the slot mutex, where the generation, admission and abort
-state live; abort marks the word like a wake, so a running task is requeued
-by its finish and the next dispatch selects cleanup. The task object is
-never reused, and its final turn keeps the word running from the slot's
-release until publication marks it complete, so a retained stale waker
-cannot queue a reused slot.
+task through the usual lane choice. Completion and cancellation cleanup
+take the slot mutex, where the generation, admission and abort state live;
+abort sets the slot's cleanup flag under that mutex and then marks the word
+like a wake, so a running task is requeued by its finish and the next
+dispatch selects cleanup. Dispatch takes the slot mutex unless the task's
+polls take no permit (a root-scope task while the root scope neither binds
+nor counts): publication then records the task's pointer beside the slot,
+under the slot mutex and before the first queue entry is inserted, and a
+dispatcher that dequeued the task's entry begins the turn on the word
+through that record without the mutex. It then reads the cleanup flag and
+takes the slot mutex only when the flag is set, where the abort is decided.
+An abort whose wake reaches the word before the turn begins is therefore
+always seen by that dispatch, and one that reaches it during the turn
+requeues the task to cleanup, so every abort is decided under the slot mutex
+before the task is polled again. The final turn, and shutdown cleanup of a
+task no turn holds, clear the record under the slot mutex when the slot
+gives the task up; shutdown cleanup first marks the word running for good,
+so no later turn can begin. The task object is never reused, and its final
+turn keeps the word running from the slot's release until publication marks
+it complete, so a retained stale waker cannot queue a reused slot.
 The join handle of a distributed task works on the same word. The outcome
 (the output, or the cancelled, panicked or resource error) is stored once in
 the task allocation by the final turn, before the slot is released;
@@ -1544,13 +1557,18 @@ slot reuse and cleanup; a same-source Loom model checks poll-slot acquire/releas
 
 The same-source Loom models cover lane park/push, stealing versus owner pop
 and push, search admission versus a denied dispatcher's park, quota gating
-and transfer, abort and close versus spawn, and lane depth publication
+and transfer, abort and close versus spawn, lane depth publication
 (pushes and pops, including Relaxed updates of a non-empty lane, versus a
-dispatcher's steal pre-check and park rescan). They use the shipped admission
-counter, parked mask, depth publication and park-advertise/rescan helper,
-and mirror the
-engine's wake decision. They use tiny queues and do not model real condvar
-timing, OS threads, metrics, Control charges or task internals. Native tests
+dispatcher's steal pre-check and park rescan), and the permit-free dispatch
+start: a turn begun on the task word racing an abort and an external wake,
+an abort during the turn decided on the requeue, the final turn's release
+and slot reuse racing a second dispatcher and a stale waker, and the turn's
+value access against an idle take and an access without a slot. They use
+the shipped admission counter, parked mask, depth publication,
+park-advertise/rescan helper, dispatch start and task word, and mirror the
+engine's wake decision and slot handling. They use tiny queues and do not
+model real condvar timing, OS threads, metrics, Control charges or task
+internals. Native tests
 cover those integration paths. `global_queue_depth` sums lane, blocked and
 overflow depths; samples are independent and can briefly omit an entry
 moving between queues.

@@ -1239,12 +1239,17 @@ mod tests {
     let permit = PollPermit {
       release: PermitRelease::Free,
     };
+    let turn = task.as_ref().test_turn().unwrap();
     assert!(matches!(
-      task
-        .as_ref()
-        .poll(&mut Context::from_waker(&waker), permit, &mut None),
+      task.as_ref().poll(
+        &turn.key(),
+        &mut Context::from_waker(&waker),
+        permit,
+        &mut None
+      ),
       (PollResult::Ready, None)
     ));
+    drop(turn);
     task.publish();
     drop(task);
     assert!(job.is_finished());
@@ -1260,7 +1265,7 @@ mod tests {
   /// including a cache recreated after terminal cleanup.
   fn assert_terminal_path_has_no_waker_cycle<F>(
     future: F,
-    finish: impl FnOnce(Pin<&dyn ErasedTask>),
+    finish: impl FnOnce(Pin<&dyn ErasedTask>, &super::super::task::ValueKey<'_>),
   ) where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
@@ -1280,20 +1285,26 @@ mod tests {
     let cached = task.clone().task_waker();
     assert!(waker.will_wake(&cached));
     drop(cached);
-    finish(task.as_ref());
+    {
+      let turn = task.as_ref().test_turn().unwrap();
+      finish(task.as_ref(), &turn.key());
+    }
     assert_eq!(strong_count(&task), before + 1);
     drop(waker);
     assert_eq!(strong_count(&task), before);
     // A dispatch after cleanup finds no future; its waker has no cached owner.
     let recreated = task.clone().task_waker();
+    let turn = task.as_ref().test_turn().unwrap();
     assert!(matches!(
       task.as_ref().poll(
+        &turn.key(),
         &mut Context::from_waker(&recreated),
         unscheduled_permit(),
         &mut None
       ),
       (PollResult::Ready, None)
     ));
+    drop(turn);
     assert_eq!(strong_count(&task), before + 1);
     drop(recreated);
     drop(job);
@@ -1315,9 +1326,10 @@ mod tests {
 
   #[test]
   fn completed_task_has_no_waker_cycle() {
-    assert_terminal_path_has_no_waker_cycle(std::future::ready(()), |task| {
+    assert_terminal_path_has_no_waker_cycle(std::future::ready(()), |task, key| {
       assert!(matches!(
         task.poll(
+          key,
           &mut Context::from_waker(Waker::noop()),
           unscheduled_permit(),
           &mut None
@@ -1329,15 +1341,18 @@ mod tests {
 
   #[test]
   fn cancel_panic_and_resource_failure_have_no_waker_cycle() {
-    assert_terminal_path_has_no_waker_cycle(std::future::pending::<()>(), |task| task.cancel());
-    assert_terminal_path_has_no_waker_cycle(std::future::pending::<()>(), |task| {
-      task.fail_resource(DomainError::WaitersFull);
+    assert_terminal_path_has_no_waker_cycle(std::future::pending::<()>(), |task, key| {
+      task.cancel(key);
+    });
+    assert_terminal_path_has_no_waker_cycle(std::future::pending::<()>(), |task, key| {
+      task.fail_resource(key, DomainError::WaitersFull);
     });
     assert_terminal_path_has_no_waker_cycle(
       std::future::poll_fn(|_| -> std::task::Poll<()> { panic!("contained poll panic") }),
-      |task| {
+      |task, key| {
         assert!(matches!(
           task.poll(
+            key,
             &mut Context::from_waker(Waker::noop()),
             unscheduled_permit(),
             &mut None

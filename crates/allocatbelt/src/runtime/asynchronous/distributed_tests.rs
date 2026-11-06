@@ -166,14 +166,16 @@ fn run(shared: &Arc<Shared>, work: Selected) {
   let d = engine(shared);
   match work {
     Selected::Cancel(reference, lease) => {
-      lease.task().cancel();
+      lease.task().cancel(&lease.key());
       d.finish_cancel(shared, reference, lease);
     }
     Selected::Poll(reference, lease, permit) => {
-      let (result, permit) =
-        lease
-          .task()
-          .poll(&mut Context::from_waker(Waker::noop()), permit, &mut None);
+      let (result, permit) = lease.task().poll(
+        &lease.key(),
+        &mut Context::from_waker(Waker::noop()),
+        permit,
+        &mut None,
+      );
       drop(permit);
       d.finish_poll(
         shared,
@@ -1142,7 +1144,8 @@ fn pending_self_yields_take_zero_global_one_slot_and_two_lane_locks_case() {
         d.lane_locks.load(Ordering::Relaxed),
       );
       if let Some((g, s, l)) = previous {
-        assert_eq!((counts.0 - g, counts.1 - s, counts.2 - l), (0, 1, 2));
+        // A permit-free dispatch takes no slot lock.
+        assert_eq!((counts.0 - g, counts.1 - s, counts.2 - l), (0, 0, 2));
       }
       previous = Some(counts);
       polls += 1;
@@ -1339,7 +1342,7 @@ fn spawn_wake_completion_and_steal_lock_counts_case() {
       d.slot_locks.load(Ordering::Relaxed) - before.1,
       d.lane_locks.load(Ordering::Relaxed) - before.2
     ),
-    (1, 2, 1)
+    (1, 1, 1) // the permit-free dispatch takes no slot lock
   );
   finish(job).unwrap();
   check_distributed(&shared);
@@ -3575,9 +3578,12 @@ fn a_turn_borrows_the_slot_owner_without_a_reference_count() {
   assert_eq!(count(&owner), idle);
   let waker = lease.waker();
   assert_eq!(count(&owner), idle);
-  let (result, permit) = lease
-    .task()
-    .poll(&mut Context::from_waker(&waker), permit, &mut None);
+  let (result, permit) = lease.task().poll(
+    &lease.key(),
+    &mut Context::from_waker(&waker),
+    permit,
+    &mut None,
+  );
   assert!(matches!(result, PollResult::Pending));
   drop(permit);
   // A kept clone holds its own count; waking it by value gives it back.

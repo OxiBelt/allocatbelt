@@ -120,6 +120,41 @@ impl PollWord {
     self.load() & RUNNING != 0
   }
 
+  /// Takes `RUNNING` for a turn that no queue entry began: the final
+  /// owner's cleanup of a task no dispatcher holds. A compare-and-swap that
+  /// sets `RUNNING` and keeps every other bit; it fails, changing nothing,
+  /// while a turn holds the word or once it is complete. Like a final turn,
+  /// the claim is never ended: no later `begin` can succeed.
+  ///
+  /// A `RUNNING` seen by a plain load may be stale even after the turn
+  /// ended, so the first attempt assumes it clear and only a failed
+  /// compare-and-swap, which reads the latest word, can refuse.
+  pub(crate) fn claim(&self) -> bool {
+    let mut current = self.load() & !RUNNING;
+    loop {
+      if current & (RUNNING | COMPLETE) != 0 {
+        return false;
+      }
+      match self.0.compare_exchange_weak(
+        current,
+        current | RUNNING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+      ) {
+        Ok(_) => return true,
+        Err(observed) => current = observed,
+      }
+    }
+  }
+
+  /// Ends a claim taken with [`Self::claim`] outside the scheduler (tests
+  /// that drive a cell without a slot), keeping `NOTIFIED`.
+  #[cfg(test)]
+  pub(crate) fn release_claim(&self) {
+    let previous = self.0.fetch_and(!RUNNING, Ordering::AcqRel);
+    debug_assert_ne!(previous & RUNNING, 0, "released an unclaimed word");
+  }
+
   /// Ends a pending poll in one RMW: `RUNNING` becomes idle, and
   /// `RUNNING | NOTIFIED` becomes `NOTIFIED`, in which case the caller owns
   /// the new queue entry and must insert it.

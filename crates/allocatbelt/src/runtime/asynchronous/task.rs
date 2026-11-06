@@ -16,13 +16,19 @@ use crate::runtime::resource_domain::{
   ControlCharge, DomainError, DomainReservation, DomainResource, DomainResources, DomainWaiter,
   TenantDomain,
 };
+#[cfg(all(test, not(loom)))]
+pub(super) use crate::sys::runtime_task_cell::CellTurn;
 #[cfg(not(loom))]
 pub(super) use crate::sys::runtime_task_cell::{
-  CellPoll, JoinSide, Lease, PollNotify, TaskCell, TaskHeader, TaskJoin, TaskLend, TaskSlot,
-  TaskWord,
+  CellPoll, JoinSide, Lease, PollNotify, PublishedTask, TaskCell, TaskHeader, TaskJoin, TaskLend,
+  TaskSlot, TaskWord, ValueKey,
 };
+#[cfg(all(test, loom))]
+pub(super) use loom_cell::CellTurn;
 #[cfg(loom)]
-pub(super) use loom_cell::{CellPoll, JoinSide, Lease, TaskCell, TaskHeader, TaskLend, TaskSlot};
+pub(super) use loom_cell::{
+  CellPoll, JoinSide, Lease, PublishedTask, TaskCell, TaskHeader, TaskLend, TaskSlot, ValueKey,
+};
 #[cfg(loom)]
 pub(super) use word::{PollNotify, PollWord, TaskJoin, TaskWord};
 
@@ -55,23 +61,23 @@ pub(super) enum PollResult {
 /// that may touch the stored future take `Pin<&Self>`, which is all the
 /// pinned `Arc` hands out.
 pub(super) trait ErasedTask: TaskLend {
-  /// Polls once without a scheduler lock. The scheduler protocol serializes
-  /// polling and cancellation cleanup; the future cell's claim serializes
-  /// access to the stored future even without it.
+  /// Polls once without a scheduler lock, in the turn `key` proves; the
+  /// key is what lets the cell claim the stored future.
   /// Pending returns the quota permit for the caller's locked completion.
   /// `cpu_ticket` is the CPU ticket held for this poll, if any; a ready poll
   /// drops it right after the permit, and a pending poll leaves it with the
   /// caller.
   fn poll(
     self: Pin<&Self>,
+    key: &ValueKey<'_>,
     cx: &mut Context<'_>,
     permit: PollPermit,
     cpu_ticket: &mut Option<DomainReservation>,
   ) -> (PollResult, Option<PollPermit>);
 
   /// Drops a cancelled future and stores its terminal outcome, with no
-  /// scheduler lock held.
-  fn cancel(self: Pin<&Self>);
+  /// scheduler lock held, in the turn `key` proves.
+  fn cancel(self: Pin<&Self>, key: &ValueKey<'_>);
 
   /// Publishes the stored outcome after scheduler admission has been
   /// released.
@@ -89,12 +95,21 @@ pub(super) trait ErasedTask: TaskLend {
   /// occupant of the slot.
   fn poll_word(&self) -> &TaskWord;
 
-  /// Stores a typed resource failure without polling user code.
-  fn fail_resource(self: Pin<&Self>, error: DomainError);
+  /// The slot and generation the task was published under.
+  fn task_ref(&self) -> TaskRef;
+
+  /// Stores a typed resource failure without polling user code, in the
+  /// turn `key` proves.
+  fn fail_resource(self: Pin<&Self>, key: &ValueKey<'_>, error: DomainError);
 
   /// The owners of the allocation besides this consumed handle.
   #[cfg(test)]
   fn strong_count(self: Pin<Arc<Self>>) -> usize;
+
+  /// Takes the task's turn outside a scheduler, for tests that drive a
+  /// task without a slot; see the cell's `claim_turn`.
+  #[cfg(test)]
+  fn test_turn(self: Pin<&Self>) -> Option<CellTurn<'_>>;
 }
 
 // Taking a waiter for domain admission must not undo concurrent cleanup.
@@ -194,10 +209,10 @@ where
 {
   /// Drops the future in place and stores `error`, or the destructor's
   /// panic, as the outcome.
-  fn drop_future_and_store(self: Pin<&Self>, error: AsyncJoinError) {
-    let stored = self.finish(|payload| after_drop(Err(error), payload));
-    // The scheduler runs cleanup only inside the task's own turn or as the
-    // final owner, so no poll can hold the future here.
+  fn drop_future_and_store(self: Pin<&Self>, key: &ValueKey<'_>, error: AsyncJoinError) {
+    let stored = self.finish(key, |payload| after_drop(Err(error), payload));
+    // Cleanup runs inside the task's own turn or as its final owner, which
+    // the key proves, so no poll can hold the future here.
     debug_assert!(stored || self.is_finished(), "cleanup raced a poll");
     let this = self.header();
     this.release_waiter();
@@ -212,6 +227,7 @@ where
 {
   fn poll(
     self: Pin<&Self>,
+    key: &ValueKey<'_>,
     cx: &mut Context<'_>,
     permit: PollPermit,
     cpu_ticket: &mut Option<DomainReservation>,
@@ -224,7 +240,7 @@ where
       CpuExecutionGuard::enter(cpu_ticket.as_ref().map(DomainReservation::domain_identity));
     let result = {
       let _cooperative_poll = super::entry::CooperativePollGuard::enter();
-      panic::catch_unwind(AssertUnwindSafe(|| self.poll_future(cx)))
+      panic::catch_unwind(AssertUnwindSafe(|| self.poll_future(key, cx)))
     };
     drop(cpu_execution);
     let outcome = match result {
@@ -245,18 +261,18 @@ where
     // Release before user destructors or cleanup.
     drop(permit);
     drop(cpu_ticket.take());
-    let stored = self.finish(|payload| after_drop(outcome, payload));
+    let stored = self.finish(key, |payload| after_drop(outcome, payload));
     debug_assert!(stored, "a completed poll holds the cell's only claim");
     this.release_waiter();
     this.release_task_admission();
     (PollResult::Ready, None)
   }
 
-  fn cancel(self: Pin<&Self>) {
+  fn cancel(self: Pin<&Self>, key: &ValueKey<'_>) {
     let this = self.header();
     let _task_context =
       TaskContextGuard::enter_with_resource(Some(this.id), this.resources.clone());
-    self.drop_future_and_store(AsyncJoinError::Cancelled);
+    self.drop_future_and_store(key, AsyncJoinError::Cancelled);
   }
 
   fn publish(&self) {
@@ -321,17 +337,26 @@ where
     TaskCell::into_waker(self)
   }
 
+  fn task_ref(&self) -> TaskRef {
+    self.header().reference
+  }
+
   fn poll_word(&self) -> &TaskWord {
     self.word()
   }
 
-  fn fail_resource(self: Pin<&Self>, error: DomainError) {
-    self.drop_future_and_store(AsyncJoinError::ResourceDomain(error));
+  fn fail_resource(self: Pin<&Self>, key: &ValueKey<'_>, error: DomainError) {
+    self.drop_future_and_store(key, AsyncJoinError::ResourceDomain(error));
   }
 
   #[cfg(test)]
   fn strong_count(self: Pin<Arc<Self>>) -> usize {
     TaskCell::strong_count(&self) - 1
+  }
+
+  #[cfg(test)]
+  fn test_turn(self: Pin<&Self>) -> Option<CellTurn<'_>> {
+    self.claim_turn()
   }
 }
 
@@ -473,20 +498,39 @@ where
 /// task word and the join protocol are the cell's own source (`word`), so
 /// the models cover them; they do not cover the unsafe cell, which its own
 /// Miri-checked unit tests do.
+///
+/// The stand-in claims the value exactly as the cell does: a keyed poll
+/// with a load and a store, `finish` with a compare-and-swap loop, and a
+/// witness that fails when two claims overlap, so the models check that
+/// the keys (the word's `RUNNING`) exclude each other. Its published
+/// pointer keeps every task it published alive and reads the current one
+/// with `Relaxed` ordering, and a slot marks the task it gives up: a read
+/// that the runtime's own synchronization does not order after the
+/// publication and before the release can find a stale or released task,
+/// which fails.
 #[cfg(loom)]
 mod loom_cell {
   use super::word::{
     self, JoinCells, JoinWakers, PollWord, Publication, TaskJoin, TaskWord, WakerSlot,
   };
-  use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+  use loom::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
   use std::any::Any;
   use std::future::Future;
+  use std::marker::PhantomData;
   use std::panic::{self, AssertUnwindSafe};
   use std::pin::Pin;
-  use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, TryLockError};
+  use std::sync::{Arc, Mutex, PoisonError, RwLock};
   use std::task::{Context, Poll, Wake, Waker};
 
   pub(crate) use super::word::JoinSide;
+
+  const PRESENT: u8 = 0;
+  const POLLING: u8 = 1;
+  const COMPLETE: u8 = 2;
+  const POISONED: u8 = 3;
+  const ABSENT: u8 = 4;
+  const STORING: u8 = 5;
+  const STORED: u8 = 6;
 
   pub(crate) enum CellPoll<T> {
     Ready(T),
@@ -496,12 +540,6 @@ mod loom_cell {
 
   pub(crate) trait TaskHeader: Send + Sync + 'static {
     fn wake_by_ref(&self, word: &TaskWord);
-  }
-
-  struct Slot<F> {
-    future: Option<Pin<Box<F>>>,
-    pollable: bool,
-    finished: bool,
   }
 
   /// A cell whose exclusive accesses must never overlap any other access;
@@ -570,28 +608,79 @@ mod loom_cell {
     }
   }
 
+  /// Proof of a turn, as in the cell: built only here, for one allocation.
+  pub(crate) struct ValueKey<'a> {
+    cell: *const (),
+    _turn: PhantomData<&'a ()>,
+  }
+
+  impl ValueKey<'_> {
+    fn new(cell: *const ()) -> Self {
+      Self {
+        cell,
+        _turn: PhantomData,
+      }
+    }
+
+    fn check<C>(&self, cell: &C) {
+      assert!(
+        std::ptr::addr_eq(self.cell, std::ptr::from_ref(cell)),
+        "value key for another task"
+      );
+    }
+  }
+
+  /// Releases a claim into `next` (`POISONED` if the holder unwinds).
+  struct Claim<'a> {
+    state: &'a AtomicU8,
+    holders: &'a AtomicUsize,
+    next: u8,
+  }
+
+  impl<'a> Claim<'a> {
+    fn hold(state: &'a AtomicU8, holders: &'a AtomicUsize, next: u8) -> Self {
+      assert_eq!(
+        holders.fetch_add(1, Ordering::Relaxed),
+        0,
+        "overlapping value claims"
+      );
+      Self {
+        state,
+        holders,
+        next,
+      }
+    }
+  }
+
+  impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+      self.holders.fetch_sub(1, Ordering::Relaxed);
+      self.state.store(self.next, Ordering::Release);
+    }
+  }
+
   /// Boxes both halves, so the stand-in is `Unpin` whatever `H` and `F`
   /// are and `Pin::into_inner` recovers the `Arc` for its wakers.
   pub(crate) struct TaskCell<H, F, O> {
     header: Box<H>,
     word: TaskWord,
-    slot: Mutex<Slot<F>>,
-    stored: AtomicBool,
+    state: AtomicU8,
+    holders: AtomicUsize,
+    future: Mutex<Option<Pin<Box<F>>>>,
+    released: AtomicBool,
     output: Box<Exclusive<Option<O>>>,
     join_waker: Witnessed<JoinWakers>,
   }
 
   impl<H, F, O> TaskCell<H, F, O> {
-    fn build(header: H, future: F, join_interest: bool) -> Pin<Arc<Self>> {
+    fn build(header: H, future: F, word: TaskWord) -> Pin<Arc<Self>> {
       Arc::pin(Self {
         header: Box::new(header),
-        word: TaskWord::new(join_interest),
-        slot: Mutex::new(Slot {
-          future: Some(Box::pin(future)),
-          pollable: true,
-          finished: false,
-        }),
-        stored: AtomicBool::new(false),
+        word,
+        state: AtomicU8::new(PRESENT),
+        holders: AtomicUsize::new(0),
+        future: Mutex::new(Some(Box::pin(future))),
+        released: AtomicBool::new(false),
         output: Box::new(Exclusive::new(None)),
         join_waker: Witnessed::new(JoinWakers::default()),
       })
@@ -605,7 +694,7 @@ mod loom_cell {
     where
       J: ?Sized + JoinSide<Output = O>,
     {
-      let task = Self::build(header, future, true);
+      let task = Self::build(header, future, TaskWord::new(true));
       let join = erase(Pin::clone(&task));
       (task, TaskJoin::new(join))
     }
@@ -618,9 +707,15 @@ mod loom_cell {
     where
       J: ?Sized + JoinSide<Output = O>,
     {
-      let (task, join) = Self::new_with_join(header, future, erase);
-      assert_eq!(task.word.notify(), super::PollNotify::Enqueue);
-      (task, join)
+      let task = Self::build(header, future, TaskWord::new_queued(true));
+      let join = erase(Pin::clone(&task));
+      (task, TaskJoin::new(join))
+    }
+
+    /// A task without a join handle whose word holds its first entry.
+    #[cfg(test)]
+    pub(crate) fn new_queued(header: H, future: F) -> Pin<Arc<Self>> {
+      Self::build(header, future, TaskWord::new_queued(false))
     }
 
     pub(crate) fn header(&self) -> &H {
@@ -636,11 +731,7 @@ mod loom_cell {
     }
 
     pub(crate) fn is_finished(&self) -> bool {
-      self
-        .slot
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .finished
+      matches!(self.state.load(Ordering::Acquire), STORING | STORED)
     }
 
     #[cfg(test)]
@@ -657,66 +748,102 @@ mod loom_cell {
       Waker::from(Pin::into_inner(this))
     }
 
-    fn try_claim(&self) -> Option<MutexGuard<'_, Slot<F>>> {
-      match self.slot.try_lock() {
-        Ok(slot) => Some(slot),
-        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
-        Err(TryLockError::WouldBlock) => None,
-      }
+    /// See the cell's `claim_turn`.
+    #[cfg(test)]
+    pub(crate) fn claim_turn(self: Pin<&Self>) -> Option<CellTurn<'_>> {
+      let word = self.get_ref().word.inner();
+      word.claim().then(|| CellTurn {
+        word,
+        cell: std::ptr::from_ref(self.get_ref()).cast::<()>(),
+      })
     }
 
-    pub(crate) fn poll_future(self: Pin<&Self>, cx: &mut Context<'_>) -> CellPoll<F::Output>
+    pub(crate) fn poll_future(
+      self: Pin<&Self>,
+      key: &ValueKey<'_>,
+      cx: &mut Context<'_>,
+    ) -> CellPoll<F::Output>
     where
       F: Future,
     {
-      let Some(mut guard) = self.try_claim() else {
-        return CellPoll::Rejected;
-      };
-      let slot: &mut Slot<F> = &mut guard;
-      if !slot.pollable {
+      key.check(self.get_ref());
+      // The cell's keyed claim: a load and a store, no read-modify-write.
+      if self.state.load(Ordering::Acquire) != PRESENT {
         return CellPoll::Rejected;
       }
-      let Some(future) = slot.future.as_mut() else {
-        return CellPoll::Rejected;
+      self.state.store(POLLING, Ordering::Relaxed);
+      let mut claim = Claim::hold(&self.state, &self.holders, POISONED);
+      let result = {
+        let mut future = self.future.lock().unwrap_or_else(PoisonError::into_inner);
+        match future.as_mut() {
+          Some(future) => future.as_mut().poll(cx),
+          None => unreachable!("a present state holds the future"),
+        }
       };
-      // Stays unpollable (poisoned) if the poll unwinds or completes.
-      slot.pollable = false;
-      let result = future.as_mut().poll(cx);
+      claim.next = if result.is_ready() { COMPLETE } else { PRESENT };
+      drop(claim);
       match result {
         Poll::Ready(output) => CellPoll::Ready(output),
-        Poll::Pending => {
-          slot.pollable = true;
-          CellPoll::Pending
-        }
+        Poll::Pending => CellPoll::Pending,
       }
     }
 
     pub(crate) fn finish(
       self: Pin<&Self>,
+      key: &ValueKey<'_>,
       make: impl FnOnce(Option<Box<dyn Any + Send>>) -> O,
     ) -> bool {
-      let Some(mut slot) = self.try_claim() else {
-        return false;
-      };
-      if slot.finished {
-        return false;
+      key.check(self.get_ref());
+      let mut expected = PRESENT;
+      loop {
+        match self
+          .state
+          .compare_exchange(expected, STORING, Ordering::AcqRel, Ordering::Acquire)
+        {
+          Ok(_) => break,
+          Err(observed @ (PRESENT | COMPLETE | POISONED | ABSENT)) => expected = observed,
+          Err(_) => return false,
+        }
       }
-      slot.finished = true;
-      slot.pollable = false;
-      let taken = slot.future.take();
-      drop(slot);
+      let claim = Claim::hold(&self.state, &self.holders, STORED);
+      let taken = self
+        .future
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
       let payload = panic::catch_unwind(AssertUnwindSafe(|| drop(taken))).err();
       let outcome = make(payload);
       self.output.write(|output| *output = Some(outcome));
-      self.stored.store(true, Ordering::Release);
+      drop(claim);
       true
     }
 
     pub(crate) fn publish(&self) -> Publication<O> {
-      if !self.stored.load(Ordering::Acquire) {
+      if self.state.load(Ordering::Acquire) != STORED {
         return Publication::refused();
       }
       word::publish(self.word.inner(), self)
+    }
+  }
+
+  /// See the cell's `CellTurn`.
+  #[cfg(test)]
+  pub(crate) struct CellTurn<'a> {
+    word: &'a PollWord,
+    cell: *const (),
+  }
+
+  #[cfg(test)]
+  impl CellTurn<'_> {
+    pub(crate) fn key(&self) -> ValueKey<'_> {
+      ValueKey::new(self.cell)
+    }
+  }
+
+  #[cfg(test)]
+  impl Drop for CellTurn<'_> {
+    fn drop(&mut self) {
+      self.word.release_claim();
     }
   }
 
@@ -779,6 +906,8 @@ mod loom_cell {
   pub(crate) trait TaskLend: word::Sealed + Send + Sync {
     fn lend_word(&self) -> &PollWord;
     fn lend_waker(self: Pin<Arc<Self>>) -> Waker;
+    /// Set when a slot gives this task's owner up.
+    fn lend_released(&self) -> &AtomicBool;
   }
 
   impl<H: TaskHeader, F: Send + 'static, O: Send + 'static> TaskLend for TaskCell<H, F, O> {
@@ -789,6 +918,14 @@ mod loom_cell {
     fn lend_waker(self: Pin<Arc<Self>>) -> Waker {
       Self::into_waker(self)
     }
+
+    fn lend_released(&self) -> &AtomicBool {
+      &self.released
+    }
+  }
+
+  fn key_of<T: ?Sized>(task: &Pin<Arc<T>>) -> ValueKey<'_> {
+    ValueKey::new(std::ptr::from_ref::<T>(task).cast::<()>())
   }
 
   /// The slot container; the stand-in lease holds its own clone, so Loom
@@ -810,9 +947,26 @@ mod loom_cell {
       self.task.as_ref()
     }
 
-    pub(crate) fn install(&mut self, task: Pin<Arc<T>>) {
+    pub(crate) fn install(&mut self, task: Pin<Arc<T>>, published: &PublishedTask<T>) {
       assert!(self.task.is_none(), "task slot already occupied");
+      assert!(published.held().is_none(), "task cell already published");
+      published.set(Some(&task));
       self.task = Some(task);
+    }
+
+    fn release(&mut self, published: &PublishedTask<T>) -> Option<Pin<Arc<T>>> {
+      published.set(None);
+      let task = self.task.take()?;
+      task.lend_released().store(true, Ordering::Relaxed);
+      Some(task)
+    }
+
+    fn check_publication(&self, published: &PublishedTask<T>) {
+      let matches = match (&self.task, published.held()) {
+        (Some(task), Some(held)) => std::ptr::addr_eq(&**task, &*held),
+        _ => false,
+      };
+      assert!(matches, "task published through another cell");
     }
 
     pub(crate) fn lend(&mut self) -> Option<Lease<T>> {
@@ -825,20 +979,105 @@ mod loom_cell {
       })
     }
 
-    pub(crate) fn take(&mut self, mut lease: Lease<T>) -> Pin<Arc<T>> {
+    pub(crate) fn take(
+      &mut self,
+      mut lease: Lease<T>,
+      published: &PublishedTask<T>,
+    ) -> Pin<Arc<T>> {
       let lent = lease.task.take();
-      let task = self.task.take();
-      match (task, lent) {
-        (Some(task), Some(lent)) if std::ptr::addr_eq(&*task, &*lent) => task,
-        _ => panic!("lease returned to another task slot"),
+      let matches = match (&self.task, &lent) {
+        (Some(task), Some(lent)) => std::ptr::addr_eq(&**task, &**lent),
+        _ => false,
+      };
+      assert!(matches, "lease returned to another task slot");
+      self.check_publication(published);
+      match self.release(published) {
+        Some(task) => task,
+        None => unreachable!("checked above"),
       }
     }
 
-    pub(crate) fn take_idle(&mut self) -> Option<Pin<Arc<T>>> {
-      if self.task.as_ref()?.lend_word().is_running() {
+    pub(crate) fn take_idle(&mut self, published: &PublishedTask<T>) -> Option<IdleTask<T>> {
+      let task = self.task.as_ref()?;
+      self.check_publication(published);
+      if !task.lend_word().claim() {
         return None;
       }
-      self.task.take()
+      self.release(published).map(|task| IdleTask { task })
+    }
+  }
+
+  impl<T: ?Sized + TaskLend> Drop for TaskSlot<T> {
+    fn drop(&mut self) {
+      if let Some(task) = self.task.take()
+        && task.lend_word().is_running()
+      {
+        // As in the cell's slot: a turn may still use the task.
+        std::mem::forget(task);
+      }
+    }
+  }
+
+  /// See the cell's `IdleTask`.
+  pub(crate) struct IdleTask<T: ?Sized + TaskLend> {
+    task: Pin<Arc<T>>,
+  }
+
+  impl<T: ?Sized + TaskLend> IdleTask<T> {
+    pub(crate) fn task(&self) -> Pin<&T> {
+      self.task.as_ref()
+    }
+
+    pub(crate) fn key(&self) -> ValueKey<'_> {
+      key_of(&self.task)
+    }
+  }
+
+  /// See the module documentation: every published task stays alive here,
+  /// and the current one is read with `Relaxed` ordering.
+  pub(crate) struct PublishedTask<T: ?Sized + TaskLend> {
+    current: AtomicUsize,
+    tasks: Mutex<Vec<Pin<Arc<T>>>>,
+  }
+
+  impl<T: ?Sized + TaskLend> PublishedTask<T> {
+    pub(crate) fn empty() -> Self {
+      Self {
+        current: AtomicUsize::new(0),
+        tasks: Mutex::new(Vec::new()),
+      }
+    }
+
+    fn held(&self) -> Option<Pin<Arc<T>>> {
+      let current = self.current.load(Ordering::Relaxed).checked_sub(1)?;
+      Some(Pin::clone(
+        &self.tasks.lock().unwrap_or_else(PoisonError::into_inner)[current],
+      ))
+    }
+
+    fn set(&self, task: Option<&Pin<Arc<T>>>) {
+      let current = match task {
+        Some(task) => {
+          let mut tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);
+          tasks.push(Pin::clone(task));
+          tasks.len()
+        }
+        None => 0,
+      };
+      self.current.store(current, Ordering::Relaxed);
+    }
+
+    pub(crate) fn lend(&self) -> Option<Lease<T>> {
+      let current = self.current.load(Ordering::Relaxed).checked_sub(1)?;
+      let task = Pin::clone(&self.tasks.lock().unwrap_or_else(PoisonError::into_inner)[current]);
+      assert!(
+        !task.lend_released().load(Ordering::Relaxed),
+        "published task read after its slot released it"
+      );
+      if !task.lend_word().begin() {
+        return None;
+      }
+      Some(Lease { task: Some(task) })
     }
   }
 
@@ -850,6 +1089,13 @@ mod loom_cell {
     pub(crate) fn task(&self) -> Pin<&T> {
       match &self.task {
         Some(task) => task.as_ref(),
+        None => unreachable!("a live lease holds its task"),
+      }
+    }
+
+    pub(crate) fn key(&self) -> ValueKey<'_> {
+      match &self.task {
+        Some(task) => key_of(task),
         None => unreachable!("a live lease holds its task"),
       }
     }
@@ -959,7 +1205,8 @@ mod control_tests {
     }
     impl Drop for CancelOnDrop {
       fn drop(&mut self) {
-        self.0.as_ref().cancel();
+        let turn = self.0.as_ref().test_turn().unwrap();
+        self.0.as_ref().cancel(&turn.key());
       }
     }
     let limits = ceiling();
@@ -1051,7 +1298,10 @@ mod control_tests {
     let abort = job.abort_handle();
     let waker = task.clone().task_waker();
     assert_control(task_bytes);
-    task.as_ref().cancel();
+    {
+      let turn = task.as_ref().test_turn().unwrap();
+      task.as_ref().cancel(&turn.key());
+    }
     assert!(!abort.is_finished());
     assert_eq!(domain.snapshot().used.get(DomainResource::Tasks), 0);
     // The future was dropped in place; the one allocation keeps its size.
@@ -1101,7 +1351,10 @@ mod model {
       );
       let abort = job.abort_handle();
       let stale = task.clone().task_waker();
-      task.as_ref().cancel();
+      {
+        let turn = task.as_ref().test_turn().unwrap();
+        task.as_ref().cancel(&turn.key());
+      }
       assert!(!abort.is_finished());
       stale.wake_by_ref();
       assert!(!abort.is_finished());

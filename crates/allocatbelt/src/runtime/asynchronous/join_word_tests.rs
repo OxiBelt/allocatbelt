@@ -49,9 +49,15 @@ fn complete(task: &Pin<Arc<dyn ErasedTask>>) {
   let permit = PollPermit {
     release: PermitRelease::Free,
   };
-  let result = task
-    .as_ref()
-    .poll(&mut Context::from_waker(Waker::noop()), permit, &mut None);
+  let result = {
+    let turn = task.as_ref().test_turn().unwrap();
+    task.as_ref().poll(
+      &turn.key(),
+      &mut Context::from_waker(Waker::noop()),
+      permit,
+      &mut None,
+    )
+  };
   assert!(matches!(result, (PollResult::Ready, None)));
   task.publish();
 }
@@ -169,12 +175,16 @@ fn cancellation_and_resource_failure_publish_through_the_one_waker() {
     let (task, mut job) = create(std::future::pending::<usize>());
     let (wakes, waker) = counter();
     assert!(poll(&mut job, &waker).is_pending());
-    if fail {
-      task
-        .as_ref()
-        .fail_resource(crate::runtime::resource_domain::DomainError::WaitersFull);
-    } else {
-      task.as_ref().cancel();
+    {
+      let turn = task.as_ref().test_turn().unwrap();
+      if fail {
+        task.as_ref().fail_resource(
+          &turn.key(),
+          crate::runtime::resource_domain::DomainError::WaitersFull,
+        );
+      } else {
+        task.as_ref().cancel(&turn.key());
+      }
     }
     // Storing the outcome leaves the join bits and the waker alone.
     assert_eq!(task.poll_word().join_flags(), (true, true));
@@ -391,7 +401,10 @@ fn finished_waiter_registered_alone_is_woken_by_cancellation_publication() {
   let (task, mut job) = create(std::future::pending::<usize>());
   let (wakes, waker) = counter();
   assert!(poll_finished(&mut job, &waker).is_pending());
-  task.as_ref().cancel();
+  {
+    let turn = task.as_ref().test_turn().unwrap();
+    task.as_ref().cancel(&turn.key());
+  }
   assert_eq!(wakes.load(Ordering::SeqCst), 0);
   task.publish();
   assert_eq!(wakes.load(Ordering::SeqCst), 1);

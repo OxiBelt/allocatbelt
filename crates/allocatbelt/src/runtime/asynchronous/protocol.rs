@@ -1617,7 +1617,9 @@ mod loom_tests {
     /// lock, dropping what publication hands back.
     fn publish(task: &Pin<std::sync::Arc<Cell>>, drops: &Arc<AtomicUsize>) {
       let output = Output(Arc::clone(drops));
-      assert!(task.as_ref().finish(move |_| output));
+      let turn = task.as_ref().claim_turn().unwrap();
+      assert!(task.as_ref().finish(&turn.key(), move |_| output));
+      drop(turn);
       let publication = task.publish();
       assert!(publication.published);
       drop(publication);
