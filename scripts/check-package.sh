@@ -280,11 +280,12 @@ if [[ "$(uname -m)" != riscv64 ]]; then
   run "$(caps true true false false)" --features rvv
 fi
 
-run "$(caps false false false false false false false true)" --no-default-features --features runtime
-run "$(caps true true false false false false false true)" --features runtime
-run "$(caps false false false false false false false true true)" --no-default-features --features runtime-io-uring
-run "$(caps true true false false false false false true true)" --features runtime-io-uring
-run "$(caps true true true false false false false true true)" --features runtime-io-uring,io-uring
+# `runtime` enables `resource-feedback`, so every runtime build reports it.
+run "$(caps false false false false false false false true false true)" --no-default-features --features runtime
+run "$(caps true true false false false false false true false true)" --features runtime
+run "$(caps false false false false false false false true true true)" --no-default-features --features runtime-io-uring
+run "$(caps true true false false false false false true true true)" --features runtime-io-uring
+run "$(caps true true true false false false false true true true)" --features runtime-io-uring,io-uring
 run "$(caps false false false false false false false true false true)" --no-default-features --features resource-feedback
 run "$(caps true true false false false false false true false true)" --features resource-feedback
 run "$(caps true true false false false false false true true true)" --features resource-feedback,runtime-io-uring

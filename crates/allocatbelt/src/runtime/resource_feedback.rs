@@ -1,11 +1,16 @@
-//! Opt-in autonomous sampling and actuation for resource feedback.
+//! Autonomous sampling and actuation for resource feedback.
+//!
+//! A service runs only when started: by a caller, by a factory selected with
+//! `feedback_sources`, or as the default service of an owning driver bound to
+//! a resource domain.
 //!
 //! [`ResourceFeedbackService::start`] validates all policy limits and actuator
 //! readbacks before it starts a worker. The worker samples on real monotonic
 //! 100 ms deadlines and uses the fixed-storage [`super::resource_feedback_policy`]
 //! engine to plan CPU concurrency, disk-rate, and network-rate changes. This
-//! service is off until explicitly constructed; it does not alter any default
-//! runtime configuration. An opted-in service starts one sampler and one
+//! type changes nothing until a service is constructed; the owning drivers'
+//! default selection is described in `runtime::driver`. A started service
+//! starts one sampler and one
 //! bounded join-monitor thread so shutdown polling never joins on the caller.
 //! `start_in_tenant` charges the declared shared metrics, owner, inline worker
 //! capture, monitor payload, and one logical capacity-one handoff slot before
@@ -1018,9 +1023,9 @@ impl fmt::Display for FeedbackShutdownError {
 
 impl std::error::Error for FeedbackShutdownError {}
 
-/// Off-by-default autonomous resource sampling and actuation owner.
+/// Owner of one started autonomous resource sampling and actuation service.
 ///
-/// An opted-in instance owns a sampler worker and a small join-monitor thread.
+/// A started instance owns a sampler worker and a small join-monitor thread.
 /// The monitor joins the sampler away from callers and publishes completion
 /// only after that thread has finished its thread-local destructors.
 ///

@@ -9,6 +9,9 @@ publish = false
 
 [features]
 runtime-io-uring = ["allocatbelt/runtime-io-uring"]
+# Forwards allocatbelt's `resource-feedback` alias, which its `runtime`
+# already enables. In the Loom build every feedback module is excluded by
+# `not(loom)`, so this feature adds nothing there.
 resource-feedback = ["allocatbelt/resource-feedback"]
 
 # allocatbelt's core swaps its atomics for loom's under `--cfg loom` and does

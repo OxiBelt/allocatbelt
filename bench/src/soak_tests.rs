@@ -163,6 +163,8 @@ impl NativeAcceptorFixture {
     })
     .resources(limits)
     .resource_domain(application_domain.tenant())
+    // A fixed-policy fixture: its CPU limit must not move.
+    .without_feedback()
     .timer(2)
     .rate_timer_registrations(64)
     .blocking(BlockingConfig {

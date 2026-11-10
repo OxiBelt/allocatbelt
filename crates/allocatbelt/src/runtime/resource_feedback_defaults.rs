@@ -1,4 +1,4 @@
-//! Default CPU capacity for the opt-in feedback service.
+//! Default CPU capacity for the default feedback service.
 //!
 //! The default path derives one number, the CPU capacity, and everything else
 //! from constants: [`ResourceFeedbackPolicyConfig::process_default`] is a
@@ -7,7 +7,9 @@
 //! reports, so it follows the standard library's definition, which honours
 //! the thread's CPU affinity and the CPU quota the standard library itself
 //! reports; any file access behind that call is the standard library's own.
-//! The value is read when a factory is created and is not refreshed.
+//! The value is read when `default_feedback` creates a factory, and once per
+//! build when an owning driver starts the default service by itself (after
+//! it registered as the domain's default controller); it is not refreshed.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]

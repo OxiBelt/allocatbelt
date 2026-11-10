@@ -2128,12 +2128,53 @@ on the same active domain fails promptly if capacity is exhausted. The gate
 does not account an external executor's opaque task allocations or control CPU
 time. Original futures and closures are recovered if initial admission fails.
 
-The optional `resource-feedback` feature permits an explicitly selected
-`feedback_sources` factory. Each build creates fresh source contexts and
-directional application-byte meters; feedback is off by default.
-`driver::default_feedback()` is a ready-made factory for the global CPU soft
-limit alone, described in [resource-feedback.md](resource-feedback.md); it
-needs `resource_domain` and is equally off unless selected. The sampler
+Resource feedback is compiled with the `runtime` feature (which enables
+`resource-feedback`, kept as an alias) and is on by default for drivers bound
+to a resource domain. When a `CurrentThreadBuilder` or `MultiThreadBuilder`
+has a `resource_domain` whose global CPU soft limit is nonzero, the build
+starts the default service of `driver::default_feedback()`, described in
+[resource-feedback.md](resource-feedback.md), on that global CPU soft limit.
+
+**What the default service changes.** Bound runtimes take one CPU unit of
+their domain for each active poll or blocking call
+([resource-domain.md](resource-domain.md)), so this limit bounds the
+simultaneous polls and blocking calls of every runtime bound to the domain,
+across all of its drivers and tenants, not only explicit `CpuGate` users.
+After three dense readings at or above 80% of process CPU time over the CPU
+capacity (the standard library's available parallelism, read once per
+build), the service lowers the limit by a tenth of its current value. A limit
+below ten does not fall, so one that starts at ten or more stops at nine. At
+or below 40% it raises a lowered limit by one slot, at most once per second,
+never above the value it found at start. When it stops it returns the limit
+to that value, only if the limit is still the last value it wrote. The
+reading is process-wide, so the default services of several domains in one
+process react to the same readings. Behaviour under real pressure is not
+qualified.
+
+**What it costs.** Each default service keeps a `Control` charge on the
+building tenant while it runs (including
+`ResourceFeedbackService::owner_payload_bytes()` of owner payload), runs two
+threads (the sampler and a join monitor), so a current-thread driver's
+process is no longer single-threaded, and keeps one `/proc/self/stat`
+descriptor open, read every 100 ms on the real clock even when the driver's
+clock is paused. Shutdown waits for the sampler to stop, so an idle driver's
+shutdown no longer completes on its first poll. Setting the CPU soft limit
+while the service runs latches it as external drift; reconcile with
+`request_feedback_reconcile` or build with `without_feedback()`.
+
+`.without_feedback()` on either builder turns this off; nothing is then
+started. Startup of the default service is best effort: a failure (for
+example, too little tenant `Control` headroom, an unreadable process CPU
+sensor or a domain another default service already controls) leaves the
+driver built without feedback, and `feedback_status()` reports what the build
+did. A domain has at most one default service at a time: a later explicit
+`default_feedback()` on the same domain fails with
+`DefaultDomainAlreadyControlled`, and a driver dropped without shutdown
+releases the domain only when its detached sampler exits. The default service
+allocates no byte meter. An explicitly selected `feedback_sources` factory
+replaces the default selection; its errors fail the build, and each such
+build creates fresh source contexts and directional application-byte meters.
+The sampler
 uses real monotonic time, bounded policy state, explicit floors and ceilings,
 readback verification and fixed diagnostics. Missing, sparse or stale telemetry
 freezes its affected control. Shutdown closes executor admission immediately

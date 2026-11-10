@@ -62,6 +62,19 @@ bound. A blocking worker parked for CPU capacity remains task-admitted but
 does not hold a CPU unit. In `block_in_place`, the original poll keeps its CPU
 ticket for the borrowed closure; helpers acquire their own tickets and cannot
 exceed the same global or tenant CPU limits.
+Because of this, the global CPU soft limit bounds the simultaneous polls and
+blocking calls of every runtime bound to the domain, across all of its
+drivers and tenants. Resource feedback is on by default for owning drivers
+bound to a domain: the default service lowers that limit by a tenth of its
+current value after three dense readings at or above 80% of process CPU time
+over the CPU capacity (a limit below ten does not fall, so one that starts at
+ten or more stops at nine) and, at or below 40%, raises a lowered limit by one
+slot, at most once per second, never above the value it found at start. It
+returns the limit to that value when it stops, if the limit is still the last
+value it wrote. The reading is process-wide, so several domains in
+one process react to the same readings. Behaviour under real pressure is not
+qualified. `.without_feedback()` on the builder turns it off; see
+[resource-feedback.md](resource-feedback.md).
 If `Job::join` would wait for a job in the same bounded domain while the
 calling thread holds one of that domain's CPU tickets, it returns
 `JoinError::WouldDeadlock` and leaves the handle available for a later join.

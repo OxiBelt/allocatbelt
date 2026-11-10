@@ -24,6 +24,9 @@
 #[cfg(feature = "resource-feedback")]
 #[path = "driver_feedback.rs"]
 mod feedback;
+#[cfg(feature = "resource-feedback")]
+#[path = "driver_feedback_auto.rs"]
+mod feedback_auto;
 
 #[path = "driver_io.rs"]
 mod io_bindings;
@@ -40,6 +43,10 @@ pub use feedback::{
   FeedbackContext, FeedbackFactory, FeedbackFactoryError, default_feedback,
   default_feedback_for_capacity, feedback_sources, feedback_sources_with_history,
 };
+#[cfg(feature = "resource-feedback")]
+pub use feedback_auto::{FeedbackNotApplicable, FeedbackNotStarted, FeedbackStatus};
+#[cfg(feature = "resource-feedback")]
+use feedback_auto::{FeedbackSelection, start_default_selection};
 
 use std::fmt;
 use std::future::Future;
@@ -64,10 +71,13 @@ use super::reactor::{Reactor, ReactorConfig, ReactorError, ReactorHandle};
 use super::resource_domain::{ControlCharge, DomainError, TenantDomain};
 #[cfg(feature = "resource-feedback")]
 use super::resource_feedback::{
-  FeedbackMetricsHandle, FeedbackShutdownError, FeedbackShutdownProgress, ResourceFeedbackService,
+  FeedbackMetricsHandle, FeedbackShutdownError, FeedbackShutdownProgress, ReconcileRequestError,
+  ResourceFeedbackService,
 };
 #[cfg(feature = "resource-feedback")]
 use super::resource_feedback_meter::IoFeedbackMeter;
+#[cfg(feature = "resource-feedback")]
+use super::resource_feedback_policy::FeedbackResource;
 use super::signal::{SignalDriver, SignalError};
 use super::time::{ClockMode, IdleCoordinator, TimerDriver, TimerError, TimerHandle};
 use super::{Config as BlockingConfig, Handle as BlockingHandle, Runtime as BlockingRuntime};
@@ -186,7 +196,8 @@ pub enum DriverBuildError {
   ByteRate(ByteRateError),
   /// A selected provider could not reserve global and tenant metadata.
   ResourceDomain(DomainError),
-  /// An opt-in feedback factory or its service failed during startup.
+  /// A factory selected with `feedback_sources`, or its service, failed
+  /// during startup. The default selection never reports this error.
   #[cfg(feature = "resource-feedback")]
   Feedback(FeedbackFactoryError),
 }
@@ -478,7 +489,7 @@ struct ServiceOptions {
   upload_rate: Option<ByteRateConfig>,
   download_rate: Option<ByteRateConfig>,
   #[cfg(feature = "resource-feedback")]
-  feedback: Option<FeedbackFactory>,
+  feedback: FeedbackSelection,
 }
 
 struct ByteRateLimits {
@@ -494,7 +505,7 @@ struct FeedbackStartupInputs {
   upload_rate: Option<ByteRateLimit>,
   download_rate: Option<ByteRateLimit>,
   runtime_metrics: Option<RuntimeMetrics>,
-  meters: FeedbackMeters,
+  meters: Option<FeedbackMeters>,
 }
 
 impl ServiceOptions {
@@ -542,8 +553,11 @@ impl ServiceOptions {
           "timer metadata exceeds its facade",
         ))?;
     }
+    // Only an explicit factory is known to own a service here. The default
+    // selection keeps the full facade charge and releases the service's
+    // inline share only once that service has started and charged it.
     #[cfg(feature = "resource-feedback")]
-    if tenant.is_some() && self.feedback.is_some() {
+    if tenant.is_some() && matches!(self.feedback, FeedbackSelection::Explicit(_)) {
       bytes = bytes
         .checked_sub(ResourceFeedbackService::owner_payload_bytes())
         .ok_or(DriverBuildError::InvalidConfiguration(
@@ -617,7 +631,7 @@ impl ServiceOptions {
       ));
     }
     #[cfg(feature = "resource-feedback")]
-    if let Some(factory) = &self.feedback {
+    if let FeedbackSelection::Explicit(factory) = &self.feedback {
       factory.validate().map_err(DriverBuildError::Feedback)?;
     }
     Ok(())
@@ -746,29 +760,77 @@ impl ServiceOptions {
     Ok(filesystem)
   }
 
+  /// Meters for an explicit factory, charged to the bound tenant. The
+  /// default selection and a disabled one allocate none.
+  #[cfg(feature = "resource-feedback")]
+  fn feedback_meters(
+    &self,
+    tenant: Option<&TenantDomain>,
+  ) -> Result<Option<FeedbackMeters>, DriverBuildError> {
+    if !matches!(self.feedback, FeedbackSelection::Explicit(_)) {
+      return Ok(None);
+    }
+    match tenant {
+      Some(tenant) => FeedbackMeters::new_in_tenant(tenant),
+      None => Ok(FeedbackMeters::new()),
+    }
+    .map(Some)
+    .map_err(DriverBuildError::ResourceDomain)
+  }
+
+  /// Starts the selected feedback service. Only an explicit factory can fail
+  /// the build; the default selection records its outcome in the status.
   #[cfg(feature = "resource-feedback")]
   fn start_feedback(
     &self,
     inputs: FeedbackStartupInputs,
     startup: &mut StartupGuard,
-  ) -> Result<(), DriverBuildError> {
-    if let Some(factory) = &self.feedback {
-      startup.feedback = Some(
-        factory
-          .build(FeedbackContext {
-            resources: inputs.resources,
-            disk_rate: inputs.disk_rate,
-            upload_rate: inputs.upload_rate,
-            download_rate: inputs.download_rate,
-            disk_meter: inputs.meters.disk,
-            upload_meter: inputs.meters.upload,
-            download_meter: inputs.meters.download,
-            runtime_metrics: inputs.runtime_metrics,
-          })
-          .map_err(DriverBuildError::Feedback)?,
-      );
+    owner_control: &mut ControlCharge,
+  ) -> Result<FeedbackStatus, DriverBuildError> {
+    match &self.feedback {
+      FeedbackSelection::Disabled => Ok(FeedbackStatus::Disabled),
+      FeedbackSelection::Explicit(factory) => {
+        let Some(meters) = inputs.meters else {
+          return Err(DriverBuildError::InvalidConfiguration(
+            "feedback meters were not prepared for the selected service",
+          ));
+        };
+        startup.feedback = Some(
+          factory
+            .build(FeedbackContext {
+              resources: inputs.resources,
+              disk_rate: inputs.disk_rate,
+              upload_rate: inputs.upload_rate,
+              download_rate: inputs.download_rate,
+              disk_meter: meters.disk,
+              upload_meter: meters.upload,
+              download_meter: meters.download,
+              runtime_metrics: inputs.runtime_metrics,
+            })
+            .map_err(DriverBuildError::Feedback)?,
+        );
+        Ok(FeedbackStatus::Running)
+      }
+      FeedbackSelection::Auto => {
+        let (service, status) = start_default_selection(inputs.resources.tenant_domain());
+        if let Some(service) = service {
+          // The started service charges its own inline owner payload, which
+          // the facade charged as part of itself; release the facade's share
+          // so that, once started, the payload is charged once, as with an
+          // explicit factory. During startup the default path is one owner
+          // payload higher than the explicit path. If the split fails (a
+          // facade smaller than that payload), the facade keeps its full
+          // charge and that payload stays charged twice while the driver
+          // lives; nothing fails.
+          if let Ok(share) = owner_control.split_off(ResourceFeedbackService::owner_payload_bytes())
+          {
+            drop(share);
+          }
+          startup.feedback = Some(service);
+        }
+        Ok(status)
+      }
     }
-    Ok(())
   }
 
   fn start_signal(&self, startup: &mut StartupGuard) -> Result<(), DriverBuildError> {
@@ -866,10 +928,34 @@ macro_rules! service_builder_methods {
         self
       }
 
-      /// Selects an opt-in, per-driver autonomous feedback factory.
+      /// Replaces the default feedback selection with a per-driver factory.
+      /// Its validation, source and startup errors fail the build.
       #[cfg(feature = "resource-feedback")]
       pub fn feedback_sources(mut self, factory: FeedbackFactory) -> Self {
-        self.services.feedback = Some(factory);
+        self.services.feedback = FeedbackSelection::Explicit(factory);
+        self
+      }
+
+      /// Turns resource feedback off for drivers built from this builder.
+      ///
+      /// By default a builder with a `resource_domain` starts the default
+      /// service on that domain's global CPU soft limit when it applies. That
+      /// limit bounds the simultaneous polls and blocking calls of every
+      /// runtime bound to the domain, and the service lowers it under high
+      /// process CPU use (see [`default_feedback_for_capacity`]). It also
+      /// costs a tenant `Control` charge, two threads (sampler and join
+      /// monitor), so a current-thread driver's process is no longer
+      /// single-threaded, and one open `/proc/self/stat` descriptor read every
+      /// 100 ms on the real clock, also when the driver's clock is paused.
+      ///
+      /// With this selection the build starts no feedback service and spawns
+      /// no feedback thread, and the driver reports
+      /// [`FeedbackStatus::Disabled`]. Use it where the domain's CPU limit
+      /// must stay fixed. A later `feedback_sources` call selects that
+      /// factory instead.
+      #[cfg(feature = "resource-feedback")]
+      pub fn without_feedback(mut self) -> Self {
+        self.services.feedback = FeedbackSelection::Disabled;
         self
       }
     }
@@ -911,7 +997,7 @@ impl CurrentThreadBuilder {
         upload_rate: None,
         download_rate: None,
         #[cfg(feature = "resource-feedback")]
-        feedback: None,
+        feedback: FeedbackSelection::Auto,
       },
     }
   }
@@ -945,7 +1031,7 @@ impl CurrentThreadBuilder {
         .map_err(DriverBuildError::ResourceDomain)?,
       None => ResourceScope::new(self.resources),
     };
-    let owner_control = self.services.owner_control(
+    let mut owner_control = self.services.owner_control(
       resources.tenant_domain(),
       std::mem::size_of::<CurrentThreadDriver>(),
       std::mem::size_of::<LocalRuntime>(),
@@ -957,16 +1043,7 @@ impl CurrentThreadBuilder {
       download: download_rate,
     } = self.services.build_rate_limits(resources.tenant_domain())?;
     #[cfg(feature = "resource-feedback")]
-    let feedback_meters = self
-      .services
-      .feedback
-      .as_ref()
-      .map(|_| match resources.tenant_domain() {
-        Some(tenant) => FeedbackMeters::new_in_tenant(tenant),
-        None => Ok(FeedbackMeters::new()),
-      })
-      .transpose()
-      .map_err(DriverBuildError::ResourceDomain)?;
+    let feedback_meters = self.services.feedback_meters(resources.tenant_domain())?;
     let mut startup = StartupGuard::default();
     startup.local = Some(
       LocalRuntime::with_resources(self.config, resources.clone())
@@ -991,24 +1068,18 @@ impl CurrentThreadBuilder {
       feedback_meters.as_ref(),
     )?;
     #[cfg(feature = "resource-feedback")]
-    if self.services.feedback.is_some() {
-      let Some(meters) = feedback_meters.clone() else {
-        return Err(DriverBuildError::InvalidConfiguration(
-          "feedback meters were not prepared for the selected service",
-        ));
-      };
-      self.services.start_feedback(
-        FeedbackStartupInputs {
-          resources: resources.clone(),
-          disk_rate: disk_rate.clone(),
-          upload_rate: upload_rate.clone(),
-          download_rate: download_rate.clone(),
-          runtime_metrics: None,
-          meters,
-        },
-        &mut startup,
-      )?;
-    }
+    let feedback_status = self.services.start_feedback(
+      FeedbackStartupInputs {
+        resources: resources.clone(),
+        disk_rate: disk_rate.clone(),
+        upload_rate: upload_rate.clone(),
+        download_rate: download_rate.clone(),
+        runtime_metrics: None,
+        meters: feedback_meters.clone(),
+      },
+      &mut startup,
+      &mut owner_control,
+    )?;
     self.services.start_signal(&mut startup)?;
     if let Some(timer) = startup.timer.as_ref().map(TimerDriver::handle) {
       let blocking_handle = startup.blocking.as_ref().map(BlockingRuntime::handle);
@@ -1033,6 +1104,8 @@ impl CurrentThreadBuilder {
       feedback: startup.feedback.take(),
       #[cfg(feature = "resource-feedback")]
       feedback_meters,
+      #[cfg(feature = "resource-feedback")]
+      feedback_status,
       disk_rate,
       upload_rate,
       download_rate,
@@ -1086,7 +1159,7 @@ impl MultiThreadBuilder {
         upload_rate: None,
         download_rate: None,
         #[cfg(feature = "resource-feedback")]
-        feedback: None,
+        feedback: FeedbackSelection::Auto,
       },
     }
   }
@@ -1149,7 +1222,7 @@ impl MultiThreadBuilder {
         .map_err(DriverBuildError::ResourceDomain)?,
       None => ResourceScope::new(self.resources),
     };
-    let owner_control = self.services.owner_control(
+    let mut owner_control = self.services.owner_control(
       resources.tenant_domain(),
       std::mem::size_of::<MultiThreadDriver>(),
       std::mem::size_of::<AsyncRuntime>(),
@@ -1161,16 +1234,7 @@ impl MultiThreadBuilder {
       download: download_rate,
     } = self.services.build_rate_limits(resources.tenant_domain())?;
     #[cfg(feature = "resource-feedback")]
-    let feedback_meters = self
-      .services
-      .feedback
-      .as_ref()
-      .map(|_| match resources.tenant_domain() {
-        Some(tenant) => FeedbackMeters::new_in_tenant(tenant),
-        None => Ok(FeedbackMeters::new()),
-      })
-      .transpose()
-      .map_err(DriverBuildError::ResourceDomain)?;
+    let feedback_meters = self.services.feedback_meters(resources.tenant_domain())?;
     let mut startup = StartupGuard::default();
     let mut options =
       AsyncRuntimeOptions::new().thread_options(self.thread_options.unwrap_or_default());
@@ -1202,24 +1266,18 @@ impl MultiThreadBuilder {
     #[cfg(feature = "resource-feedback")]
     let runtime_metrics = startup.asynchronous.as_ref().map(AsyncRuntime::metrics);
     #[cfg(feature = "resource-feedback")]
-    if self.services.feedback.is_some() {
-      let Some(meters) = feedback_meters.clone() else {
-        return Err(DriverBuildError::InvalidConfiguration(
-          "feedback meters were not prepared for the selected service",
-        ));
-      };
-      self.services.start_feedback(
-        FeedbackStartupInputs {
-          resources: resources.clone(),
-          disk_rate: disk_rate.clone(),
-          upload_rate: upload_rate.clone(),
-          download_rate: download_rate.clone(),
-          runtime_metrics,
-          meters,
-        },
-        &mut startup,
-      )?;
-    }
+    let feedback_status = self.services.start_feedback(
+      FeedbackStartupInputs {
+        resources: resources.clone(),
+        disk_rate: disk_rate.clone(),
+        upload_rate: upload_rate.clone(),
+        download_rate: download_rate.clone(),
+        runtime_metrics,
+        meters: feedback_meters.clone(),
+      },
+      &mut startup,
+      &mut owner_control,
+    )?;
     self.services.start_signal(&mut startup)?;
     if let Some(timer) = startup.timer.as_ref().map(TimerDriver::handle)
       && let Some(blocking) = startup.blocking.as_mut()
@@ -1243,6 +1301,8 @@ impl MultiThreadBuilder {
       feedback: startup.feedback.take(),
       #[cfg(feature = "resource-feedback")]
       feedback_meters,
+      #[cfg(feature = "resource-feedback")]
+      feedback_status,
       disk_rate,
       upload_rate,
       download_rate,
@@ -1325,6 +1385,8 @@ pub struct CurrentThreadDriver {
   feedback: Option<ResourceFeedbackService>,
   #[cfg(feature = "resource-feedback")]
   feedback_meters: Option<FeedbackMeters>,
+  #[cfg(feature = "resource-feedback")]
+  feedback_status: FeedbackStatus,
   disk_rate: Option<ByteRateLimit>,
   upload_rate: Option<ByteRateLimit>,
   download_rate: Option<ByteRateLimit>,
@@ -1488,7 +1550,8 @@ impl CurrentThreadDriver {
     )
   }
 
-  /// A cloneable metrics handle for this driver's feedback service, if selected.
+  /// A cloneable metrics handle for this driver's feedback service, if the
+  /// build started one (by default or from `feedback_sources`).
   #[cfg(feature = "resource-feedback")]
   #[must_use]
   pub fn feedback_metrics(&self) -> Option<FeedbackMetricsHandle> {
@@ -1496,6 +1559,38 @@ impl CurrentThreadDriver {
       .feedback
       .as_ref()
       .map(ResourceFeedbackService::metrics_handle)
+  }
+
+  /// What the build did about resource feedback: started a service, was
+  /// turned off, found the default service not applicable, or could not
+  /// start it. This is the build outcome: a service that later latches a
+  /// control still reports [`FeedbackStatus::Running`]; read its controls
+  /// through [`Self::feedback_metrics`].
+  #[cfg(feature = "resource-feedback")]
+  #[must_use]
+  pub const fn feedback_status(&self) -> FeedbackStatus {
+    self.feedback_status
+  }
+
+  /// Queues one readback reconciliation for a latched control of this
+  /// driver's feedback service, or returns `None` when the build started no
+  /// service.
+  ///
+  /// A control latches after a failed or ambiguous change, or when its limit
+  /// was changed by someone else (external drift), for example a caller that
+  /// sets the domain's global CPU soft limit while the default service runs.
+  /// After reconciliation the service continues from the limit it reads
+  /// back. To keep a caller-set limit fixed instead, build the driver with
+  /// `without_feedback`.
+  #[cfg(feature = "resource-feedback")]
+  pub fn request_feedback_reconcile(
+    &self,
+    resource: FeedbackResource,
+  ) -> Option<Result<(), ReconcileRequestError>> {
+    self
+      .feedback
+      .as_ref()
+      .map(|feedback| feedback.request_reconcile(resource))
   }
 
   /// Closes local admission and requests cancellation according to `policy`.
@@ -1704,6 +1799,8 @@ pub struct MultiThreadDriver {
   feedback: Option<ResourceFeedbackService>,
   #[cfg(feature = "resource-feedback")]
   feedback_meters: Option<FeedbackMeters>,
+  #[cfg(feature = "resource-feedback")]
+  feedback_status: FeedbackStatus,
   disk_rate: Option<ByteRateLimit>,
   upload_rate: Option<ByteRateLimit>,
   download_rate: Option<ByteRateLimit>,
@@ -1855,7 +1952,8 @@ impl MultiThreadDriver {
     )
   }
 
-  /// A cloneable metrics handle for this driver's feedback service, if selected.
+  /// A cloneable metrics handle for this driver's feedback service, if the
+  /// build started one (by default or from `feedback_sources`).
   #[cfg(feature = "resource-feedback")]
   #[must_use]
   pub fn feedback_metrics(&self) -> Option<FeedbackMetricsHandle> {
@@ -1863,6 +1961,38 @@ impl MultiThreadDriver {
       .feedback
       .as_ref()
       .map(ResourceFeedbackService::metrics_handle)
+  }
+
+  /// What the build did about resource feedback: started a service, was
+  /// turned off, found the default service not applicable, or could not
+  /// start it. This is the build outcome: a service that later latches a
+  /// control still reports [`FeedbackStatus::Running`]; read its controls
+  /// through [`Self::feedback_metrics`].
+  #[cfg(feature = "resource-feedback")]
+  #[must_use]
+  pub const fn feedback_status(&self) -> FeedbackStatus {
+    self.feedback_status
+  }
+
+  /// Queues one readback reconciliation for a latched control of this
+  /// driver's feedback service, or returns `None` when the build started no
+  /// service.
+  ///
+  /// A control latches after a failed or ambiguous change, or when its limit
+  /// was changed by someone else (external drift), for example a caller that
+  /// sets the domain's global CPU soft limit while the default service runs.
+  /// After reconciliation the service continues from the limit it reads
+  /// back. To keep a caller-set limit fixed instead, build the driver with
+  /// `without_feedback`.
+  #[cfg(feature = "resource-feedback")]
+  pub fn request_feedback_reconcile(
+    &self,
+    resource: FeedbackResource,
+  ) -> Option<Result<(), ReconcileRequestError>> {
+    self
+      .feedback
+      .as_ref()
+      .map(|feedback| feedback.request_reconcile(resource))
   }
 
   /// Closes executor admission. Blocking jobs continue first, then managed
@@ -2971,6 +3101,8 @@ mod tests {
       feedback: None,
       #[cfg(feature = "resource-feedback")]
       feedback_meters: None,
+      #[cfg(feature = "resource-feedback")]
+      feedback_status: FeedbackStatus::Disabled,
       disk_rate: None,
       upload_rate: None,
       download_rate: None,
@@ -3458,6 +3590,7 @@ mod tests {
       .feedback_sources(default_feedback_for_capacity(capacity))
       .build()
       .unwrap_or_else(|error| panic!("default feedback driver build failed: {error}"));
+    assert_eq!(driver.feedback_status(), FeedbackStatus::Running);
     let metrics = driver
       .feedback_metrics()
       .unwrap_or_else(|| panic!("default feedback service was not retained"));
@@ -3488,6 +3621,424 @@ mod tests {
         FeedbackFactoryError::DefaultRequiresResourceDomain
       ))
     ));
+  }
+
+  /// A domain whose CPU ceiling is below ten: the default policy can neither
+  /// lower that limit (its step is a tenth) nor raise it past the ceiling, so
+  /// these tests observe a limit that cannot move.
+  #[cfg(feature = "resource-feedback")]
+  fn default_selection_domain(cpu: usize, tenants: usize) -> (ResourceDomain, DomainResources) {
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, cpu)
+      .with(DomainResource::Tasks, 64)
+      .with(DomainResource::Memory, 1 << 20)
+      .with(DomainResource::Disk, 8)
+      .with(DomainResource::Network, 8)
+      .with(DomainResource::Control, 1 << 20);
+    (
+      ResourceDomain::with_waiters(ceiling, tenants, 32).unwrap(),
+      ceiling,
+    )
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  fn assert_default_service_on_cpu(metrics: &FeedbackMetricsHandle, cpu: u64) {
+    use crate::runtime::resource_feedback_policy::UNSELECTED_BYTE_RATE;
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+      snapshot
+        .control(FeedbackResource::CpuConcurrency)
+        .current_limit,
+      cpu
+    );
+    for resource in [FeedbackResource::DiskRate, FeedbackResource::NetworkRate] {
+      assert_eq!(
+        snapshot.control(resource).current_limit,
+        UNSELECTED_BYTE_RATE
+      );
+    }
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
+  fn default_selection_starts_on_the_global_cpu_limit_for_both_builders() {
+    let (domain, ceiling) = default_selection_domain(6, 2);
+    let tenant = domain.tenant(ceiling).unwrap();
+    let mut current = CurrentThreadBuilder::new(local_config())
+      .resources(limits(64))
+      .resource_domain(tenant.clone())
+      .disk_rate(feedback_rate_config())
+      .build()
+      .unwrap_or_else(|error| panic!("default-feedback current-thread build failed: {error}"));
+    assert_eq!(current.feedback_status(), FeedbackStatus::Running);
+    assert_default_service_on_cpu(&current.feedback_metrics().unwrap(), 6);
+    // The default service reads no byte meter: none is allocated, so the
+    // disk adapter and filesystem paths take no meter timestamps.
+    assert!(current.feedback_meters.is_none());
+    // The facade releases its share of the service's inline payload once the
+    // service charged it, exactly as for an explicitly selected factory.
+    assert_eq!(
+      current._control.bytes(),
+      std::mem::size_of::<CurrentThreadDriver>()
+        - std::mem::size_of::<LocalRuntime>()
+        - ResourceFeedbackService::owner_payload_bytes()
+        - TimerDriver::owner_payload_bytes()
+    );
+    assert!(domain.try_register_default_feedback().is_none());
+    assert_eq!(domain.snapshot().limit.get(DomainResource::Cpu), 6);
+    assert_eq!(tenant.snapshot().unwrap().limit.get(DomainResource::Cpu), 6);
+    shutdown_current_driver(&mut current);
+    drop(current);
+
+    // The stopped service released the domain's registration.
+    let mut multi = MultiThreadBuilder::new(async_config())
+      .resources(limits(64))
+      .resource_domain(tenant)
+      .build()
+      .unwrap_or_else(|error| panic!("default-feedback multithread build failed: {error}"));
+    assert_eq!(multi.feedback_status(), FeedbackStatus::Running);
+    assert_default_service_on_cpu(&multi.feedback_metrics().unwrap(), 6);
+    assert!(multi.feedback_meters.is_none());
+    assert_eq!(
+      multi._control.bytes(),
+      std::mem::size_of::<MultiThreadDriver>()
+        - std::mem::size_of::<AsyncRuntime>()
+        - ResourceFeedbackService::owner_payload_bytes()
+    );
+    assert_eq!(domain.snapshot().limit.get(DomainResource::Cpu), 6);
+    shutdown_multi_driver(&mut multi);
+    drop(multi);
+    assert!(domain.try_register_default_feedback().is_some());
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
+  fn default_selection_without_a_domain_or_cpu_is_not_applicable() {
+    let mut unbound = CurrentThreadBuilder::new(local_config())
+      .build()
+      .unwrap_or_else(|error| panic!("unbound build failed: {error}"));
+    assert_eq!(
+      unbound.feedback_status(),
+      FeedbackStatus::NotApplicable(FeedbackNotApplicable::NoResourceDomain)
+    );
+    assert!(unbound.feedback_metrics().is_none());
+    assert!(unbound.feedback_meters.is_none());
+    shutdown_current_driver(&mut unbound);
+    let mut unbound = MultiThreadBuilder::new(async_config())
+      .build()
+      .unwrap_or_else(|error| panic!("unbound build failed: {error}"));
+    assert_eq!(
+      unbound.feedback_status(),
+      FeedbackStatus::NotApplicable(FeedbackNotApplicable::NoResourceDomain)
+    );
+    assert!(unbound.feedback_metrics().is_none());
+    shutdown_multi_driver(&mut unbound);
+
+    // A bound runtime takes a domain CPU unit for each poll, so a domain
+    // without a CPU ceiling cannot build one; no status covers that case.
+    let (no_cpu, ceiling) = default_selection_domain(0, 2);
+    assert!(
+      CurrentThreadBuilder::new(local_config())
+        .resource_domain(no_cpu.tenant(ceiling).unwrap())
+        .build()
+        .is_err()
+    );
+    assert!(
+      MultiThreadBuilder::new(async_config())
+        .resource_domain(no_cpu.tenant(ceiling).unwrap())
+        .build()
+        .is_err()
+    );
+
+    // A zero soft limit below a nonzero ceiling builds; the default service
+    // would start at a limit its policy floor rejects.
+    let (lowered, ceiling) = default_selection_domain(4, 1);
+    lowered
+      .set_limits(ceiling.with(DomainResource::Cpu, 0))
+      .unwrap();
+    let mut driver = MultiThreadBuilder::new(async_config())
+      .resource_domain(lowered.tenant(ceiling).unwrap())
+      .build()
+      .unwrap_or_else(|error| panic!("zero-limit build failed: {error}"));
+    assert_eq!(
+      driver.feedback_status(),
+      FeedbackStatus::NotApplicable(FeedbackNotApplicable::NoCpuLimit)
+    );
+    assert!(driver.feedback_metrics().is_none());
+    assert_eq!(
+      driver._control.bytes(),
+      std::mem::size_of::<MultiThreadDriver>() - std::mem::size_of::<AsyncRuntime>()
+    );
+    assert!(lowered.try_register_default_feedback().is_some());
+    shutdown_multi_driver(&mut driver);
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
+  fn default_selection_that_cannot_start_builds_the_driver_without_feedback() {
+    let (domain, ceiling) = default_selection_domain(4, 2);
+    let tenant = domain.tenant(ceiling).unwrap();
+    feedback::fail_next_default_sensor_for_test();
+    let mut driver = CurrentThreadBuilder::new(local_config())
+      .resources(limits(64))
+      .resource_domain(tenant.clone())
+      .build()
+      .unwrap_or_else(|error| panic!("sensor-failure build failed: {error}"));
+    assert_eq!(
+      driver.feedback_status(),
+      FeedbackStatus::NotStarted(FeedbackNotStarted::Sensor(io::ErrorKind::PermissionDenied))
+    );
+    assert!(driver.feedback_metrics().is_none());
+    assert_eq!(
+      driver._control.bytes(),
+      std::mem::size_of::<CurrentThreadDriver>() - std::mem::size_of::<LocalRuntime>()
+    );
+    // The failed start released the registration it had taken.
+    assert!(domain.try_register_default_feedback().is_some());
+    let used = tenant.snapshot().unwrap().used.get(DomainResource::Control);
+
+    // A second identical driver fits the tenant's Control limit exactly, so
+    // the default service's own charge is refused and nothing is retained.
+    tenant
+      .set_limits(ceiling.with(DomainResource::Control, 2 * used))
+      .unwrap();
+    let mut constrained = CurrentThreadBuilder::new(local_config())
+      .resources(limits(64))
+      .resource_domain(tenant.clone())
+      .build()
+      .unwrap_or_else(|error| panic!("Control-constrained build failed: {error}"));
+    assert_eq!(
+      constrained.feedback_status(),
+      FeedbackStatus::NotStarted(FeedbackNotStarted::Domain(DomainError::Exhausted(
+        DomainResource::Control
+      )))
+    );
+    assert!(constrained.feedback_metrics().is_none());
+    assert_eq!(
+      tenant.snapshot().unwrap().used.get(DomainResource::Control),
+      2 * used
+    );
+    assert!(domain.try_register_default_feedback().is_some());
+    // The driver works once its tenant has room for a root call's charge.
+    tenant.set_limits(ceiling).unwrap();
+    assert_eq!(constrained.block_on(async { 7 }).unwrap(), 7);
+    shutdown_current_driver(&mut constrained);
+    shutdown_current_driver(&mut driver);
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
+  fn without_feedback_starts_nothing_and_explicit_factories_still_fail_the_build() {
+    let (domain, ceiling) = default_selection_domain(4, 2);
+    let tenant = domain.tenant(ceiling).unwrap();
+    let mut driver = MultiThreadBuilder::new(async_config())
+      .resource_domain(tenant.clone())
+      .without_feedback()
+      .build()
+      .unwrap_or_else(|error| panic!("feedback-off build failed: {error}"));
+    assert_eq!(driver.feedback_status(), FeedbackStatus::Disabled);
+    assert!(driver.feedback_metrics().is_none());
+    assert!(driver.feedback_meters.is_none());
+    assert_eq!(
+      driver._control.bytes(),
+      std::mem::size_of::<MultiThreadDriver>() - std::mem::size_of::<AsyncRuntime>()
+    );
+    assert!(domain.try_register_default_feedback().is_some());
+    shutdown_multi_driver(&mut driver);
+
+    // The last selection wins, and an explicit factory's errors still fail
+    // the build rather than falling back to the default service.
+    let failing = feedback_sources(feedback_policy(), |_| {
+      Err::<(MissingFeedbackSensor, TestFeedbackActuator), io::Error>(io::Error::other(
+        "intentional source failure",
+      ))
+    });
+    let error = CurrentThreadBuilder::new(local_config())
+      .resource_domain(tenant.clone())
+      .without_feedback()
+      .feedback_sources(failing.clone())
+      .build()
+      .err()
+      .unwrap_or_else(|| panic!("failing explicit factory unexpectedly built"));
+    assert!(matches!(
+      error,
+      DriverBuildError::Feedback(FeedbackFactoryError::Sources(_))
+    ));
+    assert!(domain.try_register_default_feedback().is_some());
+    let mut off = CurrentThreadBuilder::new(local_config())
+      .resource_domain(tenant)
+      .feedback_sources(failing)
+      .without_feedback()
+      .build()
+      .unwrap_or_else(|error| panic!("feedback-off build failed: {error}"));
+    assert_eq!(off.feedback_status(), FeedbackStatus::Disabled);
+    shutdown_current_driver(&mut off);
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
+  fn a_build_failing_after_the_default_service_started_releases_it() {
+    // The process-wide signal bridge is fixed at one listener (as in
+    // `startup_failure_after_services_start_joins_the_partial_runtime`), so
+    // asking for two fails at the last startup step, after feedback started.
+    let _permanent_signal =
+      SignalDriver::new(1).unwrap_or_else(|error| panic!("signal setup failed: {error}"));
+    let (domain, ceiling) = default_selection_domain(4, 2);
+    let error = CurrentThreadBuilder::new(local_config())
+      .resource_domain(domain.tenant(ceiling).unwrap())
+      .signals(2)
+      .build()
+      .err()
+      .unwrap_or_else(|| panic!("mismatched process signal ceiling unexpectedly built"));
+    assert!(matches!(
+      error,
+      DriverBuildError::Signal(SignalError::ConfigurationMismatch)
+    ));
+    // Startup rollback stopped the default service, which released the
+    // domain's registration and left the CPU limit as it was.
+    assert!(domain.try_register_default_feedback().is_some());
+    assert_eq!(domain.snapshot().limit.get(DomainResource::Cpu), 4);
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
+  fn driver_forwards_feedback_reconciliation_after_external_drift() {
+    use crate::runtime::resource_feedback_actuator::GlobalCpuFeedbackActuator;
+    let (domain, ceiling) = default_selection_domain(20, 2);
+    let global = domain.clone();
+    // Busy readings make the service plan reductions, so its pre-write drift
+    // check runs; fixed byte controls cannot change.
+    let policy = ResourceFeedbackPolicyConfig {
+      cpu_concurrency: FeedbackControlConfig::new(1, 20, 20, 4000, 8000),
+      disk_rate: FeedbackControlConfig::new(5, 5, 5, 4000, 8000),
+      network_rate: FeedbackControlConfig::new(6, 6, 6, 4000, 8000),
+    };
+    let mut driver = CurrentThreadBuilder::new(local_config())
+      .resource_domain(domain.tenant(ceiling).unwrap())
+      .feedback_sources(feedback_sources(policy, move |_| {
+        Ok((
+          BusyFeedbackSensor,
+          GlobalCpuFeedbackActuator::new(global.clone(), 5, 6),
+        ))
+      }))
+      .build()
+      .unwrap_or_else(|error| panic!("feedback build failed: {error}"));
+    let metrics = driver.feedback_metrics().unwrap();
+    assert_eq!(
+      driver.request_feedback_reconcile(FeedbackResource::CpuConcurrency),
+      Some(Err(ReconcileRequestError::NotFaulted))
+    );
+    // Another writer changes the limit under the running service.
+    domain
+      .set_limits(ceiling.with(DomainResource::Cpu, 15))
+      .unwrap();
+    let faulted = || {
+      metrics
+        .snapshot()
+        .control(FeedbackResource::CpuConcurrency)
+        .policy_faulted
+    };
+    let deadline = Instant::now() + DRIVER_TEST_WATCHDOG;
+    while !faulted() {
+      assert!(Instant::now() < deadline, "external drift was not latched");
+      std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(domain.snapshot().limit.get(DomainResource::Cpu), 15);
+    assert_eq!(driver.feedback_status(), FeedbackStatus::Running);
+    assert_eq!(
+      driver.request_feedback_reconcile(FeedbackResource::CpuConcurrency),
+      Some(Ok(()))
+    );
+    while faulted() {
+      assert!(Instant::now() < deadline, "reconciliation did not complete");
+      std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(domain.snapshot().limit.get(DomainResource::Cpu) <= 15);
+    shutdown_current_driver(&mut driver);
+
+    let mut off = CurrentThreadBuilder::new(local_config())
+      .resource_domain(domain.tenant(ceiling).unwrap())
+      .without_feedback()
+      .build()
+      .unwrap_or_else(|error| panic!("feedback-off build failed: {error}"));
+    assert_eq!(
+      off.request_feedback_reconcile(FeedbackResource::CpuConcurrency),
+      None
+    );
+    shutdown_current_driver(&mut off);
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
+  fn a_domain_has_one_default_controller_until_its_service_stops() {
+    let (domain, ceiling) = default_selection_domain(4, 4);
+    let builder = CurrentThreadBuilder::new(local_config())
+      .resources(limits(64))
+      .resource_domain(domain.tenant(ceiling).unwrap());
+    let mut first = builder
+      .clone()
+      .build()
+      .unwrap_or_else(|error| panic!("first default build failed: {error}"));
+    assert_eq!(first.feedback_status(), FeedbackStatus::Running);
+
+    // A cloned builder on the same tenant, and a driver of another tenant of
+    // the same domain, both find the domain controlled.
+    let mut cloned = builder
+      .build()
+      .unwrap_or_else(|error| panic!("cloned default build failed: {error}"));
+    assert_eq!(
+      cloned.feedback_status(),
+      FeedbackStatus::NotStarted(FeedbackNotStarted::DomainAlreadyControlled)
+    );
+    assert!(cloned.feedback_metrics().is_none());
+    let mut other = MultiThreadBuilder::new(async_config())
+      .resource_domain(domain.tenant(ceiling).unwrap())
+      .build()
+      .unwrap_or_else(|error| panic!("second-tenant default build failed: {error}"));
+    assert_eq!(
+      other.feedback_status(),
+      FeedbackStatus::NotStarted(FeedbackNotStarted::DomainAlreadyControlled)
+    );
+    let explicit = MultiThreadBuilder::new(async_config())
+      .resource_domain(domain.tenant(ceiling).unwrap())
+      .feedback_sources(default_feedback_for_capacity(
+        std::num::NonZeroU32::new(4).unwrap(),
+      ))
+      .build();
+    assert!(matches!(
+      explicit,
+      Err(DriverBuildError::Feedback(
+        FeedbackFactoryError::DefaultDomainAlreadyControlled
+      ))
+    ));
+    // Caller-built factories with their own actuators are not restricted.
+    let mut caller_built = CurrentThreadBuilder::new(local_config())
+      .resource_domain(domain.tenant(ceiling).unwrap())
+      .feedback_sources(feedback_sources(feedback_policy(), |_| {
+        Ok((
+          MissingFeedbackSensor,
+          TestFeedbackActuator {
+            limits: [16, 1000, 1000],
+          },
+        ))
+      }))
+      .build()
+      .unwrap_or_else(|error| panic!("caller-built factory build failed: {error}"));
+    assert_eq!(caller_built.feedback_status(), FeedbackStatus::Running);
+    shutdown_current_driver(&mut caller_built);
+    drop(caller_built);
+
+    shutdown_current_driver(&mut first);
+    drop(first);
+    let mut next = CurrentThreadBuilder::new(local_config())
+      .resource_domain(domain.tenant(ceiling).unwrap())
+      .build()
+      .unwrap_or_else(|error| panic!("follow-up default build failed: {error}"));
+    assert_eq!(next.feedback_status(), FeedbackStatus::Running);
+    assert_default_service_on_cpu(&next.feedback_metrics().unwrap(), 4);
+    shutdown_current_driver(&mut next);
+    shutdown_current_driver(&mut cloned);
+    shutdown_multi_driver(&mut other);
   }
 
   #[cfg(feature = "resource-feedback")]
@@ -4036,10 +4587,14 @@ mod tests {
 
     let multi_completion_drain = crate::runtime::thread_completion::CompletionDrain::new();
     let multi_drain_registration = multi_completion_drain.register_for_current_thread();
+    // This test pins the facade's exact Control charge and the return to the
+    // baseline after the process provider drains; a default feedback service
+    // would add its own charges, so it is turned off here.
     let mut multi = MultiThreadBuilder::new(async_config())
       .resource_domain(tenant.clone())
       .resources(limits(0))
       .processes(1)
+      .without_feedback()
       .build()
       .unwrap();
     drop(multi_drain_registration);
@@ -4071,6 +4626,7 @@ mod tests {
       .resource_domain(tenant)
       .resources(limits(0))
       .processes(1)
+      .without_feedback()
       .build()
       .unwrap();
     drop(current_drain_registration);

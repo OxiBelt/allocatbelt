@@ -18,8 +18,12 @@ use crate::Allocatbelt;
 pub struct CompiledCapabilities {
   /// Feature `runtime`: the safe bounded blocking worker runtime.
   pub runtime: bool,
-  /// Feature `resource-feedback`: opt-in real-clock sensor/actuator service.
-  /// It starts only when explicitly constructed with finite policy bounds.
+  /// Feature `resource-feedback`: the real-clock sensor/actuator service.
+  /// `runtime` enables it, so it is compiled whenever the runtime is; the
+  /// feature name remains as an alias. An owning driver bound to a resource
+  /// domain starts the default service unless its builder calls
+  /// `without_feedback`; other services start only when explicitly
+  /// constructed with finite policy bounds.
   pub resource_feedback: bool,
   /// Feature `runtime-io-uring`: bounded owned-buffer positional file I/O.
   /// A separate driver must start successfully before it accepts operations.

@@ -230,6 +230,13 @@ selected broader stable Linux behavior, a unified owning runtime builder and
 opt-in autonomous CPU, disk and network feedback. These additions are planned
 requirements, not qualified implementation claims.
 
+Note (2026-11-10): the owner changed the feedback requirements in this
+section ("opt-in" above, "off by default" below) to on by default for owning
+drivers bound to a resource domain. The default service moves only the
+domain's global CPU soft limit; see
+[resource-feedback.md](../resource-feedback.md). The text of this section is
+kept as recorded.
+
 The additive `runtime::driver` facade must preserve the existing blocking
 `runtime::Runtime` and lower-level constructors. Its typed current-thread and
 multithread builders own selected drivers, bind roots and children to a shared

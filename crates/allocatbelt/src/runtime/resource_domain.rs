@@ -135,6 +135,9 @@ struct State {
   waiters: Vec<WaiterSlot>,
   next_waiter_pool: u64,
   next_wait_sequence: u64,
+  /// Whether a [`DefaultFeedbackRegistration`] of this domain is live.
+  #[cfg(any(all(feature = "resource-feedback", not(loom)), all(test, loom)))]
+  default_feedback_registered: bool,
 }
 
 struct WaiterSlot {
@@ -309,6 +312,8 @@ impl ResourceDomain {
         waiters,
         next_waiter_pool: 1,
         next_wait_sequence: 1,
+        #[cfg(any(all(feature = "resource-feedback", not(loom)), all(test, loom)))]
+        default_feedback_registered: false,
       })),
       identity,
     })
@@ -429,6 +434,43 @@ impl ResourceDomain {
         drop_contained(payload);
       }
     }
+  }
+}
+
+/// The registration of the one default feedback controller a domain may have.
+///
+/// Two default controllers moving the same global CPU soft limit would see
+/// each other's changes as external drift. The default path acquires this
+/// registration before it reads the limit and keeps it with its actuator, so
+/// it is released when that actuator is dropped: after the service stopped,
+/// after a failed startup, or when a detached sampler finishes. Explicit
+/// caller-built actuators take none.
+#[cfg(any(all(feature = "resource-feedback", not(loom)), all(test, loom)))]
+pub(crate) struct DefaultFeedbackRegistration {
+  state: Arc<Mutex<State>>,
+}
+
+#[cfg(any(all(feature = "resource-feedback", not(loom)), all(test, loom)))]
+impl ResourceDomain {
+  /// Takes the default feedback registration of this domain, or returns
+  /// `None` while another registration is live.
+  pub(crate) fn try_register_default_feedback(&self) -> Option<DefaultFeedbackRegistration> {
+    let mut state = lock(&self.state);
+    if state.default_feedback_registered {
+      return None;
+    }
+    state.default_feedback_registered = true;
+    drop(state);
+    Some(DefaultFeedbackRegistration {
+      state: Arc::clone(&self.state),
+    })
+  }
+}
+
+#[cfg(any(all(feature = "resource-feedback", not(loom)), all(test, loom)))]
+impl Drop for DefaultFeedbackRegistration {
+  fn drop(&mut self) {
+    lock(&self.state).default_feedback_registered = false;
   }
 }
 
@@ -1190,6 +1232,23 @@ mod tests {
   use super::*;
   use std::sync::atomic::{AtomicUsize, Ordering};
   use std::task::Wake;
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
+  fn default_feedback_registration_is_exclusive_per_domain_and_released_on_drop() {
+    let domain = ResourceDomain::new(limits(4, 64), 1).unwrap();
+    let other = ResourceDomain::new(limits(4, 64), 1).unwrap();
+    let first = domain.try_register_default_feedback().unwrap();
+    assert!(domain.clone().try_register_default_feedback().is_none());
+    // Another domain has its own registration.
+    let unrelated = other.try_register_default_feedback().unwrap();
+    drop(first);
+    let again = domain.try_register_default_feedback().unwrap();
+    assert!(domain.try_register_default_feedback().is_none());
+    drop(again);
+    drop(unrelated);
+    assert!(other.try_register_default_feedback().is_some());
+  }
 
   fn limits(cpu: usize, memory: usize) -> DomainResources {
     DomainResources::ZERO
@@ -1966,6 +2025,35 @@ mod model {
       self.0.fetch_add(1, Ordering::SeqCst);
     }
   }
+  #[test]
+  fn loom_default_feedback_registration_admits_one_holder_and_releases_on_drop() {
+    loom::model(|| {
+      let limits = DomainResources::ZERO
+        .with(DomainResource::Cpu, 1)
+        .with(DomainResource::Control, 4096);
+      let domain = ResourceDomain::new(limits, 1).unwrap();
+      let racing = domain.clone();
+      let holders = LoomArc::new(AtomicUsize::new(0));
+      let racing_holders = LoomArc::clone(&holders);
+      let worker = loom::thread::spawn(move || {
+        if let Some(registration) = racing.try_register_default_feedback() {
+          assert_eq!(racing_holders.fetch_add(1, Ordering::SeqCst), 0);
+          racing_holders.fetch_sub(1, Ordering::SeqCst);
+          drop(registration);
+        }
+      });
+      let local = domain.try_register_default_feedback();
+      if local.is_some() {
+        assert_eq!(holders.fetch_add(1, Ordering::SeqCst), 0);
+        holders.fetch_sub(1, Ordering::SeqCst);
+      }
+      drop(local);
+      worker.join().unwrap();
+      // Every registration was dropped, so the registration is free again.
+      assert!(domain.try_register_default_feedback().is_some());
+    });
+  }
+
   #[test]
   fn loom_global_and_tenant_reservations_never_overadmit() {
     loom::model(|| {

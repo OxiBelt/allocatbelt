@@ -2755,8 +2755,11 @@ fn run_native_session(
       .ok_or_else(|| "external soak omitted its feedback service factory".to_owned())?;
     builder.feedback_sources(factory)
   } else {
-    builder
+    builder.without_feedback()
   };
+  // Without the bench feature no family runs feedback.
+  #[cfg(not(feature = "resource-feedback"))]
+  let builder = builder.without_feedback();
   let mut driver = builder
     .build()
     .map_err(|error| format!("owning soak runtime startup failed: {error}"))?;

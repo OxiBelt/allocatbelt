@@ -444,10 +444,15 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
   } else {
     builder
   };
+  // Only the external-pressure family runs feedback; fixed-policy runs turn
+  // off the default service so their CPU limit stays fixed.
   #[cfg(feature = "resource-feedback")]
-  let builder = match domain.feedback_factory()? {
+  let feedback = domain.feedback_factory()?;
+  #[cfg(not(feature = "resource-feedback"))]
+  let feedback = None;
+  let builder = match feedback {
     Some(factory) => builder.feedback_sources(factory),
-    None => builder,
+    None => builder.without_feedback(),
   };
   let mut async_runtime = builder
     .disk_rate(rate_configs.disk)

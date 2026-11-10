@@ -1244,10 +1244,16 @@ fn run_with_plan(
         .disk_rate(rate_configs.disk)
         .upload_rate(rate_configs.upload)
         .download_rate(rate_configs.download);
+      // Only the external-pressure family runs feedback; fixed-policy runs
+      // turn off the default service so their CPU limit stays fixed.
       #[cfg(feature = "resource-feedback")]
-      if let Some(factory) = domain.feedback_factory()? {
-        builder = builder.feedback_sources(factory);
-      }
+      let feedback = domain.feedback_factory()?;
+      #[cfg(not(feature = "resource-feedback"))]
+      let feedback = None;
+      builder = match feedback {
+        Some(factory) => builder.feedback_sources(factory),
+        None => builder.without_feedback(),
+      };
       if matches!(options.workload, Workload::Disk | Workload::Mixed) {
         builder = builder
           .blocking(BlockingConfig {

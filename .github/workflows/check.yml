@@ -573,6 +573,7 @@ jobs:
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::asynchronous::task_set::model
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::asynchronous::join::model
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::managed::model
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::resource_domain::model
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::time::loom_tests
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::semaphore::loom_tests
           cargo test --release --locked -p allocatbelt-runtime --lib runtime::mutex::loom_tests

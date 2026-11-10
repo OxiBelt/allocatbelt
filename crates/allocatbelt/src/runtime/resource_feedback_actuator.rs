@@ -9,7 +9,9 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use super::byte_rate::ByteRateLimit;
-use super::resource_domain::{DomainResource, ResourceDomain, TenantDomain};
+use super::resource_domain::{
+  DefaultFeedbackRegistration, DomainResource, ResourceDomain, TenantDomain,
+};
 use super::resource_feedback::{FeedbackActuator, FeedbackActuatorError};
 use super::resource_feedback_policy::{FeedbackResource, PlanTicket};
 
@@ -107,21 +109,63 @@ impl FeedbackActuator for RuntimeFeedbackActuator {
 /// nothing uses. Those dimensions have no admissible change; a disk or
 /// network ticket is refused with [`FeedbackActuatorError::Unavailable`] and
 /// the service latches that control instead of pretending a write happened.
+///
+/// The actuator built by the default factory also holds its domain's single
+/// default-controller registration and the soft limit it started from. When
+/// it is dropped it first returns the limit to that start value with one
+/// compare-exchange, only if the limit still equals the last value it wrote
+/// successfully and no change of its own failed, and then releases the
+/// registration. It never retries or rolls back a failed change.
 pub struct GlobalCpuFeedbackActuator {
   cpu: CpuFeedbackTarget,
   fixed_disk_rate: u64,
   fixed_network_rate: u64,
+  default: Option<DefaultOwnership>,
+}
+
+/// What the default path's actuator owns besides its target.
+struct DefaultOwnership {
+  start_limit: usize,
+  last_applied: Option<usize>,
+  failed: bool,
+  // Dropped after `GlobalCpuFeedbackActuator::drop` restored the limit.
+  _registration: DefaultFeedbackRegistration,
 }
 
 impl GlobalCpuFeedbackActuator {
   /// Selects `domain`'s global CPU soft limit. The fixed byte-rate values are
-  /// reported unchanged by every readback.
+  /// reported unchanged by every readback. An actuator built here takes no
+  /// default-controller registration.
   #[must_use]
   pub const fn new(domain: ResourceDomain, fixed_disk_rate: u64, fixed_network_rate: u64) -> Self {
     Self {
       cpu: CpuFeedbackTarget::Global(domain),
       fixed_disk_rate,
       fixed_network_rate,
+      default: None,
+    }
+  }
+
+  /// The default path's actuator. It keeps `registration` until it is
+  /// dropped, and `start_limit` is the global CPU soft limit it returns to on
+  /// drop when the limit is still the last value it wrote.
+  pub(crate) const fn with_default_registration(
+    domain: ResourceDomain,
+    registration: DefaultFeedbackRegistration,
+    start_limit: usize,
+    fixed_disk_rate: u64,
+    fixed_network_rate: u64,
+  ) -> Self {
+    Self {
+      cpu: CpuFeedbackTarget::Global(domain),
+      fixed_disk_rate,
+      fixed_network_rate,
+      default: Some(DefaultOwnership {
+        start_limit,
+        last_applied: None,
+        failed: false,
+        _registration: registration,
+      }),
     }
   }
 
@@ -145,16 +189,42 @@ impl FeedbackActuator for GlobalCpuFeedbackActuator {
   fn apply(&mut self, ticket: PlanTicket) -> Result<(), FeedbackActuatorError> {
     match ticket.resource() {
       FeedbackResource::CpuConcurrency => {
-        if self.cpu.compare_exchange(ticket)? {
-          Ok(())
-        } else {
-          Err(FeedbackActuatorError::OperationFailed)
+        let result = match self.cpu.compare_exchange(ticket) {
+          Ok(true) => Ok(()),
+          Ok(false) => Err(FeedbackActuatorError::OperationFailed),
+          Err(error) => Err(error),
+        };
+        if let Some(default) = &mut self.default {
+          match result {
+            Ok(()) => default.last_applied = usize::try_from(ticket.to_limit()).ok(),
+            Err(_) => default.failed = true,
+          }
         }
+        result
       }
       FeedbackResource::DiskRate | FeedbackResource::NetworkRate => {
         Err(FeedbackActuatorError::Unavailable)
       }
     }
+  }
+}
+
+impl Drop for GlobalCpuFeedbackActuator {
+  fn drop(&mut self) {
+    let (Some(default), CpuFeedbackTarget::Global(domain)) = (&self.default, &self.cpu) else {
+      return;
+    };
+    if default.failed {
+      return;
+    }
+    if let Some(last) = default.last_applied
+      && last != default.start_limit
+    {
+      // Changes nothing if anyone else changed the limit since; a raise
+      // wakes CPU waiters like any other increase.
+      let _ = domain.compare_exchange_limit(DomainResource::Cpu, last, default.start_limit);
+    }
+    // The registration is released when `default` is dropped after this.
   }
 }
 
@@ -324,5 +394,81 @@ mod tests {
       );
       std::thread::yield_now();
     }
+  }
+
+  fn stop_service(mut service: ResourceFeedbackService) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    service.request_stop();
+    while service.try_shutdown().unwrap() != FeedbackShutdownProgress::Complete {
+      assert!(
+        Instant::now() < deadline,
+        "feedback worker did not finish shutdown"
+      );
+      std::thread::yield_now();
+    }
+  }
+
+  fn start_default_busy(domain: &ResourceDomain) -> ResourceFeedbackService {
+    let registration = domain.try_register_default_feedback().unwrap();
+    let policy = ResourceFeedbackPolicyConfig {
+      cpu_concurrency: FeedbackControlConfig::new(1, 20, 20, 4000, 8000),
+      disk_rate: FeedbackControlConfig::new(5, 5, 5, 4000, 8000),
+      network_rate: FeedbackControlConfig::new(6, 6, 6, 4000, 8000),
+    };
+    let actuator =
+      GlobalCpuFeedbackActuator::with_default_registration(domain.clone(), registration, 20, 5, 6);
+    ResourceFeedbackService::start(policy, BusySensor, actuator).unwrap()
+  }
+
+  fn wait_until_lowered(domain: &ResourceDomain) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while domain.snapshot().limit.get(DomainResource::Cpu) == 20 {
+      assert!(Instant::now() < deadline, "global CPU limit did not change");
+      std::thread::sleep(Duration::from_millis(10));
+    }
+  }
+
+  #[test]
+  fn default_actuator_returns_the_limit_it_lowered_when_it_stops() {
+    let domain = cpu_domain(20);
+    let service = start_default_busy(&domain);
+    wait_until_lowered(&domain);
+    assert!(domain.try_register_default_feedback().is_none());
+    stop_service(service);
+    // The limit is back at the start value before the registration is free.
+    assert_eq!(domain.snapshot().limit.get(DomainResource::Cpu), 20);
+    assert!(domain.try_register_default_feedback().is_some());
+  }
+
+  #[test]
+  fn default_actuator_leaves_an_externally_changed_limit_in_place() {
+    let domain = cpu_domain(20);
+    let service = start_default_busy(&domain);
+    wait_until_lowered(&domain);
+    let snapshot = domain.snapshot();
+    domain
+      .set_limits(snapshot.limit.with(DomainResource::Cpu, 7))
+      .unwrap();
+    stop_service(service);
+    assert_eq!(domain.snapshot().limit.get(DomainResource::Cpu), 7);
+    assert!(domain.try_register_default_feedback().is_some());
+  }
+
+  #[test]
+  fn default_actuator_that_never_wrote_changes_nothing_on_drop() {
+    let domain = cpu_domain(20);
+    let registration = domain.try_register_default_feedback().unwrap();
+    domain
+      .set_limits(domain.snapshot().limit.with(DomainResource::Cpu, 12))
+      .unwrap();
+    drop(GlobalCpuFeedbackActuator::with_default_registration(
+      domain.clone(),
+      registration,
+      20,
+      5,
+      6,
+    ));
+    assert_eq!(domain.snapshot().limit.get(DomainResource::Cpu), 12);
+    assert!(domain.try_register_default_feedback().is_some());
   }
 }

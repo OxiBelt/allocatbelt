@@ -1218,6 +1218,9 @@ impl ApplicationDomain {
     driver: &MultiThreadDriver,
   ) -> Result<ApplicationRunBindings, String> {
     validate_native_scope_binding(&self.tenant, driver.resources(), self.local_limits)?;
+    if !self.mode.feedback_enabled() && driver.feedback_metrics().is_some() {
+      return Err("fixed-policy native runtime runs a feedback service".to_owned());
+    }
     let io = driver
       .io_bindings()
       .map_err(|error| format!("native I/O bindings failed: {error:?}"))?;

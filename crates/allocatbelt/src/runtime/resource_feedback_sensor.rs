@@ -1,4 +1,4 @@
-//! Bounded Linux process CPU telemetry for the opt-in feedback service.
+//! Bounded Linux process CPU telemetry for the feedback service.
 //!
 //! This source measures user plus system CPU time of this process, normalized
 //! by an explicitly configured CPU capacity. It does not attribute tenants,
