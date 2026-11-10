@@ -63,6 +63,15 @@ pub enum FeedbackSensorError {
 }
 
 /// Caller-provided telemetry source used by the worker thread.
+///
+/// The input surface is one method returning one [`FeedbackSample`]:
+/// utilization readings only. The service never asks a sensor for latency,
+/// pressure-stall, queue-length, memory or per-tenant figures, and the
+/// sensors this crate supplies read this process's CPU time and explicitly
+/// attached application-byte meters only. A further required method or input
+/// kind is a design-constraint change (`docs/design-constraints.md`);
+/// `sensor_and_actuator_traits_keep_their_exact_required_methods` stops
+/// compiling when a required method is added.
 pub trait FeedbackSensor: Send + 'static {
   /// Reads one sample with its measurement time from the real monotonic clock.
   fn sample(&mut self) -> Result<FeedbackSample, FeedbackSensorError>;
@@ -81,6 +90,17 @@ pub enum FeedbackActuatorError {
 }
 
 /// Actuator for the three configured feedback controls.
+///
+/// The output surface is two methods: read one limit back, and attempt one
+/// planned change of one limit from its expected old value to its new value.
+/// The service asks for nothing else. It never rejects, delays or reorders
+/// requests, changes a priority or a thread count, stops a process, frees
+/// memory or notifies an external manager, and the actuators this crate
+/// supplies change runtime-internal limits only and write no operating-system
+/// or control-group setting. A further required method is a design-constraint
+/// change (`docs/design-constraints.md`);
+/// `sensor_and_actuator_traits_keep_their_exact_required_methods` stops
+/// compiling when one is added.
 pub trait FeedbackActuator: Send + 'static {
   /// Reads the actual current limit for one control.
   fn readback(&mut self, resource: FeedbackResource) -> Result<u64, FeedbackActuatorError>;
@@ -3841,6 +3861,44 @@ mod tests {
         .metrics()
         .control(FeedbackResource::DiskRate)
         .policy_faulted
+    );
+  }
+
+  // Exactly the current required methods and nothing else: adding a required
+  // method to either trait stops these implementations from compiling.
+  struct ExactSurfaceSensor;
+
+  impl FeedbackSensor for ExactSurfaceSensor {
+    fn sample(&mut self) -> Result<FeedbackSample, FeedbackSensorError> {
+      Ok(FeedbackSample::new(Instant::now(), None, None, None))
+    }
+  }
+
+  struct ExactSurfaceActuator;
+
+  impl FeedbackActuator for ExactSurfaceActuator {
+    fn readback(&mut self, resource: FeedbackResource) -> Result<u64, FeedbackActuatorError> {
+      Ok(match resource {
+        FeedbackResource::CpuConcurrency => 1,
+        FeedbackResource::DiskRate => 2,
+        FeedbackResource::NetworkRate => 3,
+      })
+    }
+
+    fn apply(&mut self, _ticket: PlanTicket) -> Result<(), FeedbackActuatorError> {
+      Err(FeedbackActuatorError::Unavailable)
+    }
+  }
+
+  #[test]
+  fn sensor_and_actuator_traits_keep_their_exact_required_methods() {
+    let mut sensor = ExactSurfaceSensor;
+    let sample = sensor.sample().unwrap();
+    assert_eq!(sample.cpu_utilization_basis_points, None);
+    let mut actuator = ExactSurfaceActuator;
+    assert_eq!(
+      RESOURCES.map(|resource| actuator.readback(resource).unwrap()),
+      [1, 2, 3]
     );
   }
 }

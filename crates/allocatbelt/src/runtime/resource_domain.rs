@@ -495,6 +495,13 @@ impl TenantDomain {
     self.owner.domain.identity
   }
 
+  /// The global domain this tenant was created in. Crate-internal: a tenant
+  /// handle given to application code does not expose the shared ledger.
+  #[cfg(all(feature = "resource-feedback", not(loom)))]
+  pub(crate) fn global_domain(&self) -> ResourceDomain {
+    self.owner.domain.clone()
+  }
+
   /// Takes the complete vector under one lock or changes neither ledger.
   pub fn try_acquire(&self, request: DomainResources) -> Result<DomainReservation, DomainError> {
     let mut state = lock(&self.owner.domain.state);

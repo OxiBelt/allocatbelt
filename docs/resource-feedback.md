@@ -65,6 +65,52 @@ rejects stale writers without clobbering other dimensions or burst limits.
 Use those buckets in the actual I/O path; actuator construction does not
 intercept arbitrary syscalls or establish a physical traffic limit.
 
+`ResourceFeedbackPolicyConfig::process_default(cpu_capacity)` and
+`driver::default_feedback()` supply default values; feedback still runs only
+when a builder selects the factory with `feedback_sources`. The capacity is
+`std::thread::available_parallelism()`, or one if that fails, read once when
+the factory is created. It follows the standard library's definition, which
+honours CPU affinity and the CPU quota the standard library reports; the
+library itself opens no control-group, `/sys` or pressure file for it.
+`driver::default_feedback_for_capacity` takes the capacity explicitly. The
+policy is a constant function of the capacity: CPU concurrency has floor 1 and
+starts at its ceiling, the capacity, with fixed 40% and 80% thresholds
+(`DEFAULT_LOW_UTILIZATION_BASIS_POINTS`, `DEFAULT_HIGH_UTILIZATION_BASIS_POINTS`).
+The default factory uses the capacity as the sensor's utilization denominator
+only. Its CPU control starts at the global CPU soft limit the domain has when
+the driver is built and stays between floor 1 and the domain's hard CPU
+ceiling, so a limit an earlier driver lowered can recover and no limit rises
+above what the caller configured as the ceiling.
+
+Two properties follow from the fixed law and are not tuned away. A reduction
+is a tenth of the current limit, so a limit below ten never falls and a larger
+one stops at nine. Utilization is this process's CPU time over the capacity,
+not over the domain limit: a domain limit well below the capacity may keep
+admitted work under the high threshold, and then the limit never falls.
+Select the default factory for at most one driver per domain; two services
+moving the same limit see each other's changes as external drift and latch.
+
+The default factory selects a `ProcessCpuSensor` and a
+`GlobalCpuFeedbackActuator`. Only the global CPU soft limit of the domain the
+builder's `resource_domain` tenant belongs to can change. Disk and network
+rates are not selected: no meter feeds the sensor, so both dimensions report
+missing telemetry and stay frozen at `UNSELECTED_BYTE_RATE`, and the actuator
+owns no byte bucket. Its byte readbacks return that fixed configured value so
+startup verification still checks all three controls; a byte ticket, which the
+frozen dimensions cannot produce, is refused and latches. Tenant CPU targets
+and byte-rate control remain available through an explicit `feedback_sources`
+factory.
+
+Startup conditions are reported rather than repaired. A builder without
+`resource_domain` has no CPU ledger, and the build fails with
+`FeedbackFactoryError::DefaultRequiresResourceDomain` before a sensor is
+opened. A zero CPU soft limit, or a ceiling the policy cannot represent, fails
+with `FeedbackFactoryError::InvalidPolicy`. Failures while starting the
+service, such as a tenant without Control headroom or a limit changed between
+the factory's snapshot and the startup readback, are
+`FeedbackFactoryError::Service`. [design-constraints.md](design-constraints.md) lists the rules the
+feedback surface must keep.
+
 `runtime::rate_io::RateLimitedIo` adds directional stream admission around
 runtime-neutral read/write endpoints. It reserves available byte credit before
 polling the endpoint, commits reported progress synchronously, and refunds

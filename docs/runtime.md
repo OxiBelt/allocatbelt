@@ -2130,7 +2130,10 @@ time. Original futures and closures are recovered if initial admission fails.
 
 The optional `resource-feedback` feature permits an explicitly selected
 `feedback_sources` factory. Each build creates fresh source contexts and
-directional application-byte meters; feedback is off by default. The sampler
+directional application-byte meters; feedback is off by default.
+`driver::default_feedback()` is a ready-made factory for the global CPU soft
+limit alone, described in [resource-feedback.md](resource-feedback.md); it
+needs `resource_domain` and is equally off unless selected. The sampler
 uses real monotonic time, bounded policy state, explicit floors and ceilings,
 readback verification and fixed diagnostics. Missing, sparse or stale telemetry
 freezes its affected control. Shutdown closes executor admission immediately

@@ -47,7 +47,7 @@ Inside a VM (or a VM inside a VM), the allocator uses the guest's view and nothi
 - **ISA:** `cpuid`/`xgetbv` on x86_64, `getauxval(AT_HWCAP*)` on aarch64 and `riscv_hwprobe` on riscv64, all answered for the current process. A host with AVX-512 whose guest exposes only x86-64-v3 gives x86-64-v3. Detection alone selects no kernel (`KernelSet::Baseline`).
 - **Kernel:** the guest's kernel, through its own syscalls and probe results.
 - **Topology:** no structure is sized by a CPU count. The shard count is a constant, the maintenance thread is a single thread, and `mm_cid` (experimental) is dense over the CPUs the process may use.
-- **No host guessing:** nothing reads `/proc/cpuinfo`, `/sys` topology or DMI files, or the hypervisor `cpuid` leaves. `tests/sandbox.rs::no_hidden_host_probes` checks the sources for these.
+- **No host guessing:** nothing reads `/proc/cpuinfo`, `/sys` topology or DMI files, or the hypervisor `cpuid` leaves. `tests/sandbox.rs::no_hidden_host_probes` checks the sources for these. The one CPU-count query outside tests is the opt-in runtime feedback default (`runtime::resource_feedback_defaults`), which asks the standard library for the available parallelism only when a caller requests the default factory and uses it as a utilization denominator, not to size a structure (the standard library's answer reflects the process's CPU affinity and the CPU quota it reads); the same test confines it to that module.
 
 ## How it is checked
 

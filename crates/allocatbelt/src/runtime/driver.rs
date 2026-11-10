@@ -37,8 +37,8 @@ pub use super::resource_feedback::FeedbackHistoryConfig;
 use feedback::FeedbackMeters;
 #[cfg(feature = "resource-feedback")]
 pub use feedback::{
-  FeedbackContext, FeedbackFactory, FeedbackFactoryError, feedback_sources,
-  feedback_sources_with_history,
+  FeedbackContext, FeedbackFactory, FeedbackFactoryError, default_feedback,
+  default_feedback_for_capacity, feedback_sources, feedback_sources_with_history,
 };
 
 use std::fmt;
@@ -3437,6 +3437,57 @@ mod tests {
     drop(second_disk);
     shutdown_current_driver(&mut first);
     shutdown_current_driver(&mut second);
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
+  fn default_feedback_factory_builds_a_driver_on_the_global_cpu_limit() {
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 4)
+      .with(DomainResource::Tasks, 64)
+      .with(DomainResource::Memory, 1 << 20)
+      .with(DomainResource::Disk, 8)
+      .with(DomainResource::Network, 8)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 2, 32).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let capacity = std::num::NonZeroU32::new(4).unwrap();
+    let mut driver = MultiThreadBuilder::new(async_config())
+      .resources(limits(64))
+      .resource_domain(tenant.clone())
+      .feedback_sources(default_feedback_for_capacity(capacity))
+      .build()
+      .unwrap_or_else(|error| panic!("default feedback driver build failed: {error}"));
+    let metrics = driver
+      .feedback_metrics()
+      .unwrap_or_else(|| panic!("default feedback service was not retained"));
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+      snapshot
+        .control(FeedbackResource::CpuConcurrency)
+        .current_limit,
+      4
+    );
+    // No byte bucket was configured and none is needed by the default path.
+    assert!(driver.disk_rate().is_none());
+    assert!(driver.download_rate().is_none());
+    assert_eq!(domain.snapshot().limit.get(DomainResource::Cpu), 4);
+    assert_eq!(tenant.snapshot().unwrap().limit.get(DomainResource::Cpu), 4);
+    shutdown_multi_driver(&mut driver);
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  #[test]
+  fn default_feedback_factory_needs_a_resource_domain() {
+    let result = CurrentThreadBuilder::new(local_config())
+      .feedback_sources(default_feedback())
+      .build();
+    assert!(matches!(
+      result,
+      Err(DriverBuildError::Feedback(
+        FeedbackFactoryError::DefaultRequiresResourceDomain
+      ))
+    ));
   }
 
   #[cfg(feature = "resource-feedback")]

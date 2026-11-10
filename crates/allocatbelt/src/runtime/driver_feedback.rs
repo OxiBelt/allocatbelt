@@ -5,20 +5,24 @@
 
 use std::fmt;
 use std::io;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use super::super::asynchronous::RuntimeMetrics;
 use super::super::byte_rate::ByteRateLimit;
 use super::super::managed::ResourceScope;
-use super::super::resource_domain::{DomainError, TenantDomain};
+use super::super::resource_domain::{DomainError, DomainResource, TenantDomain};
 use super::super::resource_feedback::{
   FeedbackActuator, FeedbackHistoryConfig, FeedbackSensor, FeedbackStartError,
   ResourceFeedbackService,
 };
+use super::super::resource_feedback_actuator::GlobalCpuFeedbackActuator;
+use super::super::resource_feedback_defaults::default_cpu_capacity;
 use super::super::resource_feedback_meter::IoFeedbackMeter;
 use super::super::resource_feedback_policy::{
   PolicyError, ResourceFeedbackPolicy, ResourceFeedbackPolicyConfig,
 };
+use super::super::resource_feedback_sensor::ProcessCpuSensor;
 
 /// Owned runtime resources a feedback source may select from.
 ///
@@ -113,6 +117,9 @@ pub enum FeedbackFactoryError {
   /// History-enabled feedback requires a tenant whose Control ledger can
   /// charge the retained ring.
   HistoryRequiresTenant,
+  /// The default factory changes the global CPU soft limit of the driver's
+  /// resource domain, and the builder selected none. Nothing was started.
+  DefaultRequiresResourceDomain,
 }
 
 impl fmt::Display for FeedbackFactoryError {
@@ -124,6 +131,9 @@ impl fmt::Display for FeedbackFactoryError {
       Self::HistoryRequiresTenant => {
         f.write_str("feedback history requires a tenant Control ledger")
       }
+      Self::DefaultRequiresResourceDomain => {
+        f.write_str("default feedback requires a driver resource domain")
+      }
     }
   }
 }
@@ -134,7 +144,7 @@ impl std::error::Error for FeedbackFactoryError {
       Self::InvalidPolicy(error) => Some(error),
       Self::Sources(error) => Some(error),
       Self::Service(error) => Some(error),
-      Self::HistoryRequiresTenant => None,
+      Self::HistoryRequiresTenant | Self::DefaultRequiresResourceDomain => None,
     }
   }
 }
@@ -253,6 +263,70 @@ where
   }
 }
 
+/// Creates the default feedback factory for this process's CPU capacity.
+///
+/// Feedback stays off until a builder selects this factory with
+/// `feedback_sources`. The capacity is the standard library's parallelism
+/// query (one if it fails), read once here by `default_cpu_capacity`; see
+/// [`default_feedback_for_capacity`] for everything derived from it.
+#[must_use]
+pub fn default_feedback() -> FeedbackFactory {
+  default_feedback_for_capacity(default_cpu_capacity())
+}
+
+/// Creates the default feedback factory for an explicit CPU capacity.
+///
+/// The policy is [`ResourceFeedbackPolicyConfig::process_default`]. Each
+/// driver build opens a [`ProcessCpuSensor`], which reads this process's CPU
+/// time and reports disk and network utilization as missing, and a
+/// [`GlobalCpuFeedbackActuator`] on the global CPU soft limit of the domain
+/// the builder's `resource_domain` tenant belongs to. No tenant limit, byte
+/// bucket or byte meter is selected, so only that one limit can change.
+///
+/// `cpu_capacity` is the sensor's utilization denominator. The CPU control
+/// starts at the global CPU soft limit the domain has when the driver is
+/// built and stays between `DEFAULT_CPU_FLOOR` and the domain's hard CPU
+/// ceiling, so a limit lowered by an earlier driver can recover. Reductions
+/// are a tenth of the current limit, so a limit below ten does not fall.
+/// A domain without CPU, or a ceiling the policy cannot represent, fails with
+/// [`FeedbackFactoryError::InvalidPolicy`]; startup failures are reported as
+/// [`FeedbackFactoryError::Service`]. Select the default factory for at most
+/// one driver per domain: two services moving the same limit see each
+/// other's changes as external drift and latch.
+///
+/// A builder without `resource_domain` has no CPU ledger to change; the build
+/// fails with [`FeedbackFactoryError::DefaultRequiresResourceDomain`] before
+/// any sensor is opened rather than adjusting a ledger nothing admits against.
+#[must_use]
+pub fn default_feedback_for_capacity(cpu_capacity: NonZeroU32) -> FeedbackFactory {
+  let policy = ResourceFeedbackPolicyConfig::process_default(cpu_capacity);
+  let invalid_policy = ResourceFeedbackPolicy::new(policy).err();
+  let build = Arc::new(move |context: FeedbackContext| {
+    let Some(tenant) = context.resources.tenant_domain().cloned() else {
+      return Err(FeedbackFactoryError::DefaultRequiresResourceDomain);
+    };
+    let global = tenant.global_domain();
+    let snapshot = global.snapshot();
+    let to_u64 = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+    let mut policy = policy;
+    policy.cpu_concurrency.initial = to_u64(snapshot.limit.get(DomainResource::Cpu));
+    policy.cpu_concurrency.ceiling = to_u64(snapshot.ceiling.get(DomainResource::Cpu));
+    ResourceFeedbackPolicy::new(policy).map_err(FeedbackFactoryError::InvalidPolicy)?;
+    let sensor = ProcessCpuSensor::new(cpu_capacity).map_err(FeedbackFactoryError::Sources)?;
+    let actuator = GlobalCpuFeedbackActuator::new(
+      global,
+      policy.disk_rate.initial,
+      policy.network_rate.initial,
+    );
+    ResourceFeedbackService::start_in_tenant(policy, sensor, actuator, &tenant)
+      .map_err(FeedbackFactoryError::Service)
+  });
+  FeedbackFactory {
+    build,
+    invalid_policy,
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -266,7 +340,8 @@ mod tests {
     FeedbackActuatorError, FeedbackEventKind, FeedbackSensorError, FeedbackShutdownProgress,
   };
   use crate::runtime::resource_feedback_policy::{
-    FeedbackControlConfig, FeedbackResource, FeedbackSample, PlanTicket,
+    FeedbackControlConfig, FeedbackResource, FeedbackSample, NoChangeReason, PlanTicket,
+    TelemetryStatus, UNSELECTED_BYTE_RATE,
   };
 
   struct QuietSensor;
@@ -541,5 +616,138 @@ mod tests {
       stable_control_usage(&domain, Duration::from_secs(2)),
       before
     );
+  }
+
+  fn bare_context(resources: ResourceScope) -> FeedbackContext {
+    FeedbackContext {
+      resources,
+      disk_rate: None,
+      upload_rate: None,
+      download_rate: None,
+      disk_meter: IoFeedbackMeter::new(),
+      upload_meter: IoFeedbackMeter::new(),
+      download_meter: IoFeedbackMeter::new(),
+      runtime_metrics: None,
+    }
+  }
+
+  fn stop(mut service: ResourceFeedbackService) {
+    service.request_stop();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(
+      service.try_shutdown(),
+      Ok(FeedbackShutdownProgress::Complete)
+    ) {
+      assert!(Instant::now() < deadline, "default service did not stop");
+      std::thread::yield_now();
+    }
+  }
+
+  #[test]
+  fn default_feedback_without_a_resource_domain_fails_with_a_typed_error() {
+    let factory = default_feedback();
+    assert!(factory.validate().is_ok());
+    assert!(matches!(
+      factory.build(bare_context(ResourceScope::new(ResourceLimits::default()))),
+      Err(FeedbackFactoryError::DefaultRequiresResourceDomain)
+    ));
+  }
+
+  #[test]
+  fn default_feedback_controls_only_the_global_cpu_limit_and_freezes_byte_rates() {
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 6)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 0).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let factory = default_feedback_for_capacity(NonZeroU32::new(6).unwrap());
+    let service = factory
+      .build(bare_context(ResourceScope::from_tenant(
+        ResourceLimits::default(),
+        tenant.clone(),
+      )))
+      .unwrap();
+    let metrics = service.metrics_handle();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+      let snapshot = metrics.snapshot();
+      // The CPU sensor's first read is a baseline; wait for real plans.
+      let frozen = snapshot.sample_count >= 3;
+      if frozen {
+        for resource in [FeedbackResource::DiskRate, FeedbackResource::NetworkRate] {
+          let control = snapshot.control(resource);
+          assert_eq!(control.current_limit, UNSELECTED_BYTE_RATE);
+          assert_eq!(control.telemetry, TelemetryStatus::Missing);
+          assert_eq!(control.utilization_basis_points, None);
+          assert_eq!(
+            control.no_change,
+            Some(NoChangeReason::TelemetryUnavailable)
+          );
+          assert!(!control.policy_faulted);
+        }
+        assert_eq!(
+          snapshot
+            .control(FeedbackResource::CpuConcurrency)
+            .current_limit,
+          6
+        );
+        break;
+      }
+      assert!(
+        Instant::now() < deadline,
+        "byte dimensions did not report missing"
+      );
+      std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(domain.snapshot().limit.get(DomainResource::Cpu), 6);
+    assert_eq!(tenant.snapshot().unwrap().limit.get(DomainResource::Cpu), 6);
+    stop(service);
+  }
+
+  #[test]
+  fn default_feedback_starts_at_the_soft_limit_below_the_hard_ceiling() {
+    let ceiling = DomainResources::ZERO
+      .with(DomainResource::Cpu, 9)
+      .with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 0).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    // An earlier owner lowered the soft limit; the capacity differs from both.
+    assert!(
+      domain
+        .compare_exchange_limit(DomainResource::Cpu, 9, 5)
+        .unwrap()
+    );
+    let factory = default_feedback_for_capacity(NonZeroU32::new(4).unwrap());
+    let service = factory
+      .build(bare_context(ResourceScope::from_tenant(
+        ResourceLimits::default(),
+        tenant,
+      )))
+      .unwrap();
+    assert_eq!(
+      service
+        .metrics()
+        .control(FeedbackResource::CpuConcurrency)
+        .current_limit,
+      5
+    );
+    assert_eq!(domain.snapshot().limit.get(DomainResource::Cpu), 5);
+    assert_eq!(domain.snapshot().ceiling.get(DomainResource::Cpu), 9);
+    stop(service);
+  }
+
+  #[test]
+  fn default_feedback_rejects_a_zero_global_cpu_limit() {
+    let ceiling = DomainResources::ZERO.with(DomainResource::Control, 1 << 20);
+    let domain = ResourceDomain::with_waiters(ceiling, 1, 0).unwrap();
+    let tenant = domain.tenant(ceiling).unwrap();
+    let factory = default_feedback_for_capacity(NonZeroU32::new(4).unwrap());
+    assert!(matches!(
+      factory.build(bare_context(ResourceScope::from_tenant(
+        ResourceLimits::default(),
+        tenant,
+      ))),
+      Err(FeedbackFactoryError::InvalidPolicy(_))
+    ));
   }
 }

@@ -15,6 +15,7 @@
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
 
 use std::fmt;
+use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 /// Required interval between accepted utilization samples.
@@ -33,6 +34,16 @@ pub const REQUIRED_BREACH_SAMPLES: u8 = 3;
 pub const ACTUATION_COOLDOWN: Duration = Duration::from_secs(1);
 /// Version bound into benchmark receipts for the original 10-percent CPU rule.
 pub const FEEDBACK_POLICY_VERSION: &str = "runtime-feedback-policy-v1";
+/// Smallest CPU concurrency the process-default policy may reach.
+pub const DEFAULT_CPU_FLOOR: u64 = 1;
+/// Healthy utilization threshold of the process-default policy: 40%.
+pub const DEFAULT_LOW_UTILIZATION_BASIS_POINTS: u16 = 4000;
+/// Breach utilization threshold of the process-default policy: 80%.
+pub const DEFAULT_HIGH_UTILIZATION_BASIS_POINTS: u16 = 8000;
+/// Fixed floor, initial value and ceiling of a byte-rate control that the
+/// process-default policy does not select. With all three equal the control
+/// has no admissible change even if a reading were supplied.
+pub const UNSELECTED_BYTE_RATE: u64 = u64::MAX;
 
 const RESOURCE_COUNT: usize = 3;
 const RESOURCES: [FeedbackResource; RESOURCE_COUNT] = [
@@ -110,6 +121,40 @@ pub struct ResourceFeedbackPolicyConfig {
 }
 
 impl ResourceFeedbackPolicyConfig {
+  /// The process-default policy for `cpu_capacity` CPU equivalents.
+  ///
+  /// This is a constant function of its argument: it reads no clock, file or
+  /// environment and uses only the `DEFAULT_*` constants of this module. CPU
+  /// concurrency starts at its ceiling, `cpu_capacity`, and moves toward
+  /// [`DEFAULT_CPU_FLOOR`] inside the fixed 40%/80% utilization band (a limit
+  /// below ten has no reduction step). Disk
+  /// and network byte rates are not selected: their floor, initial value and
+  /// ceiling are all [`UNSELECTED_BYTE_RATE`], so they cannot change, and a
+  /// sensor without attached byte meters reports them missing and frozen.
+  #[must_use]
+  pub const fn process_default(cpu_capacity: NonZeroU32) -> Self {
+    // Lossless widening; `u64::from` is not callable in a constant function.
+    let capacity = cpu_capacity.get() as u64;
+    let unselected = FeedbackControlConfig::new(
+      UNSELECTED_BYTE_RATE,
+      UNSELECTED_BYTE_RATE,
+      UNSELECTED_BYTE_RATE,
+      DEFAULT_LOW_UTILIZATION_BASIS_POINTS,
+      DEFAULT_HIGH_UTILIZATION_BASIS_POINTS,
+    );
+    Self {
+      cpu_concurrency: FeedbackControlConfig::new(
+        DEFAULT_CPU_FLOOR,
+        capacity,
+        capacity,
+        DEFAULT_LOW_UTILIZATION_BASIS_POINTS,
+        DEFAULT_HIGH_UTILIZATION_BASIS_POINTS,
+      ),
+      disk_rate: unselected,
+      network_rate: unselected,
+    }
+  }
+
   const fn controls(self) -> [FeedbackControlConfig; RESOURCE_COUNT] {
     [self.cpu_concurrency, self.disk_rate, self.network_rate]
   }
@@ -135,6 +180,13 @@ impl fmt::Display for PolicyConfigError {
 impl std::error::Error for PolicyConfigError {}
 
 /// One measured utilization sample. Missing fields freeze only their control.
+///
+/// A sample carries a measurement time and three utilization readings in
+/// basis points, nothing else. It has no latency, pressure-stall, queue
+/// length, memory, throughput or per-tenant field; adding an input is a
+/// design-constraint change (`docs/design-constraints.md`), and the
+/// `feedback_sample_has_exactly_one_time_and_three_utilization_readings` test
+/// stops compiling when a field is added.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FeedbackSample {
   /// Monotonic time when the readings were measured.
@@ -1857,5 +1909,110 @@ mod tests {
     assert_eq!(policy.pending_tickets()[0], None);
     assert!(policy.faults()[0]);
     assert_eq!(policy.current_limits()[0], 100);
+  }
+
+  #[test]
+  fn feedback_sample_has_exactly_one_time_and_three_utilization_readings() {
+    // Exhaustive destructuring without `..`: a new field stops compilation.
+    let FeedbackSample {
+      at: _,
+      cpu_utilization_basis_points,
+      disk_utilization_basis_points,
+      network_utilization_basis_points,
+    } = FeedbackSample::new(Instant::now(), Some(1), Some(2), Some(3));
+    let readings: [Option<u16>; RESOURCE_COUNT] = [
+      cpu_utilization_basis_points,
+      disk_utilization_basis_points,
+      network_utilization_basis_points,
+    ];
+    assert_eq!(readings, [Some(1), Some(2), Some(3)]);
+  }
+
+  #[test]
+  fn feedback_resource_has_exactly_three_controls() {
+    // No wildcard arm: a new variant stops compilation.
+    const fn position(resource: FeedbackResource) -> usize {
+      match resource {
+        FeedbackResource::CpuConcurrency => 0,
+        FeedbackResource::DiskRate => 1,
+        FeedbackResource::NetworkRate => 2,
+      }
+    }
+    for (expected, resource) in RESOURCES.into_iter().enumerate() {
+      assert_eq!(position(resource), expected);
+      assert_eq!(resource.index(), expected);
+    }
+  }
+
+  // Evaluated at compile time, which cannot open a file, read a clock or
+  // consult the environment: the defaults are a function of the capacity only.
+  const DEFAULT_FOR_EIGHT: ResourceFeedbackPolicyConfig =
+    ResourceFeedbackPolicyConfig::process_default(NonZeroU32::new(8).unwrap());
+
+  #[test]
+  fn process_default_is_a_constant_function_of_capacity() {
+    assert_eq!(
+      DEFAULT_FOR_EIGHT,
+      ResourceFeedbackPolicyConfig::process_default(NonZeroU32::new(8).unwrap())
+    );
+    assert_eq!(
+      DEFAULT_FOR_EIGHT.cpu_concurrency,
+      FeedbackControlConfig::new(1, 8, 8, 4000, 8000)
+    );
+  }
+
+  #[test]
+  fn process_default_thresholds_are_the_named_constants_for_every_capacity() {
+    const { assert!(DEFAULT_CPU_FLOOR == 1) };
+    const { assert!(DEFAULT_LOW_UTILIZATION_BASIS_POINTS == 4000) };
+    const { assert!(DEFAULT_HIGH_UTILIZATION_BASIS_POINTS == 8000) };
+    for capacity in [1, 2, 7, 64, 4096, u32::MAX] {
+      let config =
+        ResourceFeedbackPolicyConfig::process_default(NonZeroU32::new(capacity).unwrap());
+      for control in config.controls() {
+        assert_eq!(
+          control.low_utilization_basis_points,
+          DEFAULT_LOW_UTILIZATION_BASIS_POINTS
+        );
+        assert_eq!(
+          control.high_utilization_basis_points,
+          DEFAULT_HIGH_UTILIZATION_BASIS_POINTS
+        );
+      }
+      assert_eq!(config.cpu_concurrency.floor, DEFAULT_CPU_FLOOR);
+      assert_eq!(config.cpu_concurrency.initial, u64::from(capacity));
+      assert_eq!(config.cpu_concurrency.ceiling, u64::from(capacity));
+      for unselected in [config.disk_rate, config.network_rate] {
+        assert_eq!(unselected.floor, UNSELECTED_BYTE_RATE);
+        assert_eq!(unselected.initial, UNSELECTED_BYTE_RATE);
+        assert_eq!(unselected.ceiling, UNSELECTED_BYTE_RATE);
+      }
+      assert!(ResourceFeedbackPolicy::new(config).is_ok());
+    }
+  }
+
+  #[test]
+  fn process_default_byte_rates_stay_frozen_while_cpu_follows_its_band() {
+    let config = ResourceFeedbackPolicyConfig::process_default(NonZeroU32::new(20).unwrap());
+    let mut policy = ResourceFeedbackPolicy::new(config).unwrap();
+    let start = Instant::now();
+    let mut last = None;
+    for step in 1..=3_u32 {
+      let at = start + SAMPLE_INTERVAL * step;
+      policy
+        .observe_at(FeedbackSample::new(at, Some(10_000), None, None), at)
+        .unwrap();
+      last = Some(policy.plan_at(at + Duration::from_millis(1)).unwrap());
+    }
+    let plan = last.unwrap();
+    assert!(matches!(
+      plan.cpu_concurrency.status,
+      DecisionStatus::Planned(ticket) if ticket.from_limit() == 20 && ticket.to_limit() == 18
+    ));
+    for frozen in [plan.disk_rate, plan.network_rate] {
+      assert_eq!(frozen.telemetry, TelemetryStatus::Missing);
+      assert_eq!(frozen.current_limit, UNSELECTED_BYTE_RATE);
+      assert!(matches!(frozen.status, DecisionStatus::NoChange(_)));
+    }
   }
 }

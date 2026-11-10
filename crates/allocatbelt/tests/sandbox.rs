@@ -259,6 +259,8 @@ fn only_the_visible_isa_is_detected() {
 
 /// Nothing in the allocator looks past the current process: no hypervisor
 /// identity, no host topology files, no CPU count to size structures by.
+/// The opt-in runtime feedback default asks the standard library for the
+/// available parallelism in one place, as a utilization denominator only.
 /// Checked on the sources, which the package ships.
 #[test]
 fn no_hidden_host_probes() {
@@ -291,6 +293,19 @@ fn no_hidden_host_probes() {
       // CPU counts only in benchmarks and tests of the core, which are
       // compiled by allocatbelt-core-check, not into the allocator.
       if text.contains("available_parallelism") {
+        // The one runtime use is the opt-in feedback default capacity: it
+        // runs only when a caller asks for the default factory and sizes no
+        // allocator structure.
+        if path.ends_with("runtime/resource_feedback_defaults.rs") {
+          assert!(!text.contains("use std::thread"), "{}", path.display());
+          assert_eq!(
+            text.matches("thread::available_parallelism()").count(),
+            1,
+            "{}",
+            path.display()
+          );
+          continue;
+        }
         assert!(path.ends_with("core/lock.rs"), "{}", path.display());
         let first = text.find("available_parallelism").unwrap();
         let tests = text.find("#[cfg(all(test").unwrap_or(usize::MAX);
