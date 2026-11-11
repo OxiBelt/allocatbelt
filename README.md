@@ -146,7 +146,10 @@ RUSTFLAGS="-C target-feature=+zbb" cargo test --release --target riscv64gc-unkno
 ## Optional blocking runtime
 
 The additive `runtime` feature exposes the bounded blocking worker pool as
-`allocatbelt::runtime`. Allocator-only defaults and hardening are unchanged.
+`allocatbelt::runtime`, together with a separate I/O adapter pool (`IoPool`)
+that runs the filesystem, stream-adapter and network connect and resolve
+operations; the user pool queues only caller closures. Allocator-only
+defaults and hardening are unchanged.
 The production dependency graph contains no Tokio dependency. This foundation
 is experimental: it does not yet provide async execution or replace Tokio.
 See [the runtime contract](docs/runtime.md) for admission, cancellation,
