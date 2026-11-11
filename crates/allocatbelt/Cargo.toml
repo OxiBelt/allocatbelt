@@ -91,6 +91,10 @@ name = "fork_maintenance"
 required-features = ["maintenance"]
 
 [[test]]
+name = "huge_retention_maintenance"
+required-features = ["maintenance"]
+
+[[test]]
 name = "rseq_process"
 required-features = ["experimental-rseq"]
 
