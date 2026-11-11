@@ -159,22 +159,50 @@ fn pin_current_thread(cpu: usize) -> Result<(), String> {
 }
 
 /// Keeps the first pin failure reported from an executor thread-start hook,
-/// which cannot return an error itself.
+/// which cannot return an error itself, and counts the hooks that ran.
 #[derive(Default)]
-struct PinFailures(Mutex<Option<String>>);
+struct PinFailures {
+  first: Mutex<Option<String>>,
+  /// Executor threads whose start hook has run (pinned or failed).
+  started: AtomicUsize,
+  /// Executor threads the runtime starts, whose hooks a check waits for.
+  expected: usize,
+}
 
 impl PinFailures {
+  fn new(expected: usize) -> Self {
+    Self {
+      expected,
+      ..Self::default()
+    }
+  }
+
   fn record(&self, error: String) {
     self
-      .0
+      .first
       .lock()
       .unwrap_or_else(PoisonError::into_inner)
       .get_or_insert(error);
   }
 
+  /// The first failure, once every expected executor thread has run its
+  /// start hook. A runtime starts its threads when it is built, but a
+  /// thread may run its hook after the first tasks have finished on
+  /// another one, so a check right after them could miss its failure.
   fn check(&self) -> Result<(), String> {
+    let deadline = Instant::now() + COMPLETION_TIMEOUT;
+    while self.started.load(Ordering::Acquire) < self.expected {
+      if Instant::now() >= deadline {
+        return Err(format!(
+          "only {} of {} executor threads ran their start hook",
+          self.started.load(Ordering::Acquire),
+          self.expected
+        ));
+      }
+      std::thread::sleep(Duration::from_millis(1));
+    }
     self
-      .0
+      .first
       .lock()
       .unwrap_or_else(PoisonError::into_inner)
       .clone()
@@ -194,6 +222,8 @@ impl PinFailures {
     if let Err(error) = result {
       self.record(format!("executor thread {index}: {error}"));
     }
+    // After the failure is recorded, so a check that sees the count sees it.
+    self.started.fetch_add(1, Ordering::Release);
   }
 }
 
@@ -1242,7 +1272,12 @@ impl AsyncExecutors {
     max_searchers: Option<usize>,
     pin_workers: Option<Arc<[usize]>>,
   ) -> Result<Self, String> {
-    let pin_failures = Arc::new(PinFailures::default());
+    // Every executor thread of a pinned runtime runs the pin hook once.
+    let pinned_threads = match (&pin_workers, kind) {
+      (Some(_), ExecutorKind::Bounded | ExecutorKind::Tokio) => workers,
+      _ => 0,
+    };
+    let pin_failures = Arc::new(PinFailures::new(pinned_threads));
     match kind {
       ExecutorKind::Inline => Ok(Self {
         bounded: None,
