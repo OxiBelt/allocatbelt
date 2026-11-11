@@ -1091,3 +1091,27 @@ fn impossible_storage_bounds_fail_before_spawning() {
     assert_eq!(spawned, 0);
   }
 }
+
+#[test]
+fn dropping_the_handle_of_a_finished_job_contains_its_panic_payload() {
+  // The worker publishes the panic before the handle is dropped, so the
+  // handle, not the worker, drops the payload; its panicking `Drop` must
+  // not unwind into the caller either way.
+  let mut rt = runtime(1, 2, cpu(1));
+  let handle = rt.handle();
+  let dropped = Arc::new(AtomicUsize::new(0));
+  let c = LocksOnDrop {
+    handle: handle.clone(),
+    dropped: Arc::clone(&dropped),
+    panic: true,
+  };
+  quiet_panics(|| {
+    let job = rt.try_spawn(cpu(1), move |_| panic::panic_any(c)).unwrap();
+    while !job.is_finished() {
+      thread::yield_now();
+    }
+    drop(job);
+  });
+  assert_eq!(dropped.load(Ordering::SeqCst), 1);
+  rt.shutdown(ShutdownMode::Drain).unwrap();
+}
