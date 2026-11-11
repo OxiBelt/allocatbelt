@@ -1,0 +1,4086 @@
+//! Paired loopback HTTP transactions for the application comparator.
+//!
+//! The workload logic stays in `allocatbelt-app-ports::http`; this module
+//! owns only listener/client setup, bounded admission, result pairing, and
+//! executor-specific endpoint adapters.
+
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::io;
+use std::net::{SocketAddr, SocketAddrV4, TcpListener as StdTcpListener};
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock, mpsc};
+use std::task::{Context, Poll, Waker};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use allocatbelt::runtime::asynchronous::{
+  AsyncConfig, AsyncHandle, AsyncJob, AsyncJoinError, AsyncShutdown,
+};
+use allocatbelt::runtime::channel;
+use allocatbelt::runtime::io::{AsyncRead, AsyncWrite};
+use allocatbelt::runtime::managed::{
+  OperationPermit, OperationRequest, ResourceLimits, ResourceScope, ResourceSnapshot,
+};
+use allocatbelt::runtime::net::{
+  NetHandle, TcpListener as NativeListener, TcpStream as NativeStream,
+};
+use allocatbelt::runtime::reactor::{ReactorConfig, ReactorHandle};
+use allocatbelt::runtime::resource_domain::{DomainResource, DomainSnapshot};
+use allocatbelt::runtime::{
+  Config as BlockingConfig, MultiShutdown, MultiThreadBuilder, Resources, ShutdownMode,
+  ShutdownProgress,
+};
+use allocatbelt_app_ports::http::{self, HttpConfig};
+use allocatbelt_app_ports::memory::pattern_byte;
+use tokio::io::{AsyncRead as TokioAsyncRead, AsyncWrite as TokioAsyncWrite};
+
+#[cfg(test)]
+use super::Profile;
+#[cfg(feature = "resource-feedback")]
+use super::feedback_trace::{FeedbackTraceCollector, FeedbackTracePhase};
+use super::{
+  ApplicationDomain, ApplicationIoBindings, ApplicationRunBindings, ApplicationTaskAdmission,
+  ArrivalPlan, Executor, Mode, Observer, ObserverEventSender, ObserverWake, Options,
+  RuntimeBindingWriter, WorkOutput, Workload,
+};
+
+const WINDOW: usize = 8;
+// One accept loop may coexist with both endpoint tasks for every live pair.
+// The producer and observer are separate OS-thread roots with their own
+// tenant task leases, not slots in this executor task table.
+const ACCEPTOR_TASKS: usize = 1;
+const CLIENT_TASKS: usize = WINDOW;
+const HANDLER_TASKS: usize = WINDOW;
+const TASK_LIMIT: usize = ACCEPTOR_TASKS + CLIENT_TASKS + HANDLER_TASKS;
+const BODY_BYTES: usize = 4096;
+const CAPACITY_HORIZON: Duration = Duration::from_secs(30);
+const MAX_CAPACITY_JOBS: usize = 10_000_000;
+const WARMUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct RoleLease {
+  _hold: Arc<()>,
+}
+
+struct PairToken {
+  id: u64,
+  lease: RoleLease,
+}
+
+enum ClientJob {
+  Bounded {
+    job: AsyncJob<Result<u64, String>>,
+    result: Option<Result<Result<u64, String>, AsyncJoinError>>,
+  },
+  Tokio {
+    handle: tokio::task::JoinHandle<Result<u64, String>>,
+    result: Option<Result<Result<u64, String>, tokio::task::JoinError>>,
+  },
+}
+
+impl ClientJob {
+  fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    match self {
+      Self::Bounded { job, result } => {
+        if result.is_some() {
+          return Poll::Ready(());
+        }
+        match Pin::new(job).poll(cx) {
+          Poll::Pending => Poll::Pending,
+          Poll::Ready(output) => {
+            *result = Some(output);
+            Poll::Ready(())
+          }
+        }
+      }
+      Self::Tokio { handle, result } => {
+        if result.is_some() {
+          return Poll::Ready(());
+        }
+        match Pin::new(handle).poll(cx) {
+          Poll::Pending => Poll::Pending,
+          Poll::Ready(output) => {
+            *result = Some(output);
+            Poll::Ready(())
+          }
+        }
+      }
+    }
+  }
+
+  fn is_finished(&self) -> bool {
+    match self {
+      // Readiness is published only after this observer has cached the
+      // terminal output; the task's publication flag alone is insufficient.
+      Self::Bounded { result, .. } => result.is_some(),
+      // `handle.is_finished()` can become true after the last poll returned
+      // Pending but before this predicate is checked. Keep readiness tied to
+      // the cached output so the observer polls and stores the result first.
+      Self::Tokio { result, .. } => result.is_some(),
+    }
+  }
+}
+
+type HandlerResult = Result<(u64, u64), String>;
+type HandlerOutput = (HandlerResult, RoleLease);
+type JoinedHandler = HandlerOutput;
+
+enum HandlerJob {
+  Bounded {
+    job: AsyncJob<HandlerOutput>,
+    result: Option<Result<HandlerOutput, AsyncJoinError>>,
+  },
+  Tokio {
+    handle: tokio::task::JoinHandle<HandlerOutput>,
+    result: Option<Result<HandlerOutput, tokio::task::JoinError>>,
+  },
+}
+
+impl HandlerJob {
+  fn poll_finished(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    match self {
+      Self::Bounded { job, result } => {
+        if result.is_some() {
+          return Poll::Ready(());
+        }
+        match Pin::new(job).poll(cx) {
+          Poll::Pending => Poll::Pending,
+          Poll::Ready(output) => {
+            *result = Some(output);
+            Poll::Ready(())
+          }
+        }
+      }
+      Self::Tokio { handle, result } => {
+        if result.is_some() {
+          return Poll::Ready(());
+        }
+        match Pin::new(handle).poll(cx) {
+          Poll::Pending => Poll::Pending,
+          Poll::Ready(output) => {
+            *result = Some(output);
+            Poll::Ready(())
+          }
+        }
+      }
+    }
+  }
+}
+
+struct HandlerRecord {
+  id: u64,
+  _lease: RoleLease,
+  job: HandlerJob,
+}
+
+enum Event {
+  Client {
+    id: u64,
+    scheduled: Instant,
+    horizon_end: Instant,
+    job: ClientJob,
+  },
+  App {
+    id: u64,
+    scheduled: Instant,
+    horizon_end: Instant,
+    job: super::Job,
+  },
+  Rejected(u64, Instant),
+  Handler(HandlerRecord),
+  Done(ProducerReport),
+  Ready,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdState {
+  Unseen,
+  Rejected,
+  Admitted,
+  Completed,
+  Failed,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProducerReport {
+  attempted: usize,
+  admitted: usize,
+  rejected_full: usize,
+  rejected_logical_window: usize,
+  rejected_backend_full: usize,
+  lateness_sum_ns: u128,
+  lateness_max_ns: u64,
+  started_at: Instant,
+  production_end: Instant,
+  production_cpu_started_ns: u128,
+  trace_overrun: bool,
+}
+
+#[derive(Debug)]
+struct Report {
+  producer: ProducerReport,
+  rss_before: super::ProcessMemory,
+  rss_after_drain: super::ProcessMemory,
+  rss_after_shutdown: super::ProcessMemory,
+  setup_ns: u128,
+  timer_pair_median_ns: u64,
+  on_time: usize,
+  late: usize,
+  errors: usize,
+  digest: u64,
+  expected: u64,
+  p50_ns: u64,
+  p95_ns: u64,
+  p99_ns: u64,
+  max_observed_managed_bytes: usize,
+  retained_managed_bytes: usize,
+  final_resources: ResourceSnapshot,
+  final_global_domain: DomainSnapshot,
+  final_tenant_domain: DomainSnapshot,
+  shutdown_ns: u128,
+  last_observed: Instant,
+  drain_tail_ns: u128,
+  async_workers: usize,
+  blocking_workers: usize,
+  topology: &'static str,
+  records: Vec<super::IdRecord>,
+  family_published_on_time: [u64; 4],
+}
+
+#[derive(Debug)]
+struct ObserverReport {
+  on_time: usize,
+  late: usize,
+  errors: usize,
+  digest: u64,
+  expected: u64,
+  latencies: Vec<u64>,
+  max_observed_managed_bytes: usize,
+  retained_managed_bytes: usize,
+  last_observed: Instant,
+  records: Vec<super::IdRecord>,
+  family_published_on_time: [u64; 4],
+}
+
+#[derive(Default)]
+struct PendingPair {
+  client: Option<(Instant, Instant, ClientJob)>,
+  handler: Option<PendingHandler>,
+}
+
+type PendingHandler = (HandlerResult, RoleLease, RoleLease);
+
+#[derive(Clone, Copy)]
+struct Settings {
+  horizon: Duration,
+  arrivals: usize,
+  body_bytes: usize,
+}
+
+impl Settings {
+  fn production(options: Options, plan: ArrivalPlan) -> Result<Self, String> {
+    if options.workload != plan.workload {
+      return Err("HTTP settings workload differs from arrival plan".into());
+    }
+    if options.mode == Mode::OpenLoop {
+      super::validate_arrival_plan(plan, super::execution_deadlines().trace)?;
+    }
+    Ok(Self {
+      horizon: CAPACITY_HORIZON,
+      arrivals: plan.arrivals,
+      body_bytes: BODY_BYTES,
+    })
+  }
+
+  fn event_capacity(self, _mode: Mode) -> Result<usize, String> {
+    Ok(4 * WINDOW + 1)
+  }
+}
+
+pub(super) fn run_and_print(
+  allocator: &str,
+  options: Options,
+  plan: ArrivalPlan,
+) -> Result<(), String> {
+  let settings = Settings::production(options, plan)?;
+  let report = match options.executor {
+    Executor::Bounded => run_bounded(options, settings, plan)?,
+    Executor::Tokio => run_tokio(options, settings, plan)?,
+  };
+  super::write_id_report(&report.records, allocator, options, plan.profile)?;
+  super::write_capacity_family_report(
+    report.producer.attempted,
+    report.family_published_on_time,
+    options,
+    plan.profile,
+  )?;
+  print_row(allocator, options, &report);
+  Ok(())
+}
+
+pub(super) fn limits() -> ResourceLimits {
+  ResourceLimits {
+    managed_memory: WINDOW * 2 * http::MAX_REQUEST_BYTES + WINDOW * 2 * 128,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 2 * WINDOW,
+  }
+}
+
+fn validate_domain_receipt(
+  bindings: &ApplicationRunBindings,
+  lane: &str,
+) -> Result<(DomainSnapshot, DomainSnapshot, ResourceSnapshot), String> {
+  let (global, tenant, resources) = bindings.snapshots()?;
+  let resource_dimensions = [
+    DomainResource::Cpu,
+    DomainResource::Memory,
+    DomainResource::Disk,
+    DomainResource::Network,
+    DomainResource::Tasks,
+  ];
+  for resource in resource_dimensions {
+    let global_used = global.used.get(resource);
+    let tenant_used = tenant.used.get(resource);
+    if global_used != 0 || tenant_used != 0 {
+      return Err(format!(
+        "{lane} final domain receipt retains {resource:?}: global={global_used}, tenant={tenant_used}"
+      ));
+    }
+  }
+  if resources.managed_memory != 0 || resources.disk_ops != 0 || resources.network_ops != 0 {
+    return Err(format!(
+      "{lane} final managed-resource receipt is not empty: {resources:?}"
+    ));
+  }
+  Ok((global, tenant, resources))
+}
+
+fn domain_non_control_resources_empty(snapshot: DomainSnapshot) -> bool {
+  [
+    DomainResource::Cpu,
+    DomainResource::Memory,
+    DomainResource::Disk,
+    DomainResource::Network,
+    DomainResource::Tasks,
+  ]
+  .into_iter()
+  .all(|resource| snapshot.used.get(resource) == 0)
+}
+
+fn checked_loopback_v4(address: SocketAddr) -> Result<SocketAddrV4, String> {
+  match address {
+    SocketAddr::V4(address) if address.ip().is_loopback() => Ok(address),
+    SocketAddr::V4(address) => Err(format!("HTTP listener is not IPv4 loopback: {address}")),
+    SocketAddr::V6(address) => Err(format!("HTTP listener is not IPv4: {address}")),
+  }
+}
+
+fn native_address(reactor: &ReactorHandle) -> Result<(NativeListener, SocketAddrV4), String> {
+  let listener = StdTcpListener::bind(("127.0.0.1", 0))
+    .map_err(|error| format!("loopback listener bind failed: {error}"))?;
+  let address = listener
+    .local_addr()
+    .map_err(|error| format!("loopback listener address failed: {error}"))?;
+  let address = checked_loopback_v4(address)?;
+  let listener = NativeListener::from_std(listener, reactor)
+    .map_err(|error| format!("loopback listener registration failed: {}", error.error))?;
+  Ok((listener, address))
+}
+
+fn std_listener() -> Result<(StdTcpListener, SocketAddrV4), String> {
+  let listener = StdTcpListener::bind(("127.0.0.1", 0))
+    .map_err(|error| format!("loopback listener bind failed: {error}"))?;
+  let address = listener
+    .local_addr()
+    .map_err(|error| format!("loopback listener address failed: {error}"))?;
+  let address = checked_loopback_v4(address)?;
+  Ok((listener, address))
+}
+
+fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<Report, String> {
+  let setup_started = Instant::now();
+  let expected_oracle = build_expected_oracle(options, settings, plan)?;
+  let domain =
+    ApplicationDomain::new_for_profile(options.workload, plan.async_workers, plan.profile.label())?;
+  #[cfg(feature = "resource-feedback")]
+  let mut feedback_trace;
+  let local_limits = domain.local_limits();
+  let rate_configs = domain.rate_configs();
+  // The I/O pool runs the connector and, in the mixed workload, the
+  // filesystem operations; it keeps the sizing the shared pool had.
+  let io_workers = if options.workload == Workload::Mixed {
+    plan.async_workers
+  } else {
+    1
+  };
+  let builder = MultiThreadBuilder::new(AsyncConfig {
+    workers: plan.async_workers,
+    max_outstanding: TASK_LIMIT,
+    max_scopes: 2,
+  })
+  .resources(local_limits)
+  .resource_domain(domain.tenant())
+  .io_pool(BlockingConfig {
+    workers: io_workers,
+    max_outstanding: if options.workload == Workload::Mixed {
+      TASK_LIMIT
+    } else {
+      WINDOW + 1
+    },
+    capacity: Resources {
+      disk: if options.workload == Workload::Mixed {
+        WINDOW
+      } else {
+        0
+      },
+      ..Resources::ZERO
+    },
+  })
+  .reactor(ReactorConfig {
+    max_registrations: 2 * WINDOW + 4,
+    max_waiters: 4 * WINDOW + 8,
+  });
+  let builder = if options.workload == Workload::Mixed {
+    builder.filesystem()
+  } else {
+    builder
+  };
+  // Only the external-pressure family runs feedback; fixed-policy runs turn
+  // off the default service so their CPU limit stays fixed.
+  #[cfg(feature = "resource-feedback")]
+  let feedback = domain.feedback_factory()?;
+  #[cfg(not(feature = "resource-feedback"))]
+  let feedback = None;
+  let builder = match feedback {
+    Some(factory) => builder.feedback_sources(factory),
+    None => builder.without_feedback(),
+  };
+  let mut async_runtime = builder
+    .disk_rate(rate_configs.disk)
+    .upload_rate(rate_configs.upload)
+    .download_rate(rate_configs.download)
+    .build()
+    .map_err(|error| format!("allocatbelt owning HTTP runtime start failed: {error}"))?;
+  let mut run_bindings = domain.for_native(&async_runtime)?;
+  #[cfg(feature = "resource-feedback")]
+  {
+    feedback_trace = run_bindings.start_feedback_trace(options.mode)?;
+  }
+  #[cfg(feature = "resource-feedback")]
+  let capacity_collection = if options.mode == Mode::Capacity {
+    feedback_trace
+      .as_ref()
+      .map(|trace| trace.capacity_collection())
+      .transpose()?
+      .map_or(
+        super::CapacityCollection::Fixed,
+        super::CapacityCollection::Traced,
+      )
+  } else {
+    super::CapacityCollection::Fixed
+  };
+  #[cfg(not(feature = "resource-feedback"))]
+  let capacity_collection = super::CapacityCollection::Fixed;
+  let mut runtime_readback = RuntimeBindingWriter::begin(options, plan, &run_bindings)?;
+  let resources = run_bindings.resources();
+  let io_bindings = run_bindings.io();
+  let observer_task = run_bindings.reserve_task()?;
+  let producer_task = run_bindings.reserve_task()?;
+  let scope = async_runtime
+    .scope()
+    .map_err(|error| format!("allocatbelt task scope start failed: {error}"))?;
+  let async_handle = scope.handle();
+  super::warm_bounded_for(&async_handle, plan.async_workers)
+    .map_err(|error| format!("HTTP native async worker warm-up failed: {error}"))?;
+
+  let filesystem_handle = if options.workload == Workload::Mixed {
+    Some(
+      async_runtime
+        .filesystem()
+        .ok_or_else(|| "owning HTTP runtime omitted its selected filesystem".to_owned())?,
+    )
+  } else {
+    None
+  };
+  let io_pool_handle = async_runtime
+    .io_pool()
+    .ok_or_else(|| "owning HTTP runtime omitted its connector I/O pool".to_owned())?;
+  // Starts every I/O worker, the connector's included.
+  super::disk_lane::warm_native_workers(&io_pool_handle, &async_handle, io_workers)
+    .map_err(|error| format!("HTTP native I/O worker warm-up failed: {error}"))?;
+  let app_submitter = (options.workload == Workload::Mixed).then(|| super::Submitter::Bounded {
+    handle: async_handle.clone(),
+    disk: filesystem_handle,
+  });
+
+  let reactor_handle = async_runtime
+    .reactor()
+    .ok_or_else(|| "owning HTTP runtime omitted its selected reactor".to_owned())?;
+  let net = NetHandle::new(io_pool_handle, resources.clone(), reactor_handle.clone(), 1)
+    .map_err(|error| format!("allocatbelt network handle setup failed: {error}"))?;
+  let (listener, address) = native_address(&reactor_handle)?;
+
+  let (roles_tx, roles_rx) = channel::channel(WINDOW, WINDOW)
+    .map_err(|error| format!("HTTP accept-role channel setup failed: {error}"))?;
+  let (events_tx, events_rx) = mpsc::sync_channel(settings.event_capacity(options.mode)?);
+  let observer_thread_target = Arc::new(OnceLock::new());
+  let events_tx = ObserverEventSender::new(events_tx, Arc::clone(&observer_thread_target));
+  let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+  let accept_handle = async_handle.clone();
+  let accept_resources = resources.clone();
+  let accept_io = io_bindings.clone();
+  let accept_event_tx = events_tx.clone();
+  let accept_task = async_handle
+    .spawn(async move {
+      let _ = ready_tx.send(());
+      accept_native(
+        listener,
+        roles_rx,
+        accept_handle,
+        accept_resources,
+        accept_io,
+        accept_event_tx,
+      )
+      .await
+    })
+    .map_err(|error| format!("allocatbelt accept-task admission failed: {}", error.kind))?;
+  ready_rx
+    .recv_timeout(WARMUP_TIMEOUT)
+    .map_err(|error| format!("allocatbelt accept task did not start: {error}"))?;
+
+  let (credits_tx, credits_rx) = mpsc::sync_channel(WINDOW);
+  let (producer_tx, producer_rx) = mpsc::sync_channel(1);
+  let observer_resources = resources.clone();
+  let observer_expected_oracle = expected_oracle.clone();
+  let observer_application = Observer::Bounded(async_handle.clone());
+  let observer_capacity_collection = capacity_collection.clone();
+  let (observer_tx, observer_rx) = mpsc::sync_channel(1);
+  let observer_thread = thread::Builder::new()
+    .name("http-application-observer".into())
+    .spawn(move || {
+      let _task_owner = observer_task;
+      let report = observe_events_with_plan(
+        Joiner::Bounded,
+        options,
+        settings,
+        observer_resources,
+        events_rx,
+        credits_tx,
+        observer_expected_oracle,
+        plan,
+        Some(observer_application),
+        observer_capacity_collection,
+      );
+      let _ = observer_tx.send(report);
+    })
+    .map_err(|error| format!("HTTP observer thread start failed: {error}"))?;
+  if observer_thread_target
+    .set(observer_thread.thread().clone())
+    .is_err()
+  {
+    return Err("HTTP observer thread was registered twice".into());
+  }
+
+  let timer_pair_median_ns = super::measure_timer_pair_median_ns();
+  let rss_before = super::sample_process_memory()?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(
+      FeedbackTracePhase::RssBefore,
+      Instant::now(),
+      Some(rss_before),
+    )?;
+  }
+  if setup_started.elapsed() > super::SETUP_DEADLINE {
+    return Err("HTTP setup exceeded its 120 second finite deadline".into());
+  }
+  #[cfg(feature = "resource-feedback")]
+  let startup_feedback_observation = if run_bindings.mode().feedback_enabled() {
+    Some(run_bindings.wait_for_feedback_startup_observation()?)
+  } else {
+    None
+  };
+  #[cfg(feature = "resource-feedback")]
+  if startup_feedback_observation.is_some() && setup_started.elapsed() > super::SETUP_DEADLINE {
+    return Err("HTTP startup feedback wait exceeded the finite setup deadline".into());
+  }
+  let producer_handle = async_handle.clone();
+  let producer_resources = resources.clone();
+  let producer_net = net.clone();
+  let producer_thread = thread::Builder::new()
+    .name("http-application-producer".into())
+    .spawn(move || {
+      let _task_owner = producer_task;
+      let report = produce_native(
+        producer_handle,
+        producer_net,
+        producer_resources,
+        io_bindings,
+        address,
+        roles_tx,
+        events_tx,
+        credits_rx,
+        options,
+        settings,
+        plan,
+        app_submitter,
+        capacity_collection,
+      );
+      let _ = producer_tx.send(report);
+    })
+    .map_err(|error| format!("HTTP producer thread start failed: {error}"))?;
+
+  let producer_result = producer_rx
+    .recv_timeout(super::remaining_process_deadline(setup_started))
+    .map_err(|error| format!("HTTP producer deadline failed: {error}"))?;
+  producer_thread
+    .join()
+    .map_err(|_| "HTTP producer panicked".to_owned())?;
+  let producer = producer_result?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(sample_at) = startup_feedback_observation {
+    let (sample_bounds, production_bounds) = if let Some(trace) = feedback_trace.as_ref() {
+      (
+        Some(trace.monotonic_bounds(sample_at)?),
+        Some(trace.monotonic_bounds(producer.started_at)?),
+      )
+    } else {
+      (None, None)
+    };
+    run_bindings.validate_feedback_startup_observation(
+      sample_at,
+      producer.started_at,
+      sample_bounds,
+      production_bounds,
+    )?;
+  }
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(
+      FeedbackTracePhase::ProductionStart,
+      producer.started_at,
+      None,
+    )?;
+    trace.mark_phase(
+      FeedbackTracePhase::ProductionEnd,
+      producer.production_end,
+      None,
+    )?;
+  }
+  let process_deadline = setup_started + super::execution_deadlines().process;
+  let drain_deadline =
+    (producer.production_end + super::execution_deadlines().drain).min(process_deadline);
+  let drain_remaining = drain_deadline.saturating_duration_since(Instant::now());
+  let observed = observer_rx
+    .recv_timeout(drain_remaining)
+    .map_err(|error| format!("HTTP transaction drain deadline failed: {error}"))??;
+  observer_thread
+    .join()
+    .map_err(|_| "HTTP observer panicked".to_owned())?;
+  async_handle
+    .block_on(accept_task)
+    .map_err(|error| format!("allocatbelt accept task join failed: {error}"))?
+    .map_err(|error| format!("allocatbelt accept task output join failed: {error}"))?
+    .map_err(|error| format!("allocatbelt accept task failed: {error}"))?;
+  #[cfg(feature = "resource-feedback")]
+  let feedback_drain_upper_ns = if let Some(trace) = feedback_trace.as_ref() {
+    let drain_end = Instant::now();
+    let (_, drain_upper_ns) = trace.monotonic_bounds(drain_end)?;
+    trace.mark_phase(FeedbackTracePhase::DrainEnd, drain_end, None)?;
+    Some(drain_upper_ns)
+  } else {
+    None
+  };
+  #[cfg(feature = "resource-feedback")]
+  let collector_task_lease_count = usize::from(feedback_trace.is_some());
+  #[cfg(not(feature = "resource-feedback"))]
+  let collector_task_lease_count = 0;
+  let production_cpu_ended_ns = super::process_cpu_time_ns();
+  let drain_readback = runtime_readback.as_mut().map_or(Ok(()), |readback| {
+    readback.capture_after_drain(&run_bindings, collector_task_lease_count)
+  });
+  let feedback_drain_health = run_bindings.validate_feedback_health("after_drain");
+  drain_readback?;
+  validate_pair_counts(
+    options.mode,
+    settings.arrivals,
+    &producer,
+    &observed,
+    expected_oracle.as_deref(),
+    plan,
+  )?;
+  if observed
+    .last_observed
+    .saturating_duration_since(producer.production_end)
+    > super::execution_deadlines().drain
+  {
+    return Err("HTTP transaction drain exceeded its finite deadline".into());
+  }
+  let rss_after_drain = super::sample_after_checkpoint_delay()?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(
+      FeedbackTracePhase::RssAfterDrain,
+      Instant::now(),
+      Some(rss_after_drain),
+    )?;
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  if let (Some(drain_upper_ns), Some(trace)) = (feedback_drain_upper_ns, feedback_trace.as_ref()) {
+    run_bindings.wait_for_feedback_observation_after(drain_upper_ns, |sample_at| {
+      trace.monotonic_bounds(sample_at)
+    })?;
+  }
+
+  let shutdown_started = Instant::now();
+  let mut shutdown_timings = Vec::with_capacity(3);
+  let elapsed_ns =
+    super::run_shutdown_with_timeout("allocatbelt owning HTTP runtime", move || {
+      async_runtime
+        .block_on(scope.close())
+        .map_err(|error| format!("allocatbelt scope close failed: {error}"))?;
+      async_runtime
+        .request_shutdown(MultiShutdown {
+          tasks: AsyncShutdown::Drain,
+          blocking: ShutdownMode::Drain,
+          ..MultiShutdown::default()
+        })
+        .map_err(|error| format!("allocatbelt owning runtime shutdown request failed: {error}"))?;
+      let deadline = Instant::now() + super::execution_deadlines().shutdown;
+      loop {
+        match async_runtime
+          .drive_shutdown_step()
+          .map_err(|error| format!("allocatbelt owning runtime shutdown failed: {error}"))?
+        {
+          ShutdownProgress::Complete => return Ok(()),
+          ShutdownProgress::Pending if Instant::now() < deadline => {
+            thread::sleep(Duration::from_millis(1));
+          }
+          ShutdownProgress::Pending => {
+            return Err("allocatbelt owning runtime shutdown exceeded its finite deadline".into());
+          }
+        }
+      }
+    })?;
+  shutdown_timings.push(("allocatbelt owning HTTP runtime", elapsed_ns));
+  let feedback_shutdown = run_bindings.shutdown_feedback(super::execution_deadlines().shutdown);
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(FeedbackTracePhase::ShutdownEnd, Instant::now(), None)?;
+  }
+  #[cfg(feature = "resource-feedback")]
+  let trace_finalizer = feedback_trace
+    .take()
+    .map(FeedbackTraceCollector::stop_for_finalization)
+    .transpose()?;
+  let shutdown_readback = runtime_readback.as_mut().map_or(Ok(()), |readback| {
+    readback.capture("after_shutdown", &run_bindings)
+  });
+  let feedback_shutdown_health = run_bindings.validate_feedback_health("after_shutdown");
+  let feedback_health_error = [
+    feedback_drain_health.err(),
+    feedback_shutdown.err(),
+    feedback_shutdown_health.err(),
+  ]
+  .into_iter()
+  .flatten()
+  .next();
+  let shutdown_ns = shutdown_started.elapsed().as_nanos();
+  let shutdown_report = super::write_shutdown_report(
+    producer
+      .production_end
+      .saturating_duration_since(producer.started_at)
+      .as_nanos(),
+    producer.production_cpu_started_ns,
+    production_cpu_ended_ns,
+    observed.on_time + observed.late,
+    &shutdown_timings,
+  );
+  shutdown_readback?;
+  let (final_global_domain, final_tenant_domain, final_resources) =
+    validate_domain_receipt(&run_bindings, "HTTP")?;
+  if producer.trace_overrun {
+    return Err("HTTP open-loop producer exceeded its finite trace deadline".into());
+  }
+  let readback_domain = domain.readback_domain();
+  let fixed_control_baseline = domain.fixed_global_control_baseline();
+  drop(net);
+  drop(reactor_handle);
+  drop(async_handle);
+  drop(run_bindings);
+  drop(resources);
+  drop(domain);
+  let rss_after_shutdown = super::sample_after_checkpoint_delay()?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(finalizer) = trace_finalizer.as_ref() {
+    finalizer.mark_phase(
+      FeedbackTracePhase::RssAfterShutdown,
+      Instant::now(),
+      Some(rss_after_shutdown),
+    )?;
+  }
+  #[cfg(feature = "resource-feedback")]
+  if let Some(finalizer) = trace_finalizer {
+    finalizer.finish()?;
+  }
+  if let Some(readback) = runtime_readback {
+    readback.finish(&readback_domain, fixed_control_baseline)?;
+  }
+  shutdown_report?;
+  if let Some(error) = feedback_health_error {
+    return Err(error);
+  }
+  Ok(build_report(
+    super::ProcessCheckpoints {
+      setup_started,
+      timer_pair_median_ns,
+      rss_before,
+      rss_after_drain,
+      rss_after_shutdown,
+    },
+    producer,
+    observed,
+    final_resources,
+    final_global_domain,
+    final_tenant_domain,
+    shutdown_ns,
+    plan.async_workers,
+    if options.workload == Workload::Mixed {
+      plan.async_workers
+    } else {
+      1
+    },
+    if options.workload == Workload::Mixed && plan.async_workers == 2 {
+      "2 async + 2 owning blocking workers (connector and filesystem) + owning reactor"
+    } else if options.workload == Workload::Mixed {
+      "4 async + 4 owning blocking workers (connector and filesystem) + owning reactor"
+    } else if plan.async_workers == 2 {
+      "2 async + 1 owning blocking connector + owning reactor; NetHandle::connect_nonblocking"
+    } else {
+      "4 async + 1 owning blocking connector + owning reactor; NetHandle::connect_nonblocking"
+    },
+  ))
+}
+
+fn run_tokio(options: Options, settings: Settings, plan: ArrivalPlan) -> Result<Report, String> {
+  let setup_started = Instant::now();
+  let expected_oracle = build_expected_oracle(options, settings, plan)?;
+  let domain =
+    ApplicationDomain::new_for_profile(options.workload, plan.async_workers, plan.profile.label())?;
+  let mut run_bindings = domain.for_tokio()?;
+  #[cfg(feature = "resource-feedback")]
+  let mut feedback_trace = run_bindings.start_feedback_trace(options.mode)?;
+  #[cfg(feature = "resource-feedback")]
+  let capacity_collection = if options.mode == Mode::Capacity {
+    feedback_trace
+      .as_ref()
+      .map(|trace| trace.capacity_collection())
+      .transpose()?
+      .map_or(
+        super::CapacityCollection::Fixed,
+        super::CapacityCollection::Traced,
+      )
+  } else {
+    super::CapacityCollection::Fixed
+  };
+  #[cfg(not(feature = "resource-feedback"))]
+  let capacity_collection = super::CapacityCollection::Fixed;
+  let mut runtime_readback = RuntimeBindingWriter::begin(options, plan, &run_bindings)?;
+  let resources = run_bindings.resources();
+  let io_bindings = run_bindings.io();
+  let cpu_gate = run_bindings.cpu_gate();
+  let task_admission = run_bindings.task_admission();
+  let observer_task = run_bindings.reserve_task()?;
+  let producer_task = run_bindings.reserve_task()?;
+  let accept_task_owner = task_admission.reserve()?;
+  let runtime = tokio::runtime::Builder::new_multi_thread()
+    .worker_threads(plan.async_workers)
+    .max_blocking_threads(if options.workload == Workload::Mixed {
+      plan.async_workers
+    } else {
+      1
+    })
+    .thread_name("allocatbelt-app-tokio")
+    .enable_all()
+    .build()
+    .map_err(|error| format!("Tokio runtime start failed: {error}"))?;
+  let handle = runtime.handle().clone();
+  super::warm_tokio_for(&handle, plan.async_workers)
+    .map_err(|error| format!("HTTP Tokio worker warm-up failed: {error}"))?;
+  let connector_thread = handle.spawn_blocking(|| thread::current().id());
+  let _connector_worker_started = handle
+    .block_on(connector_thread)
+    .map_err(|error| format!("Tokio connector warm-up failed: {error}"))?;
+  let task_slots = Arc::new(tokio::sync::Semaphore::new(TASK_LIMIT));
+  let mixed_disk_slots = (options.workload == Workload::Mixed)
+    .then(|| Arc::new(tokio::sync::Semaphore::new(plan.async_workers)));
+  if options.workload == Workload::Mixed {
+    super::disk_lane::warm_tokio_workers(&handle, plan.async_workers)
+      .map_err(|error| format!("HTTP Tokio blocking worker warm-up failed: {error}"))?;
+  }
+  let app_submitter = (options.workload == Workload::Mixed).then(|| super::Submitter::Tokio {
+    handle: handle.clone(),
+    slots: task_slots.clone(),
+    disk_slots: mixed_disk_slots,
+    disk_io: io_bindings.blocking_disk_io(),
+    cpu_gate: cpu_gate.clone(),
+    task_admission: task_admission.clone(),
+  });
+
+  let (std_listener, address) = std_listener()?;
+  std_listener
+    .set_nonblocking(true)
+    .map_err(|error| format!("Tokio listener nonblocking setup failed: {error}"))?;
+  let listener = {
+    let _entered = handle.enter();
+    tokio::net::TcpListener::from_std(std_listener)
+      .map_err(|error| format!("Tokio listener registration failed: {error}"))?
+  };
+
+  let accept_slot = task_slots
+    .clone()
+    .try_acquire_owned()
+    .map_err(|_| "Tokio task window could not reserve its accept slot".to_owned())?;
+  let (roles_tx, roles_rx) = channel::channel(WINDOW, WINDOW)
+    .map_err(|error| format!("HTTP accept-role channel setup failed: {error}"))?;
+  let (events_tx, events_rx) = mpsc::sync_channel(settings.event_capacity(options.mode)?);
+  let observer_thread_target = Arc::new(OnceLock::new());
+  let events_tx = ObserverEventSender::new(events_tx, Arc::clone(&observer_thread_target));
+  let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+  let accept_handle = handle.clone();
+  let accept_resources = resources.clone();
+  let accept_io = io_bindings.clone();
+  let accept_slots = task_slots.clone();
+  let accept_cpu_gate = cpu_gate.clone();
+  let handler_cpu_gate = accept_cpu_gate.clone();
+  let accept_task_admission = task_admission.clone();
+  let accept_event_tx = events_tx.clone();
+  let accept_future = accept_cpu_gate
+    .wrap(async move {
+      let _ = ready_tx.send(());
+      accept_tokio(
+        listener,
+        roles_rx,
+        accept_handle,
+        accept_slots,
+        accept_resources,
+        accept_io,
+        handler_cpu_gate,
+        accept_task_admission,
+        accept_event_tx,
+      )
+      .await
+    })
+    .map_err(|error| format!("Tokio accept CPU admission failed: {:?}", error.kind))?;
+  // The wrapper retains its own gate owner; the construction-only clone
+  // must not keep tenant metadata alive past the final cleanup checkpoint.
+  drop(accept_cpu_gate);
+  let accept_task = handle.spawn(async move {
+    let _accept_slot = accept_slot;
+    let _accept_task_owner = accept_task_owner;
+    accept_future
+      .await
+      .map_err(|error| format!("Tokio accept CPU poll failed: {error:?}"))?
+  });
+  ready_rx
+    .recv_timeout(WARMUP_TIMEOUT)
+    .map_err(|error| format!("Tokio accept task did not start: {error}"))?;
+
+  let (credits_tx, credits_rx) = mpsc::sync_channel(WINDOW);
+  let (producer_tx, producer_rx) = mpsc::sync_channel(1);
+  let observer_resources = resources.clone();
+  let observer_expected_oracle = expected_oracle.clone();
+  let observer_application = Observer::Tokio;
+  let observer_capacity_collection = capacity_collection.clone();
+  let (observer_tx, observer_rx) = mpsc::sync_channel(1);
+  let observer_thread = thread::Builder::new()
+    .name("http-application-observer".into())
+    .spawn(move || {
+      let _task_owner = observer_task;
+      let report = observe_events_with_plan(
+        Joiner::Tokio,
+        options,
+        settings,
+        observer_resources,
+        events_rx,
+        credits_tx,
+        observer_expected_oracle,
+        plan,
+        Some(observer_application),
+        observer_capacity_collection,
+      );
+      let _ = observer_tx.send(report);
+    })
+    .map_err(|error| format!("HTTP observer thread start failed: {error}"))?;
+  if observer_thread_target
+    .set(observer_thread.thread().clone())
+    .is_err()
+  {
+    return Err("HTTP observer thread was registered twice".into());
+  }
+  let timer_pair_median_ns = super::measure_timer_pair_median_ns();
+  let rss_before = super::sample_process_memory()?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(
+      FeedbackTracePhase::RssBefore,
+      Instant::now(),
+      Some(rss_before),
+    )?;
+  }
+  if setup_started.elapsed() > super::SETUP_DEADLINE {
+    return Err("HTTP setup exceeded its 120 second finite deadline".into());
+  }
+  #[cfg(feature = "resource-feedback")]
+  let startup_feedback_observation = if run_bindings.mode().feedback_enabled() {
+    Some(run_bindings.wait_for_feedback_startup_observation()?)
+  } else {
+    None
+  };
+  #[cfg(feature = "resource-feedback")]
+  if startup_feedback_observation.is_some() && setup_started.elapsed() > super::SETUP_DEADLINE {
+    return Err("HTTP startup feedback wait exceeded the finite setup deadline".into());
+  }
+  let producer_handle = handle.clone();
+  let producer_resources = resources.clone();
+  let producer_slots = task_slots.clone();
+  let producer_task_admission = task_admission.clone();
+  let producer_thread = thread::Builder::new()
+    .name("http-application-producer".into())
+    .spawn(move || {
+      let _task_owner = producer_task;
+      let report = produce_tokio(
+        producer_handle,
+        producer_slots,
+        producer_resources,
+        io_bindings,
+        cpu_gate,
+        producer_task_admission,
+        address,
+        roles_tx,
+        events_tx,
+        credits_rx,
+        options,
+        settings,
+        plan,
+        app_submitter,
+        capacity_collection,
+      );
+      let _ = producer_tx.send(report);
+    })
+    .map_err(|error| format!("HTTP producer thread start failed: {error}"))?;
+
+  let producer_result = producer_rx
+    .recv_timeout(super::remaining_process_deadline(setup_started))
+    .map_err(|error| format!("HTTP producer deadline failed: {error}"))?;
+  producer_thread
+    .join()
+    .map_err(|_| "HTTP producer panicked".to_owned())?;
+  let producer = producer_result?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(sample_at) = startup_feedback_observation {
+    let (sample_bounds, production_bounds) = if let Some(trace) = feedback_trace.as_ref() {
+      (
+        Some(trace.monotonic_bounds(sample_at)?),
+        Some(trace.monotonic_bounds(producer.started_at)?),
+      )
+    } else {
+      (None, None)
+    };
+    run_bindings.validate_feedback_startup_observation(
+      sample_at,
+      producer.started_at,
+      sample_bounds,
+      production_bounds,
+    )?;
+  }
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(
+      FeedbackTracePhase::ProductionStart,
+      producer.started_at,
+      None,
+    )?;
+    trace.mark_phase(
+      FeedbackTracePhase::ProductionEnd,
+      producer.production_end,
+      None,
+    )?;
+  }
+  let process_deadline = setup_started + super::execution_deadlines().process;
+  let drain_deadline =
+    (producer.production_end + super::execution_deadlines().drain).min(process_deadline);
+  let drain_remaining = drain_deadline.saturating_duration_since(Instant::now());
+  let observed = observer_rx
+    .recv_timeout(drain_remaining)
+    .map_err(|error| format!("HTTP transaction drain deadline failed: {error}"))??;
+  observer_thread
+    .join()
+    .map_err(|_| "HTTP observer panicked".to_owned())?;
+  handle
+    .block_on(accept_task)
+    .map_err(|error| format!("Tokio accept task join failed: {error}"))?
+    .map_err(|error| format!("Tokio accept task failed: {error}"))?;
+  #[cfg(feature = "resource-feedback")]
+  let feedback_drain_upper_ns = if let Some(trace) = feedback_trace.as_ref() {
+    let drain_end = Instant::now();
+    let (_, drain_upper_ns) = trace.monotonic_bounds(drain_end)?;
+    trace.mark_phase(FeedbackTracePhase::DrainEnd, drain_end, None)?;
+    Some(drain_upper_ns)
+  } else {
+    None
+  };
+  #[cfg(feature = "resource-feedback")]
+  let collector_task_lease_count = usize::from(feedback_trace.is_some());
+  #[cfg(not(feature = "resource-feedback"))]
+  let collector_task_lease_count = 0;
+  let production_cpu_ended_ns = super::process_cpu_time_ns();
+  let drain_readback = runtime_readback.as_mut().map_or(Ok(()), |readback| {
+    readback.capture_after_drain(&run_bindings, collector_task_lease_count)
+  });
+  let feedback_drain_health = run_bindings.validate_feedback_health("after_drain");
+  drain_readback?;
+  validate_pair_counts(
+    options.mode,
+    settings.arrivals,
+    &producer,
+    &observed,
+    expected_oracle.as_deref(),
+    plan,
+  )?;
+  if observed
+    .last_observed
+    .saturating_duration_since(producer.production_end)
+    > super::execution_deadlines().drain
+  {
+    return Err("HTTP transaction drain exceeded its finite deadline".into());
+  }
+  let rss_after_drain = super::sample_after_checkpoint_delay()?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(
+      FeedbackTracePhase::RssAfterDrain,
+      Instant::now(),
+      Some(rss_after_drain),
+    )?;
+  }
+
+  #[cfg(feature = "resource-feedback")]
+  if let (Some(drain_upper_ns), Some(trace)) = (feedback_drain_upper_ns, feedback_trace.as_ref()) {
+    run_bindings.wait_for_feedback_observation_after(drain_upper_ns, |sample_at| {
+      trace.monotonic_bounds(sample_at)
+    })?;
+  }
+
+  let shutdown_started = Instant::now();
+  let elapsed_ns = super::run_shutdown_with_timeout("Tokio HTTP runtime", move || {
+    runtime.shutdown_timeout(super::execution_deadlines().shutdown);
+    Ok(())
+  })?;
+  let feedback_shutdown_started = Instant::now();
+  let feedback_shutdown = run_bindings.shutdown_feedback(super::execution_deadlines().shutdown);
+  let feedback_shutdown_ns = feedback_shutdown_started.elapsed().as_nanos();
+  let rate_timer_started = Instant::now();
+  let timer_shutdown = run_bindings.shutdown_auxiliary_timer();
+  let rate_timer_shutdown_ns = rate_timer_started.elapsed().as_nanos();
+  let mut shutdown_timings = vec![("Tokio HTTP runtime", elapsed_ns)];
+  if run_bindings.feedback_started() {
+    shutdown_timings.push(("Tokio resource feedback", feedback_shutdown_ns));
+  }
+  shutdown_timings.push(("Tokio fixed rate timer", rate_timer_shutdown_ns));
+  #[cfg(feature = "resource-feedback")]
+  if let Some(trace) = feedback_trace.as_ref() {
+    trace.mark_phase(FeedbackTracePhase::ShutdownEnd, Instant::now(), None)?;
+  }
+  timer_shutdown?;
+  #[cfg(feature = "resource-feedback")]
+  let trace_finalizer = feedback_trace
+    .take()
+    .map(FeedbackTraceCollector::stop_for_finalization)
+    .transpose()?;
+  let shutdown_readback = runtime_readback.as_mut().map_or(Ok(()), |readback| {
+    readback.capture("after_shutdown", &run_bindings)
+  });
+  let feedback_shutdown_health = run_bindings.validate_feedback_health("after_shutdown");
+  let feedback_health_error = [
+    feedback_drain_health.err(),
+    feedback_shutdown.err(),
+    feedback_shutdown_health.err(),
+  ]
+  .into_iter()
+  .flatten()
+  .next();
+  let shutdown_ns = shutdown_started.elapsed().as_nanos();
+  let shutdown_report = super::write_shutdown_report(
+    producer
+      .production_end
+      .saturating_duration_since(producer.started_at)
+      .as_nanos(),
+    producer.production_cpu_started_ns,
+    production_cpu_ended_ns,
+    observed.on_time + observed.late,
+    &shutdown_timings,
+  );
+  shutdown_readback?;
+  let (final_global_domain, final_tenant_domain, final_resources) =
+    validate_domain_receipt(&run_bindings, "Tokio HTTP")?;
+  if producer.trace_overrun {
+    return Err("HTTP open-loop producer exceeded its finite trace deadline".into());
+  }
+  let readback_domain = domain.readback_domain();
+  let fixed_control_baseline = domain.fixed_global_control_baseline();
+  drop(task_admission);
+  drop(task_slots);
+  drop(handle);
+  drop(run_bindings);
+  drop(resources);
+  drop(domain);
+  let rss_after_shutdown = super::sample_after_checkpoint_delay()?;
+  #[cfg(feature = "resource-feedback")]
+  if let Some(finalizer) = trace_finalizer.as_ref() {
+    finalizer.mark_phase(
+      FeedbackTracePhase::RssAfterShutdown,
+      Instant::now(),
+      Some(rss_after_shutdown),
+    )?;
+  }
+  #[cfg(feature = "resource-feedback")]
+  if let Some(finalizer) = trace_finalizer {
+    finalizer.finish()?;
+  }
+  if let Some(readback) = runtime_readback {
+    readback.finish(&readback_domain, fixed_control_baseline)?;
+  }
+  shutdown_report?;
+  if let Some(error) = feedback_health_error {
+    return Err(error);
+  }
+  Ok(build_report(
+    super::ProcessCheckpoints {
+      setup_started,
+      timer_pair_median_ns,
+      rss_before,
+      rss_after_drain,
+      rss_after_shutdown,
+    },
+    producer,
+    observed,
+    final_resources,
+    final_global_domain,
+    final_tenant_domain,
+    shutdown_ns,
+    plan.async_workers,
+    if options.workload == Workload::Mixed {
+      plan.async_workers
+    } else {
+      1
+    },
+    if options.workload == Workload::Mixed && plan.async_workers == 2 {
+      "2 async + Tokio blocking pool max2 (filesystem execution cap2) + integrated I/O driver"
+    } else if options.workload == Workload::Mixed {
+      "4 async + Tokio blocking pool max4 (filesystem execution cap4) + integrated I/O driver"
+    } else if plan.async_workers == 2 {
+      "2 async + 1 reserved blocking worker (Tokio TcpSocket::connect) + integrated I/O driver"
+    } else {
+      "4 async + 1 reserved blocking worker (Tokio TcpSocket::connect) + integrated I/O driver"
+    },
+  ))
+}
+
+async fn accept_native(
+  listener: NativeListener,
+  mut roles: channel::Receiver<PairToken>,
+  handle: AsyncHandle,
+  resources: ResourceScope,
+  io_bindings: ApplicationIoBindings,
+  events: ObserverEventSender<Event>,
+) -> Result<(), String> {
+  while let Some(token) = roles.recv().await {
+    // A producer-issued role token is consumed before accept, so the listener
+    // cannot retain an unaccounted accepted socket while awaiting a handler.
+    let (stream, _) = listener
+      .accept()
+      .await
+      .map_err(|error| format!("allocatbelt accept failed: {error}"))?;
+    let id = token.id;
+    let observer_lease = token.lease.clone();
+    let task_lease = token.lease;
+    let handler_resources = resources.clone();
+    let handler_io = io_bindings.clone();
+    let ready_events = events.clone();
+    let handler = async move {
+      let endpoint_permit = handler_resources
+        .try_acquire(OperationRequest {
+          disk: 0,
+          network: 1,
+        })
+        .map_err(|error| error.to_string());
+      match endpoint_permit {
+        Ok(permit) => {
+          let endpoint = NativeEndpoint {
+            stream,
+            _permit: permit,
+          };
+          match handler_io.rate_io(endpoint) {
+            Ok(mut endpoint) => http::serve_connection_io(&mut endpoint, &handler_resources)
+              .await
+              .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+          }
+        }
+        Err(error) => {
+          drop(stream);
+          Err(error)
+        }
+      }
+    };
+    let job = handle
+      .spawn(async move {
+        let result = handler.await;
+        let output = (result, task_lease);
+        let _ = ready_events.send(Event::Ready);
+        output
+      })
+      .map_err(|error| format!("allocatbelt handler admission failed: {}", error.kind))?;
+    events
+      .send(Event::Handler(HandlerRecord {
+        id,
+        _lease: observer_lease,
+        job: HandlerJob::Bounded { job, result: None },
+      }))
+      .map_err(|_| "HTTP observer queue closed while publishing handler".to_owned())?;
+  }
+  Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn accept_tokio(
+  listener: tokio::net::TcpListener,
+  mut roles: channel::Receiver<PairToken>,
+  handle: tokio::runtime::Handle,
+  slots: Arc<tokio::sync::Semaphore>,
+  resources: ResourceScope,
+  io_bindings: ApplicationIoBindings,
+  cpu_gate: allocatbelt::runtime::cpu_gate::CpuGate,
+  task_admission: ApplicationTaskAdmission,
+  events: ObserverEventSender<Event>,
+) -> Result<(), String> {
+  while let Some(token) = roles.recv().await {
+    // Reserve global task capacity and the pair role before accepting a file
+    // descriptor. The lease remains in the observer record through join.
+    let task_slot = slots
+      .clone()
+      .acquire_owned()
+      .await
+      .map_err(|error| format!("Tokio handler task window closed: {error}"))?;
+    let task_owner = task_admission.reserve()?;
+    let (stream, _) = listener
+      .accept()
+      .await
+      .map_err(|error| format!("Tokio accept failed: {error}"))?;
+    let id = token.id;
+    let observer_lease = token.lease.clone();
+    let task_lease = token.lease;
+    let handler_resources = resources.clone();
+    let handler_io = io_bindings.clone();
+    let handler_cpu_gate = cpu_gate.clone();
+    let ready_events = events.clone();
+    let handler = async move {
+      match handler_resources.try_acquire(OperationRequest {
+        disk: 0,
+        network: 1,
+      }) {
+        Ok(permit) => {
+          let endpoint = TokioEndpoint {
+            stream,
+            _permit: permit,
+          };
+          match handler_io.rate_io(endpoint) {
+            Ok(mut endpoint) => http::serve_connection_io(&mut endpoint, &handler_resources)
+              .await
+              .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+          }
+        }
+        Err(error) => {
+          drop(stream);
+          Err(error.to_string())
+        }
+      }
+    };
+    let handler = handler_cpu_gate
+      .wrap(handler)
+      .map_err(|error| format!("Tokio handler CPU admission failed: {:?}", error.kind))?;
+    let job = handle.spawn(async move {
+      let _task_slot = task_slot;
+      let _task_owner = task_owner;
+      let result = match handler.await {
+        Ok(output) => output,
+        Err(error) => Err(format!("Tokio handler CPU poll failed: {error:?}")),
+      };
+      let output = (result, task_lease);
+      let _ = ready_events.send(Event::Ready);
+      output
+    });
+    events
+      .send(Event::Handler(HandlerRecord {
+        id,
+        _lease: observer_lease,
+        job: HandlerJob::Tokio {
+          handle: job,
+          result: None,
+        },
+      }))
+      .map_err(|_| "HTTP observer queue closed while publishing handler".to_owned())?;
+  }
+  Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn produce_native(
+  handle: AsyncHandle,
+  net: NetHandle,
+  resources: ResourceScope,
+  io_bindings: ApplicationIoBindings,
+  address: SocketAddrV4,
+  roles: channel::Sender<PairToken>,
+  events: ObserverEventSender<Event>,
+  credits: mpsc::Receiver<()>,
+  options: Options,
+  settings: Settings,
+  plan: ArrivalPlan,
+  app_submitter: Option<super::Submitter>,
+  capacity_collection: super::CapacityCollection,
+) -> Result<ProducerReport, String> {
+  let role_sender = roles.clone();
+  let ready_events = events.clone();
+  produce_with_plan(
+    options,
+    settings,
+    plan,
+    events,
+    credits,
+    capacity_collection,
+    move |id, workload, lease| {
+      if workload != Workload::Http {
+        drop(lease);
+        let submitter = app_submitter.as_ref().ok_or(SubmitResult::Closed)?;
+        return submitter
+          .submit(workload, super::LaneConfig::default(), &resources, id)
+          .map(Submission::App)
+          .map_err(map_app_rejection);
+      }
+      let net = net.clone();
+      let resources = resources.clone();
+      let io_bindings = io_bindings.clone();
+      let operation = async move {
+        let stream = net
+          .connect_nonblocking(SocketAddr::V4(address))
+          .await
+          .map_err(|error| format!("allocatbelt HTTP connect failed: {error}"))?;
+        let permit = resources
+          .try_acquire(OperationRequest {
+            disk: 0,
+            network: 1,
+          })
+          .map_err(|error| format!("allocatbelt client endpoint admission failed: {error}"))?;
+        let endpoint = NativeEndpoint {
+          stream,
+          _permit: permit,
+        };
+        let mut endpoint = io_bindings.rate_io(endpoint)?;
+        http::transact_client_io(
+          &mut endpoint,
+          &resources,
+          id,
+          HttpConfig {
+            body_bytes: settings.body_bytes,
+            seed: request_seed(id),
+          },
+        )
+        .await
+        .map_err(|error| error.to_string())
+      };
+      let ready_events = ready_events.clone();
+      let future = async move {
+        let result = operation.await;
+        let _ = ready_events.send(Event::Ready);
+        result
+      };
+      let job = handle.spawn(future).map_err(|error| {
+        if error.kind == allocatbelt::runtime::asynchronous::AsyncError::Full {
+          SubmitResult::Full
+        } else {
+          SubmitResult::Closed
+        }
+      })?;
+      let token = PairToken { id, lease };
+      handle
+        .block_on(role_sender.send(token))
+        .map_err(|_| SubmitResult::Closed)?
+        .map_err(|_| SubmitResult::Closed)?;
+      Ok(Submission::Http(ClientJob::Bounded { job, result: None }))
+    },
+  )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn produce_tokio(
+  handle: tokio::runtime::Handle,
+  slots: Arc<tokio::sync::Semaphore>,
+  resources: ResourceScope,
+  io_bindings: ApplicationIoBindings,
+  cpu_gate: allocatbelt::runtime::cpu_gate::CpuGate,
+  task_admission: ApplicationTaskAdmission,
+  address: SocketAddrV4,
+  roles: channel::Sender<PairToken>,
+  events: ObserverEventSender<Event>,
+  credits: mpsc::Receiver<()>,
+  options: Options,
+  settings: Settings,
+  plan: ArrivalPlan,
+  app_submitter: Option<super::Submitter>,
+  capacity_collection: super::CapacityCollection,
+) -> Result<ProducerReport, String> {
+  let role_sender = roles.clone();
+  let ready_events = events.clone();
+  produce_with_plan(
+    options,
+    settings,
+    plan,
+    events,
+    credits,
+    capacity_collection,
+    move |id, workload, lease| {
+      if workload != Workload::Http {
+        drop(lease);
+        let submitter = app_submitter.as_ref().ok_or(SubmitResult::Closed)?;
+        return submitter
+          .submit(workload, super::LaneConfig::default(), &resources, id)
+          .map(Submission::App)
+          .map_err(map_app_rejection);
+      }
+      let task_slot = slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|error| match error {
+          tokio::sync::TryAcquireError::Closed => SubmitResult::Closed,
+          tokio::sync::TryAcquireError::NoPermits => SubmitResult::Full,
+        })?;
+      let task_owner = task_admission.reserve().map_err(|_| SubmitResult::Closed)?;
+      let resources_for_client = resources.clone();
+      let io_for_client = io_bindings.clone();
+      let operation = async move {
+        let stream = tokio_connect_nonblocking(&resources_for_client, address)
+          .await
+          .map_err(|error| format!("Tokio HTTP connect failed: {error}"))?;
+        let permit = resources_for_client
+          .try_acquire(OperationRequest {
+            disk: 0,
+            network: 1,
+          })
+          .map_err(|error| format!("Tokio client endpoint admission failed: {error}"))?;
+        let endpoint = TokioEndpoint {
+          stream,
+          _permit: permit,
+        };
+        let mut endpoint = io_for_client.rate_io(endpoint)?;
+        http::transact_client_io(
+          &mut endpoint,
+          &resources_for_client,
+          id,
+          HttpConfig {
+            body_bytes: settings.body_bytes,
+            seed: request_seed(id),
+          },
+        )
+        .await
+        .map_err(|error| error.to_string())
+      };
+      let gated = cpu_gate.wrap(operation).map_err(|_| SubmitResult::Closed)?;
+      let token = PairToken { id, lease };
+      handle
+        .block_on(role_sender.send(token))
+        .map_err(|_| SubmitResult::Closed)?;
+      let ready_events = ready_events.clone();
+      Ok(Submission::Http(ClientJob::Tokio {
+        handle: handle.spawn(async move {
+          let _task_slot = task_slot;
+          let _task_owner = task_owner;
+          let result = gated
+            .await
+            .unwrap_or_else(|error| Err(format!("Tokio client CPU poll failed: {error:?}")));
+          let _ = ready_events.send(Event::Ready);
+          result
+        }),
+        result: None,
+      }))
+    },
+  )
+}
+
+#[derive(Clone, Copy)]
+enum SubmitResult {
+  Full,
+  Closed,
+}
+
+enum Submission {
+  Http(ClientJob),
+  App(super::Job),
+}
+
+fn map_app_rejection(error: super::Rejection) -> SubmitResult {
+  match error {
+    super::Rejection::Full => SubmitResult::Full,
+    super::Rejection::Closed => SubmitResult::Closed,
+  }
+}
+
+fn produce_with_plan(
+  options: Options,
+  settings: Settings,
+  plan: ArrivalPlan,
+  events: ObserverEventSender<Event>,
+  credits: mpsc::Receiver<()>,
+  capacity_collection: super::CapacityCollection,
+  mut submit: impl FnMut(u64, Workload, RoleLease) -> Result<Submission, SubmitResult>,
+) -> Result<ProducerReport, String> {
+  let started_at = Instant::now();
+  let horizon_end = match options.mode {
+    Mode::Capacity => capacity_collection.production_horizon_end(started_at, settings.horizon)?,
+    Mode::OpenLoop => started_at
+      .checked_add(Duration::from_nanos(plan.trace_duration_ns()?))
+      .ok_or_else(|| "HTTP arrival trace end instant overflow".to_owned())?,
+  };
+  let mut attempted = 0usize;
+  let mut admitted = 0usize;
+  let mut rejected_logical_window = 0usize;
+  let mut rejected_backend_full = 0usize;
+  let mut lateness_sum_ns = 0u128;
+  let mut lateness_max_ns = 0u64;
+  let mut outstanding = 0usize;
+  let mut next_capacity_id = 0u64;
+  let mut collection_stop = None;
+
+  let production_cpu_started_ns = super::process_cpu_time_ns();
+  loop {
+    if options.mode == Mode::Capacity
+      && let Some(stopped_at) = capacity_collection.try_stop()?
+    {
+      collection_stop = Some(stopped_at);
+      break;
+    }
+    while let Ok(()) = credits.try_recv() {
+      outstanding = outstanding.saturating_sub(1);
+    }
+    if options.mode == Mode::Capacity
+      && let Some(stopped_at) =
+        super::wait_until_capacity_pulse(plan, started_at, horizon_end, &capacity_collection)?
+    {
+      collection_stop = Some(stopped_at);
+      break;
+    }
+    let (id, scheduled) = match options.mode {
+      Mode::Capacity => {
+        if Instant::now() >= horizon_end {
+          if let Some(stopped_at) = capacity_collection.try_stop()? {
+            collection_stop = Some(stopped_at);
+          } else if capacity_collection.is_traced() {
+            return Err("HTTP capacity trace collection reached its production deadline".into());
+          }
+          break;
+        }
+        if attempted >= MAX_CAPACITY_JOBS {
+          return Err("HTTP capacity lane reached its 10M operation safety cap".into());
+        }
+        let pulse_end = super::capacity_pulse_end(plan, started_at, horizon_end);
+        while outstanding >= WINDOW {
+          if capacity_collection.is_traced()
+            && let Some(stopped_at) = capacity_collection.try_stop()?
+          {
+            collection_stop = Some(stopped_at);
+            break;
+          }
+          if Instant::now() >= horizon_end {
+            if let Some(stopped_at) = capacity_collection.try_stop()? {
+              collection_stop = Some(stopped_at);
+            } else if capacity_collection.is_traced() {
+              return Err("HTTP capacity trace collection reached its production deadline".into());
+            }
+            break;
+          }
+          let remaining = pulse_end.saturating_duration_since(Instant::now());
+          let wait = if capacity_collection.is_traced() {
+            remaining.min(super::CAPACITY_COLLECTION_POLL)
+          } else {
+            remaining
+          };
+          match credits.recv_timeout(wait) {
+            Ok(()) => outstanding -= 1,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+              if capacity_collection.is_traced() {
+                if let Some(stopped_at) = capacity_collection.try_stop()? {
+                  collection_stop = Some(stopped_at);
+                  break;
+                }
+                if Instant::now() < pulse_end {
+                  continue;
+                }
+              }
+              break;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+              return Err("HTTP observer closed before returning window credit".into());
+            }
+          }
+        }
+        if collection_stop.is_some() {
+          break;
+        }
+        if Instant::now() >= horizon_end {
+          if let Some(stopped_at) = capacity_collection.try_stop()? {
+            collection_stop = Some(stopped_at);
+          } else if capacity_collection.is_traced() {
+            return Err("HTTP capacity trace collection reached its production deadline".into());
+          }
+          break;
+        }
+        if Instant::now() >= pulse_end {
+          continue;
+        }
+        let id = next_capacity_id;
+        next_capacity_id += 1;
+        (id, Instant::now())
+      }
+      Mode::OpenLoop => {
+        if attempted >= settings.arrivals {
+          break;
+        }
+        let offset_ns = plan.scheduled_offset_ns(attempted as u64)?;
+        let scheduled = started_at
+          .checked_add(Duration::from_nanos(offset_ns))
+          .ok_or_else(|| "HTTP scheduled instant overflow".to_owned())?;
+        if let Some(remaining) = scheduled.checked_duration_since(Instant::now()) {
+          thread::sleep(remaining);
+        }
+        while let Ok(()) = credits.try_recv() {
+          outstanding = outstanding.saturating_sub(1);
+        }
+        (attempted as u64, scheduled)
+      }
+    };
+    let lateness_ns = Instant::now()
+      .saturating_duration_since(scheduled)
+      .as_nanos();
+    lateness_sum_ns = lateness_sum_ns.saturating_add(lateness_ns);
+    lateness_max_ns = lateness_max_ns.max(lateness_ns.min(u128::from(u64::MAX)) as u64);
+    attempted += 1;
+    if options.mode == Mode::OpenLoop && outstanding >= WINDOW {
+      rejected_logical_window += 1;
+      events
+        .send(Event::Rejected(id, scheduled))
+        .map_err(|_| "HTTP observer queue closed before rejection publication".to_owned())?;
+      continue;
+    }
+    let lease = RoleLease {
+      _hold: Arc::new(()),
+    };
+    let workload = plan.workload_for(id);
+    match submit(id, workload, lease) {
+      Ok(Submission::Http(job)) => {
+        admitted += 1;
+        outstanding += 1;
+        events
+          .send(Event::Client {
+            id,
+            scheduled,
+            horizon_end,
+            job,
+          })
+          .map_err(|_| "HTTP observer queue closed before client publication".to_owned())?;
+      }
+      Ok(Submission::App(job)) => {
+        admitted += 1;
+        outstanding += 1;
+        events
+          .send(Event::App {
+            id,
+            scheduled,
+            horizon_end,
+            job,
+          })
+          .map_err(|_| "HTTP observer queue closed before application publication".to_owned())?;
+      }
+      Err(SubmitResult::Full) => {
+        rejected_backend_full += 1;
+        if options.mode == Mode::OpenLoop {
+          events
+            .send(Event::Rejected(id, scheduled))
+            .map_err(|_| "HTTP observer queue closed before rejection publication".to_owned())?;
+        }
+        if options.mode == Mode::Capacity {
+          return Err("HTTP capacity lane encountered a backend Full rejection".into());
+        }
+      }
+      Err(SubmitResult::Closed) => {
+        return Err("HTTP executor closed during client admission".into());
+      }
+    }
+  }
+  if options.mode == Mode::OpenLoop
+    && let Some(remaining) = horizon_end.checked_duration_since(Instant::now())
+  {
+    thread::sleep(remaining);
+  }
+  let production_end = if options.mode == Mode::Capacity {
+    match collection_stop {
+      Some(stopped_at) => stopped_at,
+      None if capacity_collection.is_traced() => {
+        capacity_collection.try_stop()?.ok_or_else(|| {
+          "HTTP capacity trace collection stopped before an eligible sample ACK".to_owned()
+        })?
+      }
+      None => Instant::now(),
+    }
+  } else {
+    Instant::now()
+  };
+  let trace_overrun =
+    super::trace_exceeded_for_plan(options.mode, started_at, production_end, plan)?;
+  let report = ProducerReport {
+    attempted,
+    admitted,
+    rejected_full: rejected_logical_window + rejected_backend_full,
+    rejected_logical_window,
+    rejected_backend_full,
+    lateness_sum_ns,
+    lateness_max_ns,
+    started_at,
+    production_end,
+    production_cpu_started_ns,
+    trace_overrun,
+  };
+  events
+    .send(Event::Done(report))
+    .map_err(|_| "HTTP observer queue closed before producer completion".to_owned())?;
+  Ok(report)
+}
+
+enum Joiner {
+  Bounded,
+  Tokio,
+}
+
+impl Joiner {
+  fn client(&self, job: ClientJob) -> Result<u64, String> {
+    match (self, job) {
+      (
+        Self::Bounded,
+        ClientJob::Bounded {
+          result: Some(result),
+          ..
+        },
+      ) => result.map_err(|error| format!("allocatbelt client task failed: {error}"))?,
+      (Self::Bounded, ClientJob::Bounded { result: None, .. }) => {
+        Err("allocatbelt client was consumed before terminal completion".into())
+      }
+      (
+        Self::Tokio,
+        ClientJob::Tokio {
+          result: Some(result),
+          ..
+        },
+      ) => match result {
+        Err(error) => Err(format!("Tokio client join failed: {error}")),
+        Ok(result) => result,
+      },
+      (Self::Tokio, ClientJob::Tokio { result: None, .. }) => {
+        Err("Tokio client was consumed before terminal completion".into())
+      }
+      _ => Err("HTTP client job belongs to the wrong executor".into()),
+    }
+  }
+
+  fn handler(&self, job: HandlerJob) -> Result<JoinedHandler, String> {
+    let (result, task_lease) = match (self, job) {
+      (
+        Self::Bounded,
+        HandlerJob::Bounded {
+          result: Some(result),
+          ..
+        },
+      ) => result.map_err(|error| format!("allocatbelt handler task failed: {error}"))?,
+      (Self::Bounded, HandlerJob::Bounded { result: None, .. }) => {
+        return Err("allocatbelt handler was consumed before terminal completion".into());
+      }
+      (
+        Self::Tokio,
+        HandlerJob::Tokio {
+          result: Some(result),
+          ..
+        },
+      ) => result.map_err(|error| format!("Tokio handler join failed: {error}"))?,
+      (Self::Tokio, HandlerJob::Tokio { result: None, .. }) => {
+        return Err("Tokio handler was consumed before terminal completion".into());
+      }
+      _ => return Err("HTTP handler job belongs to the wrong executor".into()),
+    };
+    Ok((result, task_lease))
+  }
+}
+
+#[cfg(test)]
+fn observe_events(
+  joiner: Joiner,
+  options: Options,
+  settings: Settings,
+  resources: ResourceScope,
+  events: mpsc::Receiver<Event>,
+  credits: mpsc::SyncSender<()>,
+  expected_oracle: Option<Arc<Vec<u64>>>,
+) -> Result<ObserverReport, String> {
+  let rate = options.rate_per_second.unwrap_or(1);
+  let plan = ArrivalPlan::new(Profile::Steady, options.workload, settings.arrivals, rate)?;
+  observe_events_with_plan(
+    joiner,
+    options,
+    settings,
+    resources,
+    events,
+    credits,
+    expected_oracle,
+    plan,
+    None,
+    super::CapacityCollection::Fixed,
+  )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_events_with_plan(
+  joiner: Joiner,
+  options: Options,
+  settings: Settings,
+  resources: ResourceScope,
+  events: mpsc::Receiver<Event>,
+  credits: mpsc::SyncSender<()>,
+  expected_oracle: Option<Arc<Vec<u64>>>,
+  plan: ArrivalPlan,
+  application_observer: Option<Observer>,
+  capacity_collection: super::CapacityCollection,
+) -> Result<ObserverReport, String> {
+  let mut pending = HashMap::<u64, PendingPair>::new();
+  pending
+    // Admitted work remains within the live producer window until the
+    // observer removes a completed pair and returns its credit. The ID state
+    // and latency tables below still cover the full open-loop trace.
+    .try_reserve(WINDOW + 1)
+    .map_err(|_| "could not reserve bounded HTTP pair table".to_owned())?;
+  let mut handler_jobs = Vec::<(u64, HandlerJob, RoleLease)>::new();
+  handler_jobs
+    .try_reserve_exact(WINDOW)
+    .map_err(|_| "could not reserve bounded HTTP handler jobs".to_owned())?;
+  let mut application_jobs = Vec::<(u64, Instant, Instant, super::Job)>::new();
+  application_jobs
+    .try_reserve_exact(WINDOW)
+    .map_err(|_| "could not reserve bounded mixed application jobs".to_owned())?;
+  let mut states = if options.mode == Mode::OpenLoop {
+    let mut values = Vec::new();
+    values
+      .try_reserve_exact(settings.arrivals)
+      .map_err(|_| "could not reserve HTTP observer ID table".to_owned())?;
+    values.resize(settings.arrivals, IdState::Unseen);
+    Some(values)
+  } else {
+    None
+  };
+  let mut producer: Option<ProducerReport> = None;
+  let mut next_scheduled_id = 0u64;
+  let mut completed = 0usize;
+  let mut on_time = 0usize;
+  let mut late = 0usize;
+  let mut errors = 0usize;
+  let mut first_error = None;
+  let mut digest = 0u64;
+  let mut latencies = Vec::new();
+  let mut records = Vec::new();
+  let mut family_published_on_time = [0u64; 4];
+  if options.mode == Mode::OpenLoop {
+    records
+      .try_reserve_exact(settings.arrivals)
+      .map_err(|_| "could not reserve bounded HTTP per-ID records".to_owned())?;
+  }
+  if options.mode == Mode::OpenLoop {
+    latencies
+      .try_reserve_exact(settings.arrivals)
+      .map_err(|_| "could not reserve bounded HTTP latency samples".to_owned())?;
+  }
+  let mut max_observed_managed_bytes = 0usize;
+  let mut retained_outputs = VecDeque::<WorkOutput>::new();
+  let mut retained_managed_bytes = 0usize;
+  let mut last_observed = Instant::now();
+  let completion_waker = Waker::from(Arc::new(ObserverWake(thread::current())));
+
+  loop {
+    max_observed_managed_bytes =
+      max_observed_managed_bytes.max(resources.snapshot().managed_memory);
+    let mut made_progress = false;
+    let mut events_disconnected = false;
+    let event = match events.try_recv() {
+      Ok(event) => Some(event),
+      Err(mpsc::TryRecvError::Empty) => None,
+      Err(mpsc::TryRecvError::Disconnected) => {
+        events_disconnected = true;
+        None
+      }
+    };
+    if let Some(event) = event {
+      made_progress = true;
+      match event {
+        Event::Done(report) => producer = Some(report),
+        Event::Client {
+          id,
+          scheduled,
+          horizon_end,
+          job,
+        } => {
+          if id != next_scheduled_id {
+            return Err("HTTP producer published client IDs out of sequence".into());
+          }
+          next_scheduled_id += 1;
+          if let Some(states) = &mut states {
+            let state = states
+              .get_mut(id as usize)
+              .ok_or_else(|| "HTTP client ID was out of range".to_owned())?;
+            if *state != IdState::Unseen {
+              return Err("HTTP producer repeated an open-loop ID".into());
+            }
+            *state = IdState::Admitted;
+          }
+          let pair = pending.entry(id).or_default();
+          if pair.client.replace((scheduled, horizon_end, job)).is_some() {
+            return Err(format!("duplicate HTTP client result record for ID {id}"));
+          }
+        }
+        Event::Rejected(id, scheduled) => {
+          if id != next_scheduled_id {
+            return Err("HTTP producer published rejected IDs out of sequence".into());
+          }
+          next_scheduled_id += 1;
+          if let Some(states) = &mut states {
+            let state = states
+              .get_mut(id as usize)
+              .ok_or_else(|| "HTTP rejected ID was out of range".to_owned())?;
+            if *state != IdState::Unseen {
+              return Err("HTTP producer repeated an open-loop ID".into());
+            }
+            *state = IdState::Rejected;
+          }
+          let completion = Instant::now();
+          let (scheduled_ns, completion_ns) =
+            super::arrival_times_for_plan(id, scheduled, completion, plan)?;
+          let workload = plan.workload_for(id);
+          let expected_checksum = expected_oracle
+            .as_deref()
+            .and_then(|values| values.get(id as usize).copied())
+            .unwrap_or_else(|| {
+              if workload == Workload::Http {
+                expected_request_checksum(id, settings.body_bytes)
+              } else {
+                super::expected_value(workload, &super::LaneConfig::default(), id)
+              }
+            });
+          records.push(super::IdRecord {
+            id,
+            workload,
+            scheduled_ns,
+            completion_ns,
+            terminal: "rejected",
+            checksum: 0,
+            expected_checksum,
+          });
+        }
+        Event::Handler(record) => {
+          handler_jobs.push((record.id, record.job, record._lease));
+        }
+        Event::App {
+          id,
+          scheduled,
+          horizon_end,
+          job,
+        } => {
+          if id != next_scheduled_id {
+            return Err("HTTP producer published application IDs out of sequence".into());
+          }
+          next_scheduled_id += 1;
+          if let Some(states) = &mut states {
+            let state = states
+              .get_mut(id as usize)
+              .ok_or_else(|| "mixed application ID was out of range".to_owned())?;
+            if *state != IdState::Unseen {
+              return Err("HTTP producer repeated an open-loop application ID".into());
+            }
+            *state = IdState::Admitted;
+          }
+          application_jobs.push((id, scheduled, horizon_end, job));
+        }
+        Event::Ready => {}
+      }
+    }
+
+    let mut context = Context::from_waker(&completion_waker);
+    let mut index = 0;
+    while index < handler_jobs.len() {
+      if handler_jobs[index]
+        .1
+        .poll_finished(&mut context)
+        .is_pending()
+      {
+        index += 1;
+        continue;
+      }
+      let (id, job, event_lease) = handler_jobs.swap_remove(index);
+      made_progress = true;
+      let (handler_result, task_lease) = joiner.handler(job)?;
+      let pair_id = handler_result
+        .as_ref()
+        .map_or(id, |(handler_id, _)| *handler_id);
+      let pair = pending.entry(pair_id).or_default();
+      if pair
+        .handler
+        .replace((handler_result, event_lease, task_lease))
+        .is_some()
+      {
+        return Err("duplicate HTTP handler result record".into());
+      }
+    }
+
+    for pair in pending.values_mut() {
+      if let Some((_, _, job)) = pair.client.as_mut() {
+        let _ = job.poll_finished(&mut context);
+      }
+    }
+
+    let mut index = 0;
+    while index < application_jobs.len() {
+      if application_jobs[index]
+        .3
+        .poll_finished(&mut context)
+        .is_pending()
+      {
+        index += 1;
+        continue;
+      }
+      let (id, scheduled, horizon_end, job) = application_jobs.swap_remove(index);
+      made_progress = true;
+      let result = application_observer
+        .as_ref()
+        .ok_or_else(|| "mixed application observer is missing".to_owned())?
+        .join(job);
+      let observed = Instant::now();
+      last_observed = observed;
+      if options.mode == Mode::OpenLoop {
+        latencies.push(observed.saturating_duration_since(scheduled).as_nanos() as u64);
+      }
+      let workload = plan.workload_for(id);
+      let oracle_checksum = expected_oracle
+        .as_deref()
+        .and_then(|values| values.get(id as usize).copied())
+        .unwrap_or_else(|| super::expected_value(workload, &super::LaneConfig::default(), id));
+      let mut checksum = 0;
+      let succeeded = match result {
+        Ok(output)
+          if super::validate_output_with_oracle(
+            workload,
+            &super::LaneConfig::default(),
+            id,
+            &output,
+            expected_oracle.as_deref(),
+          ) =>
+        {
+          let value = output.value();
+          checksum = value;
+          if capacity_collection.on_time(observed, horizon_end) {
+            on_time += 1;
+            if let Some(index) = workload.family_index() {
+              family_published_on_time[index] = family_published_on_time[index].saturating_add(1);
+            }
+          } else {
+            late += 1;
+          }
+          digest = digest.wrapping_add(value ^ id);
+          if let Some(states) = &mut states {
+            let state = states
+              .get_mut(id as usize)
+              .ok_or_else(|| "mixed observer saw an out-of-range ID".to_owned())?;
+            if *state != IdState::Admitted {
+              return Err("mixed observer saw a duplicate or unadmitted ID".into());
+            }
+            *state = IdState::Completed;
+          }
+          if let WorkOutput::Memory(memory) = output {
+            if retained_outputs.len() == WINDOW
+              && let Some(WorkOutput::Memory(old)) = retained_outputs.pop_front()
+            {
+              retained_managed_bytes =
+                retained_managed_bytes.saturating_sub(old.buffer.charged_bytes());
+            }
+            retained_managed_bytes += memory.buffer.charged_bytes();
+            retained_outputs.push_back(WorkOutput::Memory(memory));
+          }
+          true
+        }
+        Ok(_) => {
+          errors += 1;
+          first_error
+            .get_or_insert_with(|| "mixed result checksum differs from its ID oracle".into());
+          false
+        }
+        Err(error) => {
+          errors += 1;
+          first_error.get_or_insert(error);
+          false
+        }
+      };
+      if !succeeded
+        && let Some(states) = &mut states
+        && let Some(state) = states.get_mut(id as usize)
+        && *state == IdState::Admitted
+      {
+        *state = IdState::Failed;
+      }
+      if options.mode == Mode::OpenLoop {
+        let (scheduled_ns, completion_ns) =
+          super::arrival_times_for_plan(id, scheduled, observed, plan)?;
+        records.push(super::IdRecord {
+          id,
+          workload,
+          scheduled_ns,
+          completion_ns,
+          terminal: if succeeded { "completed" } else { "error" },
+          checksum,
+          expected_checksum: oracle_checksum,
+        });
+      }
+      completed += 1;
+      let _ = credits.send(());
+    }
+
+    while let Some(id) = pending.iter().find_map(|(id, pair)| {
+      (pair
+        .client
+        .as_ref()
+        .is_some_and(|(_, _, job)| job.is_finished())
+        && pair.handler.is_some())
+      .then_some(*id)
+    }) {
+      let mut pair = pending.remove(&id).expect("ready pair remains present");
+      made_progress = true;
+      let (scheduled, horizon_end, client_job) = pair.client.take().expect("ready client exists");
+      let (handler_result, event_lease, task_lease) =
+        pair.handler.take().expect("ready handler exists");
+      let client_result = joiner.client(client_job);
+      // Publication time is captured immediately after the second join is
+      // consumed. Checksum/reference validation is deliberately outside the
+      // measured response interval.
+      let observed = Instant::now();
+      drop(task_lease);
+      drop(event_lease);
+      last_observed = observed;
+      if options.mode == Mode::OpenLoop {
+        latencies.push(observed.saturating_duration_since(scheduled).as_nanos() as u64);
+      }
+      let result = match (client_result, handler_result) {
+        (Ok(client_checksum), Ok((handler_id, handler_checksum))) => validate_response_pair(
+          id,
+          client_checksum,
+          handler_id,
+          handler_checksum,
+          expected_oracle.as_deref(),
+          settings,
+        )
+        .map_err(|error| error.to_owned()),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+      };
+      let mut checksum = 0;
+      let mut succeeded = false;
+      match result {
+        Ok(value) => {
+          checksum = value;
+          succeeded = true;
+          if capacity_collection.on_time(observed, horizon_end) {
+            on_time += 1;
+            if let Some(index) = plan.workload_for(id).family_index() {
+              family_published_on_time[index] = family_published_on_time[index].saturating_add(1);
+            }
+          } else {
+            late += 1;
+          }
+          digest = digest.wrapping_add(if plan.workload == Workload::Mixed {
+            value ^ id
+          } else {
+            value
+          });
+          if let Some(states) = &mut states {
+            let state = states
+              .get_mut(id as usize)
+              .ok_or_else(|| "HTTP observer saw an out-of-range request ID".to_owned())?;
+            if *state != IdState::Admitted {
+              return Err("HTTP observer saw a duplicate or unadmitted request ID".into());
+            }
+            *state = IdState::Completed;
+          }
+        }
+        Err(error) => {
+          errors += 1;
+          if first_error.is_none() {
+            first_error = Some(error);
+          }
+          if let Some(states) = &mut states
+            && let Some(state) = states.get_mut(id as usize)
+            && *state == IdState::Admitted
+          {
+            *state = IdState::Failed;
+          }
+        }
+      }
+      if options.mode == Mode::OpenLoop {
+        let (scheduled_ns, completion_ns) =
+          super::arrival_times_for_plan(id, scheduled, observed, plan)?;
+        let workload = plan.workload_for(id);
+        let expected_checksum =
+          expected_response_checksum(expected_oracle.as_deref(), id, settings)
+            .ok_or_else(|| "HTTP per-ID oracle missed a completed request".to_owned())?;
+        records.push(super::IdRecord {
+          id,
+          workload,
+          scheduled_ns,
+          completion_ns,
+          terminal: if succeeded { "completed" } else { "error" },
+          checksum,
+          expected_checksum,
+        });
+      }
+      completed += 1;
+      // In open-loop mode the producer never waits for the observer and may
+      // have finished its fixed trace before this pair drains. Capacity mode
+      // likewise has no further admissions after Done.
+      let _ = credits.send(());
+    }
+    if producer.is_some_and(|report| completed >= report.admitted) {
+      break;
+    }
+    if events_disconnected {
+      if producer.is_none() {
+        return Err(format!(
+          "HTTP event channel closed before producer completion (completed {completed}, handler jobs {}, pending {})",
+          handler_jobs.len(),
+          pending.len() + application_jobs.len(),
+        ));
+      }
+      if handler_jobs.is_empty()
+        && application_jobs.is_empty()
+        && pending
+          .values()
+          .any(|pair| pair.client.is_none() || pair.handler.is_none())
+      {
+        return Err(format!(
+          "HTTP event channel closed with an admitted pair missing a role (completed {completed}, admitted {}, pending {})",
+          producer.map_or(0, |report| report.admitted),
+          pending.len(),
+        ));
+      }
+      if handler_jobs.is_empty()
+        && application_jobs.is_empty()
+        && pending.is_empty()
+        && completed < producer.unwrap().admitted
+      {
+        return Err(format!(
+          "HTTP event channel closed before all admitted pairs were reported (completed {completed}, admitted {})",
+          producer.unwrap().admitted,
+        ));
+      }
+    }
+    if !made_progress {
+      thread::park_timeout(Duration::from_millis(1));
+    }
+  }
+  let producer = producer.ok_or_else(|| "HTTP producer completion record missing".to_owned())?;
+  if next_scheduled_id != producer.attempted as u64 {
+    return Err("HTTP observer did not see every producer ID exactly once".into());
+  }
+  if !pending.is_empty() {
+    return Err("HTTP observer drained with unpaired client or handler records".into());
+  }
+  if let Some(values) = &states
+    && (values.iter().any(|state| {
+      !matches!(
+        state,
+        IdState::Rejected | IdState::Completed | IdState::Failed
+      )
+    }) || values
+      .iter()
+      .filter(|state| matches!(state, IdState::Completed | IdState::Failed))
+      .count()
+      != producer.admitted)
+  {
+    return Err("HTTP open-loop IDs are missing or unresolved".into());
+  }
+  let mut expected = 0u64;
+  match &states {
+    Some(values) => {
+      for (id, state) in values.iter().enumerate() {
+        match state {
+          IdState::Completed => {
+            let expected_value = match &expected_oracle {
+              Some(oracle) => oracle
+                .get(id)
+                .copied()
+                .ok_or_else(|| "HTTP open-loop checksum oracle missed a completed ID".to_owned())?,
+              None => expected_request_checksum(id as u64, settings.body_bytes),
+            };
+            expected = expected.wrapping_add(if plan.workload == Workload::Mixed {
+              expected_value ^ id as u64
+            } else {
+              expected_value
+            });
+          }
+          IdState::Rejected => {}
+          IdState::Failed => {
+            return Err(format!(
+              "HTTP open-loop request {id} failed before result accounting: {:?}",
+              first_error.as_deref()
+            ));
+          }
+          state => {
+            return Err(format!(
+              "HTTP open-loop ID {id} remained unresolved as {state:?}"
+            ));
+          }
+        }
+      }
+    }
+    None => {
+      for id in 0..producer.admitted as u64 {
+        let workload = plan.workload_for(id);
+        let value = if workload == Workload::Http {
+          expected_request_checksum(id, settings.body_bytes)
+        } else {
+          super::expected_value(workload, &super::LaneConfig::default(), id)
+        };
+        expected = expected.wrapping_add(if plan.workload == Workload::Mixed {
+          value ^ id
+        } else {
+          value
+        });
+      }
+    }
+  }
+  if digest != expected {
+    return Err(format!(
+      "HTTP per-ID result digest differs from the independent reference ({digest:#x} != {expected:#x}; completed={completed}, admitted={}, errors={errors}, first_error={first_error:?})",
+      producer.admitted,
+    ));
+  }
+  Ok(ObserverReport {
+    on_time,
+    late,
+    errors,
+    digest,
+    expected,
+    latencies,
+    max_observed_managed_bytes,
+    retained_managed_bytes,
+    last_observed,
+    records,
+    family_published_on_time,
+  })
+}
+
+#[derive(Debug)]
+struct NativeEndpoint {
+  stream: NativeStream,
+  _permit: OperationPermit,
+}
+
+impl AsyncRead for NativeEndpoint {
+  fn poll_read(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    buf: &mut [u8],
+  ) -> Poll<io::Result<usize>> {
+    Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+  }
+}
+
+impl AsyncWrite for NativeEndpoint {
+  fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+  }
+
+  fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+  }
+
+  fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+  }
+}
+
+#[derive(Debug)]
+struct TokioEndpoint {
+  stream: tokio::net::TcpStream,
+  _permit: allocatbelt::runtime::managed::OperationPermit,
+}
+
+impl AsyncRead for TokioEndpoint {
+  fn poll_read(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    buf: &mut [u8],
+  ) -> Poll<io::Result<usize>> {
+    let this = self.get_mut();
+    let mut read_buf = tokio::io::ReadBuf::new(buf);
+    match Pin::new(&mut this.stream).poll_read(cx, &mut read_buf) {
+      Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+      Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+      Poll::Pending => Poll::Pending,
+    }
+  }
+}
+
+impl AsyncWrite for TokioEndpoint {
+  fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+  }
+
+  fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+  }
+
+  fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+  }
+}
+
+async fn tokio_connect_nonblocking(
+  resources: &ResourceScope,
+  address: SocketAddrV4,
+) -> io::Result<tokio::net::TcpStream> {
+  // Match NetHandle::connect_nonblocking: one temporary slot covers socket
+  // creation and registration/connect, then drops before endpoint admission.
+  let temporary = resources
+    .try_acquire(OperationRequest {
+      disk: 0,
+      network: 1,
+    })
+    .map_err(|error| {
+      io::Error::other(format!("Tokio connect operation admission failed: {error}"))
+    })?;
+  let socket = tokio::net::TcpSocket::new_v4()?;
+  let stream = socket.connect(SocketAddr::V4(address)).await?;
+  drop(temporary);
+  Ok(stream)
+}
+
+pub(super) const ORACLE_BODY_BYTES: usize = BODY_BYTES;
+
+fn build_expected_oracle(
+  options: Options,
+  settings: Settings,
+  plan: ArrivalPlan,
+) -> Result<Option<Arc<Vec<u64>>>, String> {
+  if options.mode != Mode::OpenLoop {
+    return Ok(None);
+  }
+  if options.workload != plan.workload {
+    return Err("HTTP oracle workload differs from the arrival plan".into());
+  }
+  if options.workload == Workload::Http {
+    return build_open_loop_checksum_oracle(Mode::OpenLoop, settings);
+  }
+  if settings.body_bytes != ORACLE_BODY_BYTES {
+    return Err("mixed HTTP body size differs from the frozen per-ID oracle".into());
+  }
+  super::build_plan_expected_oracle(plan, &super::LaneConfig::default()).map(Some)
+}
+
+pub(super) fn expected_request_checksum(id: u64, body_bytes: usize) -> u64 {
+  (0..body_bytes).fold(0xcbf2_9ce4_8422_2325, |hash, index| {
+    (hash ^ u64::from(pattern_byte(request_seed(id), index))).wrapping_mul(0x0000_0100_0000_01b3)
+  })
+}
+
+fn expected_response_checksum(
+  oracle: Option<&Vec<u64>>,
+  id: u64,
+  settings: Settings,
+) -> Option<u64> {
+  match oracle {
+    Some(values) => values.get(id as usize).copied(),
+    None => Some(expected_request_checksum(id, settings.body_bytes)),
+  }
+}
+
+fn validate_response_pair(
+  request_id: u64,
+  client_checksum: u64,
+  handler_id: u64,
+  handler_checksum: u64,
+  oracle: Option<&Vec<u64>>,
+  settings: Settings,
+) -> Result<u64, String> {
+  if handler_id != request_id || handler_checksum != client_checksum {
+    return Err(format!(
+      "HTTP client/handler request IDs or checksums differ (request={request_id}, handler={handler_id}, client={client_checksum:#x}, server={handler_checksum:#x})"
+    ));
+  }
+  let expected = expected_response_checksum(oracle, request_id, settings)
+    .ok_or_else(|| format!("HTTP checksum oracle missed request {request_id}"))?;
+  if expected != client_checksum {
+    return Err(format!(
+      "HTTP response checksum for request {request_id} was {client_checksum:#x}, expected {expected:#x}"
+    ));
+  }
+  Ok(client_checksum)
+}
+
+fn build_open_loop_checksum_oracle(
+  mode: Mode,
+  settings: Settings,
+) -> Result<Option<Arc<Vec<u64>>>, String> {
+  if mode != Mode::OpenLoop {
+    return Ok(None);
+  }
+  if settings.arrivals > super::MAX_OPEN_LOOP_ARRIVALS {
+    return Err("HTTP checksum oracle exceeds the configured ID bound".into());
+  }
+  let mut oracle = Vec::new();
+  oracle
+    .try_reserve_exact(settings.arrivals)
+    .map_err(|_| "could not reserve bounded HTTP checksum oracle".to_owned())?;
+  oracle.extend(
+    (0..settings.arrivals).map(|id| expected_request_checksum(id as u64, settings.body_bytes)),
+  );
+  Ok(Some(Arc::new(oracle)))
+}
+
+pub(super) fn request_seed(id: u64) -> u64 {
+  0xbb67_ae85_84ca_a73b ^ id.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+fn validate_pair_counts(
+  mode: Mode,
+  arrivals: usize,
+  producer: &ProducerReport,
+  observer: &ObserverReport,
+  expected_oracle: Option<&Vec<u64>>,
+  plan: ArrivalPlan,
+) -> Result<(), String> {
+  let completed = observer.on_time + observer.late;
+  if producer.rejected_full != producer.rejected_logical_window + producer.rejected_backend_full
+    || producer.attempted != producer.admitted + producer.rejected_full
+    || producer.admitted != completed
+  {
+    return Err("HTTP producer and paired completion counts do not balance".into());
+  }
+  if observer.errors != 0 || observer.digest != observer.expected {
+    return Err("HTTP lane had failed transactions or a checksum mismatch".into());
+  }
+  if mode == Mode::Capacity && producer.rejected_full != 0 {
+    return Err("HTTP capacity lane rejected a transaction".into());
+  }
+  if mode == Mode::OpenLoop && producer.attempted != arrivals {
+    return Err("HTTP open-loop lane did not schedule every request ID".into());
+  }
+  if mode == Mode::OpenLoop {
+    let oracle = expected_oracle.ok_or_else(|| {
+      "HTTP open-loop checksum oracle missing during per-ID validation".to_owned()
+    })?;
+    if oracle.len() != arrivals {
+      return Err("HTTP checksum oracle length differs from requested arrivals".into());
+    }
+    let (recorded_completed, recorded_rejected) =
+      super::validate_id_records(&observer.records, oracle)?;
+    if observer.records.iter().any(|record| {
+      plan.workload_for(record.id) != record.workload
+        || plan.scheduled_offset_ns(record.id).ok() != Some(record.scheduled_ns)
+    }) {
+      return Err("HTTP per-ID schedule or workload differs from the canonical profile".into());
+    }
+    if recorded_completed != producer.admitted || recorded_rejected != producer.rejected_full {
+      return Err("HTTP per-ID terminal counts differ from the producer report".into());
+    }
+  }
+  Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_report(
+  checkpoints: super::ProcessCheckpoints,
+  producer: ProducerReport,
+  observer: ObserverReport,
+  final_resources: ResourceSnapshot,
+  final_global_domain: DomainSnapshot,
+  final_tenant_domain: DomainSnapshot,
+  shutdown_ns: u128,
+  async_workers: usize,
+  blocking_workers: usize,
+  topology: &'static str,
+) -> Report {
+  let mut latencies = observer.latencies;
+  latencies.sort_unstable();
+  let last_observed = observer.last_observed;
+  let drain_tail_ns = last_observed
+    .saturating_duration_since(producer.production_end)
+    .as_nanos();
+  Report {
+    setup_ns: producer
+      .started_at
+      .saturating_duration_since(checkpoints.setup_started)
+      .as_nanos(),
+    timer_pair_median_ns: checkpoints.timer_pair_median_ns,
+    rss_before: checkpoints.rss_before,
+    rss_after_drain: checkpoints.rss_after_drain,
+    rss_after_shutdown: checkpoints.rss_after_shutdown,
+    producer,
+    on_time: observer.on_time,
+    late: observer.late,
+    errors: observer.errors,
+    digest: observer.digest,
+    expected: observer.expected,
+    p50_ns: percentile(&latencies, 50),
+    p95_ns: percentile(&latencies, 95),
+    p99_ns: percentile(&latencies, 99),
+    max_observed_managed_bytes: observer.max_observed_managed_bytes,
+    retained_managed_bytes: observer.retained_managed_bytes,
+    final_resources,
+    final_global_domain,
+    final_tenant_domain,
+    shutdown_ns,
+    last_observed,
+    drain_tail_ns,
+    async_workers,
+    blocking_workers,
+    topology,
+    records: observer.records,
+    family_published_on_time: observer.family_published_on_time,
+  }
+}
+
+fn percentile(samples: &[u64], percentile: usize) -> u64 {
+  if samples.is_empty() {
+    return 0;
+  }
+  let rank = percentile
+    .saturating_mul(samples.len())
+    .div_ceil(100)
+    .max(1);
+  samples[rank.saturating_sub(1).min(samples.len() - 1)]
+}
+
+fn print_row(allocator: &str, options: Options, report: &Report) {
+  debug_assert!(domain_non_control_resources_empty(
+    report.final_global_domain
+  ));
+  debug_assert!(domain_non_control_resources_empty(
+    report.final_tenant_domain
+  ));
+  let production_ns = report
+    .producer
+    .production_end
+    .saturating_duration_since(report.producer.started_at)
+    .as_nanos()
+    .max(1);
+  let capacity_rate = if options.mode == Mode::Capacity {
+    (report.on_time as f64 / production_ns as f64 * 1_000_000_000.0).to_string()
+  } else {
+    String::new()
+  };
+  let wall_ns = super::wall_through_drain_ns(
+    report.producer.started_at,
+    report.producer.production_end,
+    report.last_observed,
+  );
+  let drained_rate =
+    (report.on_time + report.late) as f64 / wall_ns.max(1) as f64 * 1_000_000_000.0;
+  let values = [
+    if options.workload == Workload::Mixed {
+      "mixed-application-v1".to_owned()
+    } else {
+      super::HTTP_CONNECT_POLICY_SCHEMA.to_owned()
+    },
+    allocator.to_owned(),
+    options.executor.label().to_owned(),
+    options.workload.label().to_owned(),
+    options.mode.label().to_owned(),
+    report.async_workers.to_string(),
+    report.blocking_workers.to_string(),
+    report.topology.to_owned(),
+    WINDOW.to_string(),
+    TASK_LIMIT.to_string(),
+    if options.workload == Workload::Mixed {
+      WINDOW.to_string()
+    } else {
+      "0".to_owned()
+    },
+    options
+      .rate_per_second
+      .map_or(String::new(), |rate| rate.to_string()),
+    if options.mode == Mode::OpenLoop {
+      report.producer.attempted.to_string()
+    } else {
+      String::new()
+    },
+    report.producer.attempted.to_string(),
+    report.producer.admitted.to_string(),
+    report.producer.rejected_full.to_string(),
+    "0".to_owned(),
+    report.on_time.to_string(),
+    report.late.to_string(),
+    report.errors.to_string(),
+    "0".to_owned(),
+    report
+      .producer
+      .admitted
+      .saturating_sub(report.on_time + report.late + report.errors)
+      .to_string(),
+    report
+      .producer
+      .attempted
+      .saturating_sub(report.on_time + report.late)
+      .to_string(),
+    report.digest.to_string(),
+    report.expected.to_string(),
+    capacity_rate,
+    drained_rate.to_string(),
+    report.setup_ns.to_string(),
+    report.timer_pair_median_ns.to_string(),
+    wall_ns.to_string(),
+    report.drain_tail_ns.to_string(),
+    report.p50_ns.to_string(),
+    report.p95_ns.to_string(),
+    report.p99_ns.to_string(),
+    if report.producer.attempted == 0 {
+      "0".to_owned()
+    } else {
+      (report.producer.lateness_sum_ns / report.producer.attempted as u128).to_string()
+    },
+    report.producer.lateness_max_ns.to_string(),
+    report.max_observed_managed_bytes.to_string(),
+    report.retained_managed_bytes.to_string(),
+    if options.workload == Workload::Mixed {
+      super::resource_limits(Workload::Mixed)
+        .managed_memory
+        .to_string()
+    } else {
+      limits().managed_memory.to_string()
+    },
+    if options.workload == Workload::Mixed {
+      "8"
+    } else {
+      "0"
+    }
+    .to_owned(),
+    "16".to_owned(),
+    report.final_resources.managed_memory.to_string(),
+    report.final_resources.disk_ops.to_string(),
+    report.final_resources.network_ops.to_string(),
+    report.rss_before.rss_kib.to_string(),
+    report.rss_after_drain.rss_kib.to_string(),
+    report.rss_after_shutdown.rss_kib.to_string(),
+    report.rss_before.hwm_kib.to_string(),
+    report.rss_after_drain.hwm_kib.to_string(),
+    report.rss_after_shutdown.hwm_kib.to_string(),
+    report.shutdown_ns.to_string(),
+    report.producer.rejected_logical_window.to_string(),
+    report.producer.rejected_backend_full.to_string(),
+  ];
+  debug_assert_eq!(values.len(), super::TSV_HEADER.split('\t').count());
+  println!("{}", super::TSV_HEADER);
+  println!("{}", values.join("\t"));
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{
+    AsyncConfig, AsyncHandle, AsyncShutdown, ClientJob, Event, HandlerJob, HandlerRecord, Joiner,
+    Mode, ProducerReport, RoleLease, Settings, TASK_LIMIT, WINDOW, build_open_loop_checksum_oracle,
+    checked_loopback_v4, expected_request_checksum, observe_events, run_bounded, run_tokio,
+    tokio_connect_nonblocking, validate_response_pair,
+  };
+  use crate::application::{Executor, HTTP_CONNECT_POLICY_SCHEMA, Options, Workload};
+  use allocatbelt::runtime::asynchronous::AsyncRuntime;
+  use allocatbelt::runtime::managed::ResourceScope;
+  use allocatbelt::runtime::managed::{OperationRequest, ResourceLimits};
+  use allocatbelt::runtime::net::{
+    NetHandle, NetworkError, TcpConnectError, TcpListener as NativeTcpListener,
+    TcpSocket as NativeTcpSocket,
+  };
+  use allocatbelt::runtime::reactor::{Reactor, ReactorConfig};
+  use allocatbelt::runtime::{Config as BlockingConfig, IoPool, Resources};
+  use std::future::Future;
+  use std::io;
+  use std::net::{SocketAddr, TcpListener, TcpStream as StdTcpStream};
+  use std::process::{Command, Stdio};
+  use std::sync::{Arc, mpsc};
+  use std::task::{Context, Waker};
+  use std::thread;
+  use std::time::Duration;
+  use std::time::Instant;
+
+  fn options(executor: Executor, mode: Mode, rate_per_second: Option<u64>) -> Options {
+    Options {
+      executor,
+      workload: Workload::Http,
+      mode,
+      rate_per_second,
+    }
+  }
+
+  fn settings(mode: Mode) -> Settings {
+    Settings {
+      horizon: Duration::from_millis(40),
+      arrivals: if mode == Mode::OpenLoop { 32 } else { 64 },
+      body_bytes: 256,
+    }
+  }
+
+  fn assert_domain_receipt(report: &super::Report) {
+    for resource in [
+      allocatbelt::runtime::resource_domain::DomainResource::Cpu,
+      allocatbelt::runtime::resource_domain::DomainResource::Memory,
+      allocatbelt::runtime::resource_domain::DomainResource::Disk,
+      allocatbelt::runtime::resource_domain::DomainResource::Network,
+      allocatbelt::runtime::resource_domain::DomainResource::Tasks,
+    ] {
+      assert_eq!(report.final_global_domain.used.get(resource), 0);
+      assert_eq!(report.final_tenant_domain.used.get(resource), 0);
+    }
+  }
+
+  fn in_watchdog_child(case: &str) -> bool {
+    std::env::var("ALLOCATBELT_HTTP_CONNECT_CASE")
+      .ok()
+      .as_deref()
+      == Some(case)
+  }
+
+  fn run_with_external_watchdog(case: &str) {
+    const WATCHDOG: Duration = Duration::from_secs(45);
+    let executable = std::env::current_exe().expect("test executable path");
+    let listing = Command::new(&executable)
+      .args(["--list", "--format", "terse"])
+      .output()
+      .expect("list connector test cases");
+    assert!(listing.status.success(), "test listing failed: {listing:?}");
+    let candidates = String::from_utf8_lossy(&listing.stdout)
+      .lines()
+      .filter_map(|line| {
+        let (name, kind) = line.split_once(": ")?;
+        (kind == "test" && name.rsplit("::").next() == Some(case)).then_some(name.to_owned())
+      })
+      .collect::<Vec<_>>();
+    assert_eq!(candidates.len(), 1, "expected one test named {case}");
+    let mut child = Command::new(executable)
+      .arg("--exact")
+      .arg(&candidates[0])
+      .arg("--nocapture")
+      .env("ALLOCATBELT_HTTP_CONNECT_CASE", case)
+      .stdout(Stdio::inherit())
+      .stderr(Stdio::inherit())
+      .spawn()
+      .expect("start connector case under watchdog");
+    let deadline = Instant::now() + WATCHDOG;
+    loop {
+      if let Some(status) = child.try_wait().expect("poll connector child") {
+        assert!(status.success(), "connector child {case} failed: {status}");
+        return;
+      }
+      if Instant::now() >= deadline {
+        child.kill().expect("kill stalled connector child");
+        let status = child.wait().expect("reap stalled connector child");
+        panic!("connector child {case} exceeded {WATCHDOG:?}; reaped {status}");
+      }
+      thread::sleep(Duration::from_millis(10));
+    }
+  }
+
+  fn assert_connection_refused(error: io::Error) {
+    assert_eq!(
+      error.kind(),
+      io::ErrorKind::ConnectionRefused,
+      "expected the bound non-listening loopback socket to refuse connect: {error}"
+    );
+  }
+
+  fn tokio_permit_lifecycle_case() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("test runtime");
+    assert_eq!(HTTP_CONNECT_POLICY_SCHEMA, "http-nonblocking-connect-v1");
+    let loopback: SocketAddr = "127.0.0.1:8080".parse().expect("IPv4 loopback");
+    assert!(checked_loopback_v4(loopback).is_ok());
+    let external: SocketAddr = "192.0.2.1:8080".parse().expect("IPv4 address");
+    assert!(checked_loopback_v4(external).is_err());
+    let ipv6: SocketAddr = "[::1]:8080".parse().expect("IPv6 loopback");
+    assert!(checked_loopback_v4(ipv6).is_err());
+    let resources = ResourceScope::new(ResourceLimits {
+      managed_memory: 0,
+      disk_concurrent_ops: 0,
+      network_concurrent_ops: 1,
+    });
+    let listener = runtime
+      .block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await })
+      .expect("loopback listener");
+    let address = match listener.local_addr().expect("listener address") {
+      SocketAddr::V4(address) if address.ip().is_loopback() => address,
+      address => panic!("expected checked IPv4 loopback address, got {address}"),
+    };
+    let held = resources
+      .try_acquire(OperationRequest {
+        disk: 0,
+        network: 1,
+      })
+      .expect("reserve the only temporary connector permit");
+    assert!(
+      runtime
+        .block_on(tokio_connect_nonblocking(&resources, address))
+        .is_err()
+    );
+    assert_eq!(resources.snapshot().network_ops, 1);
+    drop(held);
+    let stream = runtime
+      .block_on(tokio_connect_nonblocking(&resources, address))
+      .expect("nonblocking loopback connect");
+    assert_eq!(resources.snapshot().network_ops, 0);
+    let endpoint = resources
+      .try_acquire(OperationRequest {
+        disk: 0,
+        network: 1,
+      })
+      .expect("temporary permit released before endpoint admission");
+    let (peer, _) = runtime
+      .block_on(listener.accept())
+      .expect("accept connected peer");
+    drop(stream);
+    drop(peer);
+    drop(endpoint);
+
+    let refusal_socket = tokio::net::TcpSocket::new_v4().expect("refusal socket");
+    refusal_socket
+      .bind("127.0.0.1:0".parse().expect("IPv4 bind address"))
+      .expect("bind non-listening refusal socket");
+    let refused = checked_loopback_v4(refusal_socket.local_addr().expect("refusal address"))
+      .expect("checked refusal address");
+    assert_connection_refused(
+      runtime
+        .block_on(tokio_connect_nonblocking(&resources, refused))
+        .expect_err("non-listening bound port must refuse connect"),
+    );
+    assert_eq!(resources.snapshot().network_ops, 0);
+    drop(refusal_socket);
+    drop(listener);
+    runtime.shutdown_timeout(Duration::from_secs(2));
+  }
+
+  #[test]
+  fn tokio_nonblocking_connector_permit_lifecycle() {
+    const CASE: &str = "tokio_nonblocking_connector_permit_lifecycle";
+    if in_watchdog_child(CASE) {
+      tokio_permit_lifecycle_case();
+    } else {
+      run_with_external_watchdog(CASE);
+    }
+  }
+
+  fn native_permit_lifecycle_case() {
+    let async_runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 4,
+      max_scopes: 2,
+    })
+    .expect("async runtime");
+    let task_scope = async_runtime.scope().expect("task scope");
+    let async_handle = task_scope.handle();
+    let mut blocking = IoPool::new(BlockingConfig {
+      workers: 1,
+      max_outstanding: 1,
+      capacity: Resources::ZERO,
+    })
+    .expect("blocking runtime");
+    let reactor = Reactor::new(ReactorConfig {
+      max_registrations: 4,
+      max_waiters: 8,
+    })
+    .expect("reactor");
+    let scope = ResourceScope::new(ResourceLimits {
+      managed_memory: 0,
+      disk_concurrent_ops: 0,
+      network_concurrent_ops: 1,
+    });
+    let net = NetHandle::new(blocking.handle(), scope.clone(), reactor.handle(), 1)
+      .expect("network handle");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+    let address = checked_loopback_v4(listener.local_addr().expect("listener address"))
+      .expect("checked IPv4 loopback");
+
+    let held = scope
+      .try_acquire(OperationRequest {
+        disk: 0,
+        network: 1,
+      })
+      .expect("reserve the only temporary connector permit");
+    assert!(
+      async_handle
+        .block_on(net.connect_nonblocking(SocketAddr::V4(address)))
+        .expect("root task")
+        .is_err()
+    );
+    assert_eq!(scope.snapshot().network_ops, 1);
+    drop(held);
+
+    let stream = async_handle
+      .block_on(net.connect_nonblocking(SocketAddr::V4(address)))
+      .expect("root task")
+      .expect("native nonblocking loopback connect");
+    assert_eq!(scope.snapshot().network_ops, 0);
+    let endpoint = scope
+      .try_acquire(OperationRequest {
+        disk: 0,
+        network: 1,
+      })
+      .expect("temporary permit released before endpoint admission");
+    let (peer, _) = listener.accept().expect("accept connected peer");
+    drop(stream);
+    drop(peer);
+    drop(endpoint);
+
+    let refusal_socket = NativeTcpSocket::new_v4().expect("refusal socket");
+    refusal_socket
+      .bind(SocketAddr::V4(
+        "127.0.0.1:0".parse().expect("IPv4 bind address"),
+      ))
+      .expect("bind non-listening refusal socket");
+    let refused = checked_loopback_v4(refusal_socket.local_addr().expect("refusal address"))
+      .expect("checked refusal address");
+    let failure = async_handle
+      .block_on(net.connect_nonblocking(SocketAddr::V4(refused)))
+      .expect("root task");
+    match failure {
+      Err(TcpConnectError::Operation(NetworkError::Io(error))) => {
+        assert_connection_refused(error);
+      }
+      Err(error) => panic!("expected connection refusal, got {error}"),
+      Ok(_) => panic!("bound non-listening loopback socket accepted a connection"),
+    }
+    assert_eq!(scope.snapshot().network_ops, 0);
+    assert_eq!(reactor.handle().registrations(), 0);
+    assert_eq!(reactor.handle().waiters(), 0);
+    drop(refusal_socket);
+    shutdown_bounded_runtime(async_handle, task_scope, async_runtime);
+    blocking.shutdown().expect("I/O pool shutdown");
+  }
+
+  #[test]
+  fn native_nonblocking_connector_permit_lifecycle() {
+    const CASE: &str = "native_nonblocking_connector_permit_lifecycle";
+    if in_watchdog_child(CASE) {
+      native_permit_lifecycle_case();
+    } else {
+      run_with_external_watchdog(CASE);
+    }
+  }
+
+  fn tokio_pending_cancellation_case() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("test runtime");
+    let resources = ResourceScope::new(ResourceLimits {
+      managed_memory: 0,
+      disk_concurrent_ops: 0,
+      network_concurrent_ops: 1,
+    });
+    let (listener, address) = runtime.block_on(async {
+      let listener_socket = tokio::net::TcpSocket::new_v4().expect("listener socket");
+      listener_socket
+        .bind("127.0.0.1:0".parse().expect("IPv4 bind address"))
+        .expect("bind loopback listener socket");
+      let listener = listener_socket.listen(0).expect("listen with zero backlog");
+      let address = checked_loopback_v4(listener.local_addr().expect("listener address"))
+        .expect("checked listener address");
+      (listener, address)
+    });
+    // Occupy the zero-backlog accept slot so the second connect stays pending.
+    let filler =
+      StdTcpStream::connect(SocketAddr::V4(address)).expect("fill the zero-backlog listener queue");
+    let mut attempt = Box::pin(tokio_connect_nonblocking(&resources, address));
+    let pending = runtime.block_on(std::future::poll_fn(|cx| {
+      std::task::Poll::Ready(attempt.as_mut().poll(cx).is_pending())
+    }));
+    assert!(pending, "connect did not expose an admitted pending phase");
+    assert_eq!(resources.snapshot().network_ops, 1);
+    drop(attempt);
+    assert_eq!(resources.snapshot().network_ops, 0);
+    let sentinel = resources
+      .try_acquire(OperationRequest {
+        disk: 0,
+        network: 1,
+      })
+      .expect("permit reusable after pending connect cancellation");
+    assert_eq!(resources.snapshot().network_ops, 1);
+    drop(sentinel);
+    assert_eq!(resources.snapshot().network_ops, 0);
+    drop(filler);
+    drop(listener);
+    runtime.shutdown_timeout(Duration::from_secs(2));
+  }
+
+  #[test]
+  fn tokio_nonblocking_connector_pending_cancellation_releases_admission() {
+    const CASE: &str = "tokio_nonblocking_connector_pending_cancellation_releases_admission";
+    if in_watchdog_child(CASE) {
+      tokio_pending_cancellation_case();
+    } else {
+      run_with_external_watchdog(CASE);
+    }
+  }
+
+  fn native_pending_cancellation_case() {
+    let async_runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 4,
+      max_scopes: 2,
+    })
+    .expect("async runtime");
+    let task_scope = async_runtime.scope().expect("task scope");
+    let async_handle = task_scope.handle();
+    let mut blocking = IoPool::new(BlockingConfig {
+      workers: 1,
+      max_outstanding: 1,
+      capacity: Resources::ZERO,
+    })
+    .expect("blocking runtime");
+    let reactor = Reactor::new(ReactorConfig {
+      max_registrations: 4,
+      max_waiters: 8,
+    })
+    .expect("reactor");
+    let scope = ResourceScope::new(ResourceLimits {
+      managed_memory: 0,
+      disk_concurrent_ops: 0,
+      network_concurrent_ops: 1,
+    });
+    let net = NetHandle::new(blocking.handle(), scope.clone(), reactor.handle(), 1)
+      .expect("network handle");
+    let listener_socket = NativeTcpSocket::new_v4().expect("listener socket");
+    listener_socket
+      .bind(SocketAddr::V4(
+        "127.0.0.1:0".parse().expect("IPv4 bind address"),
+      ))
+      .expect("bind loopback listener socket");
+    let listener: NativeTcpListener = listener_socket
+      .listen(0, &reactor.handle())
+      .expect("listen with zero backlog");
+    let address = checked_loopback_v4(listener.get_ref().local_addr().expect("listener address"))
+      .expect("checked listener address");
+    // Occupy the zero-backlog accept slot so the second connect stays pending.
+    let filler =
+      StdTcpStream::connect(SocketAddr::V4(address)).expect("fill the zero-backlog listener queue");
+    let mut attempt = Box::pin(net.connect_nonblocking(SocketAddr::V4(address)));
+    let pending = async_handle
+      .block_on(std::future::poll_fn(|cx| match attempt.as_mut().poll(cx) {
+        std::task::Poll::Pending if reactor.handle().waiters() > 0 => std::task::Poll::Ready(true),
+        std::task::Poll::Pending => {
+          cx.waker().wake_by_ref();
+          std::task::Poll::Pending
+        }
+        std::task::Poll::Ready(_) => std::task::Poll::Ready(false),
+      }))
+      .expect("poll owning task");
+    assert!(pending, "connect did not expose an admitted pending phase");
+    assert_eq!(scope.snapshot().network_ops, 1);
+    assert_eq!(reactor.handle().registrations(), 2);
+    assert!(reactor.handle().waiters() > 0);
+    drop(attempt);
+    assert_eq!(scope.snapshot().network_ops, 0);
+    assert_eq!(reactor.handle().registrations(), 1);
+    assert_eq!(reactor.handle().waiters(), 0);
+    let sentinel = scope
+      .try_acquire(OperationRequest {
+        disk: 0,
+        network: 1,
+      })
+      .expect("permit reusable after pending connect cancellation");
+    assert_eq!(scope.snapshot().network_ops, 1);
+    drop(sentinel);
+    assert_eq!(scope.snapshot().network_ops, 0);
+    drop(filler);
+    drop(listener);
+    assert_eq!(reactor.handle().registrations(), 0);
+    shutdown_bounded_runtime(async_handle, task_scope, async_runtime);
+    blocking.shutdown().expect("I/O pool shutdown");
+  }
+
+  #[test]
+  fn native_nonblocking_connector_pending_cancellation_releases_admission() {
+    const CASE: &str = "native_nonblocking_connector_pending_cancellation_releases_admission";
+    if in_watchdog_child(CASE) {
+      native_pending_cancellation_case();
+    } else {
+      run_with_external_watchdog(CASE);
+    }
+  }
+
+  fn shutdown_bounded_runtime(
+    _handle: AsyncHandle,
+    scope: allocatbelt::runtime::asynchronous::OwnedTaskScope,
+    runtime: AsyncRuntime,
+  ) {
+    // Close from the runtime's implicit root. The scoped handle is a borrowed
+    // task context, so waiting on its own scope-close future can be rejected
+    // as a same-scope wait.
+    runtime
+      .block_on(scope.close())
+      .expect("bounded scope close root");
+    runtime
+      .shutdown(AsyncShutdown::Drain)
+      .expect("bounded runtime shutdown");
+  }
+
+  #[test]
+  fn tokio_client_readiness_requires_a_cached_terminal_result() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("test runtime");
+    let handle = runtime.spawn(async { Ok::<u64, String>(71) });
+    runtime.block_on(async { tokio::task::yield_now().await });
+    assert!(handle.is_finished());
+
+    let mut job = ClientJob::Tokio {
+      handle,
+      result: None,
+    };
+    assert!(!job.is_finished());
+    let waker = Waker::from(Arc::new(
+      crate::application::ObserverWake(thread::current()),
+    ));
+    let mut context = Context::from_waker(&waker);
+    assert!(job.poll_finished(&mut context).is_ready());
+    assert!(job.is_finished());
+    assert_eq!(Joiner::Tokio.client(job), Ok(71));
+    runtime.shutdown_timeout(Duration::from_secs(2));
+  }
+
+  #[test]
+  fn bounded_client_readiness_requires_a_cached_terminal_result() {
+    let runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 1,
+      max_scopes: 2,
+    })
+    .expect("bounded runtime");
+    let scope = runtime.scope().expect("bounded task scope");
+    let handle = scope.handle();
+    let job = handle
+      .spawn(async { Ok::<u64, String>(71) })
+      .expect("bounded client task");
+    let finished = job.abort_handle();
+    let mut client = ClientJob::Bounded { job, result: None };
+    let waker = Waker::from(Arc::new(
+      crate::application::ObserverWake(thread::current()),
+    ));
+    let mut context = Context::from_waker(&waker);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !finished.is_finished() && Instant::now() < deadline {
+      thread::yield_now();
+    }
+    assert!(
+      finished.is_finished(),
+      "bounded task should publish completion"
+    );
+    assert!(
+      !client.is_finished(),
+      "task publication must not bypass observer result caching"
+    );
+    assert!(client.poll_finished(&mut context).is_ready());
+    assert!(client.poll_finished(&mut context).is_ready());
+    assert!(client.is_finished());
+    assert_eq!(Joiner::Bounded.client(client), Ok(71));
+
+    // Close from the implicit root because the scoped handle would wait on
+    // its own borrowed task admission.
+    runtime.block_on(scope.close()).expect("scope close root");
+    runtime
+      .shutdown(AsyncShutdown::Drain)
+      .expect("bounded runtime shutdown");
+  }
+
+  #[test]
+  fn bounded_client_consumes_cached_errors_and_rejects_uncached_results() {
+    let runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 1,
+      max_outstanding: 2,
+      max_scopes: 2,
+    })
+    .expect("bounded runtime");
+    let scope = runtime.scope().expect("bounded task scope");
+    let handle = scope.handle();
+    let job = handle
+      .spawn(std::future::pending::<Result<u64, String>>())
+      .expect("pending bounded client task");
+    let abort = job.abort_handle();
+    abort.abort();
+    let mut client = ClientJob::Bounded { job, result: None };
+    let waker = Waker::from(Arc::new(
+      crate::application::ObserverWake(thread::current()),
+    ));
+    let mut context = Context::from_waker(&waker);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !abort.is_finished() && Instant::now() < deadline {
+      thread::yield_now();
+    }
+    assert!(
+      abort.is_finished(),
+      "cancelled task should publish completion"
+    );
+    assert!(client.poll_finished(&mut context).is_ready());
+    assert!(client.poll_finished(&mut context).is_ready());
+    assert_eq!(
+      Joiner::Bounded.client(client),
+      Err("allocatbelt client task failed: async task was cancelled".into())
+    );
+
+    let premature = ClientJob::Bounded {
+      job: handle
+        .spawn(std::future::pending::<Result<u64, String>>())
+        .expect("second bounded client task"),
+      result: None,
+    };
+    assert_eq!(
+      Joiner::Bounded.client(premature),
+      Err("allocatbelt client was consumed before terminal completion".into())
+    );
+
+    runtime.block_on(scope.close()).expect("scope close root");
+    runtime
+      .shutdown(AsyncShutdown::Drain)
+      .expect("bounded runtime shutdown");
+  }
+
+  #[test]
+  fn disconnected_done_channel_rejects_a_terminal_client_missing_its_handler() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("test runtime");
+    let handle = runtime.handle().clone();
+    let client_handle = handle.spawn(async { Ok::<u64, String>(71) });
+    runtime.block_on(async { tokio::task::yield_now().await });
+    assert!(client_handle.is_finished());
+    let client = ClientJob::Tokio {
+      handle: client_handle,
+      result: None,
+    };
+
+    let started = Instant::now();
+    let (events_tx, events_rx) = mpsc::sync_channel(2);
+    events_tx
+      .send(Event::Client {
+        id: 0,
+        scheduled: started,
+        horizon_end: started + Duration::from_secs(1),
+        job: client,
+      })
+      .expect("client event");
+    events_tx
+      .send(Event::Done(ProducerReport {
+        attempted: 1,
+        admitted: 1,
+        rejected_full: 0,
+        rejected_logical_window: 0,
+        rejected_backend_full: 0,
+        lateness_sum_ns: 0,
+        lateness_max_ns: 0,
+        started_at: started,
+        production_end: Instant::now(),
+        production_cpu_started_ns: 0,
+        trace_overrun: false,
+      }))
+      .expect("producer completion event");
+    drop(events_tx);
+
+    let error = observe_events(
+      Joiner::Tokio,
+      options(Executor::Tokio, Mode::OpenLoop, Some(1000)),
+      Settings {
+        horizon: Duration::from_secs(1),
+        arrivals: 1,
+        body_bytes: 256,
+      },
+      ResourceScope::new(super::limits()),
+      events_rx,
+      mpsc::sync_channel(1).0,
+      None, // This test verifies role reconciliation, not checksum validation.
+    )
+    .expect_err("a disconnected channel cannot supply the missing handler");
+    assert!(error.contains("admitted pair missing a role"));
+    runtime.shutdown_timeout(Duration::from_secs(2));
+  }
+
+  #[test]
+  fn open_loop_http_oracle_is_bounded_and_matches_request_reference() {
+    let selected = Settings {
+      horizon: Duration::from_millis(40),
+      arrivals: 3,
+      body_bytes: 256,
+    };
+    let oracle = build_open_loop_checksum_oracle(Mode::OpenLoop, selected)
+      .expect("small bounded HTTP oracle")
+      .expect("open-loop oracle exists");
+    assert_eq!(oracle.len(), selected.arrivals);
+    for (id, actual) in oracle.iter().enumerate() {
+      assert_eq!(
+        *actual,
+        expected_request_checksum(id as u64, selected.body_bytes)
+      );
+      assert_eq!(
+        super::expected_response_checksum(Some(&oracle), id as u64, selected),
+        Some(*actual)
+      );
+    }
+    assert_eq!(oracle.get(selected.arrivals), None);
+    assert_eq!(
+      super::expected_response_checksum(Some(&oracle), selected.arrivals as u64, selected),
+      None
+    );
+    assert_eq!(
+      super::expected_response_checksum(None, 0, selected),
+      Some(expected_request_checksum(0, selected.body_bytes))
+    );
+    let expected = oracle[1];
+    assert_eq!(
+      validate_response_pair(1, expected, 1, expected, Some(&oracle), selected),
+      Ok(expected)
+    );
+    assert!(validate_response_pair(1, expected, 2, expected, Some(&oracle), selected).is_err());
+    assert!(validate_response_pair(1, expected, 1, expected ^ 1, Some(&oracle), selected).is_err());
+    assert!(
+      validate_response_pair(1, expected ^ 1, 1, expected ^ 1, Some(&oracle), selected).is_err()
+    );
+    assert!(
+      build_open_loop_checksum_oracle(Mode::Capacity, selected)
+        .expect("capacity keeps existing reference path")
+        .is_none()
+    );
+    let oversized = Settings {
+      arrivals: super::super::MAX_OPEN_LOOP_ARRIVALS + 1,
+      ..selected
+    };
+    assert!(build_open_loop_checksum_oracle(Mode::OpenLoop, oversized).is_err());
+  }
+
+  #[test]
+  fn allocatbelt_pairs_each_http_client_with_handler_and_cleans_ledgers() {
+    let mode = Mode::OpenLoop;
+    let selected_options = options(Executor::Bounded, mode, Some(1000));
+    let selected_settings = settings(mode);
+    let plan = super::super::ArrivalPlan::new(
+      super::super::Profile::Steady,
+      super::super::Workload::Http,
+      selected_settings.arrivals,
+      1000,
+    )
+    .expect("steady HTTP plan");
+    let report = run_bounded(selected_options, selected_settings, plan)
+      .expect("bounded HTTP pair lane should drain");
+    assert_eq!(report.producer.attempted, 32);
+    assert_eq!(report.producer.admitted, report.on_time + report.late);
+    assert_eq!(report.errors, 0);
+    assert_eq!(report.digest, report.expected);
+    assert_eq!(report.final_resources.managed_memory, 0);
+    assert_eq!(report.final_resources.network_ops, 0);
+    assert_eq!(report.records.len(), 32);
+    assert_domain_receipt(&report);
+  }
+
+  #[test]
+  fn allocatbelt_single_http_pair_has_a_quiet_tenant_receipt() {
+    let selected_options = options(Executor::Bounded, Mode::OpenLoop, Some(1000));
+    let selected_settings = Settings {
+      horizon: Duration::from_millis(40),
+      arrivals: 1,
+      body_bytes: 256,
+    };
+    let plan =
+      super::super::ArrivalPlan::new(super::super::Profile::Steady, Workload::Http, 1, 1000)
+        .expect("single HTTP plan");
+    let report = run_bounded(selected_options, selected_settings, plan)
+      .expect("single bound HTTP pair should drain");
+    assert_eq!(report.producer.admitted, 1);
+    assert_eq!(report.errors, 0);
+    assert_eq!(report.digest, report.expected);
+    assert_domain_receipt(&report);
+  }
+
+  #[test]
+  fn mixed_trace_dispatches_all_four_families_through_one_executor_domain() {
+    for executor in [Executor::Bounded, Executor::Tokio] {
+      let selected_options = Options {
+        executor,
+        workload: Workload::Mixed,
+        mode: Mode::OpenLoop,
+        rate_per_second: Some(16),
+      };
+      let selected_settings = Settings {
+        horizon: super::CAPACITY_HORIZON,
+        arrivals: 16,
+        body_bytes: super::BODY_BYTES,
+      };
+      let plan = super::super::ArrivalPlan::new(
+        super::super::Profile::Mixed,
+        Workload::Mixed,
+        selected_settings.arrivals,
+        16,
+      )
+      .expect("mixed one-per-family schedule");
+      let report = match executor {
+        Executor::Bounded => run_bounded(selected_options, selected_settings, plan),
+        Executor::Tokio => run_tokio(selected_options, selected_settings, plan),
+      }
+      .expect("mixed per-ID lane should complete and validate");
+      assert_eq!(report.producer.attempted, 16);
+      assert_eq!(report.producer.admitted, 16);
+      assert!(
+        report
+          .producer
+          .production_end
+          .saturating_duration_since(report.producer.started_at)
+          >= Duration::from_nanos(plan.trace_duration_ns().expect("finite mixed horizon")),
+        "producer must remain open through the canonical mixed trace horizon"
+      );
+      assert_eq!(report.on_time + report.late, 16);
+      assert_eq!(report.errors, 0);
+      assert_eq!(report.digest, report.expected);
+      assert_eq!(report.final_resources.managed_memory, 0);
+      assert_eq!(report.final_resources.disk_ops, 0);
+      assert_eq!(report.final_resources.network_ops, 0);
+      assert_eq!(report.records.len(), 16);
+      assert_domain_receipt(&report);
+      for id in 0..16 {
+        assert!(
+          report
+            .records
+            .iter()
+            .any(|record| { record.id == id && record.workload == plan.workload_for(id) })
+        );
+      }
+      for workload in [
+        Workload::Cpu,
+        Workload::Memory,
+        Workload::Http,
+        Workload::Disk,
+      ] {
+        assert_eq!(
+          report
+            .records
+            .iter()
+            .filter(|record| record.workload == workload)
+            .count(),
+          4
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn tokio_pairs_each_http_client_with_handler_and_cleans_ledgers() {
+    let mode = Mode::Capacity;
+    let selected_options = options(Executor::Tokio, mode, None);
+    let selected_settings = settings(mode);
+    let plan = super::super::ArrivalPlan::new(
+      super::super::Profile::Steady,
+      super::super::Workload::Http,
+      selected_settings.arrivals,
+      1,
+    )
+    .expect("capacity HTTP plan");
+    let report = run_tokio(selected_options, selected_settings, plan)
+      .expect("Tokio HTTP pair lane should drain");
+    assert_eq!(report.producer.rejected_full, 0);
+    assert_eq!(report.producer.admitted, report.on_time + report.late);
+    assert_eq!(report.errors, 0);
+    assert_eq!(report.digest, report.expected);
+    assert_eq!(report.final_resources.managed_memory, 0);
+    assert_eq!(report.final_resources.network_ops, 0);
+    assert_domain_receipt(&report);
+  }
+
+  #[test]
+  fn later_http_pair_is_observed_while_an_earlier_client_remains_pending() {
+    const ARRIVALS: usize = 64;
+
+    fn queue_handler(
+      handle: &AsyncHandle,
+      events: &mpsc::Sender<Event>,
+      lease_guards: &mut Vec<std::sync::Weak<()>>,
+      record_id: u64,
+      result_id: u64,
+      checksum: u64,
+    ) {
+      let lease = Arc::new(());
+      let lease_weak = Arc::downgrade(&lease);
+      let event_lease = Arc::clone(&lease);
+      lease_guards.push(lease_weak);
+      let job = HandlerJob::Bounded {
+        job: handle
+          .spawn(async move { (Ok((result_id, checksum)), RoleLease { _hold: lease }) })
+          .expect("bounded handler task"),
+        result: None,
+      };
+      events
+        .send(Event::Handler(HandlerRecord {
+          id: record_id,
+          _lease: RoleLease { _hold: event_lease },
+          job,
+        }))
+        .expect("handler event");
+    }
+
+    fn queue_client(
+      handle: &AsyncHandle,
+      events: &mpsc::Sender<Event>,
+      id: u64,
+      checksum: u64,
+      started: Instant,
+      horizon: Instant,
+      gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) {
+      let job = ClientJob::Bounded {
+        job: handle
+          .spawn(async move {
+            if let Some(gate) = gate {
+              gate.await.map_err(|_| "test gate closed".to_owned())?;
+            }
+            Ok(checksum)
+          })
+          .expect("bounded client task"),
+        result: None,
+      };
+      events
+        .send(Event::Client {
+          id,
+          scheduled: started,
+          horizon_end: horizon,
+          job,
+        })
+        .expect("client event");
+    }
+
+    let runtime = AsyncRuntime::new(AsyncConfig {
+      workers: 2,
+      max_outstanding: TASK_LIMIT,
+      max_scopes: 2,
+    })
+    .expect("bounded test runtime");
+    let scope = runtime.scope().expect("bounded test scope");
+    let handle = scope.handle();
+    let shutdown_handle = handle.clone();
+    let (release_first, first_gate) = tokio::sync::oneshot::channel::<()>();
+    let started = Instant::now();
+    let horizon = started + Duration::from_secs(30);
+    let (events_tx, events_rx) = mpsc::channel();
+    let (credits_tx, credits_rx) = mpsc::sync_channel(8);
+    let mut lease_guards = Vec::with_capacity(ARRIVALS);
+
+    // Let all first-window handlers arrive first, with event IDs deliberately
+    // reordered; their completed results carry the actual request IDs.
+    for id in 0..WINDOW as u64 {
+      queue_handler(
+        &handle,
+        &events_tx,
+        &mut lease_guards,
+        WINDOW as u64 - 1 - id,
+        id,
+        expected_request_checksum(id, 256),
+      );
+    }
+    let mut first_gate = Some(first_gate);
+    for id in 0..WINDOW as u64 {
+      queue_client(
+        &handle,
+        &events_tx,
+        id,
+        expected_request_checksum(id, 256),
+        started,
+        horizon,
+        if id == 0 { first_gate.take() } else { None },
+      );
+    }
+
+    let selected_options = options(Executor::Bounded, Mode::OpenLoop, Some(1000));
+    let selected_settings = Settings {
+      horizon: Duration::from_secs(1),
+      arrivals: ARRIVALS,
+      body_bytes: 256,
+    };
+    let expected_oracle = build_open_loop_checksum_oracle(Mode::OpenLoop, selected_settings)
+      .expect("64-ID HTTP checksum oracle")
+      .expect("open-loop oracle exists");
+    let (report_tx, report_rx) = mpsc::sync_channel(1);
+    let observer = std::thread::spawn(move || {
+      let _ = report_tx.send(observe_events(
+        Joiner::Bounded,
+        selected_options,
+        selected_settings,
+        ResourceScope::new(super::limits()),
+        events_rx,
+        credits_tx,
+        Some(expected_oracle),
+      ));
+    });
+
+    let credit_watchdog = Instant::now() + Duration::from_secs(10);
+    let mut first_window_error = None;
+    for _ in 0..WINDOW - 1 {
+      if credits_rx
+        .recv_timeout(credit_watchdog.saturating_duration_since(Instant::now()))
+        .is_err()
+      {
+        first_window_error = Some("later pairs should return credits while pair zero is pending");
+        break;
+      }
+    }
+    if first_window_error.is_none()
+      && !matches!(credits_rx.try_recv(), Err(mpsc::TryRecvError::Empty))
+    {
+      first_window_error = Some("the gated first pair must retain the eighth credit");
+    }
+    if let Some(error) = first_window_error {
+      let _ = release_first.send(());
+      drop(events_tx);
+      drop(credits_rx);
+      let _ = report_rx.recv_timeout(Duration::from_secs(10));
+      shutdown_bounded_runtime(shutdown_handle, scope, runtime);
+      observer
+        .join()
+        .expect("HTTP observer thread should stop after watchdog cleanup");
+      panic!("{error}");
+    }
+
+    // Reuse seven returned slots, then keep no more than WINDOW requests
+    // outstanding as credits arrive for the rest of the longer trace.
+    let mut outstanding = 1;
+    for id in WINDOW as u64..(2 * WINDOW - 1) as u64 {
+      queue_handler(
+        &handle,
+        &events_tx,
+        &mut lease_guards,
+        id,
+        id,
+        expected_request_checksum(id, 256),
+      );
+      queue_client(
+        &handle,
+        &events_tx,
+        id,
+        expected_request_checksum(id, 256),
+        started,
+        horizon,
+        None,
+      );
+      outstanding += 1;
+    }
+    for id in (2 * WINDOW - 1) as u64..ARRIVALS as u64 {
+      if credits_rx
+        .recv_timeout(credit_watchdog.saturating_duration_since(Instant::now()))
+        .is_err()
+      {
+        let _ = release_first.send(());
+        drop(events_tx);
+        drop(credits_rx);
+        let _ = report_rx.recv_timeout(Duration::from_secs(10));
+        shutdown_bounded_runtime(shutdown_handle, scope, runtime);
+        observer
+          .join()
+          .expect("HTTP observer thread should stop after watchdog cleanup");
+        panic!("producer window credit should arrive before the watchdog");
+      }
+      outstanding -= 1;
+      queue_handler(
+        &handle,
+        &events_tx,
+        &mut lease_guards,
+        id,
+        id,
+        expected_request_checksum(id, 256),
+      );
+      queue_client(
+        &handle,
+        &events_tx,
+        id,
+        expected_request_checksum(id, 256),
+        started,
+        horizon,
+        None,
+      );
+      outstanding += 1;
+    }
+    assert_eq!(outstanding, WINDOW);
+    events_tx
+      .send(Event::Done(ProducerReport {
+        attempted: ARRIVALS,
+        admitted: ARRIVALS,
+        rejected_full: 0,
+        rejected_logical_window: 0,
+        rejected_backend_full: 0,
+        lateness_sum_ns: 0,
+        lateness_max_ns: 0,
+        started_at: started,
+        production_end: Instant::now(),
+        production_cpu_started_ns: 0,
+        trace_overrun: false,
+      }))
+      .expect("producer completion event");
+    drop(events_tx);
+
+    release_first.send(()).expect("release first client");
+    let observed = report_rx.recv_timeout(Duration::from_secs(10));
+    if observed.is_err() {
+      drop(credits_rx);
+      shutdown_bounded_runtime(shutdown_handle, scope, runtime);
+      observer
+        .join()
+        .expect("HTTP observer thread should stop after watchdog cleanup");
+      panic!("HTTP observer completion should arrive before the watchdog");
+    }
+    observer.join().expect("observer thread should not panic");
+    let trailing_credits = credits_rx.try_iter().count();
+    shutdown_bounded_runtime(shutdown_handle, scope, runtime);
+    let report = observed
+      .expect("HTTP observer completion should arrive before the watchdog")
+      .expect("all pairs should drain");
+    assert_eq!(report.on_time + report.late, ARRIVALS);
+    assert_eq!(report.errors, 0);
+    assert_eq!(report.latencies.len(), ARRIVALS);
+    assert_eq!(report.digest, report.expected);
+    assert_eq!(
+      trailing_credits + (WINDOW - 1) + (ARRIVALS - (2 * WINDOW - 1)),
+      ARRIVALS
+    );
+    assert!(lease_guards.iter().all(|lease| lease.upgrade().is_none()));
+  }
+
+  #[test]
+  fn ready_hint_does_not_credit_http_pair_until_both_jobs_are_terminal() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+      .worker_threads(2)
+      .enable_all()
+      .build()
+      .expect("test runtime");
+    let handle = runtime.handle().clone();
+    let (release_client, client_gate) = tokio::sync::oneshot::channel::<()>();
+    let checksum = expected_request_checksum(0, 256);
+    let client = ClientJob::Tokio {
+      handle: handle.spawn(async move {
+        client_gate
+          .await
+          .map_err(|_| "test gate closed".to_owned())?;
+        Ok(checksum)
+      }),
+      result: None,
+    };
+    let handler = HandlerJob::Tokio {
+      handle: handle.spawn(async move {
+        (
+          Ok((0, checksum)),
+          RoleLease {
+            _hold: Arc::new(()),
+          },
+        )
+      }),
+      result: None,
+    };
+    let started = Instant::now();
+    let (events_tx, events_rx) = mpsc::sync_channel(8);
+    let (credits_tx, credits_rx) = mpsc::sync_channel(1);
+    events_tx
+      .send(Event::Client {
+        id: 0,
+        scheduled: started,
+        horizon_end: started + Duration::from_secs(5),
+        job: client,
+      })
+      .expect("client event");
+    events_tx
+      .send(Event::Handler(HandlerRecord {
+        id: 0,
+        _lease: RoleLease {
+          _hold: Arc::new(()),
+        },
+        job: handler,
+      }))
+      .expect("handler event");
+    events_tx.send(Event::Ready).expect("early ready hint");
+    events_tx
+      .send(Event::Done(ProducerReport {
+        attempted: 1,
+        admitted: 1,
+        rejected_full: 0,
+        rejected_logical_window: 0,
+        rejected_backend_full: 0,
+        lateness_sum_ns: 0,
+        lateness_max_ns: 0,
+        started_at: started,
+        production_end: Instant::now(),
+        production_cpu_started_ns: 0,
+        trace_overrun: false,
+      }))
+      .expect("producer completion event");
+    drop(events_tx);
+
+    let selected_options = options(Executor::Tokio, Mode::OpenLoop, Some(1000));
+    let selected_settings = Settings {
+      horizon: Duration::from_secs(1),
+      arrivals: 1,
+      body_bytes: 256,
+    };
+    let (report_tx, report_rx) = mpsc::sync_channel(1);
+    let observer = std::thread::spawn(move || {
+      let _ = report_tx.send(observe_events(
+        Joiner::Tokio,
+        selected_options,
+        selected_settings,
+        ResourceScope::new(super::limits()),
+        events_rx,
+        credits_tx,
+        None, // This test verifies terminal pairing, not checksum validation.
+      ));
+    });
+
+    assert!(
+      credits_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+      "a Ready hint and one terminal role cannot return pair credit"
+    );
+    release_client.send(()).expect("release client");
+    credits_rx
+      .recv_timeout(Duration::from_secs(2))
+      .expect("pair credit follows both terminal jobs");
+    let report = report_rx
+      .recv_timeout(Duration::from_secs(2))
+      .expect("HTTP observer completes")
+      .expect("valid paired result");
+    observer.join().expect("observer should not panic");
+    assert_eq!(report.on_time + report.late, 1);
+    assert_eq!(report.errors, 0);
+    assert_eq!(report.digest, checksum);
+    assert_eq!(report.digest, report.expected);
+    runtime.shutdown_timeout(Duration::from_secs(2));
+  }
+}

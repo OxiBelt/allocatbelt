@@ -1,0 +1,18 @@
+[package]
+name = "allocatbelt-tokio"
+description = "Hooks that let a Tokio runtime's worker threads use allocatbelt well: cache return when a worker parks and one shard per worker."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+allocatbelt.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync"] }
+
+[lints]
+workspace = true

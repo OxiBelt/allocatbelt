@@ -1,0 +1,686 @@
+name: Check allocatbelt
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('{0}-run-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  rust-checks:
+    name: Rust checks (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rust_version:
+          - 1.99.0
+        runner:
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install ${{ matrix.rust_version }} --profile minimal
+          rustup default ${{ matrix.rust_version }}
+          rustup component add rustfmt clippy --toolchain ${{ matrix.rust_version }}
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: Cargo fmt
+        run: cargo fmt --all --check
+
+      - name: Cargo clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Verification runner regression checks
+        run: |
+          bash scripts/tests/check-miri-test.sh
+          bash scripts/tests/check-sandbox-test.sh
+
+      # Verify workload observation and comparator feature separation only.
+      # Hosted runners do not qualify allocator or runtime performance.
+      - name: Latency collector and comparator checks
+        run: |
+          bash scripts/tests/bench-latency-test.sh
+          scripts/check-benchmark-baselines.sh
+          cargo test --release --locked --manifest-path bench/standard-mimalloc/Cargo.toml
+
+      # Checks that every detected SIMD candidate runs on this runner's CPU
+      # (AVX2/AVX-512 on x86_64, NEON/SVE on the arm runner).
+      # Hosted-runner timings are not evidence (docs/research/simd-benchmarks.md).
+      - name: SIMD benchmark smoke run
+        run: cargo run --release --locked -p allocatbelt-simd-bench --bin bench-simd -- --quick
+
+      # Checks that the resource profiler and the benchmarks' per-workload
+      # usage columns work (docs/research/profiling.md). Hosted-runner
+      # figures are not evidence.
+      - name: Resource profiler smoke run
+        run: scripts/profile.sh --quick --alloc system,allocatbelt --out target/profile/ci resources
+
+      # Reports the runner's kernel, whether the maintenance thread's
+      # io_uring (and Linux 7.0's SQ_REWIND) can be set up there, and batched
+      # purges against one madvise per run (docs/research/benchmarks.md).
+      # Informational: hosted-runner timings are not evidence.
+      - name: io_uring purge ring report
+        run: |
+          uname -r
+          cargo test --release --locked -p allocatbelt --features io-uring --lib ring_benchmark -- --ignored --nocapture
+
+  # Release test results qualify correctness only; hosted runners do not
+  # establish allocator or runtime performance.
+  release-tests:
+    name: Release correctness tests (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        rust_version:
+          - 1.99.0
+        runner:
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install ${{ matrix.rust_version }} --profile minimal --no-self-update
+          rustup default ${{ matrix.rust_version }}
+
+      - name: Configure short private temporary directory
+        run: |
+          umask 077
+          temp_dir="$(mktemp -d /tmp/abt.XXXXXX)"
+          echo "TMPDIR=$temp_dir" >> "$GITHUB_ENV"
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: Cargo release correctness tests
+        run: cargo test --release --all-features --locked
+
+  scalar-isa-arm64:
+    name: ARM64 scalar instruction probes
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install pinned stable Rust
+        run: rustup toolchain install 1.99.0 --profile minimal
+      - name: Check ARM64 bit scans and population counts
+        run: scripts/check-scalar-isa.sh
+
+  # The platform contract (docs/platform.md): x86_64 builds need x86-64-v3,
+  # and unsupported architectures, ABIs, byte orders and operating systems
+  # fail at compile time with the gates' own messages.
+  platform-gates:
+    name: Platform gates (x86-64-v3 floor, unsupported targets rejected)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain and targets
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
+          rustup target add \
+            x86_64-unknown-linux-musl \
+            aarch64-unknown-linux-gnu \
+            riscv64gc-unknown-linux-gnu \
+            i686-unknown-linux-gnu \
+            armv7-unknown-linux-gnueabihf \
+            x86_64-unknown-linux-gnux32 \
+            riscv32imac-unknown-none-elf \
+            wasm32-unknown-unknown \
+            powerpc64le-unknown-linux-gnu \
+            loongarch64-unknown-linux-gnu \
+            s390x-unknown-linux-gnu \
+            x86_64-unknown-freebsd
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: Check the platform gates
+        run: scripts/check-platform-gates.sh
+
+  # Single-package directive §3.7: `allocatbelt` is the one published
+  # package. It must package and pass `cargo publish --dry-run`, and a
+  # consumer outside this repository must build it (and, on x86_64, stop at
+  # the gate without x86-64-v3).
+  package:
+    name: crates.io package (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: Package, dry-run publish and build a consumer
+        run: scripts/check-package.sh
+
+  # Directive Phase C: every supported combination of allocatbelt's Cargo
+  # features builds without warnings and passes its tests on stable
+  # (docs/features.md).
+  features:
+    name: Feature combinations (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
+          rustup component add clippy --toolchain 1.99.0
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: Clippy and tests per feature combination
+        run: scripts/check-features.sh
+
+  # Directive Phase E: a hardened container (no capabilities, read-only,
+  # no-new-privileges, Docker's default seccomp) runs every test; seccomp
+  # profiles deny or allow io_uring and sched_setscheduler to check the
+  # fallbacks and `Require` errors; qemu-user CPU models check that only
+  # the ISA visible to the process is detected. The runner is itself a VM,
+  # so this is Docker in a VM (docs/sandbox.md).
+  sandbox:
+    name: Sandbox and virtualization (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --target "$(uname -m)-unknown-linux-musl"
+          rustup default 1.99.0
+
+      - name: Install qemu-user and static process fixtures
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user bash-static busybox-static binutils
+          docker version --format '{{.Server.Version}}'
+          uname -r
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: Hardened container, fallbacks and visible ISA
+        run: scripts/check-sandbox.sh
+
+  # Single-package directive Phase H: the experimental rseq `mm_cid` shard
+  # selection with glibc's registration, with it turned off by a glibc
+  # tunable, and on musl (no registration); fork, a one-CPU cpuset, a
+  # seccomp filter refusing rseq and policy switching under load.
+  experimental-rseq:
+    name: Experimental rseq mm_cid (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-26.04
+          - ubuntu-26.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --target "$(uname -m)-unknown-linux-musl"
+          rustup default 1.99.0
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: glibc, glibc with rseq off, musl
+        run: scripts/check-rseq.sh
+
+  # Single-package directive Phase F: the experimental SVE/SVE2 kernels,
+  # checked against the portable loop and for their selection, natively and
+  # under qemu CPU models and SVE vector lengths. Stable toolchain.
+  experimental-sve:
+    name: Experimental aarch64 SVE/SVE2 kernels
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component clippy
+          rustup default 1.99.0
+
+      - name: Install qemu-user
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-user
+          grep -m1 -o 'Features.*' /proc/cpuinfo || true
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: Cargo clippy (SVE features)
+        run: |
+          cargo clippy -p allocatbelt --all-targets --locked --features experimental-aarch64-sve -- -D warnings
+          cargo clippy -p allocatbelt --all-targets --locked --features experimental-aarch64-sve2 -- -D warnings
+
+      - name: Kernels and selection under qemu CPU models
+        run: scripts/check-experimental-isa.sh
+
+  # Single-package directive Phase G: the experimental RVV kernel. Its naked
+  # assembly scopes V locally, so it stays on the pinned stable toolchain.
+  experimental-rvv:
+    name: Experimental riscv64 RVV kernel (stable)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install pinned stable Rust
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --component clippy \
+            --target riscv64gc-unknown-linux-gnu
+
+      - name: Install qemu-user, the riscv64 cross toolchain and llvm-objdump
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross llvm
+          qemu-riscv64 --version
+          command -v llvm-objdump || sudo ln -s "$(ls /usr/bin/llvm-objdump-* | sort -V | tail -1)" /usr/local/bin/llvm-objdump
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo +1.99.0 fetch --locked
+
+      - name: Lint, isolation and kernel checks under qemu
+        run: scripts/check-experimental-rvv.sh
+
+  # Theory-driven plan Stage E: the region API's pointer code under Miri
+  # (Stacked and Tree Borrows). Its unit tests use a chunk source over the
+  # system allocator, since the heap needs mmap, which Miri does not run.
+  miri-region:
+    name: Miri (region API, nightly)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install the pinned nightly toolchain with Miri
+        run: |
+          rustup toolchain install nightly-2026-09-27 --profile minimal --component miri,rust-src
+          cargo +nightly-2026-09-27 miri setup
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo +nightly-2026-09-27 fetch --locked
+
+      - name: Region tests under Miri
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: |
+          cargo +nightly-2026-09-27 miri test --locked -p allocatbelt --lib region::
+          MIRIFLAGS="$MIRIFLAGS -Zmiri-tree-borrows" \
+            cargo +nightly-2026-09-27 miri test --locked -p allocatbelt --lib region::
+
+  # The one pinned allocation of a native async task (`runtime` feature):
+  # the `sys` cell's pointer code under Miri (Stacked and Tree Borrows),
+  # including its cross-thread hand-over tests, which Miri's data-race
+  # detector checks against the cell's release/acquire protocol.
+  miri-task-cell:
+    name: Miri (async task cell, nightly)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install the pinned nightly toolchain with Miri
+        run: |
+          rustup toolchain install nightly-2026-09-27 --profile minimal --component miri,rust-src
+          cargo +nightly-2026-09-27 miri setup
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo +nightly-2026-09-27 fetch --locked
+
+      - name: Task cell tests under Miri
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-many-seeds=0..8
+        run: |
+          cargo +nightly-2026-09-27 miri test --locked -p allocatbelt --features runtime \
+            --lib sys::runtime_task_cell
+          MIRIFLAGS="$MIRIFLAGS -Zmiri-tree-borrows" \
+            cargo +nightly-2026-09-27 miri test --locked -p allocatbelt --features runtime \
+              --lib sys::runtime_task_cell
+
+  # Plan phase 3: the bit scans lower to tzcnt/popcnt/lzcnt on x86-64-v3
+  # and to ctz/cpop/clz on riscv64 with Zbb (assembly only, no qemu).
+  scalar-isa:
+    name: Scalar ISA lowering (x86-64-v3, riscv64 + Zbb)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --target riscv64gc-unknown-linux-gnu
+          rustup default 1.99.0
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: Check the generated bit instructions
+        run: scripts/check-scalar-isa.sh
+
+  riscv64-qemu-tests:
+    name: riscv64 tests under qemu-user (${{ matrix.name }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: rv64gc
+            rustflags: ""
+          - name: rv64gc + Zbb
+            rustflags: "-C target-feature=+zbb"
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --target riscv64gc-unknown-linux-gnu
+          rustup default 1.99.0
+
+      # qemu-user 8.2 intermittently crashes with "QEMU internal SIGSEGV" on
+      # the multithreaded tests; 10.2.1 is the oldest release verified clean.
+      - name: Install qemu-user and the riscv64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross
+          qemu_version="$(dpkg-query -W -f='${Version}' qemu-user)"
+          qemu-riscv64 --version
+          dpkg --compare-versions "${qemu_version}" ge "1:10.2.1" \
+            || { echo "qemu-user ${qemu_version} is older than 10.2.1" >&2; exit 1; }
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      # The runner in `.cargo/config.toml` uses `-cpu max`: Zbb for the +zbb
+      # build, and RVA23 for Ubuntu 26.04's riscv64 cross glibc. With
+      # `io-uring` and `experimental-rseq`, whose fallbacks qemu-user's
+      # ENOSYS exercises (glibc registers no rseq area there).
+      - name: Cargo test
+        env:
+          ALLOCATBELT_EXPECT_RSEQ: not registered
+        run: cargo test --release --locked --target riscv64gc-unknown-linux-gnu -p allocatbelt -p allocatbelt-core-check -p allocatbelt-simd-bench --features allocatbelt/io-uring,allocatbelt/experimental-rseq
+
+      # The experimental RVV candidates: the auto-vectorized kernels built
+      # with V (an unstable target feature, hence rustc's warning).
+      - name: Cargo test (SIMD candidates with V)
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }} -C target-feature=+v
+        run: cargo test --release --locked --target riscv64gc-unknown-linux-gnu -p allocatbelt-simd-bench
+
+  loom-models:
+    name: loom models of allocator and runtime protocols
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: --cfg loom
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
+
+      - name: Fetch locked Cargo dependency graph
+        run: cargo fetch --locked
+
+      - name: Cargo test (loom)
+        run: |
+          cargo test --release --locked -p allocatbelt-core-check --lib loom
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::model
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::asynchronous::lane::loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::asynchronous::protocol::loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::asynchronous::handoff_protocol::seat_loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::asynchronous::task_set::model
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::asynchronous::join::model
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::managed::model
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::resource_domain::model
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::time::loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::semaphore::loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::mutex::loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::rwlock::loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::channel::loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::oneshot::model
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::notify::loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::barrier::loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::once_cell::loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::watch::loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::broadcast::loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::signal::protocol::loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::process_completion::loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::split_io::loom_tests
+          cargo test --release --locked -p allocatbelt-runtime --lib runtime::uring_protocol::loom_tests
+
+  fuzz:
+    name: Fuzz the heap model (cargo-fuzz, 10 minutes)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchains and cargo-fuzz
+        run: |
+          rustup toolchain install nightly-2026-09-28 --profile minimal
+          rustup toolchain install 1.99.0 --profile minimal
+          cargo +1.99.0 install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Fuzz heap_ops
+        working-directory: fuzz
+        run: cargo +nightly-2026-09-28 fuzz run heap_ops -- -max_total_time=600 -rss_limit_mb=4096 -max_len=4096
+
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # 7.0.1
+        with:
+          name: allocatbelt-fuzz-${{ github.run_id }}-${{ github.run_attempt }}
+          path: fuzz/artifacts
+          if-no-files-found: warn
+          retention-days: 30
+
+  rust-advisory-checks:
+    name: Rust dependency admission
+    runs-on: ubuntu-26.04
+    if: github.actor != 'dependabot[bot]'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
+
+      - name: Install pinned Rust dependency tools
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+
+      - name: Cargo audit
+        run: cargo audit
+
+      - name: Cargo deny complete policy
+        run: cargo deny check
+
+  mutation-testing:
+    name: Core mutation testing (mewt 4.0.0)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    if: github.actor != 'dependabot[bot]'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
+
+      - name: Install pinned mewt
+        run: |
+          cargo +1.99.0 install mewt --version 4.0.0 --locked
+          test "$(mewt --version)" = "mewt 4.0.0"
+
+      - name: Run mutation campaign
+        run: scripts/run-mutation-testing.sh
+
+      - name: Upload mutation evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # 7.0.1
+        with:
+          name: allocatbelt-mutation-testing-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/allocatbelt-mutation-testing
+          if-no-files-found: warn
+          retention-days: 30

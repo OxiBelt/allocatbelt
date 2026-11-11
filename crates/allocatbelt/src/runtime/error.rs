@@ -1,0 +1,153 @@
+//! Submission and join errors.
+
+use crate::runtime::resource_domain::DomainError;
+use std::any::Any;
+use std::fmt;
+
+/// Why a submission was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SubmitErrorKind {
+  /// The runtime is shut down or shutting down, or was dropped.
+  Closed,
+  /// `max_outstanding` jobs are queued or running.
+  Full,
+  /// The request fits the capacity but not what is free now.
+  InsufficientResources,
+  /// The request exceeds the capacity in some component and can never be
+  /// admitted.
+  InvalidRequest,
+  /// The bound global or tenant resource domain refused admission. This
+  /// retains the specific domain cause, including Control budget exhaustion.
+  ResourceDomain(DomainError),
+}
+
+impl fmt::Display for SubmitErrorKind {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Closed => f.write_str("runtime is closed"),
+      Self::Full => f.write_str("outstanding job bound reached"),
+      Self::InsufficientResources => f.write_str("not enough free resources"),
+      Self::InvalidRequest => f.write_str("request exceeds the runtime's capacity"),
+      Self::ResourceDomain(error) => write!(f, "resource domain refused admission: {error}"),
+    }
+  }
+}
+
+impl std::error::Error for SubmitErrorKind {}
+
+/// A rejected submission. Owns the closure that was not admitted: take it
+/// back with [`SubmitError::into_job`] or the public field.
+pub struct SubmitError<F> {
+  /// Why it was rejected.
+  pub kind: SubmitErrorKind,
+  /// The closure that was not admitted, unchanged.
+  pub job: F,
+}
+
+impl<F> SubmitError<F> {
+  /// Why it was rejected.
+  #[must_use]
+  pub const fn kind(&self) -> SubmitErrorKind {
+    self.kind
+  }
+
+  /// The closure that was not admitted.
+  #[must_use]
+  pub fn into_job(self) -> F {
+    self.job
+  }
+}
+
+impl<F> fmt::Debug for SubmitError<F> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("SubmitError")
+      .field("kind", &self.kind)
+      .finish_non_exhaustive()
+  }
+}
+
+impl<F> fmt::Display for SubmitError<F> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "job rejected: {}", self.kind)
+  }
+}
+
+impl<F> std::error::Error for SubmitError<F> {}
+
+/// Why [`Job::join`](crate::runtime::Job::join) has no result.
+#[non_exhaustive]
+pub enum JoinError {
+  /// The job was cancelled before it started, or dropped unstarted by a
+  /// cancelling shutdown or the runtime's drop. Its closure has been
+  /// dropped and its admission released. A job that started and saw its
+  /// token cancelled returns whatever its closure returned instead.
+  Cancelled,
+  /// The closure panicked; the payload is the panic's.
+  Panicked(Box<dyn Any + Send + 'static>),
+  /// This handle's one-shot outcome was already taken by an earlier join or
+  /// future poll.
+  OutcomeTaken,
+  /// The outcome was not ready, and the join was called from one of the
+  /// job's runtime's workers, from the thread dropping its queued jobs, or
+  /// while holding a CPU ticket from the same bounded resource domain.
+  /// Waiting there could deadlock (see [`Job::join`](crate::runtime::Job::join)).
+  /// The job and its outcome remain available through the same handle.
+  WouldDeadlock,
+  /// A bound runtime could not acquire CPU admission before execution.
+  ResourceDomain(DomainError),
+}
+
+impl fmt::Debug for JoinError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Cancelled => f.write_str("Cancelled"),
+      Self::Panicked(_) => f.write_str("Panicked(..)"),
+      Self::OutcomeTaken => f.write_str("OutcomeTaken"),
+      Self::WouldDeadlock => f.write_str("WouldDeadlock"),
+      Self::ResourceDomain(error) => f.debug_tuple("ResourceDomain").field(error).finish(),
+    }
+  }
+}
+
+impl fmt::Display for JoinError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(match self {
+      Self::Cancelled => "job was cancelled before it started",
+      Self::Panicked(_) => "job panicked",
+      Self::OutcomeTaken => "job outcome was already taken",
+      Self::WouldDeadlock => "join would block work that only the calling thread can advance",
+      Self::ResourceDomain(_) => "job resource-domain admission failed",
+    })
+  }
+}
+
+impl std::error::Error for JoinError {}
+
+#[cfg(test)]
+mod tests {
+  use super::{JoinError, SubmitError, SubmitErrorKind};
+
+  struct NotDebug(u32);
+
+  #[test]
+  fn errors_format_without_debug_payloads() {
+    let e = SubmitError {
+      kind: SubmitErrorKind::Full,
+      job: NotDebug(7),
+    };
+    assert_eq!(e.to_string(), "job rejected: outstanding job bound reached");
+    assert!(format!("{e:?}").contains("Full"));
+    let boxed: Box<dyn std::error::Error> = Box::new(SubmitError {
+      kind: SubmitErrorKind::Closed,
+      job: NotDebug(1),
+    });
+    assert_eq!(boxed.to_string(), "job rejected: runtime is closed");
+    assert_eq!(e.kind(), SubmitErrorKind::Full);
+    assert_eq!(e.into_job().0, 7);
+    assert_eq!(
+      format!("{:?}", JoinError::Panicked(Box::new(3))),
+      "Panicked(..)"
+    );
+  }
+}

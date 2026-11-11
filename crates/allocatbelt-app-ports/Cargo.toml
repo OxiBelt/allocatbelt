@@ -1,0 +1,17 @@
+[package]
+name = "allocatbelt-app-ports"
+description = "Unpublished functional application ports for allocatbelt's Tokio-free optional runtime."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+allocatbelt = { workspace = true, features = ["runtime"] }
+
+[dev-dependencies]
+rustix = { workspace = true, features = ["event"] }
+
+[lints]
+workspace = true

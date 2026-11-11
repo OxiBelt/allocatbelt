@@ -1,0 +1,328 @@
+# Runtime capability and acceptance status
+
+This ledger distinguishes implemented operations from migration acceptance and
+release qualification. The [runtime contract](../runtime.md) defines behavior;
+the [implementation plan](resource-runtime-plan.md) defines the stable Linux
+capability baseline and performance gates. A source or test link establishes
+where an implementation or fixture lives. It does not assert that a new
+qualification campaign passed.
+
+The published package has allocator-only defaults and optional runtime modules.
+Development comparators may use Tokio; published normal/build dependencies must
+exclude it. Replacement uses explicit bounded application ports, with rejection
+and ownership recovery, rather than exact Tokio API or binary compatibility.
+
+## Operations and acceptance
+
+| Operations | Implemented contract and focused fixtures | Remaining acceptance |
+| --- | --- | --- |
+| Owned Send tasks, local tasks, entry, joins, task sets and cancellation | [Async runtime](../../crates/allocatbelt/src/runtime/asynchronous/mod.rs), [lifecycle tests](../../crates/allocatbelt/src/runtime/asynchronous/tests.rs), [local tests](../../crates/allocatbelt/src/runtime/asynchronous/local_tests.rs) | Current source qualification; preserve model limits and explicit bounded admission |
+| Original-thread blocking handoff | [Handoff](../../crates/allocatbelt/src/runtime/asynchronous/handoff.rs), [handoff tests](../../crates/allocatbelt/src/runtime/asynchronous/handoff_tests.rs) | Migration must retain borrowed and non-Send closures on the calling thread |
+| Cooperative task progress | [Cooperative tests](../../crates/allocatbelt/src/runtime/asynchronous/cooperative_tests.rs), [timer cooperation](../../crates/allocatbelt/src/runtime/time_cooperative_tests.rs), [shared readiness I/O gate](../../crates/allocatbelt/src/runtime/readiness_io.rs) | Direct child-pipe and cached buffered operations have native exhausted-budget fixtures; application acceptance must preserve shared budgets and descendant charges |
+| Channels, locks, semaphores, notifications, barriers and initialization | [Runtime exports](../../crates/allocatbelt/src/runtime/mod.rs), [same-source managed models](../../crates/allocatbelt/src/runtime/managed_model.rs) | Preserve FIFO, cancellation, retained-message charges and documented model coverage |
+| Sleep, timeout, intervals and paused clock | [Time](../../crates/allocatbelt/src/runtime/time.rs) | Current-thread idle automatic advancement, pause/resume and representable-clock saturation have focused native fixtures; preserve explicit epoch-model limits |
+| Worker metrics and thread lifecycle options | [Metrics](../../crates/allocatbelt/src/runtime/asynchronous/metrics.rs), [thread options](../../crates/allocatbelt/src/runtime/asynchronous/thread_options.rs) | Focused counters, hooks and handoff fixtures; current-source and native overhead qualification remains open |
+| Readiness, TCP, UDP, Unix sockets, options and DNS | [Reactor](../../crates/allocatbelt/src/runtime/reactor.rs), [network tests](../../crates/allocatbelt/src/runtime/net_tests.rs) | Current lifecycle qualification and realistic application measurements; raw readiness has explicit cooperative-accounting limits |
+| Files, directories and owned blocking/standard streams | [Filesystem tests](../../crates/allocatbelt/src/runtime/fs_tests.rs), [blocking-stream tests](../../crates/allocatbelt/src/runtime/blocking_io_tests.rs) | Application acceptance for detached cancellation, recovered inputs and completion-held permits/storage |
+| Anonymous pipes and named FIFOs | [Pipe tests](../../crates/allocatbelt/src/runtime/unix_pipe_tests.rs), [FIFO tests](../../crates/allocatbelt/src/runtime/fs_fifo_tests.rs) | Buffered/FIFO migration with backpressure, partial cancellation, peer close and explicit driver cleanup |
+| Managed simplex/duplex, buffering and stream utilities | [Managed pipes](../../crates/allocatbelt/src/runtime/io_pipes.rs), [buffered I/O](../../crates/allocatbelt/src/runtime/buffered_io.rs), [bounded-read tests](../../crates/allocatbelt/src/runtime/io_bounded_tests.rs), [bidirectional tests](../../crates/allocatbelt/src/runtime/io_bidirectional_tests.rs) | Application acceptance for exact retained suffixes, permits and cancellation recovery |
+| Child lifecycle, pipes, bounded output and signals | [Child pipes and tests](../../crates/allocatbelt/src/runtime/process/pipe.rs), [bounded output](../../crates/allocatbelt/src/runtime/process/output.rs), [process-output acceptance tests](../../crates/allocatbelt-app-ports/tests/process_output.rs), [signal protocol tests](../../crates/allocatbelt/src/runtime/signal/protocol_tests.rs) | Focused process-output cases passed once on Linux; broader platform, lifecycle and release qualification remains open, including explicit ChildWait and SignalRecv accounting limits |
+| Heterogeneous join, error-join and selection | [Composition](../../crates/allocatbelt/src/runtime/concurrency_many.rs), [declarative helpers](../../crates/allocatbelt/src/runtime/concurrency_macros.rs) | Randomized/refutable selection and rotating heterogeneous joins have focused fixtures; current-source and application qualification must preserve borrowing and panic-safe loser cleanup |
+| Resource ledgers and explicit cgroup/adaptive controls | [Managed storage](../../crates/allocatbelt/src/runtime/managed.rs), [cgroup controls](../../crates/allocatbelt/src/runtime/cgroup.rs), [adaptive policy](../../crates/allocatbelt/src/runtime/adaptive.rs) | Real-pressure and overload qualification with readback failures; synthetic samples and successful writes establish correctness only |
+| Owned-buffer runtime io_uring | [Runtime ring](../../crates/allocatbelt/src/runtime/uring.rs), [ring protocol](../../crates/allocatbelt/src/runtime/uring_protocol.rs) | Supported-kernel qualification, denial and no replay after submission; this additional capability is separate from the stable Tokio baseline |
+| CPU, memory, HTTP, relay and disk application ports | [Ports and acceptance fixtures](../../crates/allocatbelt-app-ports/README.md) | HTTP/relay migrations are implemented with focused cancellation, rejection and half-close fixtures; realistic matched comparisons remain pending |
+
+The buffering fixtures already retain the exact unwritten suffix after partial
+progress and cancellation, clamp reads to valid buffered bytes, and retain the
+managed charge through `into_parts`. Child-pipe fixtures already drain stdout
+and stderr concurrently beyond pipe capacity and cover vectored partial reads,
+EOF, stdin shutdown and waiter cancellation. These component contracts are the
+starting point for the remaining application migrations.
+
+### Opt-in resource feedback history
+
+`ResourceFeedbackService::start` and `start_in_tenant` keep history disabled.
+Tenant-bound callers can opt in with `start_in_tenant_with_history` or a
+driver's `feedback_sources_with_history`, which reserves Control for a fixed
+ring before startup readbacks or worker creation. `FeedbackMetricsHandle`
+copies typed `Copy` events into caller-provided slots without allocating or
+calling the sensor/actuator. Records include startup readbacks, raw and
+sanitized sample decisions, per-control plans, callback start/return times,
+mandatory post-write readbacks, acknowledgements, reconciliation, stop,
+failure and joined shutdown. Reads report the retained sequence window;
+overwritten cursors and sequence exhaustion are explicit errors. The sticky
+`truncated` flag reports that the retention window has wrapped; a caught-up
+streaming reader can continue when each read has no gap, while a reader that
+needs the full trace from startup must reject any gap. The ring charge stays
+with shared history while metrics-handle clones remain alive. Native tests
+cover ordering, caught-up wrap continuation, stale-cursor gaps, overflow,
+preflight budget refusal, and retained-clone lifetime; no concurrency
+primitive beyond the service's existing shared state mutex was added.
+
+### SourceSchemaV4 functional integration mode
+
+`scripts/test-application-pair-functional-e2e.py` retains the legacy signed
+9290 overlay mode and has a separate SourceSchemaV4 mode. The latter requires
+the exact raw manifest SHA-256, a caller-frozen full uppercase OpenPGP signer
+fingerprint and signed source root. Before executing checkout code, the helper
+authenticates the canonical raw-pinned manifest, checks the source root and
+worktree against the signed commit with bounded Git/GPG capture, requires one
+`VALIDSIG` whose signing or primary fingerprint exactly matches the caller pin,
+and captures the campaign controller only after its mode and bytes match the
+blob at that commit. The pre-exec snapshot uses raw file reads and inert Git
+listings rather than checkout filters. The verification environment pins
+Git/GPG and disables replacement objects, repository hooks and fsmonitor; it is
+restored after verification. The authenticated controller then verifies the
+manifest and all four
+allocator binaries, candidate soak binary, analysis engine, calibration binary
+and recorded calibration output. It selects one of the original 15
+workload/profile contexts, one fixed-policy matched or A/A pair, or a candidate
+comparison against the actual secure, standard or system manifest artifact.
+It creates direct functional runtime bindings from the pinned policy and
+validator; it does not construct a production spec, plan, pilot rate or
+qualification phase.
+
+Open-loop cases are capped at 1,000 arrivals and 1,000 arrivals per second.
+Functional capacity cases keep the runner's exact 30-second horizon and its
+fixed 5,000-arrival sentinel; the 5,000 value is not a capacity target. A
+capacity receipt must report a real 30-to-31-second trace, at least one on-time
+completion, and successful participation from CPU, memory, HTTP and disk in a
+mixed case. The runner caps each functional child's regular-file writes at an
+exact 16 MiB soft and hard `RLIMIT_FSIZE`. A live output-tree watchdog caps one
+case at 512 files, 128 directories, 1,024 total entries and 256 MiB, while
+preserving a 256 MiB free-space reserve. Each process gets a fresh private
+`TMPDIR` under the external output root. The helper and runner record its
+mount, device, filesystem type and free space, and refuse tmpfs/ramfs or a
+filesystem different from the output root. These storage observations are
+correctness context only; a KVM root filesystem or guest tmpfs is not a
+physical-disk performance measurement.
+
+The helper rechecks runner argv, per-process nonce, source and executable
+hashes, calibration pins and all six resource dimensions plus the directional
+disk/upload/download byte buckets. Runtime-binding receipt v2 includes a
+post-release snapshot of global CPU, memory, disk, network, and Task usage,
+requires every value to be zero, and retains the independently measured global
+Control baseline check. The reader also accepts historical v1 receipts using
+their exact legacy field set. Reports and runner ledgers remain
+`functional_only`; qualification and external-pressure guards remain zero.
+This mode provides finite functional
+integration evidence, not performance, p99 or release qualification.
+
+The finite command shape is:
+
+```sh
+python3 scripts/test-application-pair-functional-e2e.py \
+  --source-root "$SIGNED_SOURCE_ROOT" \
+  --source-manifest "$SOURCE_MANIFEST" \
+  --source-manifest-sha256 "$SOURCE_MANIFEST_FILE_SHA256" \
+  --signer-fingerprint "$SOURCE_SIGNER_FINGERPRINT" \
+  --pair-runner "$SIGNED_SOURCE_ROOT/scripts/run-application-pair.sh" \
+  --output-root "$PRIVATE_OUTPUT_ROOT/functional-case" \
+  --cpu-set "$PINNED_CPU_SET" --attempt-id "$FRESH_ATTEMPT_ID" \
+  --workload mixed --profile mixed --mode open_loop \
+  --pair-kind matched --rate-per-second 100 --arrivals 1000
+```
+
+Use `--mode capacity` without a rate and with the 30-second trace deadline for
+capacity checks. For `--pair-kind allocator-match`, also pass
+`--baseline-allocator mimalloc-secure`, `mimalloc-standard`, or `system`.
+Archive each selected case before starting another; the helper refuses to
+reuse an output directory.
+
+### Source5 evidence archive component
+
+The [per-job archive](../source5-evidence-archive.md) has focused native
+coverage: 33 archive, transfer and budget cases passed without skips or
+timeouts. The signed round-trip fixture covers disjoint coordinator copies,
+durable object storage, host acknowledgement verification and exact local
+reclamation. It uses a reduced synthetic schedule. Full-horizon journal sizing,
+campaign caller integration and the actual three-host transfer bridge remain
+pending; budget artifacts continue to report execution as unavailable.
+
+## Qualification still required
+
+The direct child-pipe and cached buffered accounting changes passed a
+thirteen-command component check: formatting, Clippy with all targets and
+features, release tests with all features, all 17 supported feature combinations,
+the packaged consumer check and focused runtime cases. The primary allocator
+release suite passed 882 cases with one ignored case. The packaged consumer
+check verified that the production dependency graph contains no Tokio. The
+same-source runtime Loom run selected three task-admission and cancellation
+models; it did not model operating-system drivers or establish complete Loom
+coverage. The native release run included 25 cooperative, five child-pipe,
+49 network, 29 reactor and nine Unix-pipe cases. The pinned dependency audit
+and policy checks also passed for the identical dependency inputs.
+These checks establish the component behavior; remaining release checks and
+application performance acceptance are still required.
+
+The repaired complete isolated core Miri campaign at signed source revision
+`c3ed95db4f9ba9b6ffd9d84d7651a3b5963de2c5` passed 135 tests and retained the
+one intentional ignored contention benchmark. All 136 test-process and log-
+writer exits were zero; no case timed out or was cancelled. Independent audit
+verified the complete manifest, logs and owned-process closure. The current
+core and checker sources match that campaign's reviewed source bridge. This
+qualifies that core campaign; runtime, platform and performance gates remain
+separate.
+
+A subsequent bounded workspace campaign passed formatting, Clippy with all
+targets and features, and release tests with all features on materialized source
+equivalent to signed revision `282124453db18ee3ff8958388e983aa947d84a32`.
+Independent audit verified all 314 materialized source entries, original and protected result equality,
+zero command exits and owned-process cleanup. The captured release log contains
+1,359 reported passes, zero reported failures and four reported ignored results
+across 100 summary reports, including nested child-test runs; these are not distinct
+test counts. Later documentation changes are outside that full source bridge.
+Feature, package, platform and performance qualification remain separate.
+
+At revision `12fbb9adedecd76ad181bcc503ac5b37b662cab5`, the completed
+[CI check campaign](https://github.com/OxiBelt/allocatbelt/actions/runs/38057356209)
+passed the native x86_64 and ARM64 standard checks, all supported feature
+combinations and packaged consumers. Its allocator/runtime Loom, region Miri,
+platform, scalar ISA, SVE/SVE2, RVV, rseq, user-mode RISC-V, mutation and
+dependency checks also passed. These are source-specific correctness results;
+hosted timings do not establish performance. The conditional fuzz job was
+skipped and is not qualified by this campaign.
+
+The same campaign failed both hardened sandbox jobs because the SIGCHLD
+fixture required a shell absent from the empty image. The separate
+[full-system RISC-V campaign](https://github.com/OxiBelt/allocatbelt/actions/runs/38057356207)
+failed its baseline runtime suite: 33 cases encountered missing Bash,
+uninitialized loopback or unavailable socket device-binding support. The
+guest rejected that run correctly. A later check qualifies one repaired
+sandbox signal component, described below; the full hardened-sandbox matrix
+remains open, and full-system guest acceptance remains pending. The successful
+jobs above do not qualify other changed inputs.
+
+A fresh Linux x86_64 native-guest check qualified the static-musl
+empty-rootfs runtime-signal component. The build and export succeeded, and the
+container test passed its five parent tests and four isolated child summaries
+with exit code zero, no reported OOM kill or runtime error, no restart,
+container PID zero, and no caller or container cgroup. The check used a bridge
+of 314 base source entries and eight overlay entries that preserved the current
+Rust signal and process-fixture bodies. This is focused component-correctness
+evidence; it does not qualify the complete current guest configuration,
+workspace, feature, package or platform matrix, broader sandbox suite, or
+performance.
+
+At signed source `8b1ad4ab810cfc1889b201ada62d17f672cf7d00`, a fresh full-system
+RISC-V build, static-musl payload and both vector-disabled and vector-enabled
+boots completed with zero exits. Both scenarios emitted every required
+`PASS` and `COMPLETE` marker under payload identity
+`c479406df14133b27c45e9a5671e868aeef2f18b344d472e3fd154dfe19ca768`.
+The disabled scenario covered platform, region, runtime and disabled dispatch;
+the enabled scenario additionally covered the RVV kernel, enabled/disabled
+dispatch and per-thread vector policy. The repaired recipe supplies guest
+shell tools, loopback networking and device-option kernel support needed by
+these fixtures. These TCG guest results establish correctness only and do not
+qualify later clock, metrics or resource-domain changes.
+
+Release requires source-specific ownership and lifecycle review, appropriate
+concurrent models, standard checks, the complete isolated core Miri campaign,
+supported-platform checks, feature combinations, a packaged consumer, and the
+pinned dependency-security checks. Preserve failures, cancellations and explicit
+coverage limits. Passing isolated cases or finding an implementation in source
+does not establish release readiness.
+
+Allocator, executor and application performance require the preregistered
+[per-guest gates](resource-runtime-plan.md#performance-gates), including p99,
+throughput, CPU and retained memory. Keep exploratory development separate from
+independent confirmation. Rejected arrivals cannot be removed to produce an
+all-arrival tail result. Instrumented diagnostic runs identify where time is
+spent; they do not qualify an uninstrumented performance improvement.
+
+The [foundation report](runtime-foundation.md) remains a historical milestone.
+Its earlier test counts and measurements are not the current release inventory.
+Update this ledger when public operations or acceptance fixtures change; publish
+only sanitized, source-specific qualification conclusions.
+
+### Signed runtime correctness qualification
+
+Signed source `9290a2b194a667aba8816020214230d111ab80a3` passed the full
+all-feature release workspace command with 1,691 passing executions and four
+documented skips, plus all-target/all-feature Clippy. These are execution
+counts, including repeated same-source checks, rather than unique test counts.
+The published runtime source also passed all 20 feature combinations and the
+packaging checks. Same-source runtime Loom checks passed 60 protocol tests and
+19 model tests; the latter include the four resource-domain models.
+
+Source-pinned checks passed all 18 compile-time platform gates, scalar ISA,
+experimental AArch64 ISA, stable RVV and rseq verification. The rebuilt
+full-system RISC-V payload passed vector-disabled and vector-enabled boots
+after full guest-asset integrity validation. Emulated outcomes establish
+correctness only.
+
+The full hardened sandbox passed after supplying static process-test fixtures:
+the runtime library recorded 1,080 passes and one existing benchmark skip,
+followed by all six seccomp/fallback scenarios and visible-ISA verification.
+The sandbox source bridge changed only its script, regression tests, CI
+prerequisites and documentation; runtime and Cargo sources were unchanged.
+The original missing-tool failures remain recorded. See the
+[sandbox contract](../sandbox.md) for fixture and isolation requirements.
+
+These results qualify the stated source and checks. Native performance gates,
+real-pressure acceptance and three-hour mixed-load soaks remain open.
+
+At signed source `33c3821ef4e84c38a9c4352881626ddfd07bded1`, two independent
+KVM-host correctness packets each matched 483 tracked source files to the same
+source archive. On both hosts, tool setup, formatting, all-target/all-feature
+Clippy, the full all-feature release workspace tests, packaging with 15
+consumers, and all 20 feature combinations passed. The CPU-gate regression
+also passed on both hosts. Native suites retained their existing documented
+skips. These checks establish source-specific correctness; they do not qualify
+host throughput or p99 performance.
+
+For that same source, Linux 7 full-system guest asset validation, payload
+construction, and vector-disabled and vector-enabled boots passed. Each
+scenario passed the selected 1,061 runtime tests, four platform-gate tests,
+and eleven region tests, with no ignored tests in the selected guest checks.
+The vector-enabled scenario exercised saved-pointer kernel permission
+rechecking and actual vector-permission behavior. This is emulated correctness
+evidence for the recorded guest kernel and assets; later environment changes
+need separate validation. It adds no Miri coverage beyond the recorded isolated
+core campaign. Native performance gates, real-pressure acceptance, three-hour
+mixed-load soaks, and release artifacts remain open.
+
+### FIFO application acceptance scope
+
+Five focused [FIFO application cases](../../crates/allocatbelt-app-ports/tests/fifo_pipeline.rs)
+passed individually under bounded timeouts. They cover admission and peer
+behavior, split UTF-8 buffering, partial writes under kernel backpressure,
+cancellation after a committed prefix with exact suffix recovery, and file-
+descriptor recovery after registration refusal. The committed-prefix case
+keeps the worker permit and managed buffer charged until actual completion and
+checks final waiter, registration and scratch cleanup. This is focused Linux
+functional evidence; broader migration and performance qualification remain
+open.
+
+### Process-output acceptance scope
+
+The focused application acceptance suite has one Linux correctness pass: all
+fourteen selected tests passed under individual process-group timeouts, with
+the helper child left ignored. Formatting, targeted Clippy, target compilation
+and the exact test-list check also passed in that run. This result covers only
+that bounded acceptance set and environment; it is not a complete Linux
+platform matrix or release qualification.
+
+| Acceptance test | Witness |
+| --- | --- |
+| `owned_scope_collects_finite_concurrent_streams_into_exact_managed_prefixes` | Concurrent stdout/stderr drain and exact retained prefixes |
+| `owned_scope_distinguishes_exact_capacity_from_one_byte_overflow_and_recovers_parts` | Exact-capacity completion, overflow policy and ownership recovery |
+| `dropping_pending_collector_cancels_waiters_while_reaper_keeps_detached_child` | Pending collector drop, waiter cancellation and child reaping |
+| `stderr_overflow_returns_original_parts_and_resumes_without_replaying_probe` | Partial overflow recovery and resumed stderr without replay |
+| `kill_and_wait_overflow_preserves_the_prefix_probe_and_reaps` | Kill-and-wait overflow handling with retained prefix and reaping |
+| `process_slot_rejection_preserves_and_retries_the_same_command_after_reap` | Rejected command ownership and retry after actual reap |
+| `task_and_scope_cancellation_follow_real_pending_output_and_release_waiters` | Task/scope cancellation after pending output and waiter release |
+| `one_worker_runs_a_gated_sibling_after_producer_completion_while_collector_is_pending` | Sibling progress while the collector is pending after producer completion |
+| `public_scalar_read_charge_and_zero_budget_gate_preserve_state` | Scalar child-pipe read charge and exhausted-budget state preservation |
+| `public_vectored_read_charge_and_zero_budget_gate_preserve_state` | Vectored child-pipe read charge and exhausted-budget state preservation |
+| `public_scalar_write_charge_and_zero_budget_gate_preserve_state` | Scalar child-pipe write charge and exhausted-budget state preservation |
+| `public_vectored_write_charge_and_zero_budget_gate_preserve_state` | Vectored child-pipe write charge and exhausted-budget state preservation |
+| `sixty_four_ready_pipe_reads_yield_to_a_gated_single_worker_sibling` | Sixty-four ready pipe reads followed by sibling progress |
+| `full_child_stdin_pending_cancels_waiter_and_resumes_same_writer_once` | Actual full-pipe pending, waiter cancellation and single resumption |
+
+The suite does not establish inherited-grandchild behavior, private partial-byte
+recovery after cancellation, the collector's own 64-operation shared-budget
+boundary, or complete pipe drain in the sibling-progress case. The ignored
+`process_output_helper_child` supports the parent cases but is not an
+independently selected acceptance case. These gaps remain for future focused
+fixtures and supported-platform qualification.

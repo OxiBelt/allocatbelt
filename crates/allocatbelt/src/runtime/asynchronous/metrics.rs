@@ -1,0 +1,366 @@
+//! Retained, point-in-time diagnostics for an asynchronous runtime.
+
+use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
+
+use super::scheduler::Shared;
+use super::thread_options::AsyncThreadContext;
+use crate::runtime::resource_domain::{ControlCharge, DomainError, TenantDomain, payload_bytes};
+
+#[derive(Debug)]
+pub(super) enum MetricsBuildError {
+  OutOfMemory,
+  ResourceDomain(DomainError),
+}
+
+// Isolate independently written shared lines, including adjacent-line fetches.
+// Mask padding costs one entry per 64 lanes; task wake words stay compact.
+#[repr(align(128))]
+#[derive(Debug)]
+pub(super) struct Padded<T>(pub(super) T);
+
+impl<T> Deref for Padded<T> {
+  type Target = T;
+
+  fn deref(&self) -> &Self::Target {
+    &self.0
+  }
+}
+
+pub(super) type PaddedCounter = Padded<AtomicUsize>;
+
+pub(super) struct RuntimeMetricsInner {
+  pub(super) workers: usize,
+  /// The scheduler whose admission count is the alive-task metric. Spawn
+  /// and completion keep no separate copy, so neither writes a metrics line.
+  /// The scheduler binds it once at construction and clears it from its
+  /// `Drop`, so a retained metrics handle never keeps the scheduler's
+  /// allocation, which its `Weak` would otherwise pin, alive past the
+  /// scheduler's last owner; once the scheduler is gone every task slot has
+  /// been released. Only the diagnostic read and those two lifetime events
+  /// take this lock.
+  admission: Mutex<Option<Weak<Shared>>>,
+  pub(super) lane_depth: Vec<PaddedCounter>,
+  pub(super) blocked_depth: Padded<AtomicUsize>,
+  pub(super) overflow_depth: Padded<AtomicUsize>,
+  pub(super) hook_panics: Padded<AtomicUsize>,
+  pub(super) threads: Vec<ThreadMetrics>,
+  _control: ControlCharge,
+}
+
+#[repr(align(128))]
+pub(super) struct ThreadMetrics {
+  pub(super) context: AsyncThreadContext,
+  pub(super) alive: AtomicBool,
+  pub(super) starts: AtomicUsize,
+  pub(super) stops: AtomicUsize,
+  pub(super) parks: AtomicUsize,
+  pub(super) unparks: AtomicUsize,
+  busy_nanos: AtomicU64,
+}
+
+impl ThreadMetrics {
+  pub(super) fn new(context: AsyncThreadContext) -> Self {
+    Self {
+      context,
+      alive: AtomicBool::new(false),
+      starts: AtomicUsize::new(0),
+      stops: AtomicUsize::new(0),
+      parks: AtomicUsize::new(0),
+      unparks: AtomicUsize::new(0),
+      busy_nanos: AtomicU64::new(0),
+    }
+  }
+
+  pub(super) fn add_busy_nanos(&self, nanos: u64) {
+    // Only the corresponding physical dispatcher writes this counter; other
+    // threads may sample it concurrently.
+    let current = self.busy_nanos.load(Ordering::Relaxed);
+    self
+      .busy_nanos
+      .store(current.saturating_add(nanos), Ordering::Relaxed);
+  }
+}
+
+/// A cloneable diagnostic view that remains usable after runtime shutdown.
+///
+/// The executor updates these counters on every runtime, whether or not the
+/// application reads them. Busy accounting timestamps the start of a turn
+/// only when no busy period is open (also on successful handoff restoration).
+/// It publishes elapsed time just before a lane or seat condition wait, after
+/// a successful handoff, on dispatcher exit before the stop hook, and every
+/// 64 completed consecutive turns. Consecutive turns share a
+/// period, including intervening cleanup, queue searches and spinning. The
+/// first search after a wait is excluded until a turn starts. Reads may lag
+/// by up to 64 consecutive turns of an open busy period. This per-thread
+/// wall-time diagnostic never
+/// controls spinning, parking, wakes or poll quotas.
+/// Scalar and per-thread getters allocate nothing;
+/// [`snapshot`](Self::snapshot) allocates a vector, while
+/// [`try_snapshot`](Self::try_snapshot) reports reservation failure. Every
+/// counter is sampled independently, the alive-task count under the
+/// scheduler's admission mutex and the others with relaxed loads; these
+/// reads do not form a transactional snapshot across fields or threads.
+#[derive(Clone)]
+pub struct RuntimeMetrics(Arc<RuntimeMetricsInner>);
+
+impl RuntimeMetrics {
+  pub(super) fn try_new(
+    workers: usize,
+    contexts: impl IntoIterator<Item = AsyncThreadContext>,
+    capacity: usize,
+    tenant: Option<&TenantDomain>,
+  ) -> Result<Self, MetricsBuildError> {
+    let lanes = workers;
+    let requested = std::mem::size_of::<RuntimeMetricsInner>()
+      .checked_add(
+        payload_bytes::<ThreadMetrics>(capacity).map_err(MetricsBuildError::ResourceDomain)?,
+      )
+      .and_then(|bytes| bytes.checked_add(payload_bytes::<PaddedCounter>(lanes).ok()?))
+      .ok_or(MetricsBuildError::ResourceDomain(DomainError::Invalid))?;
+    let mut control =
+      ControlCharge::try_new(tenant, requested).map_err(MetricsBuildError::ResourceDomain)?;
+    let mut threads = Vec::new();
+    threads
+      .try_reserve_exact(capacity)
+      .map_err(|_| MetricsBuildError::OutOfMemory)?;
+    threads.extend(contexts.into_iter().map(ThreadMetrics::new));
+    let mut lane_depth = Vec::new();
+    lane_depth
+      .try_reserve_exact(lanes)
+      .map_err(|_| MetricsBuildError::OutOfMemory)?;
+    lane_depth.resize_with(lanes, || Padded(AtomicUsize::new(0)));
+    let actual = std::mem::size_of::<RuntimeMetricsInner>()
+      .checked_add(
+        payload_bytes::<ThreadMetrics>(threads.capacity())
+          .map_err(MetricsBuildError::ResourceDomain)?,
+      )
+      .and_then(|bytes| {
+        bytes.checked_add(payload_bytes::<PaddedCounter>(lane_depth.capacity()).ok()?)
+      })
+      .ok_or(MetricsBuildError::ResourceDomain(DomainError::Invalid))?;
+    control
+      .try_resize(actual)
+      .map_err(MetricsBuildError::ResourceDomain)?;
+    Ok(Self(Arc::new(RuntimeMetricsInner {
+      workers,
+      admission: Mutex::new(None),
+      lane_depth,
+      blocked_depth: Padded(AtomicUsize::new(0)),
+      overflow_depth: Padded(AtomicUsize::new(0)),
+      hook_panics: Padded(AtomicUsize::new(0)),
+      threads,
+      _control: control,
+    })))
+  }
+
+  pub(super) fn inner(&self) -> &Arc<RuntimeMetricsInner> {
+    &self.0
+  }
+
+  /// Names the scheduler whose admission count this view reports. Called
+  /// once, by the scheduler that owns this view, before any task is admitted.
+  pub(super) fn bind_admission(&self, shared: Weak<Shared>) {
+    let previous = self
+      .0
+      .admission
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .replace(shared);
+    debug_assert!(previous.is_none(), "metrics already bound to a scheduler");
+  }
+
+  /// Whether a scheduler is bound: a retained handle stops pinning the
+  /// scheduler's allocation once this is false.
+  #[cfg(all(test, not(loom)))]
+  pub(super) fn admission_bound(&self) -> bool {
+    self
+      .0
+      .admission
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .is_some()
+  }
+
+  /// Forgets the scheduler, releasing the metrics' hold on its allocation.
+  /// Called from the scheduler's `Drop`, so no upgrade can succeed from here
+  /// on and the count reads as zero.
+  pub(super) fn unbind_admission(&self) {
+    let unbound = self
+      .0
+      .admission
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .take();
+    drop(unbound);
+  }
+
+  /// Returns the configured primary worker count.
+  #[must_use]
+  pub fn num_workers(&self) -> usize {
+    self.0.workers
+  }
+
+  /// Returns the maximum simultaneous dispatchers, equal to `num_workers`.
+  #[must_use]
+  pub fn dispatch_ceiling(&self) -> usize {
+    self.0.workers
+  }
+
+  /// Returns the current number of reserved task slots, including in-progress
+  /// spawns before domain admission/construction and cancellation cleanup.
+  /// The count is the scheduler's admission count, read under its admission
+  /// mutex, so it is exact at that instant; it includes a reserved spawn
+  /// until publication or rollback, and a published task until its slot is
+  /// released, which precedes join publication. The read holds the scheduler
+  /// alive for its duration. Once the scheduler's last owner has dropped,
+  /// no slot remains reserved and the count is zero.
+  #[must_use]
+  pub fn num_alive_tasks(&self) -> usize {
+    // Release the handle lock before the scheduler is used or dropped: if
+    // this upgrade produced the last owner, dropping it runs the scheduler's
+    // `Drop`, which takes the same lock to unbind.
+    let shared = self
+      .0
+      .admission
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .as_ref()
+      .and_then(Weak::upgrade);
+    shared.map_or(0, |shared| shared.alive_tasks())
+  }
+
+  /// Returns the current number of queued tasks, including scope poll waiters.
+  #[must_use]
+  pub fn global_queue_depth(&self) -> usize {
+    self.0.lane_depth.iter().fold(
+      self
+        .0
+        .blocked_depth
+        .load(Ordering::Relaxed)
+        .saturating_add(self.0.overflow_depth.load(Ordering::Relaxed)),
+      |sum, depth| sum.saturating_add(depth.0.load(Ordering::Relaxed)),
+    )
+  }
+
+  /// Returns the number of contained lifecycle hook panics.
+  #[must_use]
+  pub fn hook_panics(&self) -> usize {
+    self.0.hook_panics.load(Ordering::Relaxed)
+  }
+
+  /// Returns the fixed number of physical worker and helper entries.
+  #[must_use]
+  pub fn thread_count(&self) -> usize {
+    self.0.threads.len()
+  }
+
+  /// Samples one physical thread without allocating.
+  #[must_use]
+  pub fn thread(&self, physical_index: usize) -> Option<AsyncThreadMetrics> {
+    self.0.thread(physical_index).map(AsyncThreadMetrics::read)
+  }
+
+  /// Builds an owned snapshot after fallibly reserving its per-thread vector.
+  /// Concurrent changes can make fields describe adjacent moments rather than
+  /// one atomic instant.
+  pub fn try_snapshot(&self) -> Result<RuntimeMetricsSnapshot, std::collections::TryReserveError> {
+    let mut threads = Vec::new();
+    threads.try_reserve_exact(self.thread_count())?;
+    for thread in &self.0.threads {
+      threads.push(AsyncThreadMetrics::read(thread));
+    }
+    Ok(RuntimeMetricsSnapshot {
+      num_workers: self.num_workers(),
+      dispatch_ceiling: self.dispatch_ceiling(),
+      num_alive_tasks: self.num_alive_tasks(),
+      global_queue_depth: self.global_queue_depth(),
+      hook_panics: self.hook_panics(),
+      threads,
+    })
+  }
+
+  /// Samples all counters independently. Concurrent changes can therefore
+  /// make fields describe adjacent moments rather than one atomic instant.
+  /// This convenience method allocates a vector; use [`try_snapshot`](Self::try_snapshot)
+  /// when allocation failure must be reported.
+  #[must_use]
+  pub fn snapshot(&self) -> RuntimeMetricsSnapshot {
+    RuntimeMetricsSnapshot {
+      num_workers: self.0.workers,
+      dispatch_ceiling: self.0.workers,
+      num_alive_tasks: self.num_alive_tasks(),
+      global_queue_depth: self.global_queue_depth(),
+      hook_panics: self.0.hook_panics.load(Ordering::Relaxed),
+      threads: self
+        .0
+        .threads
+        .iter()
+        .map(AsyncThreadMetrics::read)
+        .collect(),
+    }
+  }
+}
+
+/// One thread's physical role and independently sampled diagnostic counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsyncThreadMetrics {
+  /// Physical role and stable runtime-local indices.
+  pub context: AsyncThreadContext,
+  /// Whether the thread is currently alive.
+  pub alive: bool,
+  /// Number of thread starts observed (zero or one for a runtime).
+  pub starts: usize,
+  /// Number of thread stops observed (zero or one for a runtime).
+  pub stops: usize,
+  /// Number of times this thread entered a scheduler wait.
+  pub parks: usize,
+  /// Number of returns from scheduler waits, including spurious wakeups.
+  pub unparks: usize,
+  /// Published wall time in continuous dispatch periods, including cleanup
+  /// and searches/spinning between turns, excluding condition waits and
+  /// successful handoff closures/restoration waits. Reads may lag by up to
+  /// 64 consecutive turns of an open busy period; see [`RuntimeMetrics`] for
+  /// timestamp boundaries.
+  /// This is per-thread diagnostic time, never scheduler policy input.
+  pub busy_duration: std::time::Duration,
+}
+
+/// Point-in-time runtime and per-thread diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeMetricsSnapshot {
+  /// Configured primary executor thread count.
+  pub num_workers: usize,
+  /// Maximum simultaneous dispatchers, equal to `num_workers`.
+  pub dispatch_ceiling: usize,
+  /// Reserved task slots, including in-progress spawns and cleanup.
+  pub num_alive_tasks: usize,
+  /// Current tasks queued in lanes or ready lists, including scope poll waiters.
+  pub global_queue_depth: usize,
+  /// Number of contained lifecycle hook panics. A naming callback panic
+  /// rejects construction before a metrics handle is returned.
+  pub hook_panics: usize,
+  /// Counters indexed by physical thread, with primary workers first.
+  pub threads: Vec<AsyncThreadMetrics>,
+}
+
+impl RuntimeMetricsInner {
+  pub(super) fn thread(&self, physical_index: usize) -> Option<&ThreadMetrics> {
+    self.threads.get(physical_index)
+  }
+}
+
+impl AsyncThreadMetrics {
+  fn read(thread: &ThreadMetrics) -> Self {
+    Self {
+      context: thread.context,
+      alive: thread.alive.load(Ordering::Relaxed),
+      starts: thread.starts.load(Ordering::Relaxed),
+      stops: thread.stops.load(Ordering::Relaxed),
+      parks: thread.parks.load(Ordering::Relaxed),
+      unparks: thread.unparks.load(Ordering::Relaxed),
+      busy_duration: std::time::Duration::from_nanos(thread.busy_nanos.load(Ordering::Relaxed)),
+    }
+  }
+}

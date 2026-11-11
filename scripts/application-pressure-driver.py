@@ -1,0 +1,4139 @@
+#!/usr/bin/env python3
+"""Run a finite, externally measured CPU, block-I/O, and IPv4 loopback load.
+
+The driver is deliberately standalone. It freezes prospective conditions,
+performs a finite contention calibration, or runs one bounded pressure session
+against one nonce-bound application process. It does not launch an application
+or make a performance decision.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import ctypes
+from collections import deque
+import hashlib
+import json
+import mmap
+import os
+import re
+import selectors
+import select
+import shutil
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import importlib.machinery
+import threading
+import time
+from pathlib import Path, PurePosixPath
+import types
+from typing import Any
+
+
+REQUEST_SCHEMA = "allocatbelt.application-pressure-request.v1"
+CALIBRATION_REQUEST_SCHEMA_V2 = "allocatbelt.application-pressure-calibration-request.v2"
+CALIBRATION_SCHEMA = "allocatbelt.application-pressure-contention-calibration.v1"
+CALIBRATION_SCHEMA_V2 = "allocatbelt.application-pressure-contention-calibration.v2"
+RECIPE_SCHEMA = "allocatbelt.application-pressure-recipe.v1"
+RECIPE_SCHEMA_V2 = "allocatbelt.application-pressure-recipe.v2"
+LAUNCH_SCHEMA = "allocatbelt.application-pressure-launch-binding.v1"
+PROCESS_BINDING_SCHEMA = "allocatbelt.application-pressure-process-binding.v1"
+EVENT_SCHEMA = "allocatbelt.application-pressure-event.v1"
+RUN_SCHEMA = "allocatbelt.application-pressure-run.v1"
+READY_SCHEMA = "allocatbelt.application-pressure-ready.v1"
+CALIBRATION_SCOPE_SCHEMA_V2 = "allocatbelt.application-pressure-calibration-scope.v2"
+CALIBRATION_SCOPE_RECEIPT_SCHEMA_V2 = "allocatbelt.application-pressure-calibration-scope-readback.v2"
+CAPACITY_BUNDLE_PIN_SCHEMA_V2 = "allocatbelt.application-pressure-capacity-bundle-pin.v2"
+CONTEXT_POLICY_BUNDLE_SCHEMA_V2 = "allocatbelt.application-pressure-context-policy-bundle.v2"
+CALIBRATION_BINDING_SCHEMA_V2 = "allocatbelt.application-pressure-calibration-binding.v2"
+SOURCE5_PRESSURE_CONDITION_SCHEMA = "allocatbelt.application-source5-pressure-condition.v1"
+
+DRIVER_PATH = Path(__file__).resolve()
+READER_PATH = DRIVER_PATH.with_name("application-pressure-readback.py")
+MAX_REQUEST_BYTES = 2 * 1024 * 1024
+MAX_CALIBRATION_BYTES = 64 * 1024 * 1024
+MAX_SCOPE_RECEIPT_BYTES = 8 * 1024 * 1024
+MAX_CONTEXT_POLICY_BUNDLE_BYTES = 8 * 1024 * 1024
+MAX_RECIPE_BYTES = 4 * 1024 * 1024
+MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
+MAX_EVENT_LINE_BYTES = 2 * 1024 * 1024
+EVENT_TERMINAL_RESERVE_BYTES = 2 * 1024 * 1024
+OWNERSHIP_PROTOCOL = "allocatbelt.pressure-worker-ownership.v1"
+OWNERSHIP_GRANT_SCHEMA = "allocatbelt.application-pressure-worker-ownership-grant.v1"
+WORKER_START_SCHEMA = "allocatbelt.application-pressure-worker-start.v2"
+WORKER_WINDOW_GRANT_SCHEMA = "allocatbelt.application-pressure-worker-window-grant.v1"
+WORKER_FINAL_CAPTURE_SCHEMA = "allocatbelt.application-pressure-worker-final-capture.v1"
+MAX_MANIFEST_BYTES = 2 * 1024 * 1024
+MAX_FAILURE_BYTES = 4 * 1024 * 1024
+MAX_SOURCE_BYTES = 64 * 1024 * 1024
+MAX_POLICY_BYTES = 8 * 1024 * 1024
+MAX_APP_BINARY_BYTES = 1024 * 1024 * 1024
+MAX_SCRATCH_BYTES = 1024 * 1024 * 1024
+MAX_DURATION_SECONDS = 12000
+MAX_CALIBRATION_SECONDS = 120
+MAX_SAMPLES = 120000
+MAX_CPU_WORKERS = 64
+MAX_PATH_BYTES = 4096
+MAX_WORKER_STDERR_RAW_BYTES = 8192
+BLOCK_BYTES = 4096
+U64_MAX = (1 << 64) - 1
+PRESSURE_IO_SCHEMA = "allocatbelt.application-pressure-io-window.v1"
+_WORKER_STOP_REQUESTED = False
+_WORKER_CONTROL_BUFFER = bytearray()
+
+
+class PressureError(ValueError):
+    """A malformed request, unsupported host, or failed bounded pressure run."""
+
+
+class WorkerStop(Exception):
+    """A bounded worker control wait was interrupted by its parent or TERM."""
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise PressureError(message)
+
+
+def canonical_bytes(value: object) -> bytes:
+    try:
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as error:
+        raise PressureError(f"value is not canonical JSON: {error}") from error
+    return (encoded + "\n").encode("ascii")
+
+
+def digest_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def digest_object(value: object) -> str:
+    return digest_bytes(canonical_bytes(value))
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise PressureError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_constant(value: str) -> None:
+    raise PressureError(f"non-finite JSON number is forbidden: {value}")
+
+
+def parse_object(raw: bytes, label: str, maximum: int) -> dict[str, Any]:
+    require(len(raw) <= maximum, f"{label} exceeds its {maximum}-byte bound")
+    try:
+        value = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_unique_object,
+            parse_constant=_reject_constant,
+        )
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise PressureError(f"{label} is not bounded UTF-8 JSON: {error}") from error
+    require(type(value) is dict, f"{label} must be a JSON object")
+    return value
+
+
+def exact_object(value: object, keys: set[str], label: str) -> dict[str, Any]:
+    require(type(value) is dict and set(value) == keys, f"{label} has an unexpected shape")
+    return value
+
+
+def string(value: object, label: str, maximum: int = 4096) -> str:
+    require(type(value) is str and 0 < len(value) <= maximum, f"{label} must be a bounded string")
+    require(not any(ord(char) < 32 or ord(char) == 127 for char in value), f"{label} contains a control character")
+    return value
+
+
+def token(value: object, label: str, maximum: int = 128) -> str:
+    result = string(value, label, maximum)
+    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", result) is not None, f"{label} is malformed")
+    return result
+
+
+def uint(value: object, label: str, *, positive: bool = False, maximum: int = U64_MAX) -> int:
+    require(type(value) is int and 0 <= value <= maximum, f"{label} must be a finite unsigned integer")
+    require(not positive or value > 0, f"{label} must be positive")
+    return value
+
+
+def sha256(value: object, label: str) -> str:
+    result = string(value, label, 64)
+    require(re.fullmatch(r"[0-9a-f]{64}", result) is not None, f"{label} must be a lowercase SHA-256 digest")
+    return result
+
+
+def absolute_path(value: object, label: str) -> Path:
+    raw = string(value, label, MAX_PATH_BYTES)
+    path = Path(raw)
+    require(path.is_absolute() and "\x00" not in raw, f"{label} must be an absolute path")
+    require(str(path) == raw and ".." not in PurePosixPath(raw).parts, f"{label} must be normalized")
+    return path
+
+
+def _stat_key(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def read_stable(path: Path, label: str, maximum: int) -> tuple[bytes, str]:
+    try:
+        require(path.resolve(strict=True) == path, f"{label} path traverses a symlink or alias")
+        before_path = path.lstat()
+        require(stat.S_ISREG(before_path.st_mode), f"{label} must be a regular nonsymlink file")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise PressureError(f"cannot safely open {label}: {error}") from error
+    try:
+        before_fd = os.fstat(descriptor)
+        require(stat.S_ISREG(before_fd.st_mode), f"{label} descriptor is not regular")
+        require(_stat_key(before_fd) == _stat_key(before_path), f"{label} changed while opening")
+        require(0 <= before_fd.st_size <= maximum, f"{label} exceeds its finite byte bound")
+        chunks: list[bytes] = []
+        count = 0
+        while count < before_fd.st_size:
+            block = os.read(descriptor, min(1024 * 1024, before_fd.st_size - count))
+            require(bool(block), f"{label} was truncated during its stable read")
+            chunks.append(block)
+            count += len(block)
+        after_fd = os.fstat(descriptor)
+        after_path = path.lstat()
+        require(_stat_key(before_fd) == _stat_key(after_fd) == _stat_key(after_path), f"{label} changed during its stable read")
+        require(count == before_fd.st_size, f"{label} size changed during its stable read")
+        raw = b"".join(chunks)
+        return raw, digest_bytes(raw)
+    finally:
+        os.close(descriptor)
+
+
+def hash_stable(path: Path, label: str, maximum: int) -> tuple[int, str]:
+    try:
+        require(path.resolve(strict=True) == path, f"{label} path traverses a symlink or alias")
+        path_info = path.lstat()
+        require(stat.S_ISREG(path_info.st_mode), f"{label} must be a regular nonsymlink file")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError as error:
+        raise PressureError(f"cannot safely open {label}: {error}") from error
+    try:
+        before = os.fstat(descriptor)
+        require(stat.S_ISREG(before.st_mode) and _stat_key(before) == _stat_key(path_info), f"{label} changed while opening")
+        require(0 <= before.st_size <= maximum, f"{label} exceeds its hard byte cap")
+        digest = hashlib.sha256()
+        count = 0
+        while count < before.st_size:
+            block = os.read(descriptor, min(1024 * 1024, before.st_size - count))
+            require(block, f"{label} was truncated during readback")
+            digest.update(block)
+            count += len(block)
+        after_fd = os.fstat(descriptor)
+        after_path = path.lstat()
+        require(_stat_key(before) == _stat_key(after_fd) == _stat_key(after_path) and count == before.st_size, f"{label} changed during readback")
+        return count, digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def verify_canonical_json(path: Path, label: str, maximum: int) -> tuple[dict[str, Any], bytes, str]:
+    raw, raw_sha256 = read_stable(path, label, maximum)
+    value = parse_object(raw, label, maximum)
+    require(raw == canonical_bytes(value), f"{label} is not canonical JSON")
+    return value, raw, raw_sha256
+
+
+def safe_directory(path: Path, label: str, *, create: bool = False) -> Path:
+    require(path.is_absolute(), f"{label} must be absolute")
+    if create:
+        try:
+            path.mkdir(mode=0o700, parents=False, exist_ok=False)
+        except OSError as error:
+            raise PressureError(f"cannot create fresh {label}: {error}") from error
+    try:
+        info = path.lstat()
+        require(stat.S_ISDIR(info.st_mode), f"{label} must be a real nonsymlink directory")
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise PressureError(f"{label} is unavailable: {error}") from error
+    require(resolved == path, f"{label} path traverses a symlink or alias")
+    return path
+
+
+def safe_existing_directory(path: Path, label: str) -> os.stat_result:
+    safe_directory(path, label)
+    try:
+        info = path.stat()
+    except OSError as error:
+        raise PressureError(f"cannot stat {label}: {error}") from error
+    return info
+
+
+def safe_write_new(path: Path, raw: bytes, label: str, *, maximum: int) -> str:
+    require(len(raw) <= maximum, f"{label} exceeds its bounded size")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise PressureError(f"cannot create fresh {label}: {error}") from error
+    try:
+        view = memoryview(raw)
+        written = 0
+        while written < len(view):
+            count = os.write(descriptor, view[written:])
+            require(count > 0, f"short write while creating {label}")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return digest_bytes(raw)
+
+
+def _read_small_text(path: Path, label: str, maximum: int = 1024 * 1024) -> str:
+    raw, _ = read_stable(path, label, maximum)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeError as error:
+        raise PressureError(f"{label} is not UTF-8 text") from error
+
+
+def _proc_stat(pid: int) -> dict[str, Any]:
+    path = Path("/proc") / str(pid) / "stat"
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise PressureError(f"cannot read process {pid} stat: {error}") from error
+    require(len(raw) <= 65536, f"process {pid} stat is oversized")
+    try:
+        text = raw.decode("ascii").strip()
+    except UnicodeError as error:
+        raise PressureError(f"process {pid} stat is not ASCII") from error
+    closing = text.rfind(")")
+    require(closing > 0, f"process {pid} stat has malformed command framing")
+    head = text[:text.find("(")].strip()
+    tail = text[closing + 1:].strip().split()
+    require(head == str(pid) and len(tail) >= 20, f"process {pid} stat has malformed fields")
+    # Fields after comm start at field 3; starttime is field 22.
+    start_ticks = uint(int(tail[19]), f"process {pid} start_ticks", positive=True)
+    parent_pid = uint(int(tail[1]), f"process {pid} parent PID")
+    process_group = uint(int(tail[2]), f"process {pid} process group", positive=True)
+    session_id = uint(int(tail[3]), f"process {pid} session", positive=True)
+    return {
+        "pid": pid, "state": tail[0], "start_ticks": start_ticks,
+        "parent_pid": parent_pid, "pgid": process_group, "session_id": session_id,
+    }
+
+
+def _install_worker_parent_death_signal(expected_parent_pid: int, expected_parent_start_ticks: int) -> None:
+    """Bind the worker to its exact driver before it can receive work authorization."""
+    parent_pid = uint(expected_parent_pid, "pressure worker driver PID", positive=True, maximum=(1 << 31) - 1)
+    parent_ticks = uint(expected_parent_start_ticks, "pressure worker driver start ticks", positive=True)
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.argtypes = (ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong)
+        prctl.restype = ctypes.c_int
+        # Linux PR_SET_PDEATHSIG is 1. Install it before checking the parent so
+        # death either delivers SIGTERM or is detected by the PID/start check.
+        result = prctl(1, signal.SIGTERM, 0, 0, 0)
+        if result != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number))
+    except (AttributeError, OSError) as error:
+        raise PressureError(f"cannot bind pressure worker to its parent lifetime: {error}") from error
+    require(os.getppid() == parent_pid, "pressure worker parent changed before its death signal was bound")
+    parent = _proc_stat(parent_pid)
+    require(parent["start_ticks"] == parent_ticks and parent["state"] not in ("Z", "X"), "pressure worker parent PID/start identity changed")
+    require(not _WORKER_STOP_REQUESTED, "pressure worker received parent-death signal before ownership")
+
+
+def _pid_exists(pid: int, start_ticks: int) -> bool:
+    try:
+        observed = _proc_stat(pid)
+    except PressureError:
+        return False
+    return observed["start_ticks"] == start_ticks and observed["state"] != "Z"
+
+
+def _proc_link(pid: int, name: str) -> str:
+    try:
+        result = os.readlink(f"/proc/{pid}/{name}")
+    except OSError as error:
+        raise PressureError(f"cannot read process {pid} {name}: {error}") from error
+    return string(result, f"process {pid} {name}", MAX_PATH_BYTES)
+
+
+def _proc_net_namespace(pid: int) -> int:
+    try:
+        info = os.stat(f"/proc/{pid}/ns/net")
+    except OSError as error:
+        raise PressureError(f"cannot stat process {pid} network namespace: {error}") from error
+    return uint(info.st_ino, f"process {pid} network namespace inode", positive=True)
+
+
+def _affinity(pid: int = 0) -> list[int]:
+    try:
+        result = sorted(os.sched_getaffinity(pid))
+    except (OSError, AttributeError) as error:
+        raise PressureError(f"cannot read CPU affinity for pid {pid}: {error}") from error
+    require(result and len(result) <= 4096, f"CPU affinity for pid {pid} is empty or exceeds its finite host cap")
+    return result
+
+
+def _validate_cpu_list(value: object, label: str) -> list[int]:
+    require(type(value) is list and 1 <= len(value) <= MAX_CPU_WORKERS, f"{label} must contain 1..{MAX_CPU_WORKERS} CPUs")
+    result = [uint(item, f"{label} item", maximum=65535) for item in value]
+    require(result == sorted(set(result)), f"{label} must be sorted and unique")
+    return result
+
+
+def _mount_unescape(value: str) -> str:
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
+
+
+def _mount_record(path: Path, st_dev: int) -> dict[str, Any]:
+    try:
+        raw = Path("/proc/self/mountinfo").read_bytes()
+    except OSError as error:
+        raise PressureError(f"cannot read mountinfo: {error}") from error
+    require(len(raw) <= 16 * 1024 * 1024, "mountinfo exceeds its finite bound")
+    device = f"{os.major(st_dev)}:{os.minor(st_dev)}"
+    target = str(path)
+    candidates: list[dict[str, Any]] = []
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeError as error:
+        raise PressureError("mountinfo is not UTF-8") from error
+    for line in lines:
+        parts = line.split(" ")
+        if "-" not in parts:
+            continue
+        separator = parts.index("-")
+        if separator < 6 or len(parts) < separator + 4:
+            continue
+        mountpoint = _mount_unescape(parts[4])
+        mount_device = parts[2]
+        if mount_device != device:
+            continue
+        if target == mountpoint or target.startswith(mountpoint.rstrip("/") + "/"):
+            candidates.append({
+                "mount_id": uint(int(parts[0]), "mount id", positive=True),
+                "parent_mount_id": uint(int(parts[1]), "parent mount id", positive=True),
+                "device": mount_device,
+                "root": _mount_unescape(parts[3]),
+                "mountpoint": mountpoint,
+                "mount_options": parts[5].split(","),
+                "filesystem": parts[separator + 1],
+                "source": _mount_unescape(parts[separator + 2]),
+                "super_options": parts[separator + 3].split(","),
+            })
+    require(candidates, f"no mountinfo record binds {target} to device {device}")
+    candidates.sort(key=lambda item: len(item["mountpoint"]), reverse=True)
+    return candidates[0]
+
+
+def _sysfs_backing_chain(device: str) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    pending = [device]
+    seen: set[str] = set()
+    while pending:
+        current = pending.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+        node = Path("/sys/dev/block") / current
+        try:
+            resolved = node.resolve(strict=True)
+            dev_text = (resolved / "dev").read_text(encoding="ascii").strip()
+            name = resolved.name
+        except OSError as error:
+            raise PressureError(f"block device {current} has no verifiable sysfs backing chain: {error}") from error
+        require(dev_text == current, f"sysfs device identity mismatch for {current}")
+        item: dict[str, Any] = {"device": current, "name": name, "sysfs_path": str(resolved)}
+        partition_file = resolved / "partition"
+        if partition_file.exists():
+            try:
+                item["partition"] = uint(int(partition_file.read_text(encoding="ascii").strip()), "partition", positive=True)
+                parent = resolved.parent
+                parent_dev = (parent / "dev").read_text(encoding="ascii").strip()
+                if re.fullmatch(r"[0-9]+:[0-9]+", parent_dev):
+                    pending.append(parent_dev)
+            except (OSError, ValueError) as error:
+                raise PressureError(f"cannot follow partition backing device {current}: {error}") from error
+        slaves_dir = resolved / "slaves"
+        if slaves_dir.is_dir():
+            try:
+                for slave in sorted(slaves_dir.iterdir(), key=lambda value: value.name):
+                    dev_text = (slave.resolve(strict=True) / "dev").read_text(encoding="ascii").strip()
+                    require(re.fullmatch(r"[0-9]+:[0-9]+", dev_text) is not None, "malformed block slave device")
+                    pending.append(dev_text)
+            except OSError as error:
+                raise PressureError(f"cannot read block slaves for {current}: {error}") from error
+        result.append(item)
+        require(len(result) <= 32, "block backing chain exceeds 32 devices")
+    return sorted(result, key=lambda item: item["device"])
+
+
+def _storage_record(path: Path, label: str) -> dict[str, Any]:
+    info = safe_existing_directory(path, label)
+    device = f"{os.major(info.st_dev)}:{os.minor(info.st_dev)}"
+    mount = _mount_record(path, info.st_dev)
+    require(mount["filesystem"] not in ("tmpfs", "ramfs", "overlay"), f"{label} is on unsupported in-memory/overlay filesystem {mount['filesystem']}")
+    chain = _sysfs_backing_chain(device)
+    return {
+        "path": str(path),
+        "device": device,
+        "mount": mount,
+        "backing_chain": chain,
+        "filesystem_type": mount["filesystem"],
+        "tmpfs": False,
+    }
+
+
+def _loopback_route() -> dict[str, Any]:
+    executable = shutil.which("ip")
+    require(executable is not None, "iproute2 `ip` is required to verify the IPv4 loopback route")
+    try:
+        completed = subprocess.run(
+            [executable, "-j", "-4", "route", "get", "127.0.0.1"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=3, check=False, close_fds=True, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise PressureError(f"cannot resolve the fixed IPv4 loopback route: {error}") from error
+    require(completed.returncode == 0 and len(completed.stdout) <= 65536, "fixed IPv4 loopback route query failed")
+    try:
+        value = json.loads(completed.stdout.decode("utf-8"), object_pairs_hook=_unique_object, parse_constant=_reject_constant)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise PressureError("iproute2 returned malformed JSON for IPv4 loopback") from error
+    require(type(value) is list and len(value) == 1 and type(value[0]) is dict, "IPv4 loopback route response is not singular")
+    route = value[0]
+    require(route.get("dst") == "127.0.0.1" and route.get("dev") == "lo", "127.0.0.1 does not resolve through lo")
+    source = route.get("prefsrc", route.get("src"))
+    require(source == "127.0.0.1", "IPv4 loopback route has a non-loopback source")
+    stable_route = {"dst": route["dst"], "dev": route["dev"], "source": source}
+    try:
+        lo_index = socket.if_nametoindex("lo")
+        lo_info = Path("/sys/class/net/lo/ifindex").read_text(encoding="ascii").strip()
+    except (OSError, AttributeError) as error:
+        raise PressureError(f"cannot verify the shared-kernel lo interface: {error}") from error
+    require(int(lo_info) == lo_index and lo_index > 0, "lo interface identity is inconsistent")
+    return {
+        "address_family": "AF_INET",
+        "destination": "127.0.0.1",
+        "source": "127.0.0.1",
+        "interface": "lo",
+        "ifindex": lo_index,
+        "route": stable_route,
+        "network_namespace_inode": uint(os.stat("/proc/self/ns/net").st_ino, "network namespace inode", positive=True),
+        "shared_kernel": True,
+        "physical_nic_claimed": False,
+        "claim": "ipv4_loopback_shared_kernel_only",
+    }
+
+
+def _host_facts(cpu_affinity: list[int], app_affinity: list[int], storage_paths: list[Path]) -> dict[str, Any]:
+    allowed = _affinity(0)
+    require(set(cpu_affinity) <= set(allowed), "pressure CPU affinity exceeds the driver's allowed CPU set")
+    require(set(app_affinity) <= set(allowed), "application CPU affinity exceeds the driver's allowed CPU set")
+    storage = [_storage_record(path, f"application I/O path {index}") for index, path in enumerate(storage_paths)]
+    first = storage[0]
+    require(all(item["device"] == first["device"] and item["mount"]["mount_id"] == first["mount"]["mount_id"] for item in storage), "application I/O paths do not share one exact backing mount/device")
+    return {
+        "kernel_release": os.uname().release,
+        "boot_id_sha256": digest_bytes(Path("/proc/sys/kernel/random/boot_id").read_bytes().strip()),
+        "allowed_cpu_affinity": allowed,
+        "pressure_cpu_affinity": cpu_affinity,
+        "application_cpu_affinity": app_affinity,
+        "application_storage": storage,
+        "pressure_scratch": None,
+        "network": _loopback_route(),
+    }
+
+
+def _file_spec(value: object, label: str) -> dict[str, Any]:
+    item = exact_object(value, {"path", "sha256"}, label)
+    path = absolute_path(item["path"], f"{label} path")
+    expected = sha256(item["sha256"], f"{label} SHA-256")
+    maximum = MAX_SOURCE_BYTES if "source" in label else MAX_POLICY_BYTES
+    _, actual = read_stable(path, label, maximum)
+    require(actual == expected, f"{label} raw SHA-256 differs from the request")
+    return {"path": str(path), "raw_sha256": actual}
+
+
+def _binary_spec(value: object) -> dict[str, Any]:
+    item = exact_object(value, {"path", "sha256"}, "application binary")
+    path = absolute_path(item["path"], "application binary path")
+    expected = sha256(item["sha256"], "application binary SHA-256")
+    _, actual = read_stable(path, "application binary", MAX_APP_BINARY_BYTES)
+    require(actual == expected, "application binary raw SHA-256 differs from the request")
+    try:
+        info = path.stat()
+    except OSError as error:
+        raise PressureError(f"cannot stat application binary: {error}") from error
+    require(stat.S_ISREG(info.st_mode) and bool(info.st_mode & 0o111), "application binary must be a regular executable file")
+    return {"path": str(path), "raw_sha256": actual, "mode": stat.S_IMODE(info.st_mode), "size": info.st_size}
+
+
+def _schedule(value: object, *, calibration: bool = False) -> dict[str, Any]:
+    keys = {
+        "seed", "duration_seconds", "sample_interval_ms", "startup_deadline_seconds",
+        "total_deadline_seconds", "term_deadline_seconds", "kill_deadline_seconds",
+        "minimum_overlap_seconds", "startup_ready_windows", "cpu_duty_basis_points",
+        "pressure_cpu_affinity", "application_cpu_affinity", "disk_bytes_per_second",
+        "scratch_file_bytes", "network_requests_per_second", "network_payload_bytes",
+    }
+    schedule = exact_object(value, keys, "pressure schedule")
+    seed = uint(schedule["seed"], "schedule seed", positive=True, maximum=(1 << 63) - 1)
+    duration = uint(schedule["duration_seconds"], "pressure duration", positive=True, maximum=MAX_DURATION_SECONDS)
+    interval = uint(schedule["sample_interval_ms"], "sample interval", positive=True, maximum=1000)
+    require(interval >= 100 and duration * 1000 % interval == 0, "sample interval must be 100..1000ms and divide the total duration exactly")
+    samples = duration * 1000 // interval
+    require(samples <= MAX_SAMPLES, "pressure schedule exceeds the finite sample bound")
+    startup = uint(schedule["startup_deadline_seconds"], "startup deadline", positive=True, maximum=10)
+    total = uint(schedule["total_deadline_seconds"], "total deadline", positive=True, maximum=14400)
+    term = uint(schedule["term_deadline_seconds"], "TERM deadline", positive=True, maximum=30)
+    kill = uint(schedule["kill_deadline_seconds"], "KILL deadline", positive=True, maximum=15)
+    overlap = uint(schedule["minimum_overlap_seconds"], "minimum application overlap", positive=True, maximum=MAX_DURATION_SECONDS)
+    ready_windows = uint(schedule["startup_ready_windows"], "startup readiness windows", positive=True, maximum=10)
+    require(overlap <= duration and ready_windows * interval <= duration * 1000, "readiness/overlap exceeds the finite pressure horizon")
+    require(total >= startup + duration + term + kill, "total deadline does not cover startup, pressure, TERM and KILL deadlines")
+    duty = uint(schedule["cpu_duty_basis_points"], "CPU duty", positive=True, maximum=10000)
+    require(100 <= duty <= 10000, "CPU duty must be in 1..100 percent")
+    pressure_affinity = _validate_cpu_list(schedule["pressure_cpu_affinity"], "pressure CPU affinity")
+    app_affinity = _validate_cpu_list(schedule["application_cpu_affinity"], "application CPU affinity")
+    disk_rate = uint(schedule["disk_bytes_per_second"], "disk write rate", positive=True, maximum=512 * 1024 * 1024)
+    disk_target_per_window = disk_rate * interval // 1000
+    require(disk_target_per_window >= BLOCK_BYTES, "disk rate cannot produce one measured block per sample interval")
+    disk_actual_per_window = ((disk_target_per_window + BLOCK_BYTES - 1) // BLOCK_BYTES) * BLOCK_BYTES
+    require(disk_actual_per_window * samples <= 64 * 1024**3, "rounded per-window pressure writes exceed the 64 GiB schedule bound")
+    scratch_bytes = uint(schedule["scratch_file_bytes"], "scratch file size", positive=True, maximum=MAX_SCRATCH_BYTES)
+    require(scratch_bytes >= BLOCK_BYTES and scratch_bytes % BLOCK_BYTES == 0, "scratch file must be block aligned and at least 4 KiB")
+    net_rate = uint(schedule["network_requests_per_second"], "loopback request rate", positive=True, maximum=100000)
+    require(net_rate * interval >= 1000, "loopback request rate cannot produce one measured request per sample interval")
+    payload = uint(schedule["network_payload_bytes"], "loopback payload size", positive=True, maximum=65536)
+    require(payload >= 16, "loopback payload must be at least 16 bytes")
+    require(net_rate * payload * 2 <= 64 * 1024**2 and net_rate * payload * 2 * duration <= 64 * 1024**3, "cumulative loopback traffic exceeds its finite byte/rate bound")
+    normalized = {
+        "seed": seed,
+        "duration_seconds": duration,
+        "sample_interval_ms": interval,
+        "startup_deadline_seconds": startup,
+        "total_deadline_seconds": total,
+        "term_deadline_seconds": term,
+        "kill_deadline_seconds": kill,
+        "minimum_overlap_seconds": overlap,
+        "startup_ready_windows": ready_windows,
+        "cpu_duty_basis_points": duty,
+        "pressure_cpu_affinity": pressure_affinity,
+        "application_cpu_affinity": app_affinity,
+        "disk_bytes_per_second": disk_rate,
+        "scratch_file_bytes": scratch_bytes,
+        "network_requests_per_second": net_rate,
+        "network_payload_bytes": payload,
+    }
+    if calibration:
+        require(3 <= duration <= MAX_CALIBRATION_SECONDS, "contention calibration must collect 3..120 seconds")
+        require(total <= 200, "contention calibration total deadline must not exceed 200 seconds")
+    return normalized
+
+
+def _artifact_budget(schedule: dict[str, Any], backing_chain: list[dict[str, Any]]) -> dict[str, int]:
+    interval_ns = schedule["sample_interval_ms"] * 1_000_000
+    minimum_interval_ns = interval_ns - max(1_000_000, interval_ns // 100)
+    cpus = schedule["pressure_cpu_affinity"]
+    cpu_max = U64_MAX
+    maximum_aggregate_cpu = cpu_max * len(cpus)
+    maximum_requests = (schedule["network_requests_per_second"] * schedule["sample_interval_ms"] + 999) // 1000 + 2
+    maximum_rate = U64_MAX * 1_000_000_000 // minimum_interval_ns
+    maximum_disk_rate = U64_MAX * 512 * 1_000_000_000 // minimum_interval_ns
+    maximum_loopback_rate = maximum_requests * 1_000_000_000 // minimum_interval_ns
+    maximum_disk_window = max(
+        BLOCK_BYTES,
+        ((schedule["disk_bytes_per_second"] * schedule["sample_interval_ms"] // 1000 + BLOCK_BYTES - 1) // BLOCK_BYTES) * BLOCK_BYTES,
+    )
+    cpu_counters = [
+        {
+            "cpu": cpu,
+            "total_ticks": cpu_max,
+            "idle_ticks": cpu_max,
+            "busy_ticks": cpu_max,
+            "busy_basis_points": 10000,
+        }
+        for cpu in cpus
+    ]
+    cpu_generators = [
+        {
+            "cpu": cpu,
+            "thread_cpu_time_ns": cpu_max,
+            "spin_witness": cpu_max,
+            "start_monotonic_ns": cpu_max,
+            "end_monotonic_ns": cpu_max,
+        }
+        for cpu in cpus
+    ]
+    worker_io = {
+        **{f"cpu:{cpu}": {"write_bytes_delta": cpu_max, "syscw_delta": cpu_max} for cpu in cpus},
+        "disk": {"write_bytes_delta": cpu_max, "syscw_delta": cpu_max},
+        "loopback": {"write_bytes_delta": cpu_max, "syscw_delta": cpu_max},
+    }
+    sample = {
+        "schema": EVENT_SCHEMA,
+        "kind": "sample",
+        "sequence": MAX_SAMPLES - 1,
+        "interval_start_monotonic_ns": cpu_max,
+        "interval_end_monotonic_ns": cpu_max,
+        "app_active": True,
+        "cpu": {
+            "per_cpu": cpu_counters,
+            "total_ticks": maximum_aggregate_cpu,
+            "idle_ticks": maximum_aggregate_cpu,
+            "busy_basis_points": 10000,
+        },
+        "cpu_psi_delta_microseconds": cpu_max,
+        "block": {
+            "writes_completed": cpu_max,
+            "sectors_written": cpu_max,
+            "write_milliseconds": cpu_max,
+            "io_milliseconds": cpu_max,
+            "weighted_io_milliseconds": cpu_max,
+            "in_flight": cpu_max,
+            "write_bytes": cpu_max * 512,
+        },
+        "io_psi_delta_microseconds": cpu_max,
+        "block_device_chain": backing_chain,
+        "loopback_counters": {
+            key: cpu_max for key in (
+                "rx_bytes", "rx_packets", "rx_errors", "rx_dropped",
+                "tx_bytes", "tx_packets", "tx_errors", "tx_dropped",
+            )
+        },
+        "loopback": {
+            "schema": PRESSURE_IO_SCHEMA,
+            "role": "loopback",
+            "recipe_sha256": "f" * 64,
+            "sequence": MAX_SAMPLES - 1,
+            "start_monotonic_ns": cpu_max,
+            "end_monotonic_ns": cpu_max,
+            "requests_completed": maximum_requests,
+            "bytes_on_wire": maximum_requests * schedule["network_payload_bytes"] * 2,
+            "latency_histogram": [maximum_requests] * 64,
+            "p99_upper_latency_nanoseconds": 1 << 63,
+        },
+        "pressure_generators": {
+            "cpu": cpu_generators,
+            "disk": {
+                "write_bytes": maximum_disk_window,
+                "write_mode": "o_direct",
+                "fdatasync_count": 1,
+                "fdatasync_time_nanoseconds": cpu_max,
+                "start_monotonic_ns": cpu_max,
+                "end_monotonic_ns": cpu_max,
+            },
+        },
+        "worker_process_io": worker_io,
+        "readiness": {
+            "cpu_ready": True,
+            "disk_ready": True,
+            "loopback_ready": True,
+            "all_ready": True,
+            "cpu_busy_basis_points": 10000,
+            "disk_write_bytes_per_second": maximum_disk_rate,
+            "disk_queue_or_stall_microseconds": cpu_max * 1001,
+            "loopback_requests_per_second": maximum_loopback_rate,
+            "loopback_latency_p99_upper_nanoseconds": 1 << 63,
+            "loopback_tx_bytes_per_second": maximum_rate,
+            "loopback_rx_bytes_per_second": maximum_rate,
+        },
+    }
+    maximum_sample_line_bytes = len(canonical_bytes(sample))
+    require(maximum_sample_line_bytes <= MAX_EVENT_LINE_BYTES, "frozen sample row exceeds the independent reader line bound")
+    sample_count = schedule["duration_seconds"] * 1000 // schedule["sample_interval_ms"]
+    sample_events_bytes = sample_count * maximum_sample_line_bytes
+    maximum_event_bytes = sample_events_bytes + EVENT_TERMINAL_RESERVE_BYTES
+    require(maximum_event_bytes <= MAX_ARTIFACT_BYTES, "frozen pressure schedule exceeds the 512 MiB event and terminal-evidence budget")
+    return {
+        "sample_count": sample_count,
+        "maximum_sample_line_bytes": maximum_sample_line_bytes,
+        "sample_events_bytes": sample_events_bytes,
+        "terminal_reserve_bytes": EVENT_TERMINAL_RESERVE_BYTES,
+        "maximum_event_bytes": maximum_event_bytes,
+    }
+
+
+def _identity(value: object, *, calibration: bool = False) -> dict[str, Any]:
+    item = exact_object(value, {"host_id", "run_id", "pair_id", "condition_id", "member", "nonce", "allocator", "executor"}, "pressure identity")
+    host_id = token(item["host_id"], "host id")
+    run_id = token(item["run_id"], "run id")
+    pair_id = token(item["pair_id"], "pair id")
+    condition_id = token(item["condition_id"], "condition id")
+    member = token(item["member"], "pair member")
+    nonce = string(item["nonce"], "process nonce", 32)
+    require(re.fullmatch(r"[0-9a-f]{32}", nonce) is not None, "process nonce must be 32 lowercase hexadecimal characters")
+    allocator = token(item["allocator"], "allocator")
+    executor = token(item["executor"], "executor")
+    return {
+        "host_id": host_id, "run_id": run_id, "pair_id": pair_id,
+        "condition_id": condition_id, "member": member, "nonce": nonce,
+        "allocator": allocator, "executor": executor,
+        "phase": "calibration" if calibration else "external_pressure",
+    }
+
+
+def _load_scope_readback_module() -> Any:
+    raw, digest = read_stable(READER_PATH, "pressure scope readback validator", 4 * 1024 * 1024)
+    name = f"allocatbelt_pressure_scope_readback_{digest[:16]}"
+    module = types.ModuleType(name)
+    module.__file__ = str(READER_PATH)
+    module.__package__ = ""
+    module.__loader__ = None
+    module.__spec__ = importlib.machinery.ModuleSpec(name, loader=None, origin=str(READER_PATH))
+    sys.modules[name] = module
+    try:
+        captured_code = compile(raw, str(READER_PATH), "exec", dont_inherit=True)
+        exec(captured_code, module.__dict__)
+    except Exception as error:
+        sys.modules.pop(name, None)
+        raise PressureError(f"verified pressure scope reader bytes could not be executed: {type(error).__name__}") from error
+    require(digest_bytes(raw) == digest and getattr(module, "CALIBRATION_SCOPE_RECEIPT_SCHEMA_V2", None) == CALIBRATION_SCOPE_RECEIPT_SCHEMA_V2, "independent pressure scope validator contract differs")
+    return module
+
+
+def _context_calibration_storage(value: object) -> dict[str, Any]:
+    storage = exact_object(value, {"application_io_paths", "pressure_scratch_path", "output_minimum_free_bytes"}, "context calibration storage")
+    raw_paths = storage["application_io_paths"]
+    require(type(raw_paths) is list and 1 <= len(raw_paths) <= 16, "context calibration application I/O paths must contain 1..16 entries")
+    paths = [absolute_path(item, f"context calibration application I/O path {index}") for index, item in enumerate(raw_paths)]
+    require(len({str(path) for path in paths}) == len(paths), "context calibration application I/O paths repeat")
+    scratch = absolute_path(storage["pressure_scratch_path"], "context calibration scratch path")
+    free_floor = uint(storage["output_minimum_free_bytes"], "context calibration output free-space floor", positive=True, maximum=1 << 40)
+    return {
+        "application_io_paths": [str(path) for path in paths],
+        "pressure_scratch_path": str(scratch),
+        "output_minimum_free_bytes": free_floor,
+    }
+
+
+def _require_live_source5_host(observed: dict[str, Any], host: dict[str, Any]) -> None:
+    require(type(observed) is dict and observed.get("schema") == "allocatbelt.application-capacity-host-context.v1", "context calibration lacks its validated Source5 host context")
+    require(os.uname().release == observed["kernel_release"] == host["kernel_release"], "live kernel differs from the observed Source5 host")
+    boot = digest_bytes(Path("/proc/sys/kernel/random/boot_id").read_bytes().strip())
+    require(boot == observed["boot_id_sha256"] == host["boot_id_sha256"], "live boot identity differs from the observed Source5 host")
+    require(_affinity(0) == observed["cpu_affinity"] == host["allowed_cpu_affinity"], "live CPU affinity differs from the observed Source5 host")
+    cpu_raw = bytearray()
+    descriptor = os.open("/proc/cpuinfo", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        while True:
+            block = os.read(descriptor, min(1024 * 1024, 16 * 1024 * 1024 + 1 - len(cpu_raw)))
+            if not block:
+                break
+            cpu_raw.extend(block)
+            require(len(cpu_raw) <= 16 * 1024 * 1024, "live CPU model source exceeds its finite bound")
+    finally:
+        os.close(descriptor)
+    try:
+        models = {
+            line.split(":", 1)[1].strip()
+            for line in bytes(cpu_raw).decode("utf-8").splitlines()
+            if line.lower().startswith("model name") and ":" in line
+        }
+    except UnicodeError as error:
+        raise PressureError("live CPU model source is not UTF-8") from error
+    require(len(models) == 1 and next(iter(models)) == observed["cpu_model"], "live CPU model differs from the observed Source5 host")
+    namespace = os.stat("/proc/self/ns/net").st_ino
+    require(namespace == observed["network_namespace_inode"] == host["network"]["network_namespace_inode"], "live network namespace differs from the observed Source5 host")
+
+
+def _source5_context_calibration_request_v2(value: object) -> dict[str, Any]:
+    request = exact_object(value, {
+        "schema", "identity", "files", "storage", "schedule", "scope",
+    }, "context calibration request v2")
+    require(request["schema"] == CALIBRATION_REQUEST_SCHEMA_V2, "unsupported context calibration request schema")
+    identity_value = exact_object(request["identity"], {"host_id", "run_id", "condition_id", "nonce"}, "context calibration identity")
+    identity = {
+        "host_id": token(identity_value["host_id"], "context calibration host"),
+        "run_id": token(identity_value["run_id"], "context calibration run ID"),
+        "condition_id": token(identity_value["condition_id"], "context calibration condition ID"),
+        "nonce": string(identity_value["nonce"], "context calibration nonce", 32),
+        "phase": "calibration",
+    }
+    require(re.fullmatch(r"[0-9a-f]{32}", identity["nonce"]) is not None, "context calibration nonce must be 32 lowercase hexadecimal characters")
+    raw_files = exact_object(request["files"], {"source_manifest", "policy", "application_capacity_calibration"}, "context calibration raw files")
+    source = _file_spec(raw_files["source_manifest"], "source manifest")
+    policy = _file_spec(raw_files["policy"], "policy")
+    capacity_file = _file_spec(raw_files["application_capacity_calibration"], "application capacity calibration")
+    scope_value = exact_object(request["scope"], {
+        "schema", "condition", "source_root", "source_manifest", "context_policy",
+        "capacity_bundle_pins", "observed_host", "capacity_key",
+    }, "context calibration scope")
+    require(scope_value["schema"] == CALIBRATION_SCOPE_SCHEMA_V2, "unsupported context calibration scope schema")
+    reader = _load_scope_readback_module()
+    key = reader._capacity_key_v2(scope_value["capacity_key"])
+    require(key["host_id"] == identity["host_id"], "context calibration identity differs from the prepared capacity key")
+    source_root = absolute_path(scope_value["source_root"], "context calibration SourceV5 root")
+    source_pin = exact_object(scope_value["source_manifest"], {"path", "raw_sha256"}, "context calibration SourceV5 manifest pin")
+    source_pin = {"path": str(absolute_path(source_pin["path"], "context calibration SourceV5 manifest path")), "raw_sha256": sha256(source_pin["raw_sha256"], "context calibration SourceV5 manifest raw SHA-256")}
+    require(source_pin == source, "context calibration SourceV5 pin differs from its raw source-manifest input")
+    context_policy_pin = exact_object(scope_value["context_policy"], {"path", "raw_sha256"}, "context calibration policy-bundle pin")
+    context_policy_pin = {"path": str(absolute_path(context_policy_pin["path"], "context calibration policy-bundle path")), "raw_sha256": sha256(context_policy_pin["raw_sha256"], "context calibration policy-bundle raw SHA-256")}
+    capacity_bundle = exact_object(scope_value["capacity_bundle_pins"], {
+        "schema", "capacity_key", "source_manifest", "request", "artifact", "receipt",
+    }, "context calibration complete capacity bundle")
+    require(capacity_bundle["schema"] == CAPACITY_BUNDLE_PIN_SCHEMA_V2 and reader._capacity_key_v2(capacity_bundle["capacity_key"]) == key, "context calibration capacity bundle schema/key differs")
+    for name in ("source_manifest", "request", "artifact", "receipt"):
+        capacity_bundle[name] = {
+            "path": str(absolute_path(capacity_bundle[name]["path"], f"capacity bundle {name} path")),
+            "raw_sha256": sha256(capacity_bundle[name]["raw_sha256"], f"capacity bundle {name} raw SHA-256"),
+        } if type(capacity_bundle[name]) is dict else capacity_bundle[name]
+        exact_object(capacity_bundle[name], {"path", "raw_sha256"}, f"capacity bundle {name} pin")
+    observed_host_pin = exact_object(scope_value["observed_host"], {"path", "raw_sha256"}, "context calibration observed-host pin")
+    observed_host_pin = {"path": str(absolute_path(observed_host_pin["path"], "observed Source5 host path")), "raw_sha256": sha256(observed_host_pin["raw_sha256"], "observed Source5 host raw SHA-256")}
+    condition_pin = exact_object(scope_value["condition"], {"path", "raw_sha256"}, "Source5 pressure condition pin")
+    condition_pin = {"path": str(absolute_path(condition_pin["path"], "Source5 pressure condition path")), "raw_sha256": sha256(condition_pin["raw_sha256"], "Source5 pressure condition raw SHA-256")}
+    scope = {
+        "schema": CALIBRATION_SCOPE_SCHEMA_V2,
+        "condition": condition_pin,
+        "condition_id": identity["condition_id"],
+        "capacity_key": key,
+        "source_root": str(source_root),
+        "source_manifest": source_pin,
+        "context_policy_bundle": context_policy_pin,
+        "capacity_bundle_pins": capacity_bundle,
+        "observed_host": observed_host_pin,
+    }
+    schedule = _schedule(request["schedule"], calibration=True)
+    try:
+        condition_pin, condition = reader._verify_condition_file_v2(condition_pin, key, identity["condition_id"], schedule)
+        source_stack = reader._source5_stack(source_pin, str(source_root))
+        observed_pin, observed = reader._verify_observed_host_pin_v2(observed_host_pin, key["host_id"])
+        capacity = reader._verify_capacity_bundle_v2(source_stack, capacity_bundle, source_pin, observed)
+        policy_context = reader._verify_context_policy_bundle_v2(source_stack, context_policy_pin, capacity, source_pin)
+    except Exception as error:
+        if isinstance(error, PressureError):
+            raise
+        raise PressureError(f"SourceV5 context calibration inputs failed independent replay: {type(error).__name__}: {error}") from error
+    require(capacity["capacity_key"] == key and capacity["capacity_tsv_raw_sha256"] == capacity_file["raw_sha256"], "prepared capacity TSV differs from the exact pinned SourceV5 producer bundle")
+    require(policy_context["policy_pin"] == policy and context_policy_pin["raw_sha256"] == policy_context["raw_sha256"], "policy input differs from the independently replayed context-policy bundle")
+    require(condition_pin["raw_sha256"] == scope["condition"]["raw_sha256"] and observed_pin == observed_host_pin, "condition/observed-host pins changed during context validation")
+    return {
+        "identity": identity,
+        "files": {
+            "source_manifest": source,
+            "policy": policy,
+            "application_capacity_calibration": capacity_file,
+        },
+        "process": None,
+        "storage": _context_calibration_storage(request["storage"]),
+        "schedule": schedule,
+        "scope": {
+            **scope,
+            "pressure_calibration_id": condition["pressure_calibration_id"],
+            "readiness_thresholds": condition["readiness_thresholds"],
+            "pressure_thresholds": condition["pressure_thresholds"],
+            "context_policy_sha256": policy_context["numeric_context_policy_sha256"],
+            "context_policy_artifact_raw_sha256": policy_context["policy_raw_sha256"],
+            "source_manifest_semantic_sha256": source_stack["source_semantic_sha256"],
+            "source_tree_sha256": source_stack["source_tree_sha256"],
+            "observed_host_value": observed,
+            "condition_value": condition,
+            "context_policy_bundle_raw_sha256": policy_context["raw_sha256"],
+        },
+    }
+
+
+def _request(value: object, *, calibration: bool = False) -> dict[str, Any]:
+    common_keys = {"schema", "identity", "files", "process", "storage", "schedule"}
+    v2_scope_input = not calibration and type(value) is dict and "calibration_scope_v2" in value
+    expected_keys = common_keys if calibration else common_keys | {"pressure_calibration", "readiness_thresholds"} | ({"calibration_scope_v2"} if v2_scope_input else set())
+    request = exact_object(value, expected_keys, "pressure request")
+    require(request["schema"] == REQUEST_SCHEMA, "unsupported pressure request schema")
+    identity = _identity(request["identity"], calibration=calibration)
+    schedule = _schedule(request["schedule"], calibration=calibration)
+    process = exact_object(request["process"], {"executable_path", "application_tmpdir_path"}, "expected application process")
+    executable_path = absolute_path(process["executable_path"], "expected application executable path")
+    application_tmpdir = absolute_path(process["application_tmpdir_path"], "expected application TMPDIR")
+    files = exact_object(request["files"], {"source_manifest", "application_binary", "policy", "application_capacity_calibration"}, "raw input files")
+    source = _file_spec(files["source_manifest"], "source manifest")
+    binary = _binary_spec(files["application_binary"])
+    policy = _file_spec(files["policy"], "policy")
+    capacity = _file_spec(files["application_capacity_calibration"], "application capacity calibration")
+    require(binary["path"] == str(executable_path), "expected process executable path differs from the pinned application binary path")
+    storage = exact_object(request["storage"], {"application_io_paths", "pressure_scratch_path", "output_minimum_free_bytes"}, "pressure storage")
+    raw_io_paths = storage["application_io_paths"]
+    require(type(raw_io_paths) is list and 1 <= len(raw_io_paths) <= 16, "application_io_paths must contain 1..16 exact application I/O directories")
+    io_paths = [absolute_path(value, f"application I/O path {index}") for index, value in enumerate(raw_io_paths)]
+    require(len({str(path) for path in io_paths}) == len(io_paths), "application I/O paths contain duplicates")
+    require(application_tmpdir in io_paths, "application TMPDIR is not in the exact application I/O path set")
+    scratch_path = absolute_path(storage["pressure_scratch_path"], "pressure scratch path")
+    minimum_free = uint(storage["output_minimum_free_bytes"], "minimum free bytes", positive=True, maximum=1 << 40)
+    pressure_calibration: dict[str, Any] | None = None
+    calibration_scope_v2: dict[str, Any] | None = None
+    thresholds: dict[str, Any] | None = None
+    if not calibration:
+        pressure_calibration = exact_object(request["pressure_calibration"], {"path", "sha256"}, "pressure contention calibration")
+        pressure_path = absolute_path(pressure_calibration["path"], "pressure contention calibration path")
+        pressure_sha = sha256(pressure_calibration["sha256"], "pressure contention calibration raw SHA-256")
+        pressure_cal, pressure_raw, actual_pressure_sha = verify_canonical_json(pressure_path, "pressure contention calibration", MAX_CALIBRATION_BYTES)
+        require(actual_pressure_sha == pressure_sha, "pressure contention calibration raw SHA-256 differs from request")
+        if v2_scope_input:
+            reader = _load_scope_readback_module()
+            binding = exact_object(request["calibration_scope_v2"], {
+                "schema", "scope_receipt", "validator_sha256", "condition", "context_policy",
+                "capacity_bundle_pins", "observed_host", "context_policy_sha256",
+            }, "pressure calibration v2 binding")
+            require(binding["schema"] == CALIBRATION_BINDING_SCHEMA_V2, "unsupported pressure calibration v2 binding")
+            validator_sha = sha256(binding["validator_sha256"], "pressure calibration v2 validator SHA-256")
+            require(validator_sha == _hash_script(READER_PATH, "pressure calibration v2 reader"), "pressure calibration v2 binding uses different reader bytes")
+            condition_pin = exact_object(binding["condition"], {"path", "raw_sha256"}, "pressure calibration v2 condition pin")
+            condition_pin = {"path": str(absolute_path(condition_pin["path"], "pressure calibration v2 condition path")), "raw_sha256": sha256(condition_pin["raw_sha256"], "pressure calibration v2 condition raw SHA-256")}
+            raw_receipt_pin = exact_object(binding["scope_receipt"], {"path", "raw_sha256", "scope_sha256"}, "pressure calibration v2 scope receipt pin")
+            receipt_pin = {
+                "path": str(absolute_path(raw_receipt_pin["path"], "pressure calibration v2 scope receipt path")),
+                "raw_sha256": sha256(raw_receipt_pin["raw_sha256"], "pressure calibration v2 scope receipt raw SHA-256"),
+                "scope_sha256": sha256(raw_receipt_pin["scope_sha256"], "pressure calibration v2 scope receipt scope SHA-256"),
+            }
+            context_policy_pin = exact_object(binding["context_policy"], {"path", "raw_sha256"}, "pressure calibration v2 context-policy bundle pin")
+            context_policy_pin = {"path": str(absolute_path(context_policy_pin["path"], "pressure calibration v2 context-policy bundle path")), "raw_sha256": sha256(context_policy_pin["raw_sha256"], "pressure calibration v2 context-policy bundle raw SHA-256")}
+            capacity_pins = exact_object(binding["capacity_bundle_pins"], {
+                "schema", "capacity_key", "source_manifest", "request", "artifact", "receipt",
+            }, "pressure calibration v2 complete capacity bundle")
+            require(capacity_pins["schema"] == CAPACITY_BUNDLE_PIN_SCHEMA_V2, "unsupported pressure calibration v2 capacity bundle schema")
+            for pin_name in ("source_manifest", "request", "artifact", "receipt"):
+                raw_pin = exact_object(capacity_pins[pin_name], {"path", "raw_sha256"}, f"pressure calibration v2 capacity {pin_name} pin")
+                capacity_pins[pin_name] = {
+                    "path": str(absolute_path(raw_pin["path"], f"pressure calibration v2 capacity {pin_name} path")),
+                    "raw_sha256": sha256(raw_pin["raw_sha256"], f"pressure calibration v2 capacity {pin_name} raw SHA-256"),
+                }
+            observed_pin = exact_object(binding["observed_host"], {"path", "raw_sha256"}, "pressure calibration v2 observed-host pin")
+            observed_pin = {"path": str(absolute_path(observed_pin["path"], "pressure calibration v2 observed-host path")), "raw_sha256": sha256(observed_pin["raw_sha256"], "pressure calibration v2 observed-host raw SHA-256")}
+            calibration_v2 = reader._validate_calibration_v2_body(pressure_cal)
+            require(calibration_v2["identity"]["host_id"] == identity["host_id"] and calibration_v2["identity"]["condition_id"] == identity["condition_id"], "context calibration v2 host/condition differs from actual recipe identity")
+            require(calibration_v2["scope"]["condition"] == condition_pin, "actual Source5 pressure condition bytes differ from the prepared calibration condition")
+            scope_receipt, _, receipt_raw_sha = verify_canonical_json(Path(receipt_pin["path"]), "pressure calibration v2 independent scope receipt", MAX_SCOPE_RECEIPT_BYTES)
+            require(receipt_raw_sha == receipt_pin["raw_sha256"], "pressure calibration v2 independent receipt raw digest differs")
+            scope_receipt = reader._validate_scope_receipt_v2(scope_receipt, actual_pressure_sha)
+            scope_replay = reader.verify_calibration_scope_v2(
+                {"path": str(pressure_path), "raw_sha256": actual_pressure_sha},
+                context_policy_pin, capacity_pins, observed_pin,
+            )
+            require(
+                reader._scope_receipts_match_replay_v2(scope_receipt, scope_replay),
+                "stored independent scope receipt differs from current SourceV5 context replay",
+            )
+            require(
+                receipt_pin["scope_sha256"] == scope_replay["scope_sha256"]
+                and binding["context_policy_sha256"] == scope_replay["context_policy_sha256"] == calibration_v2["scope"]["context_policy_sha256"],
+                "pressure calibration v2 receipt pin/policy digest differs from the verified context",
+            )
+            require(
+                scope_replay["source_manifest_sha256"] == source["raw_sha256"]
+                and scope_replay["capacity_tsv_raw_sha256"] == capacity["raw_sha256"]
+                and scope_replay["context_policy_artifact_raw_sha256"] == policy["raw_sha256"]
+                and source == calibration_v2["scope"]["source_manifest"]
+                and capacity["path"] == calibration_v2["scope"]["capacity_bundle_pins"]["artifact"]["path"]
+                and capacity["raw_sha256"] == calibration_v2["scope"]["capacity_bundle_pins"]["artifact"]["raw_sha256"]
+                and _pressure_profile(schedule) == _pressure_profile(calibration_v2["schedule"]),
+                "actual recipe files/intensity differ from the independently verified SourceV5 calibration context",
+            )
+            current_policy_bundle, _, current_policy_bundle_raw_sha = verify_canonical_json(
+                Path(context_policy_pin["path"]), "current context-policy bundle", MAX_CONTEXT_POLICY_BUNDLE_BYTES,
+            )
+            require(current_policy_bundle_raw_sha == context_policy_pin["raw_sha256"], "current context-policy bundle raw digest differs")
+            current_policy_bundle = exact_object(current_policy_bundle, {"schema", "artifact", "members"}, "current context-policy bundle")
+            current_policy_artifact = exact_object(current_policy_bundle["artifact"], {"path", "raw_sha256"}, "current shared policy artifact pin")
+            require(
+                current_policy_bundle["schema"] == CONTEXT_POLICY_BUNDLE_SCHEMA_V2
+                and current_policy_artifact == policy,
+                "actual recipe policy input differs from the current context-policy bundle artifact",
+            )
+            thresholds = reader._pressure_thresholds_v2(request["readiness_thresholds"], "actual pressure recipe numeric thresholds")
+            require(thresholds == calibration_v2["scope"]["pressure_thresholds"], "actual pressure recipe thresholds differ from the prospectively frozen Source5 condition")
+            calibration_scope_v2 = {
+                "schema": CALIBRATION_BINDING_SCHEMA_V2,
+                "scope_receipt": receipt_pin,
+                "validator_sha256": validator_sha,
+                "condition": condition_pin,
+                "context_policy": context_policy_pin,
+                "capacity_bundle_pins": capacity_pins,
+                "observed_host": observed_pin,
+                "context_policy_sha256": scope_replay["context_policy_sha256"],
+            }
+        else:
+            _validate_calibration(pressure_cal, schedule, identity, source, policy, capacity)
+            thresholds = _validate_threshold_selection(request["readiness_thresholds"], pressure_cal)
+        pressure_calibration = {"path": str(pressure_path), "raw_sha256": actual_pressure_sha}
+        del pressure_raw
+    return {
+        "identity": identity,
+        "files": {
+            "source_manifest": source,
+            "application_binary": binary,
+            "policy": policy,
+            "application_capacity_calibration": capacity,
+        },
+        "process": {"executable_path": str(executable_path), "application_tmpdir_path": str(application_tmpdir)},
+        "storage": {
+            "application_io_paths": [str(path) for path in io_paths],
+            "pressure_scratch_path": str(scratch_path),
+            "output_minimum_free_bytes": minimum_free,
+        },
+        "schedule": schedule,
+        "pressure_calibration": pressure_calibration,
+        "calibration_scope_v2": calibration_scope_v2,
+        "readiness_thresholds": thresholds,
+    }
+
+
+def _threshold_keys() -> set[str]:
+    return {
+        "cpu_busy_min_basis_points",
+        "disk_write_min_bytes_per_second",
+        "disk_queue_or_stall_min_microseconds",
+        "loopback_requests_min_per_second",
+        "loopback_latency_p99_max_nanoseconds",
+        "loopback_tx_min_bytes_per_second",
+        "loopback_rx_min_bytes_per_second",
+    }
+
+
+def _calibration_material(calibration: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in calibration.items() if key != "calibration_sha256"}
+
+
+def _validate_calibration(
+    value: object, schedule: dict[str, Any], identity: dict[str, Any],
+    source: dict[str, Any], policy: dict[str, Any], capacity: dict[str, Any],
+) -> dict[str, Any]:
+    calibration = exact_object(value, {
+        "schema", "identity", "schedule_sha256", "raw_inputs", "driver_sha256", "host", "storage",
+        "network", "worker_sessions", "samples", "summary", "suggested_readiness_thresholds",
+        "worker_cleanup", "scratch_file_removed", "start_monotonic_ns", "finish_monotonic_ns", "deadlines",
+        "calibration_sha256",
+    }, "pressure contention calibration")
+    require(calibration["schema"] == CALIBRATION_SCHEMA, "unsupported pressure contention calibration schema")
+    calibration_identity = exact_object(calibration["identity"], {"host_id", "pair_id", "condition_id", "phase"}, "pressure calibration identity")
+    require(calibration_identity["phase"] == "calibration" and calibration_identity["condition_id"] == identity["condition_id"] and calibration_identity["host_id"] == identity["host_id"] and calibration_identity["pair_id"] == identity["pair_id"], "pressure contention calibration belongs to a different host/pair/condition")
+    require(calibration["schedule_sha256"] == digest_object(_pressure_profile(schedule)), "pressure contention calibration intensity differs from the frozen schedule")
+    require(calibration["driver_sha256"] == _hash_script(DRIVER_PATH, "pressure driver"), "pressure calibration was produced by different driver bytes")
+    cal_storage = exact_object(calibration["storage"], {"application_device", "mount_id", "backing_chain"}, "calibration storage identity")
+    cal_host = exact_object(calibration["host"], {
+        "kernel_release", "boot_id_sha256", "allowed_cpu_affinity", "pressure_cpu_affinity",
+        "application_cpu_affinity", "application_storage", "pressure_scratch", "network",
+    }, "calibration host identity")
+    require(cal_host["network"] == calibration["network"], "pressure calibration host/network identity differs")
+    require(calibration["raw_inputs"] == {
+        "source_manifest_sha256": source["raw_sha256"],
+        "policy_sha256": policy["raw_sha256"],
+        "application_capacity_calibration_sha256": capacity["raw_sha256"],
+    }, "pressure contention calibration raw input hashes differ or app-byte calibration was conflated")
+    claimed = sha256(calibration["calibration_sha256"], "calibration self digest")
+    require(claimed == digest_object(_calibration_material(calibration)), "pressure contention calibration digest is invalid")
+    samples = calibration["samples"]
+    require(type(samples) is list and len(samples) >= 3, "pressure contention calibration is sparse")
+    for index, sample in enumerate(samples):
+        _validate_calibration_sample(sample, schedule, index, cal_storage["backing_chain"])
+    sessions = calibration["worker_sessions"]
+    cleanup = calibration["worker_cleanup"]
+    require(type(sessions) is list and len(sessions) == len(schedule["pressure_cpu_affinity"]) + 2 and type(cleanup) is list and len(cleanup) == len(sessions), "pressure calibration worker cleanup is sparse")
+    sessions_by_key: dict[tuple[str, int | None], dict[str, Any]] = {}
+    for item in sessions:
+        worker = exact_object(item, {"role", "cpu", "pid", "start_ticks", "pgid", "session_id"}, "calibration worker session")
+        role = token(worker["role"], "calibration worker role", 16)
+        cpu = uint(worker["cpu"], "calibration worker CPU", maximum=65535) if role == "cpu" else None
+        require(role in ("cpu", "disk", "loopback") and (role != "cpu" or cpu in schedule["pressure_cpu_affinity"]), "calibration worker session has an unexpected role/CPU")
+        pid = uint(worker["pid"], "calibration worker PID", positive=True, maximum=(1 << 31) - 1)
+        start_ticks = uint(worker["start_ticks"], "calibration worker start ticks", positive=True)
+        require(worker["pgid"] == pid and worker["session_id"] == pid and (role, cpu) not in sessions_by_key, "calibration worker session is not isolated or is duplicated")
+        sessions_by_key[(role, cpu)] = {**worker, "pid": pid, "start_ticks": start_ticks}
+    expected_sessions = {("cpu", cpu) for cpu in schedule["pressure_cpu_affinity"]} | {("disk", None), ("loopback", None)}
+    require(set(sessions_by_key) == expected_sessions, "calibration worker sessions differ from frozen pressure resources")
+    cleanup_by_key: dict[tuple[str, int | None], dict[str, Any]] = {}
+    for item in cleanup:
+        record = exact_object(item, {
+            "role", "cpu", "pid", "start_ticks", "pgid", "session_id", "exit_code",
+            "cleanup_started_monotonic_ns", "term_deadline_monotonic_ns", "kill_deadline_monotonic_ns",
+            "term_error", "kill_error", "reap_error", "alive_after_cleanup",
+            "term_sent_monotonic_ns", "kill_sent_monotonic_ns", "reaped_monotonic_ns", "stderr_output",
+            "stderr_raw_base64", "stderr_raw_sha256", "stderr_raw_bytes", "stderr_raw_truncated", "stderr_read_error",
+        }, "calibration worker cleanup")
+        key = (record["role"], record["cpu"])
+        require(key in sessions_by_key and key not in cleanup_by_key, "calibration cleanup repeats or invents a worker")
+        session = sessions_by_key[key]
+        require(all(record[name] == session[name] for name in ("pid", "start_ticks", "pgid", "session_id")), "calibration cleanup PID/start/session differs")
+        raw_stderr = _validate_worker_stderr_capture(record, "calibration worker")
+        require(_worker_exit_was_bounded(record) and record["alive_after_cleanup"] is False and all(record[name] is None for name in ("term_error", "kill_error", "reap_error")) and raw_stderr == b"", "calibration worker did not cleanly terminate and reap")
+        cleanup_started = uint(record["cleanup_started_monotonic_ns"], "calibration cleanup start", positive=True)
+        term_deadline = uint(record["term_deadline_monotonic_ns"], "calibration TERM deadline", positive=True)
+        kill_deadline = uint(record["kill_deadline_monotonic_ns"], "calibration KILL deadline", positive=True)
+        reaped = uint(record["reaped_monotonic_ns"], "calibration reap time", positive=True)
+        require(term_deadline == cleanup_started + schedule["term_deadline_seconds"] * 1_000_000_000, "calibration TERM deadline differs from the frozen profile")
+        if record["term_sent_monotonic_ns"] is not None:
+            require(cleanup_started <= uint(record["term_sent_monotonic_ns"], "calibration TERM time", positive=True) <= term_deadline, "calibration TERM escalation missed its bound")
+        if record["kill_sent_monotonic_ns"] is not None:
+            killed = uint(record["kill_sent_monotonic_ns"], "calibration KILL time", positive=True)
+            require(term_deadline <= killed <= kill_deadline, "calibration KILL escalation missed its bound")
+        require(reaped <= kill_deadline, "calibration worker reap exceeded its KILL deadline")
+        require(not _pid_exists(record["pid"], record["start_ticks"]), "calibration pressure worker is still alive")
+        cleanup_by_key[key] = record
+    require(set(cleanup_by_key) == expected_sessions and calibration["scratch_file_removed"] is True, "calibration omitted worker cleanup or scratch removal")
+    start_ns = uint(calibration["start_monotonic_ns"], "calibration start", positive=True)
+    finish_ns = uint(calibration["finish_monotonic_ns"], "calibration finish", positive=True)
+    deadlines = exact_object(calibration["deadlines"], {"startup_seconds", "total_seconds", "term_seconds", "kill_seconds"}, "calibration deadlines")
+    require(deadlines["startup_seconds"] == schedule["startup_deadline_seconds"] and deadlines["term_seconds"] == schedule["term_deadline_seconds"] and deadlines["kill_seconds"] == schedule["kill_deadline_seconds"], "pressure calibration startup/cleanup deadlines differ from the frozen profile")
+    cal_duration_ns = len(samples) * schedule["sample_interval_ms"] * 1_000_000
+    minimum_calibration_ns = (deadlines["startup_seconds"] + deadlines["term_seconds"] + deadlines["kill_seconds"]) * 1_000_000_000 + cal_duration_ns
+    require(uint(deadlines["total_seconds"], "calibration total deadline", positive=True, maximum=200) * 1_000_000_000 >= minimum_calibration_ns, "pressure calibration total deadline omits a finite phase")
+    require(finish_ns >= start_ns and finish_ns - start_ns <= deadlines["total_seconds"] * 1_000_000_000, "pressure calibration exceeded its finite total deadline")
+    summary = _summarize_samples(samples)
+    require(summary == calibration["summary"], "pressure contention calibration summary does not match raw samples")
+    suggested = _suggest_thresholds(summary)
+    require(suggested == calibration["suggested_readiness_thresholds"], "pressure contention calibration thresholds do not match its measured samples")
+    return calibration
+
+
+def _pressure_profile(schedule: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "seed", "sample_interval_ms", "startup_deadline_seconds", "term_deadline_seconds",
+        "kill_deadline_seconds", "cpu_duty_basis_points", "pressure_cpu_affinity",
+        "application_cpu_affinity", "disk_bytes_per_second", "scratch_file_bytes",
+        "network_requests_per_second", "network_payload_bytes",
+    )
+    return {key: schedule[key] for key in keys}
+
+
+def _validate_calibration_sample(
+    sample: object, schedule: dict[str, Any], sequence: int,
+    backing_chain: list[dict[str, Any]],
+) -> None:
+    item = exact_object(sample, {
+        "schema", "sequence", "interval_start_monotonic_ns", "interval_end_monotonic_ns",
+        "app_active", "cpu", "cpu_psi_delta_microseconds", "block", "io_psi_delta_microseconds",
+        "block_device_chain", "loopback_counters", "loopback", "pressure_generators", "worker_process_io",
+    }, f"calibration sample[{sequence}]")
+    require(item["schema"] == EVENT_SCHEMA and item["sequence"] == sequence and item["app_active"] is False, "calibration sample identity or phase is invalid")
+    start = uint(item["interval_start_monotonic_ns"], "calibration sample start", positive=True)
+    end = uint(item["interval_end_monotonic_ns"], "calibration sample end", positive=True)
+    sample_ns = schedule["sample_interval_ms"] * 1_000_000
+    cadence_tolerance_ns = max(1_000_000, sample_ns // 100)
+    require(sample_ns - cadence_tolerance_ns <= end - start <= sample_ns + max(500_000_000, sample_ns), "calibration sample interval is sparse or outside its clock tolerance")
+    uint(item["cpu_psi_delta_microseconds"], "calibration CPU PSI delta")
+    uint(item["io_psi_delta_microseconds"], "calibration I/O PSI delta")
+    cpu = exact_object(item["cpu"], {"per_cpu", "total_ticks", "idle_ticks", "busy_basis_points"}, "calibration CPU counters")
+    require(type(cpu["per_cpu"]) is list and len(cpu["per_cpu"]) == len(schedule["pressure_cpu_affinity"]), "calibration CPU counters are sparse")
+    require(cpu["busy_basis_points"] <= 10000 and uint(cpu["total_ticks"], "calibration CPU ticks", positive=True) > uint(cpu["idle_ticks"], "calibration idle ticks"), "calibration CPU load counters are invalid")
+    block = exact_object(item["block"], {"writes_completed", "sectors_written", "write_milliseconds", "io_milliseconds", "weighted_io_milliseconds", "in_flight", "write_bytes"}, "calibration block counters")
+    require(uint(block["writes_completed"], "calibration writes", positive=True) > 0 and uint(block["write_bytes"], "calibration block bytes", positive=True) == uint(block["sectors_written"], "calibration sectors") * 512, "calibration block counters show no consistent writes")
+    require(item["block_device_chain"] == backing_chain, "calibration block backing chain differs from its storage identity")
+    net = exact_object(item["loopback_counters"], {"rx_bytes", "rx_packets", "rx_errors", "rx_dropped", "tx_bytes", "tx_packets", "tx_errors", "tx_dropped"}, "calibration lo counters")
+    require(uint(net["rx_bytes"], "calibration lo RX", positive=True) > 0 and uint(net["tx_bytes"], "calibration lo TX", positive=True) > 0, "calibration has no loopback traffic")
+    loop = item["loopback"]
+    require(type(loop) is dict and loop.get("schema") == PRESSURE_IO_SCHEMA and loop.get("role") == "loopback" and loop.get("sequence") == sequence, "calibration loopback witness is malformed")
+    sha256(loop.get("recipe_sha256"), "calibration worker recipe SHA")
+    requests = uint(loop.get("requests_completed"), "calibration loopback requests", positive=True)
+    require(loop.get("bytes_on_wire") == requests * schedule["network_payload_bytes"] * 2, "calibration loopback bytes do not match the request schedule")
+    require(type(loop.get("latency_histogram")) is list and len(loop["latency_histogram"]) == 64 and sum(uint(count, "calibration histogram count") for count in loop["latency_histogram"]) == requests, "calibration loopback latency witness is sparse")
+    generators = exact_object(item["pressure_generators"], {"cpu", "disk"}, "calibration pressure generators")
+    require(type(generators["cpu"]) is list and len(generators["cpu"]) == len(schedule["pressure_cpu_affinity"]), "calibration CPU generator evidence is sparse")
+    for index, generator in enumerate(generators["cpu"]):
+        row = exact_object(generator, {"cpu", "thread_cpu_time_ns", "spin_witness", "start_monotonic_ns", "end_monotonic_ns"}, f"calibration CPU worker[{index}]")
+        require(row["cpu"] == schedule["pressure_cpu_affinity"][index], "calibration CPU worker differs from requested affinity")
+        uint(row["thread_cpu_time_ns"], "calibration CPU worker time", positive=True)
+    disk_generator = exact_object(generators["disk"], {"write_bytes", "write_mode", "fdatasync_count", "fdatasync_time_nanoseconds", "start_monotonic_ns", "end_monotonic_ns"}, "calibration disk generator")
+    require(uint(disk_generator["write_bytes"], "calibration generator bytes", positive=True) % BLOCK_BYTES == 0 and disk_generator["write_mode"] == "o_direct" and disk_generator["fdatasync_count"] == 1, "calibration disk worker is sparse")
+
+
+def _validate_threshold_selection(value: object, calibration: dict[str, Any]) -> dict[str, int]:
+    thresholds = exact_object(value, _threshold_keys(), "numeric readiness thresholds")
+    normalized = {
+        key: uint(thresholds[key], f"readiness threshold {key}", positive=True, maximum=U64_MAX)
+        for key in sorted(_threshold_keys())
+    }
+    suggested = calibration["suggested_readiness_thresholds"]
+    require(normalized["cpu_busy_min_basis_points"] <= suggested["cpu_busy_min_basis_points"], "selected CPU readiness threshold exceeds the measured calibration proposal")
+    require(normalized["disk_write_min_bytes_per_second"] <= suggested["disk_write_min_bytes_per_second"], "selected disk readiness threshold exceeds the measured calibration proposal")
+    require(normalized["disk_queue_or_stall_min_microseconds"] <= suggested["disk_queue_or_stall_min_microseconds"], "selected block-stall readiness threshold exceeds the measured calibration proposal")
+    require(normalized["loopback_requests_min_per_second"] <= suggested["loopback_requests_min_per_second"], "selected loopback capacity threshold exceeds the measured calibration proposal")
+    require(normalized["loopback_latency_p99_max_nanoseconds"] >= suggested["loopback_latency_p99_max_nanoseconds"], "selected loopback latency readiness threshold is stricter than measured calibration")
+    require(normalized["loopback_tx_min_bytes_per_second"] <= suggested["loopback_tx_min_bytes_per_second"], "selected loopback TX readiness threshold exceeds the measured calibration proposal")
+    require(normalized["loopback_rx_min_bytes_per_second"] <= suggested["loopback_rx_min_bytes_per_second"], "selected loopback RX readiness threshold exceeds the measured calibration proposal")
+    return normalized
+
+
+def freeze_recipe(request_path: Path, output_path: Path) -> dict[str, Any]:
+    request, request_raw, _ = verify_canonical_json(request_path, "pressure request", MAX_REQUEST_BYTES)
+    require(request_raw == canonical_bytes(request), "pressure request framing is not canonical")
+    normalized = _request(request)
+    schedule = normalized["schedule"]
+    storage_paths = [Path(path) for path in normalized["storage"]["application_io_paths"]]
+    host = _host_facts(schedule["pressure_cpu_affinity"], schedule["application_cpu_affinity"], storage_paths)
+    scratch_path = Path(normalized["storage"]["pressure_scratch_path"])
+    scratch_storage = _storage_record(scratch_path, "pressure scratch path")
+    app_storage = host["application_storage"][0]
+    require(
+        scratch_storage["device"] == app_storage["device"]
+        and scratch_storage["mount"]["mount_id"] == app_storage["mount"]["mount_id"]
+        and scratch_storage["backing_chain"] == app_storage["backing_chain"],
+        "pressure scratch path does not share the application I/O device, mount, and backing chain",
+    )
+    host["pressure_scratch"] = scratch_storage
+    pressure_calibration_path = Path(normalized["pressure_calibration"]["path"])
+    pressure_calibration, _, pressure_raw_sha = verify_canonical_json(pressure_calibration_path, "pressure contention calibration", MAX_CALIBRATION_BYTES)
+    require(pressure_raw_sha == normalized["pressure_calibration"]["raw_sha256"], "pressure contention calibration changed while freezing")
+    calibration_host = pressure_calibration["host"]
+    require(
+        calibration_host["kernel_release"] == host["kernel_release"]
+        and calibration_host["boot_id_sha256"] == host["boot_id_sha256"]
+        and calibration_host["allowed_cpu_affinity"] == host["allowed_cpu_affinity"]
+        and calibration_host["pressure_cpu_affinity"] == host["pressure_cpu_affinity"]
+        and calibration_host["application_cpu_affinity"] == host["application_cpu_affinity"],
+        "pressure calibration host/kernel/CPU conditions differ from current recipe",
+    )
+    require(pressure_calibration["network"] == host["network"], "pressure calibration IPv4 loopback route/network namespace differs")
+    require(pressure_calibration["storage"] == {
+        "application_device": app_storage["device"],
+        "mount_id": app_storage["mount"]["mount_id"],
+        "backing_chain": app_storage["backing_chain"],
+    }, "pressure calibration block device/mount/backing chain differs")
+    artifact_budget = _artifact_budget(schedule, app_storage["backing_chain"])
+    free_bytes = shutil.disk_usage(scratch_path).free
+    required_free = schedule["scratch_file_bytes"] + normalized["storage"]["output_minimum_free_bytes"]
+    require(free_bytes >= required_free, "application device lacks the frozen scratch file plus free-space reserve")
+    driver_sha = _hash_script(DRIVER_PATH, "pressure driver")
+    reader_sha = _hash_script(READER_PATH, "pressure reader")
+    require(os.geteuid() == os.stat(DRIVER_PATH).st_uid or os.access(DRIVER_PATH, os.R_OK), "pressure driver file is not readable by this process")
+    recipe_body = {
+        "schema": RECIPE_SCHEMA_V2 if normalized["calibration_scope_v2"] is not None else RECIPE_SCHEMA,
+        "identity": normalized["identity"],
+        "files": normalized["files"],
+        "process": normalized["process"],
+        "host": host,
+        "storage": {
+            **normalized["storage"],
+            "application_device": app_storage["device"],
+            "application_mount_id": app_storage["mount"]["mount_id"],
+            "backing_chain": app_storage["backing_chain"],
+            "non_tmpfs": True,
+        },
+        "network": {
+            **host["network"],
+            "claim": "ipv4_loopback_shared_kernel_only",
+            "physical_nic_claimed": False,
+        },
+        "schedule": normalized["schedule"],
+        "artifact_budget": artifact_budget,
+        "pressure_calibration": normalized["pressure_calibration"],
+        "readiness_thresholds": normalized["readiness_thresholds"],
+        "script_hashes": {"driver_sha256": driver_sha, "reader_sha256": reader_sha},
+        "condition_sha256": digest_object({
+            "host_id": normalized["identity"]["host_id"],
+            "condition_id": normalized["identity"]["condition_id"],
+            "source_manifest_sha256": normalized["files"]["source_manifest"]["raw_sha256"],
+            "policy_sha256": normalized["files"]["policy"]["raw_sha256"],
+            "application_capacity_calibration_sha256": normalized["files"]["application_capacity_calibration"]["raw_sha256"],
+            "host": {
+                "kernel_release": host["kernel_release"],
+                "boot_id_sha256": host["boot_id_sha256"],
+                "allowed_cpu_affinity": host["allowed_cpu_affinity"],
+                "pressure_cpu_affinity": host["pressure_cpu_affinity"],
+                "application_cpu_affinity": host["application_cpu_affinity"],
+            },
+            "storage": {
+                "device": app_storage["device"],
+                "mount_id": app_storage["mount"]["mount_id"],
+                "backing_chain": app_storage["backing_chain"],
+            },
+            "network": host["network"],
+            "schedule": normalized["schedule"],
+            "pressure_calibration_sha256": normalized["pressure_calibration"]["raw_sha256"],
+            "readiness_thresholds": normalized["readiness_thresholds"],
+        }),
+    }
+    if normalized["calibration_scope_v2"] is not None:
+        recipe_body["calibration_scope_v2"] = normalized["calibration_scope_v2"]
+    recipe = {**recipe_body, "recipe_sha256": digest_object(recipe_body)}
+    raw = canonical_bytes(recipe)
+    output_parent = output_path.parent
+    safe_directory(output_parent, "recipe output directory")
+    recipe_raw_sha = safe_write_new(output_path, raw, "frozen pressure recipe", maximum=MAX_RECIPE_BYTES)
+    return {"recipe_sha256": recipe["recipe_sha256"], "recipe_raw_sha256": recipe_raw_sha, "condition_sha256": recipe["condition_sha256"], "path": str(output_path)}
+
+
+def _hash_script(path: Path, label: str) -> str:
+    _, actual = read_stable(path, label, 4 * 1024 * 1024)
+    return actual
+
+
+def _validate_recipe(value: object, expected_sha256: str | None = None) -> dict[str, Any]:
+    base_keys = {
+        "schema", "identity", "files", "process", "host", "storage", "network",
+        "schedule", "artifact_budget", "pressure_calibration", "readiness_thresholds", "script_hashes",
+        "condition_sha256", "recipe_sha256",
+    }
+    require(type(value) is dict, "frozen pressure recipe must be an object")
+    recipe_schema = value.get("schema")
+    if recipe_schema == RECIPE_SCHEMA:
+        recipe = exact_object(value, base_keys, "frozen pressure recipe")
+    elif recipe_schema == RECIPE_SCHEMA_V2:
+        recipe = exact_object(value, base_keys | {"calibration_scope_v2"}, "frozen pressure recipe v2")
+    else:
+        raise PressureError("unsupported frozen pressure recipe schema")
+    body = {key: value for key, value in recipe.items() if key != "recipe_sha256"}
+    actual_sha = digest_object(body)
+    claimed = sha256(recipe["recipe_sha256"], "recipe digest")
+    require(actual_sha == claimed and (expected_sha256 is None or actual_sha == expected_sha256), "frozen pressure recipe digest differs from the independently supplied expected hash")
+    recipe_identity = exact_object(recipe["identity"], {
+        "host_id", "run_id", "pair_id", "condition_id", "member", "nonce",
+        "allocator", "executor", "phase",
+    }, "frozen pressure identity")
+    require(recipe_identity["phase"] == "external_pressure", "frozen pressure recipe has the wrong phase")
+    identity = _identity({key: value for key, value in recipe_identity.items() if key != "phase"})
+    schedule = _schedule(recipe["schedule"])
+    storage = exact_object(recipe["storage"], {
+        "application_io_paths", "pressure_scratch_path", "output_minimum_free_bytes",
+        "application_device", "application_mount_id", "backing_chain", "non_tmpfs",
+    }, "recipe storage")
+    require(type(storage["backing_chain"]) is list and 1 <= len(storage["backing_chain"]) <= 32, "recipe block backing chain is sparse or oversized")
+    artifact_budget = exact_object(recipe["artifact_budget"], {
+        "sample_count", "maximum_sample_line_bytes", "sample_events_bytes",
+        "terminal_reserve_bytes", "maximum_event_bytes",
+    }, "recipe event artifact budget")
+    require(artifact_budget == _artifact_budget(schedule, storage["backing_chain"]), "frozen event artifact budget does not match the independent schedule bounds")
+    hashes = exact_object(recipe["script_hashes"], {"driver_sha256", "reader_sha256"}, "pressure script hashes")
+    sha256(hashes["driver_sha256"], "driver SHA-256")
+    sha256(hashes["reader_sha256"], "reader SHA-256")
+    thresholds = exact_object(recipe["readiness_thresholds"], _threshold_keys(), "readiness thresholds")
+    for key in _threshold_keys():
+        uint(thresholds[key], f"readiness threshold {key}", positive=True)
+    require(recipe["network"].get("claim") == "ipv4_loopback_shared_kernel_only" and recipe["network"].get("physical_nic_claimed") is False, "network recipe makes an unsupported physical NIC claim")
+    require(recipe["network"].get("interface") == "lo" and recipe["network"].get("destination") == "127.0.0.1", "network recipe does not bind IPv4 loopback")
+    require(recipe["storage"].get("non_tmpfs") is True and recipe["storage"].get("application_device") == recipe["host"]["application_storage"][0]["device"], "storage recipe is not bound to the non-tmpfs application device")
+    require(identity["nonce"] == recipe["identity"]["nonce"], "process nonce changed during recipe validation")
+    if recipe_schema == RECIPE_SCHEMA_V2:
+        files = exact_object(recipe["files"], {"source_manifest", "application_binary", "policy", "application_capacity_calibration"}, "recipe raw files v2")
+        for label, record in files.items():
+            expected = {"path", "raw_sha256"} | ({"mode", "size"} if label == "application_binary" else set())
+            exact_object(record, expected, f"recipe {label} input")
+            absolute_path(record["path"], f"recipe {label} path")
+            sha256(record["raw_sha256"], f"recipe {label} raw SHA-256")
+        binding = exact_object(recipe["calibration_scope_v2"], {
+            "schema", "scope_receipt", "validator_sha256", "condition", "context_policy", "capacity_bundle_pins", "observed_host", "context_policy_sha256",
+        }, "recipe context calibration v2 binding")
+        require(binding["schema"] == CALIBRATION_BINDING_SCHEMA_V2, "unsupported recipe context calibration binding schema")
+        raw_receipt_pin = exact_object(binding["scope_receipt"], {"path", "raw_sha256", "scope_sha256"}, "recipe context calibration scope receipt pin")
+        binding["scope_receipt"] = {
+            "path": str(absolute_path(raw_receipt_pin["path"], "recipe context calibration scope receipt path")),
+            "raw_sha256": sha256(raw_receipt_pin["raw_sha256"], "recipe context calibration scope receipt raw SHA-256"),
+            "scope_sha256": sha256(raw_receipt_pin["scope_sha256"], "recipe context calibration scope receipt scope SHA-256"),
+        }
+        for name in ("condition", "context_policy", "observed_host"):
+            pin = exact_object(binding[name], {"path", "raw_sha256"}, f"recipe context calibration {name} pin")
+            absolute_path(pin["path"], f"recipe context calibration {name} path")
+            sha256(pin["raw_sha256"], f"recipe context calibration {name} raw SHA-256")
+        sha256(binding["context_policy_sha256"], "recipe context policy digest")
+        require(sha256(binding["validator_sha256"], "recipe scope validator SHA-256") == hashes["reader_sha256"], "recipe scope receipt validator differs from the pinned pressure reader")
+        capacity_bundle = exact_object(binding["capacity_bundle_pins"], {
+            "schema", "capacity_key", "source_manifest", "request", "artifact", "receipt",
+        }, "recipe complete context capacity bundle")
+        require(capacity_bundle["schema"] == CAPACITY_BUNDLE_PIN_SCHEMA_V2, "recipe context capacity bundle schema is unsupported")
+        capacity_key = exact_object(capacity_bundle["capacity_key"], {"host_id", "workload", "profile", "calibration_id"}, "recipe context capacity key")
+        require(capacity_key["host_id"] == recipe["identity"]["host_id"], "recipe context capacity host differs from its actual APP identity")
+        for name in ("source_manifest", "request", "artifact", "receipt"):
+            pin = exact_object(capacity_bundle[name], {"path", "raw_sha256"}, f"recipe capacity bundle {name} pin")
+            absolute_path(pin["path"], f"recipe capacity bundle {name} path")
+            sha256(pin["raw_sha256"], f"recipe capacity bundle {name} raw SHA-256")
+        require(capacity_bundle["source_manifest"] == {
+            "path": files["source_manifest"]["path"], "raw_sha256": files["source_manifest"]["raw_sha256"],
+        } and capacity_bundle["artifact"] == {
+            "path": files["application_capacity_calibration"]["path"],
+            "raw_sha256": files["application_capacity_calibration"]["raw_sha256"],
+        }, "recipe SourceV5/capacity files differ from the complete producer bundle")
+        policy_bundle, _, policy_bundle_sha = verify_canonical_json(Path(binding["context_policy"]["path"]), "recipe context-policy bundle", MAX_CONTEXT_POLICY_BUNDLE_BYTES)
+        require(policy_bundle_sha == binding["context_policy"]["raw_sha256"], "recipe context-policy bundle raw digest differs")
+        exact_object(policy_bundle, {"schema", "artifact", "members"}, "recipe context-policy bundle")
+        require(policy_bundle["schema"] == CONTEXT_POLICY_BUNDLE_SCHEMA_V2 and policy_bundle["artifact"] == {
+            "path": files["policy"]["path"], "raw_sha256": files["policy"]["raw_sha256"],
+        }, "recipe shared policy differs from the context-policy bundle")
+    return recipe
+
+
+def _verify_recipe_inputs(recipe: dict[str, Any]) -> None:
+    for label, record in recipe["files"].items():
+        maximum = MAX_APP_BINARY_BYTES if label == "application_binary" else MAX_SOURCE_BYTES if label == "source_manifest" else MAX_POLICY_BYTES
+        _, actual = read_stable(Path(record["path"]), f"frozen input {label}", maximum)
+        require(actual == record["raw_sha256"], f"frozen input {label} changed after recipe construction")
+    calibration = recipe["pressure_calibration"]
+    _, raw_sha = read_stable(Path(calibration["path"]), "frozen pressure contention calibration", MAX_CALIBRATION_BYTES)
+    require(raw_sha == calibration["raw_sha256"], "pressure contention calibration changed after recipe construction")
+    if recipe["schema"] == RECIPE_SCHEMA_V2:
+        binding = recipe["calibration_scope_v2"]
+        reader = _load_scope_readback_module()
+        calibration_value, _, _ = verify_canonical_json(Path(calibration["path"]), "frozen context calibration v2", MAX_CALIBRATION_BYTES)
+        checked_calibration = reader._validate_calibration_v2_body(calibration_value)
+        require(checked_calibration["scope"]["condition"] == binding["condition"], "Source5 pressure condition bytes changed after recipe freeze")
+        scope_receipt, _, receipt_sha = verify_canonical_json(Path(binding["scope_receipt"]["path"]), "frozen context calibration scope receipt", MAX_SCOPE_RECEIPT_BYTES)
+        require(receipt_sha == binding["scope_receipt"]["raw_sha256"], "frozen context calibration receipt changed after recipe construction")
+        scope_receipt = reader._validate_scope_receipt_v2(scope_receipt, raw_sha)
+        require(scope_receipt["scope_sha256"] == binding["scope_receipt"]["scope_sha256"], "frozen context calibration receipt pin names a different scope digest")
+        replay = reader.verify_calibration_scope_v2(
+            {"path": calibration["path"], "raw_sha256": raw_sha}, binding["context_policy"],
+            binding["capacity_bundle_pins"], binding["observed_host"],
+        )
+        require(
+            reader._scope_receipts_match_replay_v2(scope_receipt, replay)
+            and replay["context_policy_sha256"] == binding["context_policy_sha256"]
+            and replay["source_manifest_sha256"] == scope_receipt["source_manifest_sha256"],
+            "independent context calibration scope changed after recipe freeze",
+        )
+
+
+def _verify_live_environment(recipe: dict[str, Any]) -> None:
+    host = recipe["host"]
+    require(os.uname().release == host["kernel_release"], "kernel release changed after recipe freeze")
+    require(digest_bytes(Path("/proc/sys/kernel/random/boot_id").read_bytes().strip()) == host["boot_id_sha256"], "host boot identity changed after recipe freeze")
+    require(set(recipe["schedule"]["pressure_cpu_affinity"]) <= set(_affinity(0)), "live driver affinity no longer permits its frozen pressure CPUs")
+    current_network = _loopback_route()
+    for key in ("address_family", "destination", "source", "interface", "ifindex", "network_namespace_inode", "shared_kernel", "physical_nic_claimed", "claim"):
+        require(current_network[key] == host["network"][key], f"live IPv4 loopback condition {key} differs from frozen recipe")
+    require(current_network["route"] == host["network"]["route"], "live IPv4 loopback route differs from frozen recipe")
+    for index, expected in enumerate(host["application_storage"]):
+        observed = _storage_record(Path(expected["path"]), f"live application storage path {index}")
+        require(observed == expected, f"live application storage path {index} differs from frozen mount/device/backing chain")
+    scratch = _storage_record(Path(host["pressure_scratch"]["path"]), "live pressure scratch path")
+    require(scratch == host["pressure_scratch"], "live pressure scratch mount/device/backing chain differs from frozen recipe")
+
+
+def _parse_pressure(raw: bytes, label: str) -> dict[str, int]:
+    try:
+        text = raw.decode("ascii")
+    except UnicodeError as error:
+        raise PressureError(f"{label} is not ASCII") from error
+    result: dict[str, int] = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        kind = fields[0]
+        if kind not in ("some", "full"):
+            continue
+        values: dict[str, int] = {}
+        for field in fields[1:]:
+            key, sep, value = field.partition("=")
+            if sep and value.isdigit():
+                values[key] = int(value)
+        if "total" in values:
+            result[kind] = values["total"]
+    require("some" in result, f"{label} lacks a finite PSI some total")
+    return result
+
+
+def _cpu_stats() -> dict[int, tuple[int, int]]:
+    try:
+        raw = Path("/proc/stat").read_bytes()
+    except OSError as error:
+        raise PressureError(f"cannot read /proc/stat: {error}") from error
+    require(len(raw) <= 4 * 1024 * 1024, "/proc/stat exceeds its finite bound")
+    result: dict[int, tuple[int, int]] = {}
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeError as error:
+        raise PressureError("/proc/stat is not ASCII") from error
+    for line in lines:
+        fields = line.split()
+        if not fields or not re.fullmatch(r"cpu[0-9]+", fields[0]):
+            continue
+        cpu_id = int(fields[0][3:])
+        counters = [uint(int(value), f"CPU {cpu_id} counter") for value in fields[1:]]
+        require(len(counters) >= 8, f"CPU {cpu_id} counters are sparse")
+        # guest and guest_nice are already included in user/nice by Linux.
+        total = sum(counters[:8])
+        idle = counters[3] + counters[4]
+        result[cpu_id] = (total, idle)
+    require(result, "/proc/stat contains no per-CPU counters")
+    return result
+
+
+def _cpu_window(before: dict[int, tuple[int, int]], after: dict[int, tuple[int, int]], cpus: list[int]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    total_delta = 0
+    idle_delta = 0
+    per_cpu: list[dict[str, int]] = []
+    for cpu_id in cpus:
+        require(cpu_id in before and cpu_id in after, f"CPU {cpu_id} counters are missing")
+        total = after[cpu_id][0] - before[cpu_id][0]
+        idle = after[cpu_id][1] - before[cpu_id][1]
+        require(total > 0 and 0 <= idle <= total, f"CPU {cpu_id} counter interval is sparse or invalid")
+        busy = total - idle
+        per_cpu.append({"cpu": cpu_id, "total_ticks": total, "idle_ticks": idle, "busy_ticks": busy, "busy_basis_points": busy * 10000 // total})
+        total_delta += total
+        idle_delta += idle
+    result["per_cpu"] = per_cpu
+    result["total_ticks"] = total_delta
+    result["idle_ticks"] = idle_delta
+    result["busy_basis_points"] = (total_delta - idle_delta) * 10000 // total_delta
+    return result
+
+
+def _disk_stats() -> dict[str, dict[str, int]]:
+    try:
+        raw = Path("/proc/diskstats").read_bytes()
+    except OSError as error:
+        raise PressureError(f"cannot read /proc/diskstats: {error}") from error
+    require(len(raw) <= 8 * 1024 * 1024, "/proc/diskstats exceeds its finite bound")
+    result: dict[str, dict[str, int]] = {}
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeError as error:
+        raise PressureError("/proc/diskstats is not ASCII") from error
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 14:
+            continue
+        device = f"{fields[0]}:{fields[1]}"
+        numbers = [uint(int(value), f"diskstats {device} counter") for value in fields[3:14]]
+        result[device] = {
+            "reads_completed": numbers[0],
+            "reads_merged": numbers[1],
+            "sectors_read": numbers[2],
+            "read_milliseconds": numbers[3],
+            "writes_completed": numbers[4],
+            "writes_merged": numbers[5],
+            "sectors_written": numbers[6],
+            "write_milliseconds": numbers[7],
+            "in_flight": numbers[8],
+            "io_milliseconds": numbers[9],
+            "weighted_io_milliseconds": numbers[10],
+        }
+    return result
+
+
+def _net_stats() -> dict[str, int]:
+    result: dict[str, int] = {}
+    # Read the fixed Linux interface counters by their exact sysfs names.
+    for name in ("rx_bytes", "rx_packets", "rx_errors", "rx_dropped", "tx_bytes", "tx_packets", "tx_errors", "tx_dropped"):
+        path = Path("/sys/class/net/lo/statistics") / name
+        try:
+            text = path.read_text(encoding="ascii").strip()
+            require(re.fullmatch(r"[0-9]+", text) is not None, f"lo {name} counter is malformed")
+            result[name] = uint(int(text), f"lo {name}")
+        except OSError as error:
+            raise PressureError(f"cannot read lo {name} counter: {error}") from error
+    return result
+
+
+def _read_psi(path: Path, label: str) -> dict[str, int]:
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise PressureError(f"cannot read {label}: {error}") from error
+    require(len(raw) <= 65536, f"{label} exceeds its finite bound")
+    return _parse_pressure(raw, label)
+
+
+def _counter_delta(before: dict[str, int], after: dict[str, int], keys: tuple[str, ...], label: str) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for key in keys:
+        require(key in before and key in after and after[key] >= before[key], f"{label} {key} counter is missing or regressed")
+        result[key] = after[key] - before[key]
+    return result
+
+
+def _disk_window(before: dict[str, dict[str, int]], after: dict[str, dict[str, int]], device: str) -> dict[str, Any]:
+    require(device in before and device in after, f"application block device {device} has no diskstats counters")
+    prior = before[device]
+    current = after[device]
+    delta = {key: current[key] - prior[key] for key in (
+        "writes_completed", "sectors_written", "write_milliseconds", "io_milliseconds", "weighted_io_milliseconds",
+    )}
+    require(all(value >= 0 for value in delta.values()), "application block device counters regressed")
+    delta["in_flight"] = current["in_flight"]
+    delta["write_bytes"] = delta["sectors_written"] * 512
+    return delta
+
+
+def _proc_io(pid: int) -> dict[str, int]:
+    try:
+        raw = Path(f"/proc/{pid}/io").read_bytes()
+    except OSError as error:
+        raise PressureError(f"cannot read worker {pid} I/O counters: {error}") from error
+    require(len(raw) <= 65536, f"worker {pid} I/O counters are oversized")
+    result: dict[str, int] = {}
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeError as error:
+        raise PressureError(f"worker {pid} I/O counters are not ASCII") from error
+    for line in lines:
+        key, sep, value = line.partition(":")
+        if sep and value.strip().isdigit():
+            result[key] = int(value.strip())
+    require("write_bytes" in result and "syscw" in result, f"worker {pid} I/O counters are sparse")
+    return result
+
+
+def _readiness_from_sample(sample: dict[str, Any], thresholds: dict[str, int]) -> dict[str, Any]:
+    interval_ns = sample["interval_end_monotonic_ns"] - sample["interval_start_monotonic_ns"]
+    require(interval_ns > 0, "sample interval is empty")
+    cpu_busy = sample["cpu"]["busy_basis_points"] >= thresholds["cpu_busy_min_basis_points"]
+    disk_bps = sample["block"]["write_bytes"] * 1_000_000_000 // interval_ns
+    disk_stall_us = sample["block"]["weighted_io_milliseconds"] * 1000 + sample["io_psi_delta_microseconds"]
+    disk_evidence = sample["block"]["in_flight"] > 0 or disk_stall_us >= thresholds["disk_queue_or_stall_min_microseconds"]
+    disk_ready = disk_bps >= thresholds["disk_write_min_bytes_per_second"] and sample["block"]["writes_completed"] > 0 and disk_evidence
+    net_ops = sample["loopback"]["requests_completed"]
+    net_rps = net_ops * 1_000_000_000 // interval_ns
+    tx_bps = sample["loopback_counters"]["tx_bytes"] * 1_000_000_000 // interval_ns
+    rx_bps = sample["loopback_counters"]["rx_bytes"] * 1_000_000_000 // interval_ns
+    net_ready = (
+        net_rps >= thresholds["loopback_requests_min_per_second"]
+        and sample["loopback"]["p99_upper_latency_nanoseconds"] <= thresholds["loopback_latency_p99_max_nanoseconds"]
+        and tx_bps >= thresholds["loopback_tx_min_bytes_per_second"]
+        and rx_bps >= thresholds["loopback_rx_min_bytes_per_second"]
+        and sample["loopback_counters"]["rx_errors"] == 0
+        and sample["loopback_counters"]["tx_errors"] == 0
+        and sample["loopback_counters"]["rx_dropped"] == 0
+        and sample["loopback_counters"]["tx_dropped"] == 0
+    )
+    return {
+        "cpu_ready": cpu_busy,
+        "disk_ready": disk_ready,
+        "loopback_ready": net_ready,
+        "all_ready": cpu_busy and disk_ready and net_ready,
+        "cpu_busy_basis_points": sample["cpu"]["busy_basis_points"],
+        "disk_write_bytes_per_second": disk_bps,
+        "disk_queue_or_stall_microseconds": disk_stall_us,
+        "loopback_requests_per_second": net_rps,
+        "loopback_latency_p99_upper_nanoseconds": sample["loopback"]["p99_upper_latency_nanoseconds"],
+        "loopback_tx_bytes_per_second": tx_bps,
+        "loopback_rx_bytes_per_second": rx_bps,
+    }
+
+
+def _median(values: list[int], label: str) -> int:
+    require(values, f"cannot calculate measured {label} threshold from an empty sample set")
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) // 2
+
+
+def _summarize_samples(samples: list[dict[str, Any]]) -> dict[str, int]:
+    require(type(samples) is list and len(samples) >= 3, "readiness samples are sparse")
+    cpu_values = [uint(item["cpu"]["busy_basis_points"], "sample CPU busy") for item in samples]
+    disk_values: list[int] = []
+    stall_values: list[int] = []
+    rps_values: list[int] = []
+    p99_values: list[int] = []
+    tx_values: list[int] = []
+    rx_values: list[int] = []
+    for item in samples:
+        result = _readiness_from_sample(item, {
+            "cpu_busy_min_basis_points": 1,
+            "disk_write_min_bytes_per_second": 1,
+            "disk_queue_or_stall_min_microseconds": 1,
+            "loopback_requests_min_per_second": 1,
+            "loopback_latency_p99_max_nanoseconds": U64_MAX,
+            "loopback_tx_min_bytes_per_second": 1,
+            "loopback_rx_min_bytes_per_second": 1,
+        })
+        disk_values.append(result["disk_write_bytes_per_second"])
+        stall_values.append(result["disk_queue_or_stall_microseconds"])
+        rps_values.append(result["loopback_requests_per_second"])
+        p99_values.append(result["loopback_latency_p99_upper_nanoseconds"])
+        tx_values.append(result["loopback_tx_bytes_per_second"])
+        rx_values.append(result["loopback_rx_bytes_per_second"])
+    return {
+        "sample_count": len(samples),
+        "cpu_busy_basis_points_median": _median(cpu_values, "CPU busy"),
+        "disk_write_bytes_per_second_median": _median(disk_values, "block write"),
+        "disk_queue_or_stall_microseconds_median": _median(stall_values, "block queue/stall"),
+        "loopback_requests_per_second_median": _median(rps_values, "loopback capacity"),
+        "loopback_latency_p99_upper_nanoseconds_median": _median(p99_values, "loopback latency"),
+        "loopback_tx_bytes_per_second_median": _median(tx_values, "loopback transmit"),
+        "loopback_rx_bytes_per_second_median": _median(rx_values, "loopback receive"),
+    }
+
+
+def _suggest_thresholds(summary: dict[str, int]) -> dict[str, int]:
+    # These are readiness thresholds derived only from finite pressure
+    # contention measurements. They are not application performance gates.
+    values = {
+        "cpu_busy_min_basis_points": summary["cpu_busy_basis_points_median"] * 8000 // 10000,
+        "disk_write_min_bytes_per_second": summary["disk_write_bytes_per_second_median"] * 8000 // 10000,
+        "disk_queue_or_stall_min_microseconds": max(1, summary["disk_queue_or_stall_microseconds_median"] * 5000 // 10000),
+        "loopback_requests_min_per_second": summary["loopback_requests_per_second_median"] * 8000 // 10000,
+        "loopback_latency_p99_max_nanoseconds": summary["loopback_latency_p99_upper_nanoseconds_median"] * 20000 // 10000,
+        "loopback_tx_min_bytes_per_second": summary["loopback_tx_bytes_per_second_median"] * 8000 // 10000,
+        "loopback_rx_min_bytes_per_second": summary["loopback_rx_bytes_per_second_median"] * 8000 // 10000,
+    }
+    require(all(type(value) is int and value > 0 for value in values.values()), "finite calibration did not produce positive readiness thresholds for every pressure witness")
+    return values
+
+
+def _histogram_p99_upper(histogram: list[int]) -> int:
+    require(type(histogram) is list and len(histogram) == 64, "loopback latency histogram is malformed")
+    counts = [uint(item, "latency bucket count") for item in histogram]
+    total = sum(counts)
+    require(total > 0, "loopback latency witness has no completed requests")
+    wanted = (total * 99 + 99) // 100
+    cumulative = 0
+    for index, count in enumerate(counts):
+        cumulative += count
+        if cumulative >= wanted:
+            return 1 << index
+    raise PressureError("loopback latency histogram is sparse")
+
+
+def _storage_reserve(
+    recipe: dict[str, Any], output_dir: Path, *, scratch_reserved: bool = False,
+    reserve_event_budget: bool = False,
+) -> None:
+    floor = recipe["storage"]["output_minimum_free_bytes"]
+    scratch_path = Path(recipe["storage"]["pressure_scratch_path"])
+    disk_free = shutil.disk_usage(scratch_path).free
+    output_free = shutil.disk_usage(output_dir).free
+    scratch_allowance = 0 if scratch_reserved else recipe["schedule"]["scratch_file_bytes"]
+    budget = recipe.get("artifact_budget")
+    event_allowance = budget["maximum_event_bytes"] if reserve_event_budget and type(budget) is dict else 0
+    receipt_allowance = MAX_MANIFEST_BYTES if type(budget) is dict else 0
+    try:
+        scratch_info = scratch_path.stat()
+        output_info = output_dir.stat()
+        outputvfs = os.statvfs(output_dir)
+    except OSError as error:
+        raise PressureError(f"cannot inspect artifact free-space watchdog: {error}") from error
+    available = outputvfs.f_bavail * outputvfs.f_frsize
+    shared_device = scratch_info.st_dev == output_info.st_dev
+    if shared_device:
+        required = floor + scratch_allowance + event_allowance + receipt_allowance
+        require(disk_free >= required, "shared application/artifact device fell below its bounded scratch/event/receipt reserve")
+    else:
+        require(disk_free >= floor + scratch_allowance, "application block device fell below its scratch/free-space reserve")
+        require(output_free >= floor + event_allowance + receipt_allowance, "artifact device fell below its frozen event/receipt reserve")
+    require(stat.S_ISDIR(output_info.st_mode) and available >= floor + event_allowance + receipt_allowance, "artifact storage free-space watchdog failed")
+
+
+class WorkerSet:
+    def __init__(self, recipe: dict[str, Any]):
+        self.recipe = recipe
+        self.driver_pid = os.getpid()
+        self.driver_start_ticks = _proc_stat(self.driver_pid)["start_ticks"]
+        self.children: list[dict[str, Any]] = []
+        self.selector = selectors.DefaultSelector()
+        self.lines: dict[int, dict[int, dict[str, Any]]] = {}
+        self.buffers: dict[int, bytes] = {}
+        self.scratch_file: Path | None = None
+        self.scratch_removed = False
+        self.scratch_identity: tuple[int, int] | None = None
+        self._spawned = False
+        self._ownership_sha256: str | None = None
+        self._next_window_sequence = 0
+        self._last_window_end_ns: int | None = None
+        self._final_capture_sent = False
+
+    def spawn(self) -> None:
+        require(os.getsid(0) == os.getpid(), "driver must start in a fresh dedicated session")
+        recipe = self.recipe
+        script = str(DRIVER_PATH)
+        schedule = recipe["schedule"]
+        common = [
+            sys.executable, script, "_worker",
+            "--recipe-sha256", recipe["recipe_sha256"],
+            "--owner-nonce", recipe["identity"]["nonce"],
+            "--driver-pid", str(self.driver_pid),
+            "--driver-start-ticks", str(self.driver_start_ticks),
+            "--interval-ms", str(schedule["sample_interval_ms"]),
+            "--duration-seconds", str(schedule["duration_seconds"]),
+            "--seed", str(schedule["seed"]),
+        ]
+        try:
+            for cpu_id in schedule["pressure_cpu_affinity"]:
+                process = subprocess.Popen(
+                    common + ["--kind", "cpu", "--cpu", str(cpu_id), "--duty-basis-points", str(schedule["cpu_duty_basis_points"])],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    close_fds=True, start_new_session=True, bufsize=0,
+                    cwd="/", env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONUNBUFFERED": "1"},
+                )
+                self._add_child(process, "cpu", cpu_id)
+            scratch = Path(recipe["storage"]["pressure_scratch_path"]) / f".allocatbelt-pressure-{recipe['identity']['nonce']}.bin"
+            self.scratch_file = scratch
+            require(not scratch.exists() and not scratch.is_symlink(), "pressure scratch name already exists")
+            scratch_fd = os.open(
+                scratch,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                info = os.fstat(scratch_fd)
+                require(stat.S_ISREG(info.st_mode), "pressure scratch file is not regular")
+                expected_device = recipe["storage"]["application_device"]
+                observed_device = f"{os.major(info.st_dev)}:{os.minor(info.st_dev)}"
+                require(observed_device == expected_device, "pressure scratch file escaped the frozen application device")
+                self.scratch_identity = (info.st_dev, info.st_ino)
+                os.posix_fallocate(scratch_fd, 0, schedule["scratch_file_bytes"])
+                os.fsync(scratch_fd)
+            finally:
+                os.close(scratch_fd)
+            process = subprocess.Popen(
+                common + [
+                    "--kind", "disk", "--scratch-file", str(scratch),
+                    "--scratch-bytes", str(schedule["scratch_file_bytes"]),
+                    "--scratch-device", str(self.scratch_identity[0]),
+                    "--scratch-inode", str(self.scratch_identity[1]),
+                    "--disk-rate", str(schedule["disk_bytes_per_second"]),
+                ],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                close_fds=True, start_new_session=True, bufsize=0,
+                cwd="/", env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONUNBUFFERED": "1"},
+            )
+            self._add_child(process, "disk", None)
+            process = subprocess.Popen(
+                common + [
+                    "--kind", "loopback", "--requests-per-second", str(schedule["network_requests_per_second"]),
+                    "--payload-bytes", str(schedule["network_payload_bytes"]),
+                ],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                close_fds=True, start_new_session=True, bufsize=0,
+                cwd="/", env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONUNBUFFERED": "1"},
+            )
+            self._add_child(process, "loopback", None)
+            self._spawned = True
+        except BaseException:
+            self.cleanup(0, 0)
+            raise
+
+    def _add_child(self, process: subprocess.Popen[bytes], role: str, cpu: int | None) -> None:
+        require(process.stdout is not None and process.stdin is not None, "pressure worker pipes were not created")
+        record = {
+            "role": role,
+            "cpu": cpu,
+            "pid": process.pid,
+            "pgid": process.pid,
+            "session_id": process.pid,
+            "process": process,
+            "start_ticks": None,
+            "ready": False,
+            "ownership_ack": None,
+            "stderr": process.stderr,
+            "stderr_raw_capture": bytearray(),
+            "stderr_raw_truncated": False,
+            "stderr_read_error": None,
+            "stderr_capture_complete": False,
+        }
+        self.children.append(record)
+        self.lines[process.pid] = {}
+        self.buffers[process.pid] = b""
+        os.set_blocking(process.stdout.fileno(), False)
+        self.selector.register(process.stdout, selectors.EVENT_READ, record)
+
+    def await_ready(self, deadline_ns: int) -> None:
+        while not all(child["ready"] for child in self.children):
+            now = time.monotonic_ns()
+            require(now < deadline_ns, "pressure worker startup/readiness deadline expired")
+            for key, _ in self.selector.select(min(0.1, (deadline_ns - now) / 1_000_000_000)):
+                self._consume(key.fileobj, key.data)
+            for child in self.children:
+                process = child["process"]
+                if process.poll() is not None and not child["ready"]:
+                    detail = self._stderr_excerpt(child)
+                    raise PressureError(f"{child['role']} worker exited before startup readiness: {detail}")
+        for child in self.children:
+            child["start_ticks"] = _proc_stat(child["pid"])["start_ticks"]
+            child["affinity"] = _affinity(child["pid"])
+            require(child["affinity"] == ([child["cpu"]] if child["cpu"] is not None else child["affinity"]), "pressure CPU worker affinity differs from its frozen CPU")
+            child["pgid_observed"] = os.getpgid(child["pid"])
+            child["sid_observed"] = os.getsid(child["pid"])
+            require(child["pgid_observed"] == child["pid"] and child["sid_observed"] == child["pid"], "pressure worker is not isolated in its own process group and session")
+
+    def ownership_rows(self) -> list[dict[str, Any]]:
+        require(self.children and all(child["ready"] and child["start_ticks"] is not None for child in self.children), "pressure worker ownership cannot be journaled before every worker is ready and identified")
+        rows = [
+            {
+                "role": child["role"], "cpu": child["cpu"], "pid": child["pid"],
+                "start_ticks": child["start_ticks"], "pgid": child["pgid_observed"],
+                "session_id": child["sid_observed"], "nonce": self.recipe["identity"]["nonce"],
+            }
+            for child in self.children
+        ]
+        return sorted(rows, key=lambda item: (item["role"], -1 if item["cpu"] is None else item["cpu"]))
+
+    def grant_ownership(self, ownership_sha256: str) -> None:
+        sha256(ownership_sha256, "durable worker ownership journal SHA-256")
+        self._ownership_sha256 = ownership_sha256
+        rows = {(item["role"], item["cpu"]): item for item in self.ownership_rows()}
+        for child in self.children:
+            row = rows[(child["role"], child["cpu"])]
+            grant = {
+                "schema": OWNERSHIP_GRANT_SCHEMA,
+                "recipe_sha256": self.recipe["recipe_sha256"],
+                "nonce": self.recipe["identity"]["nonce"],
+                "ownership_sha256": ownership_sha256,
+                "worker": row,
+            }
+            stream = child["process"].stdin
+            require(stream is not None and not stream.closed, "pressure worker ownership pipe is unavailable")
+            stream.write(canonical_bytes(grant))
+            stream.flush()
+
+    def await_ownership_ack(self, ownership_sha256: str, deadline_ns: int) -> list[dict[str, Any]]:
+        sha256(ownership_sha256, "durable worker ownership journal SHA-256")
+        while not all(child["ownership_ack"] is not None for child in self.children):
+            now = time.monotonic_ns()
+            require(now < deadline_ns, "pressure worker ownership acknowledgement deadline expired")
+            for key, _ in self.selector.select(min(0.05, (deadline_ns - now) / 1_000_000_000)):
+                self._consume(key.fileobj, key.data)
+            for child in self.children:
+                process = child["process"]
+                if process.poll() is not None and child["ownership_ack"] is None:
+                    detail = self._stderr_excerpt(child)
+                    raise PressureError(f"{child['role']} worker exited before ownership acknowledgement: {detail}")
+        acknowledgements = [child["ownership_ack"] for child in self.children]
+        require(all(item["ownership_sha256"] == ownership_sha256 for item in acknowledgements), "worker ownership acknowledgement names a different journal digest")
+        return sorted(acknowledgements, key=lambda item: (item["role"], -1 if item["cpu"] is None else item["cpu"]))
+
+    def begin(self, start_ns: int, ownership_sha256: str, authorization_sha256: str) -> None:
+        sha256(ownership_sha256, "work-start ownership journal SHA-256")
+        sha256(authorization_sha256, "work-start authorization journal SHA-256")
+        for child in self.children:
+            stream = child["process"].stdin
+            require(stream is not None and not stream.closed, "worker stdin disappeared before work authorization")
+            message = {
+                "schema": WORKER_START_SCHEMA,
+                "recipe_sha256": self.recipe["recipe_sha256"],
+                "nonce": self.recipe["identity"]["nonce"],
+                "ownership_sha256": ownership_sha256,
+                "authorization_sha256": authorization_sha256,
+                "pid": child["pid"],
+                "start_ticks": child["start_ticks"],
+                "start_monotonic_ns": start_ns,
+            }
+            stream.write(canonical_bytes(message))
+            stream.flush()
+
+    def grant_sample_window(self, sequence: int, window_start_ns: int) -> int:
+        require(sequence == self._next_window_sequence,
+                "sample window grant is duplicated or out of order")
+        require(self._ownership_sha256 is not None,
+                "sample window cannot start before durable worker ownership")
+        uint(window_start_ns, "worker sample window start", positive=True)
+        require(self._last_window_end_ns is None or window_start_ns >= self._last_window_end_ns,
+                "worker sample-window start regressed or overlapped its previous grant")
+        interval_ns = self.recipe["schedule"]["sample_interval_ms"] * 1_000_000
+        window_end_ns = window_start_ns + interval_ns
+        for child in self.children:
+            stream = child["process"].stdin
+            require(stream is not None and not stream.closed,
+                    "worker sample window control pipe is unavailable")
+            worker_identity = {
+                "role": child["role"], "cpu": child["cpu"],
+                "pid": child["pid"], "start_ticks": child["start_ticks"],
+                "pgid": child["pgid_observed"], "session_id": child["sid_observed"],
+            }
+            grant = {
+                "schema": WORKER_WINDOW_GRANT_SCHEMA,
+                "recipe_sha256": self.recipe["recipe_sha256"],
+                "nonce": self.recipe["identity"]["nonce"],
+                "ownership_sha256": self._ownership_sha256,
+                "sequence": sequence,
+                "window_start_monotonic_ns": window_start_ns,
+                "window_end_monotonic_ns": window_end_ns,
+                "driver_pid": self.driver_pid,
+                "driver_start_ticks": self.driver_start_ticks,
+                "worker": worker_identity,
+            }
+            stream.write(canonical_bytes(grant))
+            stream.flush()
+        self._next_window_sequence += 1
+        self._last_window_end_ns = window_end_ns
+        return window_end_ns
+
+    def finish_sample_capture(self, sequence: int) -> None:
+        require(not self._final_capture_sent, "final worker capture release is duplicated")
+        require(sequence == self._next_window_sequence - 1,
+                "final worker capture release does not name the last granted window")
+        require(self._ownership_sha256 is not None,
+                "final worker capture release precedes durable ownership")
+        for child in self.children:
+            stream = child["process"].stdin
+            require(stream is not None and not stream.closed,
+                    "worker final-capture control pipe is unavailable")
+            message = {
+                "schema": WORKER_FINAL_CAPTURE_SCHEMA,
+                "recipe_sha256": self.recipe["recipe_sha256"],
+                "nonce": self.recipe["identity"]["nonce"],
+                "ownership_sha256": self._ownership_sha256,
+                "sequence": sequence,
+                "driver_pid": self.driver_pid,
+                "driver_start_ticks": self.driver_start_ticks,
+                "worker": {
+                    "role": child["role"], "cpu": child["cpu"],
+                    "pid": child["pid"], "start_ticks": child["start_ticks"],
+                    "pgid": child["pgid_observed"], "session_id": child["sid_observed"],
+                },
+            }
+            stream.write(canonical_bytes(message))
+            stream.flush()
+            stream.close()
+        self._final_capture_sent = True
+
+    def wait_sample(self, seq: int, deadline_ns: int) -> dict[str, Any]:
+        target = {child["pid"] for child in self.children}
+        while True:
+            ready = {pid for pid in target if seq in self.lines[pid]}
+            if ready == target:
+                break
+            now = time.monotonic_ns()
+            require(now < deadline_ns, f"pressure workers produced a sparse/missing sample at sequence {seq}")
+            for key, _ in self.selector.select(min(0.05, (deadline_ns - now) / 1_000_000_000)):
+                self._consume(key.fileobj, key.data)
+            for child in self.children:
+                process = child["process"]
+                if process.poll() is not None and seq not in self.lines[child["pid"]]:
+                    detail = self._stderr_excerpt(child)
+                    raise PressureError(f"{child['role']} pressure worker exited during sample {seq}: {detail}")
+        records = {child["role"] if child["cpu"] is None else f"cpu:{child['cpu']}": self.lines[child["pid"]].pop(seq) for child in self.children}
+        return records
+    def _consume(self, stream: Any, child: dict[str, Any]) -> None:
+        try:
+            chunk = os.read(stream.fileno(), 65536)
+        except BlockingIOError:
+            return
+        except OSError as error:
+            raise PressureError(f"cannot read {child['role']} worker telemetry: {error}") from error
+        if not chunk:
+            return
+        pid = child["pid"]
+        pending = self.buffers[pid] + chunk
+        require(len(pending) <= 1024 * 1024, f"{child['role']} worker telemetry line exceeds its bound")
+        pieces = pending.split(b"\n")
+        self.buffers[pid] = pieces.pop()
+        for raw_line in pieces:
+            require(len(raw_line) <= 65536, f"{child['role']} worker telemetry line is oversized")
+            item = parse_object(raw_line, f"{child['role']} worker telemetry", 65536)
+            require(raw_line + b"\n" == canonical_bytes(item), f"{child['role']} worker telemetry is not canonical")
+            if item.get("event") == "ready":
+                require(not child["ready"] and item.get("recipe_sha256") == self.recipe["recipe_sha256"] and item.get("role") == child["role"], "worker startup record is duplicated or mismatched")
+                if child["cpu"] is not None:
+                    require(item.get("cpu") == child["cpu"], "CPU worker started on the wrong logical CPU")
+                elif child["role"] == "loopback":
+                    require(item.get("address", [None])[0] == "127.0.0.1", "loopback worker did not bind IPv4 loopback")
+                    require(item.get("network_namespace_inode") == self.recipe["network"]["network_namespace_inode"], "loopback worker entered a different network namespace")
+                    child["loopback_address"] = item["address"]
+                child["ready"] = True
+                continue
+            if item.get("event") == "ownership_ack":
+                ack = exact_object(item, {
+                    "schema", "event", "recipe_sha256", "nonce", "ownership_sha256", "role", "cpu",
+                    "pid", "start_ticks", "pgid", "session_id", "ack_sha256",
+                }, "pressure worker ownership acknowledgement")
+                ack_body = {key: value for key, value in ack.items() if key != "ack_sha256"}
+                require(
+                    ack["schema"] == "allocatbelt.application-pressure-worker-ownership-ack.v1"
+                    and ack["recipe_sha256"] == self.recipe["recipe_sha256"]
+                    and ack["nonce"] == self.recipe["identity"]["nonce"]
+                    and ack["role"] == child["role"] and ack["cpu"] == child["cpu"]
+                    and ack["pid"] == child["pid"] and ack["start_ticks"] == child["start_ticks"]
+                    and ack["pgid"] == child["pgid_observed"] and ack["session_id"] == child["sid_observed"]
+                    and digest_object(ack_body) == ack["ack_sha256"],
+                    "pressure worker ownership acknowledgement differs from the durable parent row",
+                )
+                require(child["ownership_ack"] is None, "pressure worker repeated its ownership acknowledgement")
+                child["ownership_ack"] = ack
+                continue
+            seq = uint(item.get("sequence"), "worker sample sequence")
+            require(seq not in self.lines[pid], f"{child['role']} worker repeated sample {seq}")
+            self.lines[pid][seq] = item
+
+    def _stderr_capture(self, child: dict[str, Any]) -> tuple[bytes, bool, str | None]:
+        stream = child["stderr"]
+        if stream is None:
+            return b"", False, "worker stderr pipe is unavailable"
+        if child["stderr_capture_complete"]:
+            return bytes(child["stderr_raw_capture"]), child["stderr_raw_truncated"], child["stderr_read_error"]
+        try:
+            os.set_blocking(stream.fileno(), False)
+            while True:
+                try:
+                    raw = os.read(stream.fileno(), 4096)
+                except BlockingIOError:
+                    break
+                if not raw:
+                    child["stderr_capture_complete"] = True
+                    break
+                captured = child["stderr_raw_capture"]
+                remaining = MAX_WORKER_STDERR_RAW_BYTES - len(captured)
+                if remaining > 0:
+                    captured.extend(raw[:remaining])
+                if len(raw) > remaining:
+                    child["stderr_raw_truncated"] = True
+                if child["stderr_raw_truncated"]:
+                    # Drain a bounded amount on each call while retaining only
+                    # the exact prefix. This keeps a noisy worker from filling
+                    # its pipe without allowing unbounded evidence growth.
+                    break
+        except OSError as error:
+            child["stderr_read_error"] = f"{type(error).__name__}: {error}"
+        if child["process"].poll() is not None:
+            child["stderr_capture_complete"] = True
+        return bytes(child["stderr_raw_capture"]), child["stderr_raw_truncated"], child["stderr_read_error"]
+
+    def _stderr_excerpt(self, child: dict[str, Any]) -> str:
+        raw, _, read_error = self._stderr_capture(child)
+        if read_error is not None:
+            return f"worker stderr unavailable: {read_error}"
+        return raw.decode("utf-8", errors="replace")[:4096].strip() or "no worker stderr"
+
+    def process_io(self) -> dict[str, dict[str, int]]:
+        return {child["role"] if child["cpu"] is None else f"cpu:{child['cpu']}": _proc_io(child["pid"]) for child in self.children}
+
+    def cleanup(self, term_seconds: int, kill_seconds: int) -> list[dict[str, Any]]:
+        if not self._spawned and not self.children:
+            return []
+        cleanup_start = time.monotonic_ns()
+        term_deadline = cleanup_start + max(0, term_seconds) * 1_000_000_000
+        for child in self.children:
+            process = child["process"]
+            if process.poll() is None:
+                try:
+                    os.killpg(child["pgid"], signal.SIGTERM)
+                    child["term_sent_monotonic_ns"] = time.monotonic_ns()
+                except ProcessLookupError:
+                    pass
+                except OSError as error:
+                    child["term_error"] = str(error)
+        for child in self.children:
+            process = child["process"]
+            if process.poll() is None:
+                remaining = max(0.0, (term_deadline - time.monotonic_ns()) / 1_000_000_000)
+                try:
+                    process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    pass
+        kill_started = time.monotonic_ns()
+        kill_deadline = kill_started + max(0, kill_seconds) * 1_000_000_000
+        for child in self.children:
+            process = child["process"]
+            if process.poll() is None:
+                try:
+                    os.killpg(child["pgid"], signal.SIGKILL)
+                    child["kill_sent_monotonic_ns"] = time.monotonic_ns()
+                except ProcessLookupError:
+                    pass
+                except OSError as error:
+                    child["kill_error"] = str(error)
+        records: list[dict[str, Any]] = []
+        for child in self.children:
+            process = child["process"]
+            if process.poll() is None:
+                remaining = max(0.0, (kill_deadline - time.monotonic_ns()) / 1_000_000_000)
+                try:
+                    process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    child["reap_error"] = "worker survived the KILL deadline"
+            returncode = process.poll()
+            reaped_ns = time.monotonic_ns() if returncode is not None else None
+            remains = _pid_exists(child["pid"], child.get("start_ticks") or 0)
+            stderr_raw, stderr_truncated, stderr_read_error = self._stderr_capture(child)
+            stderr_text = stderr_raw.decode("utf-8", errors="replace")[:4096].strip()
+            if stderr_text == "no worker stderr":
+                stderr_text = ""
+            record = {
+                "role": child["role"], "cpu": child["cpu"], "pid": child["pid"],
+                "start_ticks": child.get("start_ticks"), "pgid": child["pgid"],
+                "session_id": child["session_id"], "exit_code": returncode,
+                "cleanup_started_monotonic_ns": cleanup_start,
+                "term_deadline_monotonic_ns": term_deadline,
+                "kill_deadline_monotonic_ns": kill_deadline,
+                "term_error": child.get("term_error"), "kill_error": child.get("kill_error"),
+                "reap_error": child.get("reap_error"), "alive_after_cleanup": remains,
+                "stderr_output": stderr_text,
+                "stderr_raw_base64": base64.b64encode(stderr_raw).decode("ascii"),
+                "stderr_raw_sha256": digest_bytes(stderr_raw),
+                "stderr_raw_bytes": len(stderr_raw),
+                "stderr_raw_truncated": stderr_truncated,
+                "stderr_read_error": stderr_read_error,
+                "term_sent_monotonic_ns": child.get("term_sent_monotonic_ns"),
+                "kill_sent_monotonic_ns": child.get("kill_sent_monotonic_ns"),
+                "reaped_monotonic_ns": reaped_ns,
+            }
+            if process.stdout is not None:
+                try:
+                    self.selector.unregister(process.stdout)
+                except Exception:
+                    pass
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            records.append(record)
+        self.selector.close()
+        if self.scratch_file is not None:
+            try:
+                if self.scratch_file.exists() or self.scratch_file.is_symlink():
+                    info = self.scratch_file.lstat()
+                    require(self.scratch_identity == (info.st_dev, info.st_ino), "pressure scratch path identity changed before cleanup")
+                    self.scratch_file.unlink()
+                self.scratch_removed = not self.scratch_file.exists() and not self.scratch_file.is_symlink()
+            except FileNotFoundError:
+                self.scratch_removed = True
+            except OSError as error:
+                records.append({"role": "scratch_cleanup", "error": str(error), "alive_after_cleanup": True})
+        return records
+
+
+def _worker_exit_was_bounded(record: dict[str, Any]) -> bool:
+    code = record.get("exit_code")
+    if code == 0:
+        return True
+    if code == -signal.SIGTERM:
+        return record.get("term_sent_monotonic_ns") is not None and record.get("kill_sent_monotonic_ns") is None
+    if code == -signal.SIGKILL:
+        return record.get("kill_sent_monotonic_ns") is not None
+    return False
+
+
+def _validate_worker_stderr_capture(record: dict[str, Any], label: str) -> bytes:
+    encoded = record["stderr_raw_base64"]
+    require(type(encoded) is str and len(encoded) <= ((MAX_WORKER_STDERR_RAW_BYTES + 2) // 3) * 4, f"{label} raw stderr capture exceeds its bound")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise PressureError(f"{label} raw stderr capture is not canonical base64: {error}") from error
+    require(len(raw) == uint(record["stderr_raw_bytes"], f"{label} stderr byte count", maximum=MAX_WORKER_STDERR_RAW_BYTES), f"{label} raw stderr byte count differs")
+    require(digest_bytes(raw) == sha256(record["stderr_raw_sha256"], f"{label} stderr SHA-256"), f"{label} raw stderr digest differs")
+    require(type(record["stderr_raw_truncated"]) is bool and record["stderr_raw_truncated"] is False, f"{label} raw stderr capture was truncated")
+    require(record["stderr_read_error"] is None, f"{label} raw stderr could not be completely read")
+    excerpt = raw.decode("utf-8", errors="replace")[:4096].strip()
+    require(record["stderr_output"] == excerpt, f"{label} stderr excerpt differs from its raw capture")
+    return raw
+
+
+def _worker_emit(value: dict[str, Any]) -> None:
+    raw = canonical_bytes(value)
+    written = os.write(sys.stdout.fileno(), raw)
+    require(written == len(raw), "short worker telemetry write")
+
+
+def _worker_read_control_line(label: str, deadline_ns: int | None = None) -> bytes | None:
+    descriptor = sys.stdin.fileno()
+    while True:
+        newline = _WORKER_CONTROL_BUFFER.find(b"\n")
+        if newline >= 0:
+            line = bytes(_WORKER_CONTROL_BUFFER[:newline])
+            del _WORKER_CONTROL_BUFFER[:newline + 1]
+            require(len(line) <= 65536, f"{label} exceeds its finite line bound")
+            return line
+        require(len(_WORKER_CONTROL_BUFFER) <= 65536,
+                f"{label} exceeds its finite line bound")
+        if _WORKER_STOP_REQUESTED:
+            return None
+        timeout = 0.05
+        if deadline_ns is not None:
+            remaining_ns = deadline_ns - time.monotonic_ns()
+            require(remaining_ns > 0, f"{label} deadline expired")
+            timeout = min(timeout, remaining_ns / 1_000_000_000)
+        try:
+            readable, _, _ = select.select([descriptor], [], [], timeout)
+        except InterruptedError:
+            if _WORKER_STOP_REQUESTED:
+                return None
+            continue
+        if not readable:
+            continue
+        try:
+            chunk = os.read(descriptor, 65536)
+        except InterruptedError:
+            if _WORKER_STOP_REQUESTED:
+                return None
+            continue
+        require(bool(chunk), f"parent closed the {label} control pipe")
+        _WORKER_CONTROL_BUFFER.extend(chunk)
+
+
+def _worker_read_ownership(args: argparse.Namespace) -> dict[str, Any]:
+    raw = _worker_read_control_line("worker ownership grant")
+    if raw is None:
+        raise WorkerStop("worker stopped before ownership grant")
+    value = parse_object(raw, "worker ownership grant", 65536)
+    require(raw + b"\n" == canonical_bytes(value), "worker ownership grant is not canonical")
+    grant = exact_object(value, {
+        "schema", "recipe_sha256", "nonce", "ownership_sha256", "worker",
+    }, "worker ownership grant")
+    require(grant["schema"] == OWNERSHIP_GRANT_SCHEMA and grant["recipe_sha256"] == args.recipe_sha256, "worker ownership grant recipe differs")
+    require(grant["nonce"] == args.owner_nonce and re.fullmatch(r"[0-9a-f]{32}", grant["nonce"]) is not None, "worker ownership grant nonce differs")
+    ownership_sha = sha256(grant["ownership_sha256"], "worker ownership journal SHA-256")
+    worker = exact_object(grant["worker"], {
+        "role", "cpu", "pid", "start_ticks", "pgid", "session_id", "nonce",
+    }, "worker ownership identity")
+    role = args.kind
+    cpu = args.cpu if role == "cpu" else None
+    observed = _proc_stat(os.getpid())
+    require(
+        worker["role"] == role and worker["cpu"] == cpu
+        and worker["pid"] == os.getpid() and worker["start_ticks"] == observed["start_ticks"]
+        and worker["pgid"] == os.getpgrp() == os.getpid()
+        and worker["session_id"] == os.getsid(0) == os.getpid()
+        and worker["nonce"] == grant["nonce"],
+        "worker ownership grant does not match this PID/start/session/nonce",
+    )
+    ack_body = {
+        "schema": "allocatbelt.application-pressure-worker-ownership-ack.v1",
+        "event": "ownership_ack",
+        "recipe_sha256": args.recipe_sha256,
+        "nonce": grant["nonce"],
+        "ownership_sha256": ownership_sha,
+        **{key: worker[key] for key in ("role", "cpu", "pid", "start_ticks", "pgid", "session_id")},
+    }
+    ack = {**ack_body, "ack_sha256": digest_object(ack_body)}
+    _worker_emit(ack)
+    return {**ack_body, "ack_sha256": ack["ack_sha256"]}
+
+
+def _worker_read_start(args: argparse.Namespace, ownership: dict[str, Any]) -> int:
+    raw = _worker_read_control_line("worker work-start barrier")
+    if raw is None:
+        raise WorkerStop("worker stopped before work-start grant")
+    value = parse_object(raw, "worker work-start barrier", 65536)
+    require(raw + b"\n" == canonical_bytes(value), "worker work-start barrier is not canonical")
+    start = exact_object(value, {
+        "schema", "recipe_sha256", "nonce", "ownership_sha256", "authorization_sha256",
+        "pid", "start_ticks", "start_monotonic_ns",
+    }, "worker work-start barrier")
+    require(start["schema"] == WORKER_START_SCHEMA and start["recipe_sha256"] == args.recipe_sha256, "worker work-start barrier recipe differs")
+    require(start["nonce"] == ownership["nonce"] and start["ownership_sha256"] == ownership["ownership_sha256"], "worker work-start barrier ownership differs")
+    sha256(start["authorization_sha256"], "worker authorization event SHA-256")
+    require(start["pid"] == os.getpid() and start["start_ticks"] == ownership["start_ticks"], "worker work-start barrier PID/start differs")
+    return uint(start["start_monotonic_ns"], "worker start time", positive=True)
+
+
+def _worker_read_window_grant(
+    args: argparse.Namespace, ownership: dict[str, Any], sequence: int,
+    grant_deadline_ns: int, previous_window_end_ns: int | None,
+) -> tuple[int, int] | None:
+    interval_ns = args.interval_ms * 1_000_000
+    raw = _worker_read_control_line("worker sample-window grant", grant_deadline_ns)
+    if raw is None:
+        return None
+    value = parse_object(raw, "worker sample-window grant", 65536)
+    require(raw + b"\n" == canonical_bytes(value), "worker sample-window grant is not canonical")
+    grant = exact_object(value, {
+        "schema", "recipe_sha256", "nonce", "ownership_sha256", "sequence",
+        "window_start_monotonic_ns", "window_end_monotonic_ns", "driver_pid",
+        "driver_start_ticks", "worker",
+    }, "worker sample-window grant")
+    observed_sequence = uint(grant["sequence"], "worker sample-window sequence", maximum=MAX_SAMPLES - 1)
+    require(grant["schema"] == WORKER_WINDOW_GRANT_SCHEMA and
+            grant["recipe_sha256"] == args.recipe_sha256 and
+            grant["nonce"] == args.owner_nonce and
+            grant["ownership_sha256"] == ownership["ownership_sha256"] and
+            observed_sequence == sequence,
+            "worker sample-window grant recipe, owner, or sequence differs")
+    worker = exact_object(grant["worker"], {
+        "role", "cpu", "pid", "start_ticks", "pgid", "session_id",
+    }, "sample-window worker identity")
+    require(worker == {
+        "role": args.kind, "cpu": args.cpu if args.kind == "cpu" else None,
+        "pid": os.getpid(), "start_ticks": ownership["start_ticks"],
+        "pgid": os.getpgrp(), "session_id": os.getsid(0),
+    }, "worker sample-window grant identity differs")
+    require(grant["driver_pid"] == args.driver_pid and
+            grant["driver_start_ticks"] == args.driver_start_ticks and
+            _proc_stat(args.driver_pid)["start_ticks"] == args.driver_start_ticks,
+            "sample-window grant came from another driver PID/start")
+    window_start = uint(grant["window_start_monotonic_ns"], "sample-window start", positive=True)
+    window_end = uint(grant["window_end_monotonic_ns"], "sample-window end", positive=True)
+    require(window_end - window_start == interval_ns and
+            (previous_window_end_ns is None or window_start >= previous_window_end_ns),
+            "sample-window grant changed cadence or regressed its window")
+    require(time.monotonic_ns() <= grant_deadline_ns,
+            "worker sample-window grant arrived after its finite deadline")
+    return window_start, window_end
+
+def _worker_wait_for_final_capture(
+    args: argparse.Namespace, ownership: dict[str, Any], sequence: int,
+    deadline_ns: int,
+) -> None:
+    raw = _worker_read_control_line("worker final-capture release", deadline_ns)
+    if raw is None:
+        raise WorkerStop("worker stopped before final counter capture")
+    value = parse_object(raw, "worker final-capture release", 65536)
+    require(raw + b"\n" == canonical_bytes(value),
+            "worker final-capture release is not canonical")
+    message = exact_object(value, {
+        "schema", "recipe_sha256", "nonce", "ownership_sha256", "sequence",
+        "driver_pid", "driver_start_ticks", "worker",
+    }, "worker final-capture release")
+    worker = exact_object(message["worker"], {
+        "role", "cpu", "pid", "start_ticks", "pgid", "session_id",
+    }, "final-capture worker identity")
+    observed_sequence = uint(message["sequence"], "final-capture sequence", maximum=MAX_SAMPLES - 1)
+    require(message["schema"] == WORKER_FINAL_CAPTURE_SCHEMA and
+            message["recipe_sha256"] == args.recipe_sha256 and
+            message["nonce"] == args.owner_nonce and
+            message["ownership_sha256"] == ownership["ownership_sha256"] and
+            observed_sequence == sequence and
+            message["driver_pid"] == args.driver_pid and
+            message["driver_start_ticks"] == args.driver_start_ticks and
+            _proc_stat(args.driver_pid)["start_ticks"] == args.driver_start_ticks and
+            worker == {
+                "role": args.kind, "cpu": args.cpu if args.kind == "cpu" else None,
+                "pid": os.getpid(), "start_ticks": ownership["start_ticks"],
+                "pgid": os.getpgrp(), "session_id": os.getsid(0),
+            },
+            "final-capture release recipe, owner, sequence, or worker identity differs")
+
+
+def _sleep_until(
+    target_ns: int,
+    *,
+    deadline_ns: int | None = None,
+    maximum_sleep_ns: int = 10_000_000,
+    label: str = "monotonic wait",
+) -> None:
+    uint(target_ns, f"{label} target", positive=True)
+    uint(maximum_sleep_ns, f"{label} maximum sleep", positive=True)
+    if deadline_ns is not None:
+        uint(deadline_ns, f"{label} deadline", positive=True)
+        require(target_ns <= deadline_ns, f"{label} target exceeds its finite deadline")
+    while True:
+        now = time.monotonic_ns()
+        if deadline_ns is not None:
+            require(now <= deadline_ns, f"{label} exceeded its finite deadline")
+        if now >= target_ns:
+            return
+        sleep_ns = min(target_ns - now, maximum_sleep_ns)
+        if deadline_ns is not None:
+            sleep_ns = min(sleep_ns, deadline_ns - now)
+        if sleep_ns > 0:
+            time.sleep(sleep_ns / 1_000_000_000)
+
+
+def _worker_wait_until(target_ns: int) -> None:
+    _sleep_until(target_ns, maximum_sleep_ns=10_000_000, label="worker start barrier")
+
+
+def _worker_cpu(args: argparse.Namespace) -> None:
+    os.sched_setaffinity(0, {args.cpu})
+    if os.sched_getaffinity(0) != {args.cpu}:
+        raise PressureError("CPU worker could not pin itself to the frozen CPU")
+    _worker_emit({"event": "ready", "role": "cpu", "cpu": args.cpu, "recipe_sha256": args.recipe_sha256})
+    ownership = _worker_read_ownership(args)
+    start_ns = _worker_read_start(args, ownership)
+    _worker_wait_until(start_ns)
+    interval_ns = args.interval_ms * 1_000_000
+    duty_ns = interval_ns * args.duty_basis_points // 10000
+    sample_count = args.duration_seconds * 1000 // args.interval_ms
+    grant_deadline_ns = start_ns + max(500_000_000, interval_ns // 2)
+    previous_window_end_ns: int | None = None
+    for sequence in range(sample_count):
+        if _WORKER_STOP_REQUESTED:
+            break
+        grant = _worker_read_window_grant(
+            args, ownership, sequence, grant_deadline_ns, previous_window_end_ns,
+        )
+        if grant is None:
+            break
+        target_start, target_end = grant
+        _worker_wait_until(target_start)
+        require(time.monotonic_ns() < target_end,
+                "CPU worker received an expired sample-window grant")
+        interval_start = time.monotonic_ns()
+        busy_end = min(target_end, interval_start + duty_ns)
+        spins = 0
+        while time.monotonic_ns() < busy_end:
+            spins = (spins * 33 + 1) & 0xFFFFFFFF
+        now = time.monotonic_ns()
+        if now < target_end:
+            time.sleep((target_end - now) / 1_000_000_000)
+        actual_end = time.monotonic_ns()
+        _worker_emit({
+            "schema": PRESSURE_IO_SCHEMA, "role": "cpu", "cpu": args.cpu,
+            "recipe_sha256": args.recipe_sha256, "sequence": sequence,
+            "start_monotonic_ns": interval_start, "end_monotonic_ns": actual_end,
+            "thread_cpu_time_ns": time.thread_time_ns(), "spin_witness": spins,
+        })
+        previous_window_end_ns = target_end
+        grant_deadline_ns = target_end + max(500_000_000, interval_ns // 2)
+    if not _WORKER_STOP_REQUESTED:
+        _worker_wait_for_final_capture(args, ownership, sample_count - 1, grant_deadline_ns)
+
+
+def _worker_disk(args: argparse.Namespace) -> None:
+    scratch = Path(args.scratch_file)
+    direct_flag = getattr(os, "O_DIRECT", None)
+    require(type(direct_flag) is int and direct_flag > 0, "Python/Linux does not expose O_DIRECT for independent block-I/O pressure")
+    flags = os.O_RDWR | direct_flag | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(scratch, flags, 0o600)
+    payload_map: mmap.mmap | None = None
+    payload_view: memoryview | None = None
+    try:
+        info = os.fstat(descriptor)
+        require(stat.S_ISREG(info.st_mode) and info.st_size == args.scratch_bytes, "pressure scratch file does not match its frozen size")
+        require(info.st_dev == args.scratch_device and info.st_ino == args.scratch_inode, "pressure scratch file identity changed before worker startup")
+        _worker_emit({"event": "ready", "role": "disk", "recipe_sha256": args.recipe_sha256})
+        ownership = _worker_read_ownership(args)
+        start_ns = _worker_read_start(args, ownership)
+        _worker_wait_until(start_ns)
+        interval_ns = args.interval_ms * 1_000_000
+        sample_count = args.duration_seconds * 1000 // args.interval_ms
+        grant_deadline_ns = start_ns + max(500_000_000, interval_ns // 2)
+        previous_window_end_ns: int | None = None
+        offset = 0
+        seed_bytes = hashlib.sha256(str(args.seed).encode("ascii")).digest()
+        payload = (seed_bytes * ((BLOCK_BYTES + len(seed_bytes) - 1) // len(seed_bytes)))[:BLOCK_BYTES]
+        payload_map = mmap.mmap(-1, BLOCK_BYTES)
+        payload_map[:] = payload
+        payload_view = memoryview(payload_map)
+        for sequence in range(sample_count):
+            if _WORKER_STOP_REQUESTED:
+                break
+            grant = _worker_read_window_grant(
+                args, ownership, sequence, grant_deadline_ns, previous_window_end_ns,
+            )
+            if grant is None:
+                break
+            target_start, target_end = grant
+            _worker_wait_until(target_start)
+            require(time.monotonic_ns() < target_end,
+                    "disk worker received an expired sample-window grant")
+            interval_start = time.monotonic_ns()
+            target_bytes = max(BLOCK_BYTES, args.disk_rate * args.interval_ms // 1000)
+            writes = 0
+            sync_ns = 0
+            while writes < target_bytes and not _WORKER_STOP_REQUESTED:
+                if offset + BLOCK_BYTES > args.scratch_bytes:
+                    offset = 0
+                count = os.pwrite(descriptor, payload_view, offset)
+                require(count == BLOCK_BYTES, "short pressure block write")
+                offset += count
+                writes += count
+            sync_start = time.monotonic_ns()
+            os.fdatasync(descriptor)
+            sync_ns += time.monotonic_ns() - sync_start
+            now = time.monotonic_ns()
+            if now < target_end:
+                time.sleep((target_end - now) / 1_000_000_000)
+            actual_end = time.monotonic_ns()
+            _worker_emit({
+                "schema": PRESSURE_IO_SCHEMA, "role": "disk", "recipe_sha256": args.recipe_sha256,
+                "sequence": sequence, "start_monotonic_ns": interval_start,
+                "end_monotonic_ns": actual_end, "write_bytes": writes,
+                "write_mode": "o_direct", "fdatasync_count": 1, "fdatasync_time_nanoseconds": sync_ns,
+            })
+            previous_window_end_ns = target_end
+            grant_deadline_ns = target_end + max(500_000_000, interval_ns // 2)
+        if not _WORKER_STOP_REQUESTED:
+            _worker_wait_for_final_capture(args, ownership, sample_count - 1, grant_deadline_ns)
+    finally:
+        if payload_view is not None:
+            payload_view.release()
+        if payload_map is not None:
+            payload_map.close()
+        os.close(descriptor)
+
+
+def _loopback_echo_exchange(
+    client: Any,
+    server: Any,
+    payload: bytes,
+    deadline_ns: int,
+    *,
+    stop_requested: Any = None,
+    clock_ns: Any = None,
+    wait_ready: Any = None,
+) -> bytes | None:
+    """Pump one TCP echo frame through both sockets from their sole owner."""
+    stop_requested = stop_requested or (lambda: _WORKER_STOP_REQUESTED)
+    clock_ns = clock_ns or time.monotonic_ns
+    wait_ready = wait_ready or select.select
+    size = len(payload)
+    require(size > 0, "loopback echo frame must not be empty")
+    require(type(deadline_ns) is int, "loopback echo deadline must be an absolute monotonic timestamp")
+    client_sent = 0
+    server_request = bytearray()
+    server_response: bytes | None = None
+    server_sent = 0
+    client_echo = bytearray()
+
+    def active(stage: str = "") -> bool:
+        if stop_requested():
+            return False
+        if clock_ns() > deadline_ns:
+            raise PressureError("loopback echo exchange exceeded its 2s I/O bound" + stage)
+        return True
+
+    while True:
+        if not active():
+            return None
+        progressed = False
+
+        # The sockets are nonblocking. Try each eligible step in fixed order
+        # before paying for readiness polling; a completed step may enable the
+        # next step in this same turn.
+        if client_sent < size:
+            if not active():
+                return None
+            try:
+                count = client.send(payload[client_sent:])
+            except (BlockingIOError, InterruptedError, TimeoutError):
+                count = None
+            except OSError as error:
+                if not active():
+                    return None
+                raise PressureError(f"loopback client send failed: {type(error).__name__}: {error}") from error
+            if not active():
+                return None
+            if count is not None:
+                if count <= 0:
+                    if stop_requested():
+                        return None
+                    raise PressureError("loopback client send returned no progress")
+                client_sent += count
+                progressed = True
+
+        if len(server_request) < size:
+            if not active():
+                return None
+            try:
+                chunk = server.recv(min(65536, size - len(server_request)))
+            except (BlockingIOError, InterruptedError, TimeoutError):
+                chunk = None
+            except OSError as error:
+                if not active():
+                    return None
+                raise PressureError(f"loopback server receive failed: {type(error).__name__}: {error}") from error
+            if not active():
+                return None
+            if chunk == b"":
+                if stop_requested():
+                    return None
+                raise PressureError("loopback echo peer closed before receiving a full request")
+            if chunk:
+                if not active():
+                    return None
+                server_request.extend(chunk)
+                if not active():
+                    return None
+                progressed = True
+                if len(server_request) == size:
+                    if not active():
+                        return None
+                    server_response = bytes(server_request)
+                    if not active():
+                        return None
+
+        if server_response is not None and server_sent < size:
+            if not active():
+                return None
+            try:
+                count = server.send(server_response[server_sent:])
+            except (BlockingIOError, InterruptedError, TimeoutError):
+                count = None
+            except OSError as error:
+                if not active():
+                    return None
+                raise PressureError(f"loopback server send failed: {type(error).__name__}: {error}") from error
+            if not active():
+                return None
+            if count is not None:
+                if count <= 0:
+                    if stop_requested():
+                        return None
+                    raise PressureError("loopback server send returned no progress")
+                server_sent += count
+                progressed = True
+
+        if client_sent == size and len(client_echo) < size:
+            if not active():
+                return None
+            try:
+                chunk = client.recv(min(65536, size - len(client_echo)))
+            except (BlockingIOError, InterruptedError, TimeoutError):
+                chunk = None
+            except OSError as error:
+                if not active():
+                    return None
+                raise PressureError(f"loopback client receive failed: {type(error).__name__}: {error}") from error
+            if not active(" after final receive"):
+                return None
+            if chunk == b"":
+                if stop_requested():
+                    return None
+                raise PressureError("loopback echo peer closed before the full echo was observed")
+            if chunk:
+                if not active():
+                    return None
+                client_echo.extend(chunk)
+                if not active():
+                    return None
+                progressed = True
+                if len(client_echo) == size:
+                    if not active():
+                        return None
+                    echoed = bytes(client_echo)
+                    if not active(" after frame assembly"):
+                        return None
+                    return echoed
+
+        if progressed:
+            continue
+        if not active():
+            return None
+
+        # Poll only when every currently eligible nonblocking operation made
+        # no progress. The returned readiness is a hint; the next turn retries
+        # the operations in the same deterministic order and handles stale
+        # readiness through the existing nonblocking error paths.
+        read_sockets = []
+        write_sockets = []
+        if len(server_request) < size:
+            read_sockets.append(server)
+        if server_response is not None and server_sent < size:
+            write_sockets.append(server)
+        if client_sent < size:
+            write_sockets.append(client)
+        if client_sent == size and len(client_echo) < size:
+            read_sockets.append(client)
+        wait_now_ns = clock_ns()
+        if wait_now_ns > deadline_ns:
+            raise PressureError("loopback echo exchange exceeded its 2s I/O bound")
+        wait_seconds = min(0.05, (deadline_ns - wait_now_ns) / 1_000_000_000)
+        try:
+            readable, writable, _ = wait_ready(read_sockets, write_sockets, [], wait_seconds)
+        except (InterruptedError, BlockingIOError):
+            if not active():
+                return None
+            continue
+        except (OSError, ValueError) as error:
+            if not active():
+                return None
+            raise PressureError(f"loopback echo readiness failed: {type(error).__name__}: {error}") from error
+        if not active():
+            return None
+        if not readable and not writable:
+            continue
+
+def _worker_loopback(args: argparse.Namespace) -> None:
+    global _WORKER_STOP_REQUESTED
+    require(hasattr(socket, "AF_INET"), "host has no IPv4 socket support")
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client: socket.socket | None = None
+    connection: socket.socket | None = None
+    try:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(2.0)
+        address = listener.getsockname()
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        client.settimeout(2.0)
+        client.connect(address)
+        connection, peer = listener.accept()
+        require(peer[0] == "127.0.0.1", "loopback server accepted a non-loopback peer")
+        connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        require(client.getpeername()[0] == "127.0.0.1" and connection.getpeername()[0] == "127.0.0.1",
+                "loopback TCP peer changed away from 127.0.0.1")
+        client.setblocking(False)
+        connection.setblocking(False)
+        _worker_emit({
+            "event": "ready", "role": "loopback", "recipe_sha256": args.recipe_sha256,
+            "address": ["127.0.0.1", address[1]], "network_namespace_inode": os.stat("/proc/self/ns/net").st_ino,
+        })
+        ownership = _worker_read_ownership(args)
+        start_ns = _worker_read_start(args, ownership)
+        _worker_wait_until(start_ns)
+        interval_ns = args.interval_ms * 1_000_000
+        sample_count = args.duration_seconds * 1000 // args.interval_ms
+        grant_deadline_ns = start_ns + max(500_000_000, interval_ns // 2)
+        previous_window_end_ns: int | None = None
+        payload_size = args.payload_bytes
+        payload = hashlib.sha256(str(args.seed).encode("ascii")).digest()
+        body = (payload * ((payload_size - 8 + len(payload) - 1) // len(payload)))[:payload_size - 8]
+        next_request = 0
+        request_id = 0
+        for sequence in range(sample_count):
+            if _WORKER_STOP_REQUESTED:
+                break
+            grant = _worker_read_window_grant(
+                args, ownership, sequence, grant_deadline_ns, previous_window_end_ns,
+            )
+            if grant is None:
+                break
+            target_start, target_end = grant
+            _worker_wait_until(target_start)
+            require(time.monotonic_ns() < target_end,
+                    "loopback worker received an expired sample-window grant")
+            interval_start = time.monotonic_ns()
+            histogram = [0] * 64
+            requests = 0
+            bytes_on_wire = 0
+            rate_interval_ns = max(1, 1_000_000_000 // args.requests_per_second)
+            while time.monotonic_ns() < target_end and not _WORKER_STOP_REQUESTED:
+                now = time.monotonic_ns()
+                if now < next_request:
+                    time.sleep(min((next_request - now) / 1_000_000_000, max(0.00005, (target_end - now) / 1_000_000_000)))
+                    continue
+                request_id += 1
+                payload_bytes = struct.pack("!Q", request_id) + body
+                sent = time.monotonic_ns()
+                deadline_ns = sent + 2_000_000_000
+                echoed = _loopback_echo_exchange(client, connection, payload_bytes, deadline_ns)
+                if echoed is None:
+                    break
+                received = time.monotonic_ns()
+                require(received <= deadline_ns,
+                        "loopback echo exchange exceeded its 2s I/O bound before caller timestamp")
+                require(echoed == payload_bytes, "loopback echo payload differs from the seeded request")
+                latency = max(1, received - sent)
+                bucket = min(63, latency.bit_length())
+                histogram[bucket] += 1
+                requests += 1
+                bytes_on_wire += payload_size * 2
+                next_request = sent + rate_interval_ns
+            now = time.monotonic_ns()
+            if now < target_end:
+                time.sleep((target_end - now) / 1_000_000_000)
+            actual_end = time.monotonic_ns()
+            if requests == 0 and _WORKER_STOP_REQUESTED:
+                break
+            _worker_emit({
+                "schema": PRESSURE_IO_SCHEMA, "role": "loopback", "recipe_sha256": args.recipe_sha256,
+                "sequence": sequence, "start_monotonic_ns": interval_start,
+                "end_monotonic_ns": actual_end, "requests_completed": requests,
+                "bytes_on_wire": bytes_on_wire, "latency_histogram": histogram,
+                "p99_upper_latency_nanoseconds": _histogram_p99_upper(histogram),
+            })
+            previous_window_end_ns = target_end
+            grant_deadline_ns = target_end + max(500_000_000, interval_ns // 2)
+        if not _WORKER_STOP_REQUESTED:
+            _worker_wait_for_final_capture(args, ownership, sample_count - 1, grant_deadline_ns)
+    finally:
+        _WORKER_STOP_REQUESTED = True
+        for endpoint in (client, connection, listener):
+            if endpoint is not None:
+                try:
+                    endpoint.close()
+                except OSError:
+                    pass
+
+
+def worker_main(args: argparse.Namespace) -> int:
+    require(re.fullmatch(r"[0-9a-f]{64}", args.recipe_sha256) is not None, "worker recipe SHA is malformed")
+    require(re.fullmatch(r"[0-9a-f]{32}", args.owner_nonce) is not None, "worker ownership nonce is malformed")
+    def stop_worker(_signum: int, _frame: Any) -> None:
+        global _WORKER_STOP_REQUESTED
+        _WORKER_STOP_REQUESTED = True
+    signal.signal(signal.SIGTERM, stop_worker)
+    _WORKER_CONTROL_BUFFER.clear()
+    _install_worker_parent_death_signal(args.driver_pid, args.driver_start_ticks)
+    try:
+        if args.kind == "cpu":
+            _worker_cpu(args)
+        elif args.kind == "disk":
+            _worker_disk(args)
+        elif args.kind == "loopback":
+            _worker_loopback(args)
+        else:
+            raise PressureError("unknown private worker kind")
+    except WorkerStop:
+        return 0
+    return 0
+
+
+def _validate_worker_record(value: dict[str, Any], child: dict[str, Any], seq: int, recipe_sha: str) -> dict[str, Any]:
+    require(value.get("schema") == PRESSURE_IO_SCHEMA and value.get("sequence") == seq and value.get("recipe_sha256") == recipe_sha, "worker telemetry schema, sequence, or recipe binding differs")
+    expected_role = child["role"]
+    require(value.get("role") == expected_role, "worker telemetry role differs")
+    if child["cpu"] is not None:
+        require(value.get("cpu") == child["cpu"], "CPU worker telemetry reports the wrong CPU")
+        exact_object(value, {"schema", "role", "cpu", "recipe_sha256", "sequence", "start_monotonic_ns", "end_monotonic_ns", "thread_cpu_time_ns", "spin_witness"}, "CPU worker telemetry")
+        uint(value["thread_cpu_time_ns"], "CPU worker time")
+        uint(value["spin_witness"], "CPU spin witness")
+    elif expected_role == "disk":
+        exact_object(value, {"schema", "role", "recipe_sha256", "sequence", "start_monotonic_ns", "end_monotonic_ns", "write_bytes", "write_mode", "fdatasync_count", "fdatasync_time_nanoseconds"}, "disk worker telemetry")
+        require(uint(value["write_bytes"], "worker written bytes", positive=True) % BLOCK_BYTES == 0, "disk worker writes are sparse or unaligned")
+        require(value["write_mode"] == "o_direct", "disk worker did not use direct block I/O")
+        require(value["fdatasync_count"] == 1, "disk worker omitted its bounded per-window synchronization")
+        uint(value["fdatasync_time_nanoseconds"], "fdatasync time")
+    else:
+        exact_object(value, {"schema", "role", "recipe_sha256", "sequence", "start_monotonic_ns", "end_monotonic_ns", "requests_completed", "bytes_on_wire", "latency_histogram", "p99_upper_latency_nanoseconds"}, "loopback worker telemetry")
+        uint(value["requests_completed"], "loopback requests", positive=True)
+        uint(value["bytes_on_wire"], "loopback bytes", positive=True)
+        require(value["bytes_on_wire"] == value["requests_completed"] * recipe_schedule_payload(recipe_sha), "loopback byte/request count differs")
+        require(type(value["latency_histogram"]) is list and len(value["latency_histogram"]) == 64, "loopback histogram is malformed")
+        require(sum(uint(item, "loopback latency bucket") for item in value["latency_histogram"]) == value["requests_completed"], "loopback latency histogram count differs from requests")
+        require(value["p99_upper_latency_nanoseconds"] == _histogram_p99_upper(value["latency_histogram"]), "loopback p99 does not match its histogram")
+    start = uint(value["start_monotonic_ns"], "worker window start", positive=True)
+    end = uint(value["end_monotonic_ns"], "worker window end", positive=True)
+    require(end > start, "worker interval is empty")
+    return value
+
+
+_WORKER_PAYLOAD_BY_RECIPE: dict[str, int] = {}
+
+
+def recipe_schedule_payload(recipe_sha: str) -> int:
+    try:
+        return _WORKER_PAYLOAD_BY_RECIPE[recipe_sha]
+    except KeyError as error:
+        raise PressureError("loopback payload is not bound to the active recipe") from error
+
+
+def _counter_snapshot(device_chain: list[dict[str, Any]]) -> dict[str, Any]:
+    devices = _disk_stats()
+    result: dict[str, Any] = {}
+    for item in device_chain:
+        device = item["device"]
+        require(device in devices, f"backing block device {device} has no independent diskstats")
+        result[device] = devices[device]
+    return {"cpu": _cpu_stats(), "cpu_psi": _read_psi(Path("/proc/pressure/cpu"), "CPU PSI"),
+            "io_psi": _read_psi(Path("/proc/pressure/io"), "I/O PSI"),
+            "disk": result, "loopback": _net_stats()}
+
+
+def _build_sample(
+    recipe: dict[str, Any], seq: int, start_ns: int, end_ns: int,
+    before: dict[str, Any], after: dict[str, Any], worker_records: dict[str, Any],
+    worker_io_before: dict[str, dict[str, int]], worker_io_after: dict[str, dict[str, int]],
+    app_active: bool,
+) -> dict[str, Any]:
+    app_storage = recipe["storage"]["backing_chain"]
+    device = recipe["storage"]["application_device"]
+    cpu = _cpu_window(before["cpu"], after["cpu"], recipe["schedule"]["pressure_cpu_affinity"])
+    cpu_psi_delta = after["cpu_psi"]["some"] - before["cpu_psi"]["some"]
+    io_psi_delta = after["io_psi"]["some"] - before["io_psi"]["some"]
+    require(cpu_psi_delta >= 0 and io_psi_delta >= 0, "PSI counters regressed")
+    block = _disk_window(before["disk"], after["disk"], device)
+    lo = _counter_delta(before["loopback"], after["loopback"], (
+        "rx_bytes", "rx_packets", "rx_errors", "rx_dropped", "tx_bytes", "tx_packets", "tx_errors", "tx_dropped",
+    ), "lo")
+    loopback_workers = worker_records["loopback"]
+    sample = {
+        "schema": EVENT_SCHEMA,
+        "sequence": seq,
+        "interval_start_monotonic_ns": start_ns,
+        "interval_end_monotonic_ns": end_ns,
+        "app_active": app_active,
+        "cpu": cpu,
+        "cpu_psi_delta_microseconds": cpu_psi_delta,
+        "block": block,
+        "io_psi_delta_microseconds": io_psi_delta,
+        "block_device_chain": app_storage,
+        "loopback_counters": lo,
+        "loopback": loopback_workers,
+        "pressure_generators": {
+            "cpu": [
+                {
+                    "cpu": item["cpu"],
+                    "thread_cpu_time_ns": item["thread_cpu_time_ns"],
+                    "spin_witness": item["spin_witness"],
+                    "start_monotonic_ns": item["start_monotonic_ns"],
+                    "end_monotonic_ns": item["end_monotonic_ns"],
+                }
+                for item in sorted(worker_records["cpu"], key=lambda value: value["cpu"])
+            ],
+            "disk": {
+                "write_bytes": worker_records["disk"]["write_bytes"],
+                "write_mode": worker_records["disk"]["write_mode"],
+                "fdatasync_count": worker_records["disk"]["fdatasync_count"],
+                "fdatasync_time_nanoseconds": worker_records["disk"]["fdatasync_time_nanoseconds"],
+                "start_monotonic_ns": worker_records["disk"]["start_monotonic_ns"],
+                "end_monotonic_ns": worker_records["disk"]["end_monotonic_ns"],
+            },
+        },
+        "worker_process_io": {
+            key: {
+                "write_bytes_delta": max(0, worker_io_after[key]["write_bytes"] - worker_io_before[key]["write_bytes"]),
+                "syscw_delta": max(0, worker_io_after[key]["syscw"] - worker_io_before[key]["syscw"]),
+            }
+            for key in worker_io_before
+        },
+    }
+    thresholds = recipe.get("readiness_thresholds")
+    if type(thresholds) is dict:
+        sample["readiness"] = _readiness_from_sample(sample, thresholds)
+    return sample
+
+
+def _calibration_sample_observations(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    observations: list[dict[str, Any]] = []
+    for sample in samples:
+        block = sample["block"]
+        disk = sample["pressure_generators"]["disk"]
+        observations.append({
+            "sequence": sample["sequence"],
+            "interval_start_monotonic_ns": sample["interval_start_monotonic_ns"],
+            "interval_end_monotonic_ns": sample["interval_end_monotonic_ns"],
+            "block": {
+                key: block[key] for key in (
+                    "writes_completed", "sectors_written", "write_bytes", "write_milliseconds",
+                    "io_milliseconds", "weighted_io_milliseconds", "in_flight",
+                )
+            },
+            "io_psi_delta_microseconds": sample["io_psi_delta_microseconds"],
+            "disk_generator": disk,
+            "disk_worker_process_io": sample["worker_process_io"]["disk"],
+        })
+    return observations
+
+
+def _calibration_failed_sample_evidence(
+    sample: dict[str, Any], readiness: dict[str, Any],
+    thresholds: dict[str, int],
+) -> dict[str, Any]:
+    """Retain the exact rejected calibration window and its failed readiness gates."""
+    require(type(sample) is dict and type(readiness) is dict and type(thresholds) is dict,
+            "rejected calibration sample evidence is malformed")
+    require(readiness.get("all_ready") is False,
+            "rejected calibration sample evidence requires a failed readiness result")
+    failed_gate_values: dict[str, Any] = {}
+    if not readiness["cpu_ready"]:
+        failed_gate_values["cpu"] = {
+            "busy_basis_points": readiness["cpu_busy_basis_points"],
+            "minimum_busy_basis_points": thresholds["cpu_busy_min_basis_points"],
+        }
+    if not readiness["disk_ready"]:
+        failed_gate_values["disk"] = {
+            "write_bytes_per_second": readiness["disk_write_bytes_per_second"],
+            "minimum_write_bytes_per_second": thresholds["disk_write_min_bytes_per_second"],
+            "writes_completed": sample["block"]["writes_completed"],
+            "minimum_writes_completed": 1,
+            "in_flight": sample["block"]["in_flight"],
+            "minimum_in_flight": 1,
+            "queue_or_stall_microseconds": readiness["disk_queue_or_stall_microseconds"],
+            "minimum_queue_or_stall_microseconds": thresholds["disk_queue_or_stall_min_microseconds"],
+        }
+    if not readiness["loopback_ready"]:
+        counters = sample["loopback_counters"]
+        failed_gate_values["loopback"] = {
+            "requests_per_second": readiness["loopback_requests_per_second"],
+            "minimum_requests_per_second": thresholds["loopback_requests_min_per_second"],
+            "p99_upper_latency_nanoseconds": readiness["loopback_latency_p99_upper_nanoseconds"],
+            "maximum_p99_upper_latency_nanoseconds": thresholds["loopback_latency_p99_max_nanoseconds"],
+            "tx_bytes_per_second": readiness["loopback_tx_bytes_per_second"],
+            "minimum_tx_bytes_per_second": thresholds["loopback_tx_min_bytes_per_second"],
+            "rx_bytes_per_second": readiness["loopback_rx_bytes_per_second"],
+            "minimum_rx_bytes_per_second": thresholds["loopback_rx_min_bytes_per_second"],
+            "rx_errors": counters["rx_errors"], "rx_dropped": counters["rx_dropped"],
+            "tx_errors": counters["tx_errors"], "tx_dropped": counters["tx_dropped"],
+            "maximum_rx_errors": 0, "maximum_rx_dropped": 0,
+            "maximum_tx_errors": 0, "maximum_tx_dropped": 0,
+        }
+    require(failed_gate_values, "rejected calibration sample has no failed gate values")
+    return {
+        "sequence": sample["sequence"],
+        "sample": sample,
+        "observed_readiness": readiness,
+        "original_thresholds": dict(thresholds),
+        "failed_gates": list(failed_gate_values),
+        "failed_gate_values": failed_gate_values,
+    }
+
+
+def _calibration_failure_body(
+    failure: str, samples: list[dict[str, Any]], cleanup: list[dict[str, Any]],
+    scratch_file_removed: bool, finish_monotonic_ns: int,
+    failed_sample: dict[str, Any] | None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "schema": "allocatbelt.application-pressure-calibration-failure.v1",
+        "failure": failure,
+        "sample_count": len(samples),
+        "device_write_sample_count": sum(
+            1 for item in samples
+            if item["block"]["writes_completed"] > 0 and item["block"]["write_bytes"] > 0
+        ),
+        "sample_observations": _calibration_sample_observations(samples),
+        "worker_cleanup": cleanup,
+        "scratch_file_removed": scratch_file_removed,
+        "finish_monotonic_ns": finish_monotonic_ns,
+    }
+    if failed_sample is not None:
+        body["failed_sample"] = failed_sample
+    return body
+
+
+def _launch_binding(path: Path, recipe: dict[str, Any]) -> tuple[dict[str, Any], bytes, str]:
+    value, raw, raw_sha = verify_canonical_json(path, "application launch binding", 256 * 1024)
+    binding = exact_object(value, {"schema", "recipe_sha256", "nonce", "process", "launch_binding_sha256"}, "application launch binding")
+    require(binding["schema"] == LAUNCH_SCHEMA, "unsupported application launch binding schema")
+    require(binding["recipe_sha256"] == recipe["recipe_sha256"] and binding["nonce"] == recipe["identity"]["nonce"], "application launch binding belongs to a different frozen recipe/nonce")
+    process = exact_object(binding["process"], {"pid", "start_ticks", "executable_path", "executable_sha256", "cwd", "tmpdir_path", "cpu_affinity", "network_namespace_inode"}, "application process identity")
+    pid = uint(process["pid"], "application PID", positive=True, maximum=(1 << 31) - 1)
+    start_ticks = uint(process["start_ticks"], "application process start ticks", positive=True)
+    executable_path = string(process["executable_path"], "application executable path", MAX_PATH_BYTES)
+    executable_sha = sha256(process["executable_sha256"], "application executable SHA-256")
+    cwd = string(process["cwd"], "application cwd", MAX_PATH_BYTES)
+    tmpdir_path = string(process["tmpdir_path"], "application TMPDIR", MAX_PATH_BYTES)
+    affinity = _validate_cpu_list(process["cpu_affinity"], "application CPU affinity")
+    netns = uint(process["network_namespace_inode"], "application network namespace inode", positive=True)
+    claimed = sha256(binding["launch_binding_sha256"], "launch binding digest")
+    body = {key: value for key, value in binding.items() if key != "launch_binding_sha256"}
+    require(claimed == digest_object(body), "application launch binding digest is invalid")
+    require(executable_path == recipe["process"]["executable_path"], "application launch executable path differs from the frozen binary")
+    require(executable_sha == recipe["files"]["application_binary"]["raw_sha256"], "application launch binary hash differs from the frozen binary")
+    require(affinity == recipe["schedule"]["application_cpu_affinity"], "application launch CPU affinity differs from frozen conditions")
+    require(netns == recipe["network"]["network_namespace_inode"], "application launch network namespace differs from frozen conditions")
+    require(cwd in recipe["storage"]["application_io_paths"], "application launch cwd is not among its frozen I/O paths")
+    require(tmpdir_path == recipe["process"]["application_tmpdir_path"] and tmpdir_path in recipe["storage"]["application_io_paths"], "application launch TMPDIR differs from the frozen I/O path")
+    current = _proc_stat(pid)
+    require(current["start_ticks"] == start_ticks and current["state"] not in ("Z", "X"), "application PID was reused, exited, or start identity changed")
+    require(_proc_link(pid, "exe") == executable_path, "live application executable path differs from its launch binding")
+    require(_proc_link(pid, "cwd") == cwd, "live application cwd differs from its launch binding")
+    require(_proc_net_namespace(pid) == netns, "live application network namespace differs from its launch binding")
+    require(_affinity(pid) == affinity, "live application CPU affinity differs from its launch binding")
+    environ = _read_proc_environ(pid)
+    require(environ.get("ALLOCATBELT_APP_PRESSURE_NONCE") == recipe["identity"]["nonce"], "live application lacks the frozen pressure nonce")
+    require(environ.get("TMPDIR") == tmpdir_path, "live application TMPDIR differs from frozen storage path")
+    binary_raw, actual_binary_sha = read_stable(Path(executable_path), "live application binary", MAX_APP_BINARY_BYTES)
+    del binary_raw
+    require(actual_binary_sha == executable_sha, "live application binary bytes differ from its frozen hash")
+    final_stat = _proc_stat(pid)
+    require(final_stat["start_ticks"] == start_ticks and final_stat["state"] not in ("Z", "X"), "application PID/start identity changed during launch authentication")
+    return binding, raw, raw_sha
+
+
+def _read_proc_environ(pid: int) -> dict[str, str]:
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError as error:
+        raise PressureError(f"cannot read application environment for PID {pid}: {error}") from error
+    require(len(raw) <= 16 * 1024 * 1024, "application environment exceeds its finite bound")
+    result: dict[str, str] = {}
+    for item in raw.split(b"\0"):
+        if not item:
+            continue
+        key, sep, value = item.partition(b"=")
+        if sep:
+            try:
+                name = key.decode("utf-8")
+                text = value.decode("utf-8")
+            except UnicodeError as error:
+                raise PressureError("application environment is not UTF-8") from error
+            if name in ("ALLOCATBELT_APP_PRESSURE_NONCE", "TMPDIR"):
+                result[name] = text
+    return result
+
+
+def _write_event_raw(stream: Any, raw: bytes, *, maximum_bytes: int = MAX_ARTIFACT_BYTES) -> bytes:
+    require(len(raw) <= MAX_EVENT_LINE_BYTES and raw.endswith(b"\n"), "pressure event line exceeds its frozen line bound")
+    require(stream.tell() + len(raw) <= maximum_bytes, "pressure event stream exceeded its frozen byte budget")
+    written = stream.write(raw)
+    require(written == len(raw), "short pressure event write")
+    stream.flush()
+    return raw
+
+
+def _write_event(stream: Any, event: dict[str, Any], *, maximum_bytes: int = MAX_ARTIFACT_BYTES) -> bytes:
+    return _write_event_raw(stream, canonical_bytes(event), maximum_bytes=maximum_bytes)
+
+
+def _write_event_durable(stream: Any, event: dict[str, Any], *, maximum_bytes: int = MAX_ARTIFACT_BYTES) -> bytes:
+    """Append and sync an ownership authorization record before releasing workers."""
+    raw = _write_event(stream, event, maximum_bytes=maximum_bytes)
+    os.fsync(stream.fileno())
+    return raw
+
+
+def _write_ready_marker(
+    path: Path, recipe: dict[str, Any], ready_sample: dict[str, Any],
+    ownership_sha256: str, authorization_sha256: str,
+) -> str:
+    body = {
+        "schema": READY_SCHEMA,
+        "recipe_sha256": recipe["recipe_sha256"],
+        "condition_sha256": recipe["condition_sha256"],
+        "nonce": recipe["identity"]["nonce"],
+        "ownership_protocol": OWNERSHIP_PROTOCOL,
+        "worker_ownership_sha256": ownership_sha256,
+        "worker_authorization_sha256": authorization_sha256,
+        "pressure_ready_monotonic_ns": ready_sample["interval_end_monotonic_ns"],
+        "readiness": ready_sample["readiness"],
+    }
+    value = {**body, "ready_sha256": digest_object(body)}
+    return safe_write_new(path, canonical_bytes(value), "pressure readiness marker", maximum=64 * 1024)
+
+
+def _try_launch_binding(
+    path: Path, recipe: dict[str, Any],
+) -> tuple[dict[str, Any], bytes, str, int] | None:
+    if not path.exists():
+        return None
+    try:
+        binding, raw, sha = _launch_binding(path, recipe)
+        return binding, raw, sha, time.monotonic_ns()
+    except PressureError:
+        # Atomic publication can expose a newly created path before its final
+        # canonical bytes. The caller retries on each measured sample until
+        # the unchanged startup deadline.
+        if path.is_symlink() or path.is_dir():
+            raise
+        return None
+
+
+def _try_launch_before_deadline(
+    path: Path, recipe: dict[str, Any], deadline_ns: int,
+) -> tuple[dict[str, Any], bytes, str, int] | None:
+    require(time.monotonic_ns() < deadline_ns,
+            "authenticated application launch binding did not arrive before the startup deadline")
+    observation = _try_launch_binding(path, recipe)
+    if observation is not None:
+        require(observation[3] <= deadline_ns,
+                "authenticated application launch binding was observed after the startup deadline")
+    return observation
+
+
+def _wait_for_launch(path: Path, recipe: dict[str, Any], deadline_ns: int) -> tuple[dict[str, Any], bytes, str, int]:
+    while time.monotonic_ns() < deadline_ns:
+        if path.exists():
+            try:
+                binding, raw, sha = _launch_binding(path, recipe)
+                return binding, raw, sha, time.monotonic_ns()
+            except PressureError:
+                # A launcher may create its private file just before completing
+                # the canonical atomic publication. Retry only until deadline.
+                if path.is_symlink() or path.is_dir():
+                    raise
+        time.sleep(0.02)
+    raise PressureError("authenticated application launch binding did not arrive before the startup deadline")
+
+
+def _proc_identity_still_same(binding: dict[str, Any]) -> bool:
+    process = binding.get("process", binding.get("identity"))
+    require(type(process) is dict, "application process identity is missing")
+    try:
+        return _pid_exists(process["pid"], process["start_ticks"])
+    except PressureError:
+        return False
+
+
+def run_pressure(recipe_path: Path, expected_sha: str, launch_path: Path, output_path: Path, ready_path: Path) -> dict[str, Any]:
+    recipe_value, _, _recipe_raw_sha = verify_canonical_json(recipe_path, "frozen pressure recipe", MAX_RECIPE_BYTES)
+    recipe = _validate_recipe(recipe_value, expected_sha)
+    actual_recipe_sha = recipe["recipe_sha256"]
+    _verify_recipe_inputs(recipe)
+    _verify_live_environment(recipe)
+    require(_hash_script(DRIVER_PATH, "pressure driver") == recipe["script_hashes"]["driver_sha256"], "pressure driver changed after recipe freeze")
+    require(_hash_script(READER_PATH, "pressure reader") == recipe["script_hashes"]["reader_sha256"], "pressure reader changed after recipe freeze")
+    require(output_path.is_absolute() and ready_path.is_absolute(), "run artifact paths must be absolute")
+    output_dir = safe_directory(output_path, "pressure run output directory", create=True)
+    require(ready_path == output_dir / "pressure-ready.json", "pressure ready marker path must be the canonical run artifact")
+    require(launch_path == output_dir / "launch-record.json", "application launch record path must be the canonical run artifact")
+    require(not ready_path.exists() and not launch_path.exists() and not launch_path.is_symlink(), "pressure ready marker or launch binding already exists")
+    launch_path.parent.resolve(strict=True)
+    require(launch_path.parent == output_dir or launch_path.parent.is_dir(), "launch binding parent is unavailable")
+    require(os.getsid(0) == os.getpid(), "pressure driver must be launched as a fresh session leader")
+    _storage_reserve(recipe, output_dir, reserve_event_budget=True)
+
+    events_path = output_dir / "events.jsonl"
+    process_binding_path = output_dir / "process-binding.json"
+    result_path = output_dir / "run.json"
+    for path in (events_path, process_binding_path, result_path):
+        require(not path.exists() and not path.is_symlink(), f"pressure artifact already exists: {path.name}")
+
+    schedule = recipe["schedule"]
+    _WORKER_PAYLOAD_BY_RECIPE[recipe["recipe_sha256"]] = schedule["network_payload_bytes"] * 2
+    children = WorkerSet(recipe)
+    events_hash = hashlib.sha256()
+    event_count = 0
+    sample_count = 0
+    sample_event_bytes = 0
+    event_max_bytes = recipe["artifact_budget"]["maximum_event_bytes"]
+    startup_readiness: deque[bool] = deque(maxlen=schedule["startup_ready_windows"])
+    active_readiness_windows = 0
+    active_readiness_ok = True
+    process_binding: dict[str, Any] | None = None
+    process_binding_raw_sha: str | None = None
+    launch_raw_sha: str | None = None
+    run_start_ns = time.monotonic_ns()
+    failure: str | None = None
+    cleanup_records: list[dict[str, Any]] = []
+    readiness_marker_sha: str | None = None
+    readiness_sample: dict[str, Any] | None = None
+    app_started_ns: int | None = None
+    app_exit_ns: int | None = None
+    app_last_alive_ns: int | None = None
+    app_last_alive_sequence: int | None = None
+    final_status = "failed"
+    events_stream = events_path.open("xb", buffering=0)
+    hard_deadline_ns = run_start_ns + schedule["total_deadline_seconds"] * 1_000_000_000
+    startup_deadline_ns = run_start_ns + schedule["startup_deadline_seconds"] * 1_000_000_000
+    try:
+        _storage_reserve(recipe, output_dir, reserve_event_budget=True)
+        children.spawn()
+        _storage_reserve(recipe, output_dir, scratch_reserved=True, reserve_event_budget=True)
+        children.await_ready(startup_deadline_ns)
+        ownership_body = {
+            "schema": EVENT_SCHEMA,
+            "kind": "worker_ownership",
+            "recipe_sha256": actual_recipe_sha,
+            "nonce": recipe["identity"]["nonce"],
+            "monotonic_ns": time.monotonic_ns(),
+            "workers": children.ownership_rows(),
+        }
+        ownership_sha256 = digest_object(ownership_body)
+        ownership_event = {**ownership_body, "ownership_sha256": ownership_sha256}
+        raw_ownership = _write_event_durable(events_stream, ownership_event, maximum_bytes=event_max_bytes)
+        events_hash.update(raw_ownership)
+        event_count += 1
+
+        # Workers acknowledge the durable ownership row and remain blocked.
+        # Only after their exact ACK set is itself journaled do they receive a
+        # separate work-start barrier.
+        children.grant_ownership(ownership_sha256)
+        ownership_acks = children.await_ownership_ack(ownership_sha256, startup_deadline_ns)
+        authorization_body = {
+            "schema": EVENT_SCHEMA,
+            "kind": "workers_authorized",
+            "recipe_sha256": actual_recipe_sha,
+            "nonce": recipe["identity"]["nonce"],
+            "ownership_sha256": ownership_sha256,
+            "monotonic_ns": time.monotonic_ns(),
+            "workers": ownership_acks,
+        }
+        authorization_sha256 = digest_object(authorization_body)
+        authorization_event = {**authorization_body, "authorization_sha256": authorization_sha256}
+        raw_authorization = _write_event_durable(events_stream, authorization_event, maximum_bytes=event_max_bytes)
+        events_hash.update(raw_authorization)
+        event_count += 1
+
+        start_ns = time.monotonic_ns() + 250_000_000
+        start_event = {
+            "schema": EVENT_SCHEMA, "kind": "pressure_start", "sequence": -1,
+            "recipe_sha256": actual_recipe_sha, "monotonic_ns": start_ns,
+            "nonce": recipe["identity"]["nonce"],
+            "ownership_sha256": ownership_sha256,
+            "authorization_sha256": authorization_sha256,
+            "workers": [{"role": child["role"], "cpu": child["cpu"], "pid": child["pid"], "start_ticks": child["start_ticks"], "pgid": child["pgid"], "session_id": child["session_id"]} for child in children.children],
+            "storage_device": recipe["storage"]["application_device"],
+            "network_namespace_inode": recipe["network"]["network_namespace_inode"],
+        }
+        raw_start = _write_event_durable(events_stream, start_event, maximum_bytes=event_max_bytes)
+        events_hash.update(raw_start)
+        event_count += 1
+        children.begin(start_ns, ownership_sha256, authorization_sha256)
+        interval_ns = schedule["sample_interval_ms"] * 1_000_000
+        total_samples = schedule["duration_seconds"] * 1000 // schedule["sample_interval_ms"]
+        _sleep_until(start_ns - 1_000_000, deadline_ns=hard_deadline_ns,
+                     maximum_sleep_ns=10_000_000, label="initial counter baseline")
+        counters_before = _counter_snapshot(recipe["storage"]["backing_chain"])
+        worker_io_before = children.process_io()
+        window_start_ns = max(start_ns, time.monotonic_ns())
+        window_end_ns = children.grant_sample_window(0, window_start_ns)
+        for seq in range(total_samples):
+            require(time.monotonic_ns() < hard_deadline_ns, "pressure run total deadline expired")
+            target_start = window_start_ns
+            target_end = window_end_ns
+            _sleep_until(target_start, deadline_ns=hard_deadline_ns, maximum_sleep_ns=10_000_000, label="pressure sample start")
+            before = counters_before
+            before_mono = window_start_ns
+            worker_before = worker_io_before
+            ready_deadline = target_end + max(500_000_000, interval_ns // 2)
+            raw_worker_records = children.wait_sample(seq, ready_deadline)
+            worker_records = _normalize_worker_records(raw_worker_records, children.children, seq, schedule, actual_recipe_sha)
+            _sleep_until(target_end, deadline_ns=hard_deadline_ns, maximum_sleep_ns=5_000_000, label="pressure sample end")
+            after = _counter_snapshot(recipe["storage"]["backing_chain"])
+            worker_after = children.process_io()
+            observed_end = time.monotonic_ns()
+            if seq + 1 == total_samples:
+                children.finish_sample_capture(seq)
+            counters_before = after
+            worker_io_before = worker_after
+            window_start_ns = observed_end
+            if seq + 1 < total_samples:
+                window_end_ns = children.grant_sample_window(seq + 1, window_start_ns)
+            app_active = False
+            if process_binding is not None:
+                app_active = _proc_identity_still_same(process_binding)
+                if app_active:
+                    app_last_alive_ns = observed_end
+                    app_last_alive_sequence = seq
+                else:
+                    app_exit_ns = app_last_alive_ns
+            sample = _build_sample(
+                recipe, seq, before_mono, observed_end, before, after,
+                worker_records, worker_before, worker_after, app_active,
+            )
+            require(observed_end - before_mono <= interval_ns + max(500_000_000, interval_ns), "pressure telemetry sample is sparse")
+            sample_count += 1
+            if process_binding is None:
+                if readiness_marker_sha is None:
+                    startup_readiness.append(sample["readiness"]["all_ready"])
+                else:
+                    require(sample["readiness"]["all_ready"],
+                            "pressure readiness failed while awaiting the authenticated application launch")
+            elif app_active and app_started_ns is not None and sample["interval_start_monotonic_ns"] >= app_started_ns:
+                active_readiness_windows += 1
+                active_readiness_ok = active_readiness_ok and sample["readiness"]["all_ready"]
+            sample_event = {"schema": EVENT_SCHEMA, "kind": "sample", **sample}
+            raw_sample = canonical_bytes(sample_event)
+            require(len(raw_sample) <= recipe["artifact_budget"]["maximum_sample_line_bytes"], "pressure sample exceeds its frozen conservative row bound")
+            require(sample_event_bytes + len(raw_sample) <= recipe["artifact_budget"]["sample_events_bytes"], "pressure samples exceed their frozen aggregate row budget")
+            raw_sample = _write_event_raw(events_stream, raw_sample, maximum_bytes=event_max_bytes)
+            sample_event_bytes += len(raw_sample)
+            events_hash.update(raw_sample)
+            event_count += 1
+            if process_binding is None and readiness_marker_sha is None and len(startup_readiness) == schedule["startup_ready_windows"]:
+                require(all(startup_readiness), "measured pressure readiness did not pass the frozen startup windows")
+                readiness_sample = sample
+                readiness_marker_sha = _write_ready_marker(
+                    ready_path, recipe, readiness_sample, ownership_sha256, authorization_sha256,
+                )
+            if process_binding is None and readiness_marker_sha is not None:
+                launch_observation = _try_launch_before_deadline(launch_path, recipe, startup_deadline_ns)
+                if launch_observation is None:
+                    require(time.monotonic_ns() < startup_deadline_ns,
+                            "authenticated application launch binding did not arrive before the startup deadline")
+                else:
+                    binding, launch_raw, launch_raw_sha, observed_launch_ns = launch_observation
+                    require(readiness_sample is not None,
+                            "authenticated launch has no original ready-sample anchor")
+                    process_binding = {
+                        "schema": PROCESS_BINDING_SCHEMA,
+                        "recipe_sha256": actual_recipe_sha,
+                        "launch_record_sha256": launch_raw_sha,
+                        "identity": {
+                            "pid": binding["process"]["pid"],
+                            "start_ticks": binding["process"]["start_ticks"],
+                            "nonce": recipe["identity"]["nonce"],
+                            "executable_sha256": binding["process"]["executable_sha256"],
+                            "tmpdir_path": binding["process"]["tmpdir_path"],
+                            "cpu_affinity": binding["process"]["cpu_affinity"],
+                            "network_namespace_inode": binding["process"]["network_namespace_inode"],
+                        },
+                        "observed_monotonic_ns": observed_launch_ns,
+                        "pressure_ready_monotonic_ns": readiness_sample["interval_end_monotonic_ns"],
+                        "readiness_snapshot": readiness_sample["readiness"],
+                        "application_capacity_calibration_sha256": recipe["files"]["application_capacity_calibration"]["raw_sha256"],
+                        "pressure_contention_calibration_sha256": recipe["pressure_calibration"]["raw_sha256"],
+                    }
+                    process_binding["process_binding_sha256"] = digest_object(process_binding)
+                    process_binding_raw_sha = safe_write_new(process_binding_path, canonical_bytes(process_binding), "bound application process identity", maximum=256 * 1024)
+                    app_started_ns = observed_launch_ns
+                    event = {
+                        "schema": EVENT_SCHEMA, "kind": "application_start", "sequence": seq,
+                        "monotonic_ns": observed_launch_ns,
+                        "pid": binding["process"]["pid"], "start_ticks": binding["process"]["start_ticks"],
+                        "launch_record_sha256": launch_raw_sha,
+                    }
+                    raw_app = _write_event(events_stream, event, maximum_bytes=event_max_bytes)
+                    events_hash.update(raw_app)
+                    event_count += 1
+                    copied_launch = output_dir / "launch-record.json"
+                    require(launch_path == copied_launch and copied_launch.exists(), "launch record was not published at its canonical artifact path")
+                    reread_binding, reread_raw, reread_sha = verify_canonical_json(copied_launch, "copied application launch binding", 256 * 1024)
+                    require(reread_raw == launch_raw and reread_sha == launch_raw_sha and reread_binding == binding, "application launch record changed after process binding")
+                    del launch_raw
+            if process_binding is not None and not _proc_identity_still_same(process_binding):
+                # The exact PID/start pair is also checked in the launch record
+                # below; if the process ended, the final interval closes here.
+                app_exit_ns = app_last_alive_ns
+                require(app_exit_ns is not None and app_last_alive_sequence is not None, "application exited before an independent live sample was recorded")
+                exit_event = {
+                    "schema": EVENT_SCHEMA, "kind": "application_exit", "sequence": app_last_alive_sequence,
+                    "monotonic_ns": app_exit_ns, "pid": binding["process"]["pid"],
+                    "start_ticks": binding["process"]["start_ticks"], "exit_observed": True,
+                }
+                raw_exit = _write_event(events_stream, exit_event, maximum_bytes=event_max_bytes)
+                events_hash.update(raw_exit)
+                event_count += 1
+                if seq + 1 < schedule["duration_seconds"] * 1000 // schedule["sample_interval_ms"]:
+                    # Its own lifetime determines the pressure stop; minimum
+                    # overlap and readiness are checked after cleanup.
+                    break
+            if seq % max(1, 1000 // schedule["sample_interval_ms"]) == 0:
+                _storage_reserve(recipe, output_dir, scratch_reserved=True)
+            # Reduce sample memory to the bounded numeric fields needed for
+            # measured readiness and the independent reader recomputes raw
+            # events directly from disk.
+            selector_start = observed_end
+            counters_before = after
+            worker_io_before = worker_after
+        require(process_binding is not None, "application launch binding was not observed")
+        if app_exit_ns is None:
+            process = process_binding["identity"]
+            if _pid_exists(process["pid"], process["start_ticks"]):
+                raise PressureError("application did not exit within the frozen pressure schedule")
+            app_exit_ns = app_last_alive_ns
+            require(app_exit_ns is not None and app_last_alive_sequence is not None, "application exited before an independent live sample was recorded")
+            exit_event = {
+                "schema": EVENT_SCHEMA, "kind": "application_exit",
+                "sequence": app_last_alive_sequence, "monotonic_ns": app_exit_ns,
+                "pid": process["pid"], "start_ticks": process["start_ticks"],
+                "exit_observed": True,
+            }
+            raw_exit = _write_event(events_stream, exit_event, maximum_bytes=event_max_bytes)
+            events_hash.update(raw_exit)
+            event_count += 1
+        require(app_started_ns is not None and app_exit_ns is not None, "application overlap bounds are missing")
+        overlap_ns = app_exit_ns - app_started_ns
+        require(overlap_ns >= schedule["minimum_overlap_seconds"] * 1_000_000_000, "application/pressure overlap is shorter than the frozen minimum")
+        require(active_readiness_windows > 0 and active_readiness_ok, "measured readiness failed during the application pressure overlap")
+        final_status = "complete"
+    except BaseException as error:
+        failure = f"{type(error).__name__}: {error}"
+        final_status = "failed"
+        try:
+            failure_event = {"schema": EVENT_SCHEMA, "kind": "pressure_failure", "sequence": sample_count, "monotonic_ns": time.monotonic_ns(), "failure": failure}
+            raw_failure = _write_event(events_stream, failure_event, maximum_bytes=event_max_bytes)
+            events_hash.update(raw_failure)
+            event_count += 1
+        except BaseException:
+            failure = failure or "failed to preserve bounded pressure failure event"
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        term_seconds = schedule["term_deadline_seconds"]
+        kill_seconds = schedule["kill_deadline_seconds"]
+        try:
+            cleanup_records = children.cleanup(term_seconds, kill_seconds)
+        except BaseException as cleanup_error:
+            cleanup_records = [{"role": "cleanup", "error": f"{type(cleanup_error).__name__}: {cleanup_error}", "alive_after_cleanup": True}]
+            failure = failure or f"cleanup failed: {cleanup_error}"
+            final_status = "failed"
+        try:
+            cleanup_ok_partial = bool(cleanup_records) and all(
+                _worker_exit_was_bounded(item) and item.get("alive_after_cleanup") is False
+                and item.get("term_error") is None and item.get("kill_error") is None and item.get("reap_error") is None and item.get("stderr_output") == ""
+                and item.get("stderr_raw_bytes") == 0 and item.get("stderr_raw_truncated") is False and item.get("stderr_read_error") is None
+                for item in cleanup_records if item.get("role") != "scratch_cleanup"
+            ) and not any(item.get("role") == "scratch_cleanup" and item.get("error") for item in cleanup_records)
+            cleanup_event = {
+                "schema": EVENT_SCHEMA,
+                "kind": "pressure_cleanup",
+                "monotonic_ns": time.monotonic_ns(),
+                "workers": cleanup_records,
+                "scratch_file_removed": children.scratch_removed,
+                "cleanup_ok": cleanup_ok_partial,
+            }
+            raw_cleanup = _write_event(events_stream, cleanup_event, maximum_bytes=event_max_bytes)
+            events_hash.update(raw_cleanup)
+            event_count += 1
+        except BaseException as error:
+            failure = failure or f"terminal cleanup event could not be preserved: {type(error).__name__}: {error}"
+            final_status = "failed"
+        try:
+            if not events_stream.closed:
+                events_stream.flush()
+                os.fsync(events_stream.fileno())
+        except BaseException as error:
+            failure = failure or f"event stream close failed: {type(error).__name__}: {error}"
+            final_status = "failed"
+        finally:
+            if not events_stream.closed:
+                try:
+                    events_stream.close()
+                except BaseException as error:
+                    failure = failure or f"event stream close failed: {type(error).__name__}: {error}"
+                    final_status = "failed"
+
+    cleanup_ok = bool(cleanup_records) and all(
+        _worker_exit_was_bounded(item) and item.get("alive_after_cleanup") is False
+        and item.get("term_error") is None and item.get("kill_error") is None and item.get("reap_error") is None and item.get("stderr_output") == ""
+        and item.get("stderr_raw_bytes") == 0 and item.get("stderr_raw_truncated") is False and item.get("stderr_read_error") is None
+        for item in cleanup_records if item.get("role") != "scratch_cleanup"
+    ) and not any(item.get("role") == "scratch_cleanup" and item.get("error") for item in cleanup_records)
+    if not cleanup_ok:
+        failure = failure or "pressure worker process/session cleanup or reaping failed"
+        final_status = "failed"
+    try:
+        events_bytes, events_sha = hash_stable(events_path, "pressure event stream", event_max_bytes)
+        require(events_sha == events_hash.hexdigest(), "live event digest differs from the bounded event file")
+    except BaseException as error:
+        failure = failure or f"bounded event verification failed after cleanup: {type(error).__name__}: {error}"
+        final_status = "failed"
+        events_sha = events_hash.hexdigest()
+        try:
+            events_bytes = events_path.stat().st_size
+        except OSError:
+            events_bytes = 0
+    try:
+        if process_binding is None:
+            process_binding = {
+                "schema": PROCESS_BINDING_SCHEMA, "recipe_sha256": actual_recipe_sha,
+                "launch_record_sha256": None, "identity": None,
+                "observed_monotonic_ns": None, "pressure_ready_monotonic_ns": None,
+                "readiness_snapshot": None,
+                "application_capacity_calibration_sha256": recipe["files"]["application_capacity_calibration"]["raw_sha256"],
+                "pressure_contention_calibration_sha256": recipe["pressure_calibration"]["raw_sha256"],
+            }
+            process_binding["process_binding_sha256"] = digest_object(process_binding)
+            if not process_binding_path.exists():
+                process_binding_raw_sha = safe_write_new(process_binding_path, canonical_bytes(process_binding), "failed process binding", maximum=256 * 1024)
+        if launch_raw_sha is not None and process_binding["launch_record_sha256"] != launch_raw_sha:
+            raise PressureError("process binding launch record hash differs")
+        if process_binding_path.exists():
+            _, _, saved_sha = verify_canonical_json(process_binding_path, "bound process identity", 256 * 1024)
+            if saved_sha != digest_bytes(canonical_bytes(process_binding)):
+                raise PressureError("saved process binding changed during pressure run")
+            process_binding_raw_sha = saved_sha
+    except BaseException as error:
+        failure = failure or f"process binding preservation failed after cleanup: {type(error).__name__}: {error}"
+        final_status = "failed"
+    if time.monotonic_ns() > hard_deadline_ns:
+        failure = failure or "pressure run exceeded the frozen total deadline during cleanup"
+        final_status = "failed"
+    result_body = {
+        "schema": RUN_SCHEMA,
+        "status": final_status,
+        "failure": failure,
+        "recipe_sha256": actual_recipe_sha,
+        "condition_sha256": recipe["condition_sha256"],
+        "events_sha256": events_sha,
+        "events_bytes": events_bytes,
+        "event_count": event_count,
+        "sample_count": sample_count,
+        "process_binding_sha256": process_binding_raw_sha,
+        "launch_record_sha256": launch_raw_sha,
+        "readiness_marker_sha256": readiness_marker_sha,
+        "application_overlap_nanoseconds": max(0, (app_exit_ns or 0) - (app_started_ns or 0)),
+        "worker_cleanup": cleanup_records,
+        "cleanup_ok": cleanup_ok,
+        "scratch_file_removed": children.scratch_removed,
+        "start_monotonic_ns": run_start_ns,
+        "finish_monotonic_ns": time.monotonic_ns(),
+        "deadlines": {
+            "startup_seconds": schedule["startup_deadline_seconds"],
+            "total_seconds": schedule["total_deadline_seconds"],
+            "term_seconds": schedule["term_deadline_seconds"],
+            "kill_seconds": schedule["kill_deadline_seconds"],
+        },
+    }
+    result = {**result_body, "run_sha256": digest_object(result_body)}
+    try:
+        run_raw_sha = safe_write_new(result_path, canonical_bytes(result), "pressure run receipt", maximum=MAX_MANIFEST_BYTES)
+    except BaseException as error:
+        raise PressureError(f"failed to preserve the post-cleanup run receipt: {type(error).__name__}: {error}") from error
+    require(final_status == "complete", failure or "bounded pressure run failed")
+    return {"status": final_status, "recipe_sha256": actual_recipe_sha, "events_sha256": events_sha,
+            "launch_record_sha256": launch_raw_sha,
+            "process_binding_sha256": process_binding_raw_sha,
+            "readiness_marker_sha256": readiness_marker_sha,
+            "run_sha256": run_raw_sha, "run_receipt_sha256": result["run_sha256"],
+            "path": str(output_dir)}
+
+
+def calibrate(request_path: Path, output_path: Path) -> dict[str, Any]:
+    return _calibrate_request(request_path, output_path, context_v2=False)
+
+
+def calibrate_context_v2(request_path: Path, output_path: Path, scope_receipt_path: Path) -> dict[str, Any]:
+    result = _calibrate_request(request_path, output_path, context_v2=True)
+    reader = _load_scope_readback_module()
+    calibration_pin = {"path": str(output_path), "raw_sha256": result["calibration_raw_sha256"]}
+    receipt = reader.verify_calibration_scope_v2(
+        calibration_pin,
+        result["_v2_scope"]["context_policy_bundle"],
+        result["_v2_scope"]["capacity_bundle_pins"],
+        result["_v2_scope"]["observed_host"],
+    )
+    receipt_raw = canonical_bytes(receipt)
+    receipt_sha = safe_write_new(scope_receipt_path, receipt_raw, "independent context calibration scope receipt", maximum=MAX_SCOPE_RECEIPT_BYTES)
+    result.pop("_v2_scope", None)
+    return {
+        **result,
+        "scope_receipt": {
+            "path": str(scope_receipt_path),
+            "raw_sha256": receipt_sha,
+            "scope_sha256": receipt["scope_sha256"],
+        },
+        "scope_sha256": receipt["scope_sha256"],
+        "context_policy_sha256": receipt["context_policy_sha256"],
+    }
+
+
+def _calibrate_request(request_path: Path, output_path: Path, *, context_v2: bool) -> dict[str, Any]:
+    request, request_raw, _ = verify_canonical_json(request_path, "pressure calibration request", MAX_REQUEST_BYTES)
+    require(request_raw == canonical_bytes(request), "pressure calibration request is not canonical")
+    normalized = _source5_context_calibration_request_v2(request) if context_v2 else _request(request, calibration=True)
+    schedule = normalized["schedule"]
+    storage_paths = [Path(path) for path in normalized["storage"]["application_io_paths"]]
+    host = _host_facts(schedule["pressure_cpu_affinity"], schedule["application_cpu_affinity"], storage_paths)
+    if context_v2:
+        _require_live_source5_host(normalized["scope"]["observed_host_value"], host)
+    scratch_path = Path(normalized["storage"]["pressure_scratch_path"])
+    scratch = _storage_record(scratch_path, "pressure calibration scratch path")
+    app_storage = host["application_storage"][0]
+    require(scratch["device"] == app_storage["device"] and scratch["mount"]["mount_id"] == app_storage["mount"]["mount_id"] and scratch["backing_chain"] == app_storage["backing_chain"], "calibration scratch path differs from the application backing device")
+    host["pressure_scratch"] = scratch
+    free = shutil.disk_usage(scratch_path).free
+    reserve = schedule["scratch_file_bytes"] + normalized["storage"]["output_minimum_free_bytes"]
+    require(free >= reserve, "calibration scratch device lacks the frozen free-space reserve")
+    safe_directory(output_path.parent, "calibration output directory")
+    require(not output_path.exists() and not output_path.is_symlink(), "pressure calibration output already exists")
+    run_dir = output_path.parent / f".pressure-calibration-{normalized['identity']['nonce']}"
+    safe_directory(run_dir, "temporary calibration output", create=True)
+    fake_recipe_body = {
+        "schema": RECIPE_SCHEMA,
+        "identity": normalized["identity"],
+        "files": normalized["files"],
+        "process": normalized["process"],
+        "host": host,
+        "storage": {**normalized["storage"], "application_device": app_storage["device"], "application_mount_id": app_storage["mount"]["mount_id"], "backing_chain": app_storage["backing_chain"], "non_tmpfs": True},
+        "network": {**host["network"], "claim": "ipv4_loopback_shared_kernel_only", "physical_nic_claimed": False},
+        "schedule": schedule,
+        "pressure_calibration": None,
+        "readiness_thresholds": None,
+        "script_hashes": {"driver_sha256": _hash_script(DRIVER_PATH, "pressure driver"), "reader_sha256": _hash_script(READER_PATH, "pressure reader")},
+        "condition_sha256": digest_object({
+            "host_id": normalized["identity"]["host_id"],
+            "condition_id": normalized["identity"]["condition_id"],
+            "source_manifest_sha256": normalized["files"]["source_manifest"]["raw_sha256"],
+            "policy_sha256": normalized["files"]["policy"]["raw_sha256"],
+            "application_capacity_calibration_sha256": normalized["files"]["application_capacity_calibration"]["raw_sha256"],
+            "host": {
+                "kernel_release": host["kernel_release"],
+                "boot_id_sha256": host["boot_id_sha256"],
+                "allowed_cpu_affinity": host["allowed_cpu_affinity"],
+                "pressure_cpu_affinity": host["pressure_cpu_affinity"],
+                "application_cpu_affinity": host["application_cpu_affinity"],
+            },
+            "storage": {"device": app_storage["device"], "mount_id": app_storage["mount"]["mount_id"], "backing_chain": app_storage["backing_chain"]},
+            "network": host["network"],
+            "schedule": schedule,
+        }),
+    }
+    fake_recipe = {**fake_recipe_body, "recipe_sha256": digest_object(fake_recipe_body)}
+    _WORKER_PAYLOAD_BY_RECIPE[fake_recipe["recipe_sha256"]] = schedule["network_payload_bytes"] * 2
+    workers = WorkerSet(fake_recipe)
+    samples: list[dict[str, Any]] = []
+    failure: str | None = None
+    failed_sample_evidence: dict[str, Any] | None = None
+    cleanup: list[dict[str, Any]] = []
+    ownership_path = run_dir / "worker-ownership.json"
+    authorization_path = run_dir / "worker-authorization.json"
+    work_start_path = run_dir / "worker-work-start.json"
+    calibration_start_ns = time.monotonic_ns()
+    calibration_deadline_ns = calibration_start_ns + schedule["total_deadline_seconds"] * 1_000_000_000
+    try:
+        _storage_reserve(fake_recipe, run_dir)
+        workers.spawn()
+        _storage_reserve(fake_recipe, run_dir, scratch_reserved=True)
+        start_deadline = calibration_start_ns + schedule["startup_deadline_seconds"] * 1_000_000_000
+        workers.await_ready(start_deadline)
+        ownership_body = {
+            "schema": EVENT_SCHEMA, "kind": "worker_ownership",
+            "recipe_sha256": fake_recipe["recipe_sha256"],
+            "nonce": normalized["identity"]["nonce"],
+            "monotonic_ns": time.monotonic_ns(),
+            "workers": workers.ownership_rows(),
+        }
+        ownership_sha256 = digest_object(ownership_body)
+        ownership_record = {**ownership_body, "ownership_sha256": ownership_sha256}
+        safe_write_new(ownership_path, canonical_bytes(ownership_record), "calibration worker ownership journal", maximum=MAX_EVENT_LINE_BYTES)
+        workers.grant_ownership(ownership_sha256)
+        ownership_acks = workers.await_ownership_ack(ownership_sha256, start_deadline)
+        authorization_body = {
+            "schema": EVENT_SCHEMA, "kind": "workers_authorized",
+            "recipe_sha256": fake_recipe["recipe_sha256"],
+            "nonce": normalized["identity"]["nonce"],
+            "ownership_sha256": ownership_sha256,
+            "monotonic_ns": time.monotonic_ns(), "workers": ownership_acks,
+        }
+        authorization_sha256 = digest_object(authorization_body)
+        authorization_record = {**authorization_body, "authorization_sha256": authorization_sha256}
+        safe_write_new(authorization_path, canonical_bytes(authorization_record), "calibration worker authorization journal", maximum=MAX_EVENT_LINE_BYTES)
+        start_ns = time.monotonic_ns() + 250_000_000
+        work_start_body = {
+            "schema": EVENT_SCHEMA, "kind": "pressure_start", "sequence": -1,
+            "recipe_sha256": fake_recipe["recipe_sha256"], "nonce": normalized["identity"]["nonce"],
+            "monotonic_ns": start_ns, "ownership_sha256": ownership_sha256,
+            "authorization_sha256": authorization_sha256,
+            "workers": [
+                {
+                    "role": child["role"], "cpu": child["cpu"], "pid": child["pid"],
+                    "start_ticks": child["start_ticks"], "pgid": child["pgid_observed"],
+                    "session_id": child["sid_observed"],
+                }
+                for child in workers.children
+            ],
+            "storage_device": app_storage["device"],
+            "network_namespace_inode": host["network"]["network_namespace_inode"],
+        }
+        safe_write_new(work_start_path, canonical_bytes(work_start_body), "calibration worker work-start journal", maximum=MAX_EVENT_LINE_BYTES)
+        workers.begin(start_ns, ownership_sha256, authorization_sha256)
+        interval_ns = schedule["sample_interval_ms"] * 1_000_000
+        sample_count = schedule["duration_seconds"] * 1000 // schedule["sample_interval_ms"]
+        _sleep_until(start_ns - 1_000_000, deadline_ns=calibration_deadline_ns,
+                     maximum_sleep_ns=10_000_000, label="calibration initial baseline")
+        counters_before = _counter_snapshot(app_storage["backing_chain"])
+        io_before = workers.process_io()
+        previous_end = max(start_ns, time.monotonic_ns())
+        window_start_ns = previous_end
+        window_end_ns = workers.grant_sample_window(0, window_start_ns)
+        for seq in range(sample_count):
+            target_start = window_start_ns
+            target_end = window_end_ns
+            _sleep_until(target_start, deadline_ns=calibration_deadline_ns, maximum_sleep_ns=10_000_000, label="calibration sample start")
+            before = counters_before
+            worker_before = io_before
+            worker_records_raw = workers.wait_sample(seq, target_end + max(500_000_000, interval_ns // 2))
+            worker_records = _normalize_worker_records(worker_records_raw, workers.children, seq, schedule, fake_recipe["recipe_sha256"])
+            _sleep_until(target_end, deadline_ns=calibration_deadline_ns, maximum_sleep_ns=5_000_000, label="calibration sample end")
+            after = _counter_snapshot(app_storage["backing_chain"])
+            worker_after = workers.process_io()
+            sample_end_ns = time.monotonic_ns()
+            if seq + 1 == sample_count:
+                workers.finish_sample_capture(seq)
+            sample = _build_sample(fake_recipe, seq, previous_end, sample_end_ns, before, after, worker_records, worker_before, worker_after, False)
+            samples.append(sample)
+            if context_v2:
+                prospective = normalized["scope"]["pressure_thresholds"]
+                observed = _readiness_from_sample(sample, prospective)
+                if not observed["all_ready"]:
+                    failed_sample_evidence = _calibration_failed_sample_evidence(
+                        sample, observed, prospective,
+                    )
+                require(observed["all_ready"], f"calibration sample[{seq}] fails its prospectively frozen Source5 pressure thresholds")
+            if seq % max(1, 1000 // schedule["sample_interval_ms"]) == 0:
+                _storage_reserve(fake_recipe, run_dir, scratch_reserved=True)
+            counters_before = after
+            io_before = worker_after
+            previous_end = sample_end_ns
+            if seq + 1 < sample_count:
+                window_start_ns = sample_end_ns
+                window_end_ns = workers.grant_sample_window(seq + 1, window_start_ns)
+        require(all(item["block"]["writes_completed"] > 0 and item["block"]["write_bytes"] > 0 for item in samples), "pressure calibration did not observe writes on the application block device")
+        require(any(item["block"]["in_flight"] > 0 or item["block"]["weighted_io_milliseconds"] > 0 or item["io_psi_delta_microseconds"] > 0 for item in samples), "pressure calibration has no independent block queue/stall evidence")
+        require(all(
+            item["loopback_counters"]["tx_bytes"] > 0 and item["loopback_counters"]["rx_bytes"] > 0
+            and all(item["loopback_counters"][key] == 0 for key in ("rx_errors", "rx_dropped", "tx_errors", "tx_dropped"))
+            for item in samples
+        ), "pressure calibration did not observe clean real IPv4 loopback traffic")
+        require(time.monotonic_ns() <= calibration_deadline_ns, "pressure calibration exceeded its frozen total deadline")
+    except BaseException as error:
+        failure = f"{type(error).__name__}: {error}"
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        cleanup = workers.cleanup(schedule["term_deadline_seconds"], schedule["kill_deadline_seconds"])
+    cleanup_ok = bool(cleanup) and all(
+        _worker_exit_was_bounded(item) and item.get("alive_after_cleanup") is False
+        and item.get("term_error") is None and item.get("kill_error") is None and item.get("reap_error") is None and item.get("stderr_output") == ""
+        and item.get("stderr_raw_bytes") == 0 and item.get("stderr_raw_truncated") is False and item.get("stderr_read_error") is None
+        for item in cleanup if item.get("role") != "scratch_cleanup"
+    ) and not any(item.get("role") == "scratch_cleanup" and item.get("error") for item in cleanup)
+    if failure is not None or not cleanup_ok or not workers.scratch_removed:
+        failure_body = _calibration_failure_body(
+            failure or "calibration process cleanup or scratch removal failed",
+            samples, cleanup, workers.scratch_removed, time.monotonic_ns(),
+            failed_sample_evidence,
+        )
+        try:
+            safe_write_new(run_dir / "failure.json", canonical_bytes(failure_body), "pressure calibration failure evidence", maximum=MAX_FAILURE_BYTES)
+        except (OSError, PressureError):
+            pass
+        raise PressureError(failure_body["failure"])
+    summary = _summarize_samples(samples)
+    require(len(samples) == schedule["duration_seconds"] * 1000 // schedule["sample_interval_ms"], "pressure calibration sample count differs from its frozen schedule")
+    suggested = _suggest_thresholds(summary)
+    worker_sessions = [
+        {"role": child["role"], "cpu": child["cpu"], "pid": child["pid"], "start_ticks": child["start_ticks"], "pgid": child["pgid"], "session_id": child["session_id"]}
+        for child in workers.children
+    ]
+    common_body = {
+        "host": host,
+        "storage": {"application_device": app_storage["device"], "mount_id": app_storage["mount"]["mount_id"], "backing_chain": app_storage["backing_chain"]},
+        "network": host["network"],
+        "worker_sessions": worker_sessions,
+        "samples": samples,
+        "summary": summary,
+        "suggested_readiness_thresholds": suggested,
+        "worker_cleanup": cleanup,
+        "scratch_file_removed": workers.scratch_removed,
+        "start_monotonic_ns": calibration_start_ns,
+        "finish_monotonic_ns": time.monotonic_ns(),
+        "deadlines": {
+            "startup_seconds": schedule["startup_deadline_seconds"],
+            "total_seconds": schedule["total_deadline_seconds"],
+            "term_seconds": schedule["term_deadline_seconds"],
+            "kill_seconds": schedule["kill_deadline_seconds"],
+        },
+    }
+    if context_v2:
+        context_scope = normalized["scope"]
+        scope_value = {
+            "schema": CALIBRATION_SCOPE_SCHEMA_V2,
+            "condition": context_scope["condition"],
+            "condition_id": context_scope["condition_id"],
+            "pressure_calibration_id": context_scope["pressure_calibration_id"],
+            "capacity_key": context_scope["capacity_key"],
+            "source_root": context_scope["source_root"],
+            "source_manifest": context_scope["source_manifest"],
+            "source_manifest_semantic_sha256": context_scope["source_manifest_semantic_sha256"],
+            "source_tree_sha256": context_scope["source_tree_sha256"],
+            "capacity_bundle_pins": context_scope["capacity_bundle_pins"],
+            "context_policy_bundle": context_scope["context_policy_bundle"],
+            "context_policy_sha256": context_scope["context_policy_sha256"],
+            "readiness_thresholds": context_scope["readiness_thresholds"],
+            "pressure_thresholds": context_scope["pressure_thresholds"],
+            "observed_host": context_scope["observed_host"],
+            "host_sha256": digest_object(host),
+            "storage_sha256": digest_object(common_body["storage"]),
+            "network_sha256": digest_object(host["network"]),
+            "pressure_profile_sha256": digest_object(_pressure_profile(schedule)),
+        }
+        body = {
+            "schema": CALIBRATION_SCHEMA_V2,
+            "identity": {
+                "host_id": normalized["identity"]["host_id"],
+                "run_id": normalized["identity"]["run_id"],
+                "condition_id": normalized["identity"]["condition_id"],
+                "nonce": normalized["identity"]["nonce"],
+                "phase": "calibration",
+            },
+            "schedule": schedule,
+            "schedule_sha256": digest_object(_pressure_profile(schedule)),
+            "scope": scope_value,
+            "raw_inputs": {
+                "source_manifest_raw_sha256": normalized["files"]["source_manifest"]["raw_sha256"],
+                "policy_artifact_raw_sha256": normalized["files"]["policy"]["raw_sha256"],
+                "application_capacity_calibration_sha256": normalized["files"]["application_capacity_calibration"]["raw_sha256"],
+                "capacity_bundle_pins_sha256": digest_object(context_scope["capacity_bundle_pins"]),
+                "context_policy_bundle_raw_sha256": context_scope["context_policy_bundle_raw_sha256"],
+                "condition_raw_sha256": context_scope["condition"]["raw_sha256"],
+                "observed_host_raw_sha256": context_scope["observed_host"]["raw_sha256"],
+            },
+            "driver_sha256": _hash_script(DRIVER_PATH, "pressure driver"),
+            "reader_sha256": _hash_script(READER_PATH, "pressure reader"),
+            **common_body,
+        }
+    else:
+        body = {
+            "schema": CALIBRATION_SCHEMA,
+            "identity": {
+                "host_id": normalized["identity"]["host_id"],
+                "pair_id": normalized["identity"]["pair_id"],
+                "condition_id": normalized["identity"]["condition_id"],
+                "phase": "calibration",
+            },
+            "schedule_sha256": digest_object(_pressure_profile(schedule)),
+            "raw_inputs": {
+                "source_manifest_sha256": normalized["files"]["source_manifest"]["raw_sha256"],
+                "policy_sha256": normalized["files"]["policy"]["raw_sha256"],
+                "application_capacity_calibration_sha256": normalized["files"]["application_capacity_calibration"]["raw_sha256"],
+            },
+            "driver_sha256": _hash_script(DRIVER_PATH, "pressure driver"),
+            **common_body,
+        }
+    calibration = {**body, "calibration_sha256": digest_object(body)}
+    raw = canonical_bytes(calibration)
+    safe_write_new(output_path, raw, "pressure contention calibration", maximum=MAX_CALIBRATION_BYTES)
+    for journal_path in (work_start_path, authorization_path, ownership_path):
+        try:
+            journal_path.unlink()
+        except FileNotFoundError:
+            pass
+    try:
+        run_dir.rmdir()
+    except OSError:
+        # Keep calibration failure artifacts rather than deleting diagnostics.
+        pass
+    result = {"calibration_sha256": calibration["calibration_sha256"], "calibration_raw_sha256": digest_bytes(raw), "sample_count": len(samples), "suggested_readiness_thresholds": suggested, "path": str(output_path)}
+    if context_v2:
+        result["_v2_scope"] = normalized["scope"]
+    return result
+
+
+def _normalize_worker_records(
+    raw: dict[str, Any], children: list[dict[str, Any]], seq: int,
+    schedule: dict[str, Any], recipe_sha: str,
+) -> dict[str, Any]:
+    normalized: dict[str, Any] = {"cpu": [], "disk": None, "loopback": None}
+    by_label = {child["role"] if child["cpu"] is None else f"cpu:{child['cpu']}": child for child in children}
+    for key, child in by_label.items():
+        value = _validate_worker_record(raw[key], child, seq, recipe_sha)
+        if child["role"] == "cpu":
+            normalized["cpu"].append(value)
+        elif child["role"] == "disk":
+            normalized["disk"] = value
+        else:
+            normalized["loopback"] = value
+    require(len(normalized["cpu"]) == len(schedule["pressure_cpu_affinity"]) and normalized["disk"] is not None and normalized["loopback"] is not None, "worker telemetry is missing a pressure resource")
+    return normalized
+
+
+def _load_cli_recipe(path: Path, expected_sha: str | None) -> tuple[dict[str, Any], str]:
+    value, _, actual = verify_canonical_json(path, "frozen pressure recipe", MAX_RECIPE_BYTES)
+    recipe = _validate_recipe(value, expected_sha)
+    return recipe, actual
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    freeze = sub.add_parser("freeze", help="freeze a canonical pressure recipe; does not start load")
+    freeze.add_argument("--request", type=Path, required=True)
+    freeze.add_argument("--output", type=Path, required=True)
+    calibrate_parser = sub.add_parser("calibrate", help="run one finite contention calibration; no application performance thresholds")
+    calibrate_parser.add_argument("--request", type=Path, required=True)
+    calibrate_parser.add_argument("--output", type=Path, required=True)
+    context_calibrate = sub.add_parser("calibrate-context-v2", help="measure one SourceV5 pressure context and store an independent scope receipt")
+    context_calibrate.add_argument("--request", type=Path, required=True)
+    context_calibrate.add_argument("--output", type=Path, required=True)
+    context_calibrate.add_argument("--scope-receipt", type=Path, required=True)
+    run = sub.add_parser("run", help="run one bounded pressure session for one authenticated application process")
+    run.add_argument("--recipe", type=Path, required=True)
+    run.add_argument("--expected-recipe-sha256", required=True)
+    run.add_argument("--launch-record", type=Path, required=True)
+    run.add_argument("--output-dir", type=Path, required=True)
+    run.add_argument("--ready-file", type=Path, required=True)
+    worker = sub.add_parser("_worker", help=argparse.SUPPRESS)
+    worker.add_argument("--kind", choices=("cpu", "disk", "loopback"), required=True)
+    worker.add_argument("--recipe-sha256", required=True)
+    worker.add_argument("--owner-nonce", required=True)
+    worker.add_argument("--driver-pid", type=int, required=True)
+    worker.add_argument("--driver-start-ticks", type=int, required=True)
+    worker.add_argument("--interval-ms", type=int, required=True)
+    worker.add_argument("--duration-seconds", type=int, required=True)
+    worker.add_argument("--seed", type=int, required=True)
+    worker.add_argument("--cpu", type=int)
+    worker.add_argument("--duty-basis-points", type=int, default=0)
+    worker.add_argument("--scratch-file")
+    worker.add_argument("--scratch-bytes", type=int, default=0)
+    worker.add_argument("--scratch-device", type=int, default=0)
+    worker.add_argument("--scratch-inode", type=int, default=0)
+    worker.add_argument("--disk-rate", type=int, default=0)
+    worker.add_argument("--requests-per-second", type=int, default=0)
+    worker.add_argument("--payload-bytes", type=int, default=0)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    if args.command != "_worker":
+        def stop_driver(signum: int, _frame: Any) -> None:
+            raise PressureError(f"pressure driver received signal {signum}")
+        signal.signal(signal.SIGTERM, stop_driver)
+        signal.signal(signal.SIGINT, stop_driver)
+    try:
+        if args.command == "freeze":
+            result = freeze_recipe(args.request, args.output)
+        elif args.command == "calibrate":
+            result = calibrate(args.request, args.output)
+        elif args.command == "calibrate-context-v2":
+            result = calibrate_context_v2(args.request, args.output, args.scope_receipt)
+        elif args.command == "run":
+            expected = sha256(args.expected_recipe_sha256, "expected recipe SHA-256")
+            result = run_pressure(args.recipe, expected, args.launch_record, args.output_dir, args.ready_file)
+        elif args.command == "_worker":
+            return worker_main(args)
+        else:
+            raise PressureError("unknown command")
+    except (PressureError, OSError, subprocess.SubprocessError) as error:
+        print(f"application-pressure-driver: {error}", file=sys.stderr)
+        return 2
+    sys.stdout.buffer.write(canonical_bytes(result))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,2395 @@
+//! Bounded readiness driven network endpoints.
+//!
+//! This first network layer owns nonblocking sockets registered with an
+//! explicitly supplied [`ReactorHandle`]. Its named async methods wait for
+//! readiness and then make one standard-library syscall through the
+//! readiness guard. They do not start a runtime or a blocking pool.
+//!
+//! Standard endpoint creation and binding are synchronous. `NetHandle::connect`
+//! and `NetHandle::resolve` run on its explicitly supplied I/O adapter pool
+//! ([`IoPoolHandle`]), never on a user blocking pool; the named nonblocking TCP
+//! connect methods register before initiating one connect syscall and wait on
+//! the explicit reactor. `from_std` takes ownership only on success; a
+//! rejected socket is returned intact. Registering sets `O_NONBLOCK` on the
+//! shared open file description, which also affects other descriptors sharing
+//! it.
+//!
+//! The async methods preserve partial byte counts and retry `Interrupted`
+//! and stale-readiness `WouldBlock`. Each ready endpoint operation consumes
+//! one unit from the runtime-owned task poll's shared cooperative budget;
+//! pending readiness and stale `WouldBlock` refund their reservation, while
+//! `Interrupted` consumes a unit. Each I/O poll also caps its own
+//! stale/interrupted retry loop at 64 attempts and self-wakes before returning
+//! `Pending`. Readiness-only waits do not consume units, and manual polls
+//! outside a runtime-owned task use the cooperative helper's no-op behavior.
+//! Dropping a named async-method future releases its readiness waiter; bytes
+//! already transferred remain transferred. `TcpStream` and Unix `UnixStream`
+//! also implement [`AsyncRead`] and [`AsyncWrite`]. Their pending waiter is
+//! retained by the endpoint when the caller drops a poll future; it is freed
+//! when a later read or write poll in that direction completes (including an
+//! empty-buffer poll), by [`TcpStream::cancel_io_waits`] or
+//! [`UnixStream::cancel_io_waits`], or when the endpoint is dropped. Flush and
+//! shutdown polls do not clear read or write waiters.
+
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
+
+use std::fmt;
+use std::future::poll_fn;
+use std::io::{self, IoSlice, IoSliceMut, Read, Write};
+use std::net::{
+  Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener as StdTcpListener,
+  TcpStream as StdTcpStream, ToSocketAddrs, UdpSocket as StdUdpSocket,
+};
+use std::os::fd::OwnedFd;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use rustix::fs::{self as rfs, OFlags};
+use rustix::io::{Errno, FdFlags};
+use rustix::net::{self as rnet, AddressFamily, SocketFlags, SocketType};
+
+use super::error::{JoinError, SubmitErrorKind};
+use super::io::{AsyncRead, AsyncWrite};
+use super::io_pool::IoPoolHandle;
+use super::managed::{ManagedBuf, OperationPermit, OperationRequest, ResourceError, ResourceScope};
+use super::reactor::{AsyncFd, OwnedReadiness, ReactorHandle, RegisterError};
+#[cfg(test)]
+pub(super) use super::readiness_io::{IoAttempt, poll_io_attempt};
+pub(super) use super::readiness_io::{IoDirection, poll_io_with_retry};
+use super::resources::Resources;
+
+const IO_BUDGET: usize = 64;
+const ADDRESS_RECORD_BYTES: usize = 27;
+
+#[cfg(all(test, not(loom)))]
+#[path = "net_tests.rs"]
+mod tests;
+
+/// A refused socket registration, retaining the original socket.
+pub struct FromStdError<T> {
+  /// Why the reactor refused the descriptor.
+  pub error: io::Error,
+  /// The unchanged socket returned by the reactor.
+  pub socket: T,
+}
+
+impl<T> FromStdError<T> {
+  fn from_register(error: RegisterError<T>) -> Self {
+    let (socket, error) = error.into_parts();
+    Self { error, socket }
+  }
+}
+
+impl<T> fmt::Debug for FromStdError<T> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("FromStdError")
+      .field("error", &self.error)
+      .finish_non_exhaustive()
+  }
+}
+
+impl<T> fmt::Display for FromStdError<T> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "socket registration refused: {}", self.error)
+  }
+}
+
+impl<T: 'static> std::error::Error for FromStdError<T> {}
+
+/// An owned, nonblocking IP TCP socket that is not registered with a reactor.
+///
+/// New sockets are created with `SOCK_NONBLOCK | SOCK_CLOEXEC`. Importing an
+/// existing descriptor requires those flags, an IPv4 or IPv6 TCP stream
+/// socket, and a socket that is not listening or currently connected. The
+/// import checks cannot detect another descriptor alias that has an earlier
+/// connect in progress, changes `O_NONBLOCK`, or consumes `SO_ERROR`; callers
+/// must coordinate such aliases for the duration of a connect operation.
+#[derive(Debug)]
+pub struct TcpSocket {
+  fd: OwnedFd,
+  family: AddressFamily,
+}
+
+impl TcpSocket {
+  /// Creates an unbound, nonblocking IPv4 TCP socket.
+  pub fn new_v4() -> io::Result<Self> {
+    Self::new(AddressFamily::INET)
+  }
+
+  /// Creates an unbound, nonblocking IPv6 TCP socket.
+  pub fn new_v6() -> io::Result<Self> {
+    Self::new(AddressFamily::INET6)
+  }
+
+  fn new(family: AddressFamily) -> io::Result<Self> {
+    let fd = rnet::socket_with(
+      family,
+      SocketType::STREAM,
+      SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+      Some(rnet::ipproto::TCP),
+    )?;
+    Ok(Self { fd, family })
+  }
+
+  /// Returns the kernel-observed IPv4 type-of-service value.
+  ///
+  /// The value is in `0..=255`. Linux preserves the socket's two low ECN bits;
+  /// setting TOS controls the upper six DSCP bits but does not clear ECN.
+  /// This option may not affect IPv6 sockets. Socket aliases share the option
+  /// state.
+  pub fn tos_v4(&self) -> io::Result<u32> {
+    crate::sys::runtime_net_options::get_traffic_class(
+      &self.fd,
+      crate::sys::runtime_net_options::TrafficClass::Ipv4Tos,
+    )
+  }
+
+  /// Sets the IPv4 type-of-service value used for packets sent by this socket.
+  ///
+  /// Values outside `0..=255` are rejected before the syscall. Linux preserves
+  /// the two low ECN bits; the kernel preserves their prior value while this
+  /// setter controls the upper six DSCP bits. Socket aliases share the option
+  /// state.
+  pub fn set_tos_v4(&self, tos: u32) -> io::Result<()> {
+    crate::sys::runtime_net_options::set_traffic_class(
+      &self.fd,
+      crate::sys::runtime_net_options::TrafficClass::Ipv4Tos,
+      tos,
+    )
+  }
+
+  /// Returns the kernel-observed IPv6 traffic-class value.
+  ///
+  /// Values are in `0..=255`. Linux preserves the socket's two low ECN bits;
+  /// setting the traffic class controls the upper six DSCP bits but does not
+  /// clear ECN. Socket aliases share the option state.
+  pub fn tclass_v6(&self) -> io::Result<u32> {
+    crate::sys::runtime_net_options::get_traffic_class(
+      &self.fd,
+      crate::sys::runtime_net_options::TrafficClass::Ipv6Class,
+    )
+  }
+
+  /// Sets the IPv6 traffic-class value used for packets sent by this socket.
+  ///
+  /// Values outside `0..=255` are rejected before the syscall. Linux preserves
+  /// the two low ECN bits; the kernel preserves their prior value while this
+  /// setter controls the upper six DSCP bits. Socket aliases share the option
+  /// state.
+  pub fn set_tclass_v6(&self, tclass: u32) -> io::Result<()> {
+    crate::sys::runtime_net_options::set_traffic_class(
+      &self.fd,
+      crate::sys::runtime_net_options::TrafficClass::Ipv6Class,
+      tclass,
+    )
+  }
+
+  /// Returns the bound interface name, if `SO_BINDTODEVICE` is set.
+  ///
+  /// The returned `Vec` is ordinary caller-owned metadata and is not charged
+  /// to a [`ResourceScope`]. The kernel limits names to `IFNAMSIZ`; aliases
+  /// share this setting.
+  pub fn device(&self) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = [0_u8; libc::IFNAMSIZ];
+    let Some(length) = crate::sys::runtime_net_options::get_device(&self.fd, &mut bytes)? else {
+      return Ok(None);
+    };
+    Ok(Some(bytes[..length].to_vec()))
+  }
+
+  /// Binds this socket to a network interface, or clears the binding with
+  /// `None` or an empty name.
+  ///
+  /// A binding restricts packet handling to the selected interface where the
+  /// kernel supports it. The kernel may require a network capability to set
+  /// this option. It is not a sandbox or runtime resource reservation, and
+  /// aliases share the setting. Names containing NUL or at least `IFNAMSIZ`
+  /// bytes are rejected before the syscall.
+  pub fn bind_device(&self, interface: Option<&[u8]>) -> io::Result<()> {
+    crate::sys::runtime_net_options::set_device(&self.fd, interface)
+  }
+
+  /// Returns the configured `SO_LINGER` duration, if any.
+  pub fn linger(&self) -> io::Result<Option<Duration>> {
+    rnet::sockopt::socket_linger(&self.fd).map_err(Into::into)
+  }
+
+  /// Configures `SO_LINGER` for this socket.
+  ///
+  /// A positive duration can make synchronous socket close or `Drop` block on
+  /// the calling thread while the kernel sends queued data, even though this
+  /// socket is nonblocking. It can therefore block an executor worker. This
+  /// setting does not make `shutdown` an asynchronous linger operation. The
+  /// Rustix adapter rounds positive durations up to whole seconds; it may
+  /// reject values that do not fit the kernel option representation. Socket
+  /// aliases share the setting.
+  pub fn set_linger(&self, duration: Option<Duration>) -> io::Result<()> {
+    rnet::sockopt::set_socket_linger(&self.fd, duration).map_err(Into::into)
+  }
+
+  /// Enables abortive close for this socket by setting `SO_LINGER` to zero.
+  ///
+  /// Closing or dropping the socket discards unsent data in the kernel send
+  /// buffer and sends a reset instead of a normal close handshake. This is
+  /// destructive; aliases share the setting.
+  pub fn set_zero_linger(&self) -> io::Result<()> {
+    self.set_linger(Some(Duration::ZERO))
+  }
+
+  /// Imports an owned descriptor after checking its family, type, protocol,
+  /// nonblocking and close-on-exec flags, and listening/connected state.
+  ///
+  /// On every rejection, the exact original descriptor is returned. Import
+  /// does not alter shared open-file-description flags.
+  pub fn from_owned_fd(fd: OwnedFd) -> Result<Self, TcpSocketImportError> {
+    let family = match rnet::sockopt::socket_domain(&fd) {
+      Ok(family @ (AddressFamily::INET | AddressFamily::INET6)) => family,
+      Ok(_) => return Err(TcpSocketImportError::new(invalid_tcp_socket(), fd)),
+      Err(error) => return Err(TcpSocketImportError::new(error.into(), fd)),
+    };
+    let reject = |error, fd| TcpSocketImportError::new(error, fd);
+    let socket_type = match rnet::sockopt::socket_type(&fd) {
+      Ok(socket_type) => socket_type,
+      Err(error) => return Err(reject(error.into(), fd)),
+    };
+    if socket_type != SocketType::STREAM {
+      return Err(reject(invalid_tcp_socket(), fd));
+    }
+    let protocol = match rnet::sockopt::socket_protocol(&fd) {
+      Ok(protocol) => protocol,
+      Err(error) => return Err(reject(error.into(), fd)),
+    };
+    if protocol != Some(rnet::ipproto::TCP) {
+      return Err(reject(invalid_tcp_socket(), fd));
+    }
+    let listening = match rnet::sockopt::socket_acceptconn(&fd) {
+      Ok(listening) => listening,
+      Err(error) => return Err(reject(error.into(), fd)),
+    };
+    if listening {
+      return Err(reject(invalid_tcp_socket(), fd));
+    }
+    let connected = match rnet::getpeername(&fd) {
+      Ok(peer) => peer.is_some(),
+      Err(Errno::NOTCONN) => false,
+      Err(error) => return Err(reject(error.into(), fd)),
+    };
+    if connected {
+      return Err(reject(invalid_tcp_socket(), fd));
+    }
+    let status_flags = match rfs::fcntl_getfl(&fd) {
+      Ok(flags) => flags,
+      Err(error) => return Err(reject(error.into(), fd)),
+    };
+    let descriptor_flags = match rustix::io::fcntl_getfd(&fd) {
+      Ok(flags) => flags,
+      Err(error) => return Err(reject(error.into(), fd)),
+    };
+    if !status_flags.contains(OFlags::NONBLOCK) || !descriptor_flags.contains(FdFlags::CLOEXEC) {
+      return Err(reject(
+        io::Error::new(
+          io::ErrorKind::InvalidInput,
+          "imported TCP socket must be nonblocking and close-on-exec",
+        ),
+        fd,
+      ));
+    }
+    Ok(Self { fd, family })
+  }
+
+  /// Binds this socket to an address of its family.
+  pub fn bind(&self, address: SocketAddr) -> io::Result<()> {
+    if address_family(address) != self.family {
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "TCP socket and bind address families differ",
+      ));
+    }
+    rnet::bind(&self.fd, &address).map_err(Into::into)
+  }
+
+  /// Returns the current local address, including an assigned ephemeral port.
+  pub fn local_addr(&self) -> io::Result<SocketAddr> {
+    SocketAddr::try_from(rnet::getsockname(&self.fd)?).map_err(|_| {
+      io::Error::new(
+        io::ErrorKind::InvalidData,
+        "TCP socket returned a non-IP address",
+      )
+    })
+  }
+
+  /// Starts listening with the requested kernel backlog and registers the
+  /// resulting listener with `reactor`.
+  ///
+  /// A negative `backlog` is rejected before the syscall and returns this
+  /// unchanged socket. Zero is valid. On Linux an unbound socket is
+  /// automatically bound to a local address; the kernel may clamp the
+  /// requested backlog to its `somaxconn` setting. The backlog describes the
+  /// kernel's pending-connection queue and is not a runtime admission or
+  /// managed-memory limit.
+  ///
+  /// If the listen syscall fails, the error returns the same owned socket.
+  /// The syscall was attempted, so its address or other kernel state may have
+  /// changed; this method does not roll back or retry it. If listen succeeds
+  /// but reactor registration fails, the error returns the listening standard
+  /// library listener for recovery or later registration.
+  pub fn listen(
+    self,
+    backlog: i32,
+    reactor: &ReactorHandle,
+  ) -> Result<TcpListener, TcpListenError> {
+    self.listen_with(backlog, reactor, |fd, backlog| rnet::listen(fd, backlog))
+  }
+
+  fn listen_with(
+    self,
+    backlog: i32,
+    reactor: &ReactorHandle,
+    listen: impl FnOnce(&OwnedFd, i32) -> Result<(), Errno>,
+  ) -> Result<TcpListener, TcpListenError> {
+    if backlog < 0 {
+      return Err(TcpListenError::InvalidBacklog {
+        backlog,
+        socket: self,
+      });
+    }
+    if let Err(error) = listen(&self.fd, backlog) {
+      return Err(TcpListenError::Listen {
+        error: error.into(),
+        socket: self,
+      });
+    }
+    let Self { fd, family: _ } = self;
+    let listener: StdTcpListener = fd.into();
+    TcpListener::from_std(listener, reactor).map_err(|error| TcpListenError::Registration {
+      error: error.error,
+      listener: error.socket,
+    })
+  }
+
+  /// Sets whether the socket may bind to an address that is already in use.
+  ///
+  /// Configure this before [`TcpSocket::bind`]. The kernel determines the
+  /// exact address-reuse behavior.
+  pub fn set_reuseaddr(&self, reuseaddr: bool) -> io::Result<()> {
+    rnet::sockopt::set_socket_reuseaddr(&self.fd, reuseaddr).map_err(Into::into)
+  }
+
+  /// Returns the current `SO_REUSEADDR` setting.
+  pub fn reuseaddr(&self) -> io::Result<bool> {
+    rnet::sockopt::socket_reuseaddr(&self.fd).map_err(Into::into)
+  }
+
+  /// Sets whether this socket may share a local address and port with other
+  /// sockets using `SO_REUSEPORT`.
+  ///
+  /// Configure this before binding. Linux applies its normal `SO_REUSEPORT`
+  /// ownership and group rules; this does not reserve runtime capacity.
+  pub fn set_reuseport(&self, reuseport: bool) -> io::Result<()> {
+    rnet::sockopt::set_socket_reuseport(&self.fd, reuseport).map_err(Into::into)
+  }
+
+  /// Returns the current `SO_REUSEPORT` setting.
+  pub fn reuseport(&self) -> io::Result<bool> {
+    rnet::sockopt::socket_reuseport(&self.fd).map_err(Into::into)
+  }
+
+  /// Sets the TCP keepalive toggle (`SO_KEEPALIVE`). This does not configure
+  /// the kernel's keepalive interval or probe count.
+  pub fn set_keepalive(&self, keepalive: bool) -> io::Result<()> {
+    rnet::sockopt::set_socket_keepalive(&self.fd, keepalive).map_err(Into::into)
+  }
+
+  /// Returns the current `SO_KEEPALIVE` setting.
+  pub fn keepalive(&self) -> io::Result<bool> {
+    rnet::sockopt::socket_keepalive(&self.fd).map_err(Into::into)
+  }
+
+  /// Sets whether the socket disables Nagle's algorithm (`TCP_NODELAY`).
+  pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+    rnet::sockopt::set_tcp_nodelay(&self.fd, nodelay).map_err(Into::into)
+  }
+
+  /// Returns the current `TCP_NODELAY` setting.
+  pub fn nodelay(&self) -> io::Result<bool> {
+    rnet::sockopt::tcp_nodelay(&self.fd).map_err(Into::into)
+  }
+
+  /// Sets the requested TCP send-buffer size in bytes.
+  ///
+  /// The kernel may clamp this request. On Linux it may account for
+  /// bookkeeping by doubling the value reported by [`TcpSocket::send_buffer_size`].
+  /// The kernel buffer is not managed-memory storage and is not charged to a
+  /// [`ResourceScope`].
+  pub fn set_send_buffer_size(&self, size: u32) -> io::Result<()> {
+    let size = usize::try_from(size).map_err(|_| {
+      io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "send-buffer size is not representable",
+      )
+    })?;
+    rnet::sockopt::set_socket_send_buffer_size(&self.fd, size).map_err(Into::into)
+  }
+
+  /// Returns the kernel-observed TCP send-buffer size in bytes.
+  ///
+  /// This may differ from the value requested with
+  /// [`TcpSocket::set_send_buffer_size`] because of kernel minimums, maximums
+  /// and Linux bookkeeping adjustments.
+  pub fn send_buffer_size(&self) -> io::Result<u32> {
+    let size = rnet::sockopt::socket_send_buffer_size(&self.fd).map_err(io::Error::from)?;
+    kernel_buffer_size_u32(size)
+  }
+
+  /// Sets the requested TCP receive-buffer size in bytes.
+  ///
+  /// The kernel may clamp this request. On Linux it may account for
+  /// bookkeeping by doubling the value reported by [`TcpSocket::recv_buffer_size`].
+  /// The kernel buffer is not managed-memory storage and is not charged to a
+  /// [`ResourceScope`].
+  pub fn set_recv_buffer_size(&self, size: u32) -> io::Result<()> {
+    let size = usize::try_from(size).map_err(|_| {
+      io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "receive-buffer size is not representable",
+      )
+    })?;
+    rnet::sockopt::set_socket_recv_buffer_size(&self.fd, size).map_err(Into::into)
+  }
+
+  /// Returns the kernel-observed TCP receive-buffer size in bytes.
+  ///
+  /// This may differ from the value requested with
+  /// [`TcpSocket::set_recv_buffer_size`] because of kernel minimums, maximums
+  /// and Linux bookkeeping adjustments.
+  pub fn recv_buffer_size(&self) -> io::Result<u32> {
+    let size = rnet::sockopt::socket_recv_buffer_size(&self.fd).map_err(io::Error::from)?;
+    kernel_buffer_size_u32(size)
+  }
+
+  /// Reads and clears the pending `SO_ERROR` value, if any.
+  ///
+  /// Socket aliases share this destructive observation; callers must
+  /// coordinate aliases that can also inspect or consume the pending error.
+  pub fn take_error(&self) -> io::Result<Option<io::Error>> {
+    let status = rnet::sockopt::socket_error(&self.fd).map_err(io::Error::from)?;
+    Ok(status.err().map(io::Error::from))
+  }
+
+  /// Recovers the original descriptor before submitting a connect operation.
+  #[must_use]
+  pub fn into_owned_fd(self) -> OwnedFd {
+    self.fd
+  }
+
+  fn into_stream(self) -> StdTcpStream {
+    self.fd.into()
+  }
+}
+
+fn kernel_buffer_size_u32(size: usize) -> io::Result<u32> {
+  u32::try_from(size).map_err(|_| {
+    io::Error::new(
+      io::ErrorKind::InvalidData,
+      "kernel socket-buffer size exceeds the public u32 range",
+    )
+  })
+}
+
+fn address_family(address: SocketAddr) -> AddressFamily {
+  match address {
+    SocketAddr::V4(_) => AddressFamily::INET,
+    SocketAddr::V6(_) => AddressFamily::INET6,
+  }
+}
+
+fn invalid_tcp_socket() -> io::Error {
+  io::Error::new(
+    io::ErrorKind::InvalidInput,
+    "descriptor is not an unconnected IPv4 or IPv6 TCP stream socket",
+  )
+}
+
+/// A rejected descriptor import, retaining the unchanged owned descriptor.
+pub struct TcpSocketImportError {
+  /// Why the descriptor did not satisfy the TCP socket requirements.
+  pub error: io::Error,
+  /// The descriptor returned unchanged for recovery or another use.
+  pub socket: OwnedFd,
+}
+
+impl TcpSocketImportError {
+  fn new(error: io::Error, socket: OwnedFd) -> Self {
+    Self { error, socket }
+  }
+}
+
+impl fmt::Debug for TcpSocketImportError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("TcpSocketImportError")
+      .field("error", &self.error)
+      .finish_non_exhaustive()
+  }
+}
+
+impl fmt::Display for TcpSocketImportError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "TCP socket import rejected: {}", self.error)
+  }
+}
+
+impl std::error::Error for TcpSocketImportError {}
+
+/// A registered nonblocking TCP stream.
+pub struct TcpStream {
+  fd: AsyncFd<StdTcpStream>,
+  read_waiter: Option<OwnedReadiness<StdTcpStream>>,
+  write_waiter: Option<OwnedReadiness<StdTcpStream>>,
+}
+
+impl TcpStream {
+  /// Registers an existing stream. Registration sets nonblocking mode.
+  pub fn from_std(
+    stream: StdTcpStream,
+    reactor: &ReactorHandle,
+  ) -> Result<Self, FromStdError<StdTcpStream>> {
+    reactor
+      .register(stream)
+      .map(|fd| Self {
+        fd,
+        read_waiter: None,
+        write_waiter: None,
+      })
+      .map_err(FromStdError::from_register)
+  }
+
+  /// The underlying standard stream.
+  #[must_use]
+  pub fn get_ref(&self) -> &StdTcpStream {
+    self.fd.get_ref()
+  }
+
+  /// Returns the configured `SO_LINGER` duration, if any.
+  pub fn linger(&self) -> io::Result<Option<Duration>> {
+    rnet::sockopt::socket_linger(self.fd.get_ref()).map_err(Into::into)
+  }
+
+  /// Configures `SO_LINGER` for this stream.
+  ///
+  /// A positive duration can make synchronous stream close or `Drop` block on
+  /// the calling thread while the kernel sends queued data, even though this
+  /// stream is nonblocking. It can therefore block an executor worker. This
+  /// setting does not make `shutdown` an asynchronous linger operation. The
+  /// Rustix adapter rounds positive durations up to whole seconds; it may
+  /// reject values that do not fit the kernel option representation. Socket
+  /// aliases share the setting.
+  pub fn set_linger(&self, duration: Option<Duration>) -> io::Result<()> {
+    rnet::sockopt::set_socket_linger(self.fd.get_ref(), duration).map_err(Into::into)
+  }
+
+  /// Enables abortive close by setting `SO_LINGER` to zero.
+  ///
+  /// Closing or dropping the stream discards unsent data in the kernel send
+  /// buffer and sends a reset instead of a normal close handshake. This is
+  /// destructive; aliases share the setting.
+  pub fn set_zero_linger(&self) -> io::Result<()> {
+    self.set_linger(Some(Duration::ZERO))
+  }
+
+  /// Returns whether Linux `TCP_QUICKACK` is enabled for this stream.
+  ///
+  /// This is a socket option, not a persistent mode: Linux may reset it after
+  /// later socket operations. Aliases of this socket observe the same setting.
+  #[cfg(target_os = "linux")]
+  pub fn quickack(&self) -> io::Result<bool> {
+    rnet::sockopt::tcp_quickack(self.fd.get_ref()).map_err(Into::into)
+  }
+
+  /// Enables or disables Linux `TCP_QUICKACK` for this stream.
+  ///
+  /// Enabling it asks Linux to send acknowledgments promptly rather than
+  /// delaying them. Linux may reset the option after later socket operations;
+  /// aliases of this socket share the setting.
+  #[cfg(target_os = "linux")]
+  pub fn set_quickack(&self, quickack: bool) -> io::Result<()> {
+    rnet::sockopt::set_tcp_quickack(self.fd.get_ref(), quickack).map_err(Into::into)
+  }
+
+  /// Reads once after readable readiness, preserving the standard stream's
+  /// EOF (`Ok(0)`) and partial-read behavior.
+  pub async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+    if buf.is_empty() {
+      return ready_operation(|| Ok(0)).await;
+    }
+    ready_io(&self.fd, IoDirection::Read, |stream| (&*stream).read(buf)).await
+  }
+
+  /// Reads once into initialized buffers after readable readiness.
+  pub async fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+    stream_read_vectored(&self.fd, bufs).await
+  }
+
+  /// Writes once after writable readiness, preserving partial-write counts.
+  pub async fn write(&self, buf: &[u8]) -> io::Result<usize> {
+    if buf.is_empty() {
+      return ready_operation(|| Ok(0)).await;
+    }
+    ready_io(&self.fd, IoDirection::Write, |stream| (&*stream).write(buf)).await
+  }
+
+  /// Writes once from initialized buffers after writable readiness.
+  pub async fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+    stream_write_vectored(&self.fd, bufs).await
+  }
+
+  /// TCP flush is a no-op because writes go directly to the socket.
+  pub async fn flush(&self) -> io::Result<()> {
+    ready_operation(|| Ok(())).await
+  }
+
+  /// Shuts down the local write half. The read half remains usable.
+  pub async fn shutdown(&self) -> io::Result<()> {
+    ready_operation(|| self.get_ref().shutdown(std::net::Shutdown::Write)).await
+  }
+
+  /// Cancels readiness waits retained by [`AsyncRead`] or [`AsyncWrite`]
+  /// after their poll futures were dropped. Call after dropping those
+  /// futures; named async methods cancel their waits when dropped.
+  pub fn cancel_io_waits(&mut self) {
+    self.read_waiter = None;
+    self.write_waiter = None;
+  }
+}
+
+impl AsyncRead for TcpStream {
+  fn poll_read(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    buf: &mut [u8],
+  ) -> Poll<io::Result<usize>> {
+    let this = self.get_mut();
+    if buf.is_empty() {
+      return super::asynchronous::poll_cooperative(cx, |_| {
+        drop(this.read_waiter.take());
+        Poll::Ready(Ok(0))
+      });
+    }
+    poll_io_with_retry(
+      cx,
+      &this.fd,
+      &mut this.read_waiter,
+      IoDirection::Read,
+      |stream| (&*stream).read(buf),
+    )
+  }
+
+  fn poll_read_vectored(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    bufs: &mut [IoSliceMut<'_>],
+  ) -> Poll<io::Result<usize>> {
+    let this = self.get_mut();
+    poll_vectored_io_with_retry(
+      cx,
+      &this.fd,
+      &mut this.read_waiter,
+      IoDirection::Read,
+      |stream| match stream {
+        None => read_vectored_len(bufs).map(|len| {
+          if len == 0 {
+            VectoredCall::Empty
+          } else {
+            VectoredCall::Offered(len)
+          }
+        }),
+        Some(stream) => {
+          let mut stream = stream;
+          stream.read_vectored(bufs).map(VectoredCall::Count)
+        }
+      },
+    )
+  }
+}
+
+impl AsyncWrite for TcpStream {
+  fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    let this = self.get_mut();
+    if buf.is_empty() {
+      return super::asynchronous::poll_cooperative(cx, |_| {
+        drop(this.write_waiter.take());
+        Poll::Ready(Ok(0))
+      });
+    }
+    poll_io_with_retry(
+      cx,
+      &this.fd,
+      &mut this.write_waiter,
+      IoDirection::Write,
+      |stream| (&*stream).write(buf),
+    )
+  }
+
+  fn poll_write_vectored(
+    self: Pin<&mut Self>,
+    cx: &mut Context<'_>,
+    bufs: &[IoSlice<'_>],
+  ) -> Poll<io::Result<usize>> {
+    let this = self.get_mut();
+    poll_vectored_io_with_retry(
+      cx,
+      &this.fd,
+      &mut this.write_waiter,
+      IoDirection::Write,
+      |stream| match stream {
+        None => write_vectored_len(bufs).map(|len| {
+          if len == 0 {
+            VectoredCall::Empty
+          } else {
+            VectoredCall::Offered(len)
+          }
+        }),
+        Some(stream) => {
+          let mut stream = stream;
+          stream.write_vectored(bufs).map(VectoredCall::Count)
+        }
+      },
+    )
+  }
+
+  fn is_write_vectored(&self) -> bool {
+    true
+  }
+
+  fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    super::asynchronous::poll_cooperative(cx, |_| Poll::Ready(Ok(())))
+  }
+
+  fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    let this = self.get_mut();
+    super::asynchronous::poll_cooperative(_cx, |_| {
+      Poll::Ready(this.get_ref().shutdown(std::net::Shutdown::Write))
+    })
+  }
+}
+
+impl fmt::Debug for TcpStream {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("TcpStream").finish_non_exhaustive()
+  }
+}
+
+/// A registered nonblocking TCP listener.
+pub struct TcpListener {
+  fd: AsyncFd<StdTcpListener>,
+  reactor: ReactorHandle,
+}
+
+impl TcpListener {
+  /// Registers an existing listener. Registration sets nonblocking mode.
+  pub fn from_std(
+    listener: StdTcpListener,
+    reactor: &ReactorHandle,
+  ) -> Result<Self, FromStdError<StdTcpListener>> {
+    reactor
+      .register(listener)
+      .map(|fd| Self {
+        fd,
+        reactor: reactor.clone(),
+      })
+      .map_err(FromStdError::from_register)
+  }
+
+  /// The underlying standard listener.
+  #[must_use]
+  pub fn get_ref(&self) -> &StdTcpListener {
+    self.fd.get_ref()
+  }
+
+  /// Accepts one connection. If the accepted socket cannot be registered,
+  /// [`AcceptError::Registration`] returns that accepted socket to the
+  /// caller; the connection has already been consumed from the listen queue.
+  pub async fn accept(&self) -> Result<(TcpStream, SocketAddr), AcceptError> {
+    let (stream, address) = ready_io(&self.fd, IoDirection::Read, |listener| listener.accept())
+      .await
+      .map_err(AcceptError::Io)?;
+    let stream = TcpStream::from_std(stream, &self.reactor).map_err(AcceptError::Registration)?;
+    Ok((stream, address))
+  }
+}
+
+impl fmt::Debug for TcpListener {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("TcpListener").finish_non_exhaustive()
+  }
+}
+
+/// Failure to accept or register an accepted connection.
+#[derive(Debug)]
+pub enum AcceptError {
+  /// The accept syscall or readiness wait failed.
+  Io(io::Error),
+  /// Registration failed and the accepted socket remains available.
+  Registration(FromStdError<StdTcpStream>),
+}
+
+/// Failure while converting a [`TcpSocket`] into a registered
+/// [`TcpListener`]. Each variant retains the owned socket or listener that
+/// remains available at that stage.
+#[derive(Debug)]
+pub enum TcpListenError {
+  /// The negative backlog was rejected before calling the kernel.
+  InvalidBacklog {
+    /// The rejected backlog value.
+    backlog: i32,
+    /// The unchanged socket.
+    socket: TcpSocket,
+  },
+  /// The listen syscall failed after it was attempted.
+  Listen {
+    /// The syscall error.
+    error: io::Error,
+    /// The same socket, whose kernel state may have changed.
+    socket: TcpSocket,
+  },
+  /// Listening succeeded but reactor registration was refused.
+  Registration {
+    /// Why registration failed.
+    error: io::Error,
+    /// The live listener returned by the standard library conversion.
+    listener: StdTcpListener,
+  },
+}
+
+impl fmt::Display for TcpListenError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::InvalidBacklog { backlog, .. } => {
+        write!(f, "TCP listen backlog {backlog} is negative")
+      }
+      Self::Listen { error, .. } => write!(f, "TCP listen syscall failed: {error}"),
+      Self::Registration { error, .. } => {
+        write!(f, "TCP listener registration failed: {error}")
+      }
+    }
+  }
+}
+
+impl std::error::Error for TcpListenError {
+  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+    match self {
+      Self::InvalidBacklog { .. } => None,
+      Self::Listen { error, .. } | Self::Registration { error, .. } => Some(error),
+    }
+  }
+}
+
+impl fmt::Display for AcceptError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Io(error) => error.fmt(f),
+      Self::Registration(error) => error.fmt(f),
+    }
+  }
+}
+
+impl std::error::Error for AcceptError {}
+
+/// A network operation that uses the explicitly supplied I/O adapter pool and
+/// scope. The operation slot is held by its worker closure until the blocking
+/// syscall (including resolver iteration) has actually stopped.
+#[derive(Clone)]
+pub struct NetHandle {
+  io_pool: IoPoolHandle,
+  scope: ResourceScope,
+  reactor: ReactorHandle,
+  max_dns_addresses: usize,
+}
+
+/// Submission, execution, or operation failure from [`NetHandle`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum NetworkError {
+  /// The scope refused the network operation slot.
+  Resource(ResourceError),
+  /// The I/O pool refused the job.
+  Runtime(SubmitErrorKind),
+  /// The job was cancelled before it started or panicked.
+  Join(JoinError),
+  /// A network endpoint syscall or resolver operation failed.
+  Io(io::Error),
+  /// The connected socket could not be registered; ownership is retained.
+  Registration(FromStdError<StdTcpStream>),
+  /// Resolver yielded more than the configured maximum. The observed
+  /// addresses remain charged to their scope and include one overflow item.
+  TooManyAddresses(ResolvedAddresses),
+}
+
+impl fmt::Display for NetworkError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Resource(error) => error.fmt(f),
+      Self::Runtime(error) => write!(f, "network operation refused: {error}"),
+      Self::Join(error) => error.fmt(f),
+      Self::Io(error) => error.fmt(f),
+      Self::Registration(error) => error.fmt(f),
+      Self::TooManyAddresses(addresses) => write!(
+        f,
+        "resolver exceeded address limit (observed {})",
+        addresses.len()
+      ),
+    }
+  }
+}
+
+impl std::error::Error for NetworkError {}
+
+/// A pre-connect rejection or an error from a nonblocking TCP connect.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TcpConnectError {
+  /// Admission or reactor registration rejected a supplied socket before the
+  /// connect syscall. The socket is returned unchanged.
+  Submission(TcpConnectSubmissionError),
+  /// Socket creation or a connect operation failed after admission.
+  Operation(NetworkError),
+}
+
+impl fmt::Display for TcpConnectError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Submission(error) => error.fmt(f),
+      Self::Operation(error) => error.fmt(f),
+    }
+  }
+}
+
+impl std::error::Error for TcpConnectError {}
+
+/// The reason a supplied socket was rejected before connect was attempted.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TcpConnectRejectKind {
+  /// The scope had no network operation slot available.
+  Resource(ResourceError),
+  /// The supplied socket and destination address are incompatible.
+  Socket(io::Error),
+  /// The reactor refused registration before connect began.
+  Registration(io::Error),
+}
+
+/// A pre-connect rejection that retains the caller's supplied socket.
+pub struct TcpConnectSubmissionError {
+  /// Why admission or registration was rejected.
+  pub kind: TcpConnectRejectKind,
+  /// The original socket, still available to the caller.
+  pub socket: TcpSocket,
+}
+
+impl fmt::Debug for TcpConnectSubmissionError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("TcpConnectSubmissionError")
+      .field("kind", &self.kind)
+      .finish_non_exhaustive()
+  }
+}
+
+impl fmt::Display for TcpConnectSubmissionError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "TCP connect rejected before connect: {:?}", self.kind)
+  }
+}
+
+impl std::error::Error for TcpConnectSubmissionError {}
+
+/// A DNS request rejected before the blocking worker accepts ownership.
+/// The original hostname and port are returned unchanged for retry.
+#[derive(Debug)]
+pub struct ResolveSubmissionError {
+  /// Why resolution could not be submitted.
+  pub kind: ResolveSubmissionKind,
+  /// The hostname supplied by the caller.
+  pub host: String,
+  /// The requested port.
+  pub port: u16,
+}
+
+/// Resource or runtime admission failure for DNS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResolveSubmissionKind {
+  /// The scope could not reserve output memory or a network operation slot.
+  Resource(ResourceError),
+  /// The I/O pool rejected the request.
+  Runtime(SubmitErrorKind),
+}
+
+impl fmt::Display for ResolveSubmissionError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "DNS request refused: {:?}", self.kind)
+  }
+}
+
+impl std::error::Error for ResolveSubmissionError {}
+
+/// A DNS failure before submission, or an operation failure after admission.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ResolveError {
+  /// Submission failed and the caller's original hostname is available.
+  Submission(ResolveSubmissionError),
+  /// The submitted resolver operation failed or exceeded its bound.
+  Operation(NetworkError),
+}
+
+impl fmt::Display for ResolveError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::Submission(error) => error.fmt(f),
+      Self::Operation(error) => error.fmt(f),
+    }
+  }
+}
+
+impl std::error::Error for ResolveError {}
+
+/// A bounded DNS result backed by storage charged to its [`ResourceScope`].
+/// Clones share the bytes and their single memory charge until the last clone
+/// is dropped. This record buffer charges its full reserved capacity, even if
+/// the resolver returns fewer than the configured maximum.
+#[derive(Clone)]
+pub struct ResolvedAddresses {
+  storage: ManagedBuf,
+  len: usize,
+}
+
+impl ResolvedAddresses {
+  /// Number of returned addresses.
+  #[must_use]
+  pub const fn len(&self) -> usize {
+    self.len
+  }
+
+  /// Whether the resolver returned no addresses.
+  #[must_use]
+  pub const fn is_empty(&self) -> bool {
+    self.len == 0
+  }
+
+  /// Managed storage capacity held by this result, including unused slots.
+  #[must_use]
+  pub fn charged_bytes(&self) -> usize {
+    self.storage.charged_bytes()
+  }
+
+  /// The address at `index`, if it is in the result.
+  #[must_use]
+  pub fn get(&self, index: usize) -> Option<SocketAddr> {
+    if index >= self.len {
+      return None;
+    }
+    decode_address(
+      &self.storage.as_slice()[index * ADDRESS_RECORD_BYTES..(index + 1) * ADDRESS_RECORD_BYTES],
+    )
+  }
+
+  /// Iterates over the bounded result without allocating.
+  pub fn iter(&self) -> ResolvedAddressesIter<'_> {
+    ResolvedAddressesIter {
+      addresses: self,
+      index: 0,
+    }
+  }
+}
+
+impl fmt::Debug for ResolvedAddresses {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("ResolvedAddresses")
+      .field("len", &self.len)
+      .field("charged_bytes", &self.charged_bytes())
+      .finish_non_exhaustive()
+  }
+}
+
+/// Iterator over a [`ResolvedAddresses`] value.
+pub struct ResolvedAddressesIter<'a> {
+  addresses: &'a ResolvedAddresses,
+  index: usize,
+}
+
+impl Iterator for ResolvedAddressesIter<'_> {
+  type Item = SocketAddr;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    let address = self.addresses.get(self.index)?;
+    self.index += 1;
+    Some(address)
+  }
+
+  fn size_hint(&self) -> (usize, Option<usize>) {
+    let remaining = self.addresses.len - self.index;
+    (remaining, Some(remaining))
+  }
+}
+
+impl ExactSizeIterator for ResolvedAddressesIter<'_> {}
+
+impl NetHandle {
+  /// Uses an existing I/O adapter pool, resource scope, and reactor. DNS output
+  /// is capped at `max_dns_addresses`; one additional observed address is
+  /// retained on the explicit overflow error. The bounded result records use
+  /// managed storage. The standard resolver's own internal allocations are
+  /// platform-controlled and are not accounted here.
+  pub fn new(
+    io_pool: IoPoolHandle,
+    scope: ResourceScope,
+    reactor: ReactorHandle,
+    max_dns_addresses: usize,
+  ) -> io::Result<Self> {
+    let capacity = max_dns_addresses
+      .checked_add(1)
+      .and_then(|count| count.checked_mul(ADDRESS_RECORD_BYTES));
+    if max_dns_addresses == 0 || !matches!(capacity, Some(bytes) if bytes <= isize::MAX as usize) {
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "DNS address bound cannot be represented as managed output storage",
+      ));
+    }
+    Ok(Self {
+      io_pool,
+      scope,
+      reactor,
+      max_dns_addresses,
+    })
+  }
+
+  /// Opens a TCP connection on the supplied I/O pool, then registers it
+  /// with this handle's reactor. Dropping this future detaches the job; the
+  /// network permit remains held until the blocking connect has completed.
+  pub async fn connect(&self, address: SocketAddr) -> Result<TcpStream, NetworkError> {
+    let permit = self.acquire()?;
+    let reactor = self.reactor.clone();
+    let job = self
+      .io_pool
+      .try_spawn(Resources::ZERO, move |_token| {
+        let _permit = permit;
+        let stream = StdTcpStream::connect(address)?;
+        TcpStream::from_std(stream, &reactor).map_err(|error| {
+          let (socket, error) = (error.socket, error.error);
+          ConnectWorkerError::Registration(FromStdError { socket, error })
+        })
+      })
+      .map_err(|error| {
+        drop(error.job);
+        NetworkError::Runtime(error.kind)
+      })?;
+    match job.await.map_err(NetworkError::Join)? {
+      Ok(stream) => Ok(stream),
+      Err(ConnectWorkerError::Io(error)) => Err(NetworkError::Io(error)),
+      Err(ConnectWorkerError::Registration(error)) => Err(NetworkError::Registration(error)),
+    }
+  }
+
+  /// Connects to one address using a newly created nonblocking socket and
+  /// this handle's reactor. No DNS or address retry is performed. Cancellation
+  /// drops the local socket and waiter; it does not undo a handshake already
+  /// observed by the remote peer.
+  pub async fn connect_nonblocking(
+    &self,
+    address: SocketAddr,
+  ) -> Result<TcpStream, TcpConnectError> {
+    let permit = self.acquire().map_err(TcpConnectError::Operation)?;
+    let socket = match address_family(address) {
+      AddressFamily::INET => TcpSocket::new_v4(),
+      AddressFamily::INET6 => TcpSocket::new_v6(),
+      _ => unreachable!("IP socket address has an IP family"),
+    }
+    .map_err(|error| TcpConnectError::Operation(NetworkError::Io(error)))?;
+    self.connect_with_permit(socket, address, permit).await
+  }
+
+  /// Connects one supplied unregistered socket to one address.
+  ///
+  /// The scope slot and reactor registration are acquired before the single
+  /// connect syscall. A rejection at either step returns the same socket in
+  /// [`TcpConnectError::Submission`]. Once connect has been attempted, an
+  /// error closes the socket; the operation is never replayed. Dropping this
+  /// future closes its waiter and registered descriptor before releasing the
+  /// network operation slot. The caller must prevent descriptor aliases from
+  /// mutating connection state or flags, or consuming `SO_ERROR` while the
+  /// operation is active.
+  pub async fn connect_socket(
+    &self,
+    socket: TcpSocket,
+    address: SocketAddr,
+  ) -> Result<TcpStream, TcpConnectError> {
+    if socket.family != address_family(address) {
+      return Err(TcpConnectError::Submission(TcpConnectSubmissionError {
+        kind: TcpConnectRejectKind::Socket(io::Error::new(
+          io::ErrorKind::InvalidInput,
+          "TCP socket and connect address families differ",
+        )),
+        socket,
+      }));
+    }
+    let permit = match self.acquire() {
+      Ok(permit) => permit,
+      Err(NetworkError::Resource(error)) => {
+        return Err(TcpConnectError::Submission(TcpConnectSubmissionError {
+          kind: TcpConnectRejectKind::Resource(error),
+          socket,
+        }));
+      }
+      Err(error) => return Err(TcpConnectError::Operation(error)),
+    };
+    self.connect_with_permit(socket, address, permit).await
+  }
+
+  async fn connect_with_permit(
+    &self,
+    socket: TcpSocket,
+    address: SocketAddr,
+    permit: OperationPermit,
+  ) -> Result<TcpStream, TcpConnectError> {
+    let family = socket.family;
+    let stream = match TcpStream::from_std(socket.into_stream(), &self.reactor) {
+      Ok(stream) => stream,
+      Err(error) => {
+        let (stream, error) = (error.socket, error.error);
+        return Err(TcpConnectError::Submission(TcpConnectSubmissionError {
+          kind: TcpConnectRejectKind::Registration(error),
+          socket: TcpSocket {
+            fd: stream.into(),
+            family,
+          },
+        }));
+      }
+    };
+    let mut attempt = ConnectAttempt::new(stream, permit);
+    let pending = match ready_operation(|| {
+      initiate_tcp_connect(attempt.stream_ref(), &address, |stream, address| {
+        rnet::connect(stream, address)
+      })
+    })
+    .await
+    {
+      Ok(pending) => pending,
+      Err(error) => {
+        return Err(TcpConnectError::Operation(NetworkError::Io(error)));
+      }
+    };
+    if !pending {
+      return Ok(attempt.finish());
+    }
+
+    wait_for_tcp_connect(&mut attempt, 1)
+      .await
+      .map_err(|error| TcpConnectError::Operation(NetworkError::Io(error)))?;
+    Ok(attempt.finish())
+  }
+
+  /// Resolves `(host, port)` on the supplied I/O pool and collects no
+  /// more than the configured cap plus one address into memory charged to the
+  /// resource scope. If rejected before the worker accepts it, the original
+  /// hostname and port are returned inside [`ResolveError::Submission`]. The
+  /// resolver's own internal allocations are controlled by the platform and
+  /// are not measured by this runtime.
+  pub async fn resolve(&self, host: String, port: u16) -> Result<ResolvedAddresses, ResolveError> {
+    let permit = match self.scope.try_acquire(OperationRequest {
+      disk: 0,
+      network: 1,
+    }) {
+      Ok(permit) => permit,
+      Err(kind) => {
+        return Err(ResolveError::Submission(ResolveSubmissionError {
+          kind: ResolveSubmissionKind::Resource(kind),
+          host,
+          port,
+        }));
+      }
+    };
+    let capacity = (self.max_dns_addresses + 1) * ADDRESS_RECORD_BYTES;
+    let storage = match self.scope.try_alloc_zeroed(capacity) {
+      Ok(storage) => storage,
+      Err(error) => {
+        drop(permit);
+        return Err(ResolveError::Submission(ResolveSubmissionError {
+          kind: ResolveSubmissionKind::Resource(error),
+          host,
+          port,
+        }));
+      }
+    };
+    let maximum = self.max_dns_addresses;
+    let request = Arc::new(Mutex::new(Some(ResolveRequest {
+      host,
+      port,
+      storage,
+      permit,
+    })));
+    let worker_request = Arc::clone(&request);
+    let job = match self.io_pool.try_spawn(Resources::ZERO, move |_token| {
+      let ResolveRequest {
+        host,
+        port,
+        storage,
+        permit,
+      } = take_resolve_request(&worker_request);
+      let result = resolve_bounded(host.as_str(), port, maximum, storage);
+      drop(host);
+      drop(permit);
+      result
+    }) {
+      Ok(job) => {
+        drop(request);
+        job
+      }
+      Err(error) => {
+        let kind = error.kind;
+        drop(error.job);
+        let ResolveRequest {
+          host,
+          port,
+          storage,
+          permit,
+        } = take_resolve_request(&request);
+        drop(storage);
+        drop(permit);
+        return Err(ResolveError::Submission(ResolveSubmissionError {
+          kind: ResolveSubmissionKind::Runtime(kind),
+          host,
+          port,
+        }));
+      }
+    };
+    match job
+      .await
+      .map_err(|error| ResolveError::Operation(NetworkError::Join(error)))?
+    {
+      Ok(addresses) => Ok(addresses),
+      Err(error) => Err(ResolveError::Operation(error)),
+    }
+  }
+
+  fn acquire(&self) -> Result<OperationPermit, NetworkError> {
+    self
+      .scope
+      .try_acquire(OperationRequest {
+        disk: 0,
+        network: 1,
+      })
+      .map_err(NetworkError::Resource)
+  }
+}
+
+/// Owns the local socket and permit through cancellation and completion.
+/// The waiter is dropped first so its registration clone is gone before the
+/// original stream closes; the permit is released last.
+struct ConnectAttempt {
+  waiter: Option<OwnedReadiness<StdTcpStream>>,
+  stream: Option<TcpStream>,
+  permit: Option<OperationPermit>,
+}
+
+impl ConnectAttempt {
+  fn new(stream: TcpStream, permit: OperationPermit) -> Self {
+    Self {
+      waiter: None,
+      stream: Some(stream),
+      permit: Some(permit),
+    }
+  }
+
+  fn stream_ref(&self) -> &StdTcpStream {
+    match self.stream.as_ref() {
+      Some(stream) => stream.get_ref(),
+      None => unreachable!("connect attempt stream was already transferred"),
+    }
+  }
+
+  fn stream_fd(&self) -> &AsyncFd<StdTcpStream> {
+    match self.stream.as_ref() {
+      Some(stream) => &stream.fd,
+      None => unreachable!("connect attempt stream was already transferred"),
+    }
+  }
+
+  fn finish(mut self) -> TcpStream {
+    drop(self.waiter.take());
+    let stream = match self.stream.take() {
+      Some(stream) => stream,
+      None => unreachable!("connect attempt stream was already transferred"),
+    };
+    drop(self.permit.take());
+    stream
+  }
+}
+
+impl Drop for ConnectAttempt {
+  fn drop(&mut self) {
+    drop(self.waiter.take());
+    drop(self.stream.take());
+    drop(self.permit.take());
+  }
+}
+
+fn classify_connect_start(result: Result<(), Errno>) -> io::Result<bool> {
+  match result {
+    Ok(()) => Ok(false),
+    Err(Errno::INPROGRESS) => Ok(true),
+    Err(error) => Err(error.into()),
+  }
+}
+
+fn initiate_tcp_connect(
+  stream: &StdTcpStream,
+  address: &SocketAddr,
+  connect: impl FnOnce(&StdTcpStream, &SocketAddr) -> Result<(), Errno>,
+) -> io::Result<bool> {
+  classify_connect_start(connect(stream, address))
+}
+
+#[derive(Debug)]
+enum ConnectProbeResult {
+  Connected,
+  SocketError(io::Error),
+}
+
+fn classify_connect_probe(
+  socket_error: Result<(), Errno>,
+  peer_address: impl FnOnce() -> io::Result<SocketAddr>,
+) -> io::Result<ConnectProbeResult> {
+  if let Err(error) = socket_error {
+    return Ok(ConnectProbeResult::SocketError(error.into()));
+  }
+  match peer_address() {
+    Ok(_) => Ok(ConnectProbeResult::Connected),
+    Err(error) if error.kind() == io::ErrorKind::NotConnected => Err(io::Error::new(
+      io::ErrorKind::WouldBlock,
+      "TCP peer address is not available yet",
+    )),
+    Err(error) => Err(error),
+  }
+}
+
+fn finish_connect_probe(probe: io::Result<ConnectProbeResult>) -> io::Result<bool> {
+  match probe {
+    Ok(ConnectProbeResult::Connected) => Ok(true),
+    Ok(ConnectProbeResult::SocketError(error)) => Err(error),
+    Err(error)
+      if matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+      ) =>
+    {
+      Ok(false)
+    }
+    Err(error) => Err(error),
+  }
+}
+
+async fn wait_for_tcp_connect(
+  attempt: &mut ConnectAttempt,
+  mut endpoint_calls: usize,
+) -> io::Result<()> {
+  loop {
+    if endpoint_calls + 2 > IO_BUDGET {
+      yield_once().await;
+      endpoint_calls = 0;
+    }
+    let mut stale_would_block = false;
+    let connected = poll_fn(|cx| {
+      let result = super::asynchronous::poll_cooperative(cx, |cx| {
+        if attempt.waiter.is_none() {
+          attempt.waiter = Some(attempt.stream_fd().writable_owned());
+        }
+        let waiter = match attempt.waiter.as_mut() {
+          Some(waiter) => waiter,
+          None => unreachable!("connect readiness waiter was just created"),
+        };
+        match Pin::new(waiter).poll(cx) {
+          Poll::Pending => Poll::Pending,
+          Poll::Ready(Err(error)) => {
+            drop(attempt.waiter.take());
+            Poll::Ready(Err(error))
+          }
+          Poll::Ready(Ok(guard)) => {
+            drop(attempt.waiter.take());
+            let mut calls = 0;
+            let probe = guard.try_io(|stream| {
+              calls += 1;
+              let socket_error = rnet::sockopt::socket_error(stream)?;
+              classify_connect_probe(socket_error, || {
+                calls += 1;
+                stream.peer_addr()
+              })
+            });
+            endpoint_calls += calls;
+            match probe {
+              Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                stale_would_block = true;
+                Poll::Pending
+              }
+              probe => Poll::Ready(finish_connect_probe(probe)),
+            }
+          }
+        }
+      });
+      match result {
+        Poll::Pending if stale_would_block => Poll::Ready(Ok(false)),
+        result => result,
+      }
+    })
+    .await?;
+    if connected {
+      return Ok(());
+    }
+  }
+}
+
+/// Self-wakes once so manual and foreign polls also cap connect probes.
+async fn yield_once() {
+  let mut yielded = false;
+  poll_fn(|cx| {
+    if yielded {
+      Poll::Ready(())
+    } else {
+      yielded = true;
+      cx.waker().wake_by_ref();
+      Poll::Pending
+    }
+  })
+  .await
+}
+
+enum ConnectWorkerError {
+  Io(io::Error),
+  Registration(FromStdError<StdTcpStream>),
+}
+
+impl From<io::Error> for ConnectWorkerError {
+  fn from(error: io::Error) -> Self {
+    Self::Io(error)
+  }
+}
+
+struct ResolveRequest {
+  host: String,
+  port: u16,
+  storage: ManagedBuf,
+  permit: OperationPermit,
+}
+
+fn take_resolve_request(request: &Mutex<Option<ResolveRequest>>) -> ResolveRequest {
+  lock(request)
+    .take()
+    .unwrap_or_else(|| panic!("DNS request was consumed before worker start"))
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+  mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn resolve_bounded(
+  host: &str,
+  port: u16,
+  maximum: usize,
+  storage: ManagedBuf,
+) -> Result<ResolvedAddresses, NetworkError> {
+  collect_bounded(
+    (host, port).to_socket_addrs().map_err(NetworkError::Io)?,
+    maximum,
+    storage,
+    0,
+  )
+}
+
+fn collect_bounded(
+  addresses: impl Iterator<Item = SocketAddr>,
+  maximum: usize,
+  mut storage: ManagedBuf,
+  mut len: usize,
+) -> Result<ResolvedAddresses, NetworkError> {
+  for address in addresses {
+    if len == maximum + 1 {
+      return Err(NetworkError::TooManyAddresses(ResolvedAddresses {
+        storage,
+        len,
+      }));
+    }
+    let start = len * ADDRESS_RECORD_BYTES;
+    let end = start + ADDRESS_RECORD_BYTES;
+    let Some(bytes) = storage.get_mut() else {
+      return Err(NetworkError::Resource(ResourceError::Shared));
+    };
+    encode_address(address, &mut bytes[start..end]);
+    len += 1;
+    if len == maximum + 1 {
+      return Err(NetworkError::TooManyAddresses(ResolvedAddresses {
+        storage,
+        len,
+      }));
+    }
+  }
+  Ok(ResolvedAddresses { storage, len })
+}
+
+fn encode_address(address: SocketAddr, record: &mut [u8]) {
+  debug_assert_eq!(record.len(), ADDRESS_RECORD_BYTES);
+  record[1..3].copy_from_slice(&address.port().to_be_bytes());
+  match address {
+    SocketAddr::V4(address) => {
+      record[0] = 4;
+      record[3..7].copy_from_slice(&address.ip().octets());
+    }
+    SocketAddr::V6(address) => {
+      record[0] = 6;
+      record[3..19].copy_from_slice(&address.ip().octets());
+      record[19..23].copy_from_slice(&address.flowinfo().to_be_bytes());
+      record[23..27].copy_from_slice(&address.scope_id().to_be_bytes());
+    }
+  }
+}
+
+fn decode_address(record: &[u8]) -> Option<SocketAddr> {
+  if record.len() != ADDRESS_RECORD_BYTES {
+    return None;
+  }
+  let port = u16::from_be_bytes(record[1..3].try_into().ok()?);
+  match record[0] {
+    4 => {
+      let octets: [u8; 4] = record[3..7].try_into().ok()?;
+      Some(SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::from(octets),
+        port,
+      )))
+    }
+    6 => {
+      let octets: [u8; 16] = record[3..19].try_into().ok()?;
+      let flowinfo = u32::from_be_bytes(record[19..23].try_into().ok()?);
+      let scope_id = u32::from_be_bytes(record[23..27].try_into().ok()?);
+      Some(SocketAddr::V6(SocketAddrV6::new(
+        Ipv6Addr::from(octets),
+        port,
+        flowinfo,
+        scope_id,
+      )))
+    }
+    _ => None,
+  }
+}
+
+/// A registered nonblocking UDP socket.
+pub struct UdpSocket {
+  fd: AsyncFd<StdUdpSocket>,
+}
+
+impl UdpSocket {
+  /// Registers an existing datagram socket. Registration sets nonblocking mode.
+  pub fn from_std(
+    socket: StdUdpSocket,
+    reactor: &ReactorHandle,
+  ) -> Result<Self, FromStdError<StdUdpSocket>> {
+    reactor
+      .register(socket)
+      .map(|fd| Self { fd })
+      .map_err(FromStdError::from_register)
+  }
+
+  /// The underlying standard socket.
+  #[must_use]
+  pub fn get_ref(&self) -> &StdUdpSocket {
+    self.fd.get_ref()
+  }
+
+  /// Sends one datagram to the peer selected by the standard socket's
+  /// `connect`. Empty buffers still send a zero-length datagram. Peer
+  /// selection is explicit; this method performs no DNS or connection retry.
+  pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+    ready_io(&self.fd, IoDirection::Write, |socket| socket.send(buf)).await
+  }
+
+  /// Receives one datagram, using the kernel's connected-peer filtering when
+  /// the underlying socket is connected. Excess bytes are discarded; an
+  /// empty buffer consumes a datagram, rather than returning early.
+  pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+    self.readable_operation(|socket| socket.recv(buf)).await
+  }
+
+  /// Inspects a datagram without consuming it. The returned count is capped
+  /// by the buffer, including zero; a subsequent receive still sees the
+  /// complete original datagram, subject to competing descriptor aliases.
+  pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+    self.readable_operation(|socket| socket.peek(buf)).await
+  }
+
+  /// Inspects a datagram and its source without consuming it. Connected
+  /// sockets retain kernel peer filtering. Cancellation releases this
+  /// future's readiness waiter without dequeuing the datagram.
+  pub async fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    self
+      .readable_operation(|socket| socket.peek_from(buf))
+      .await
+  }
+
+  async fn readable_operation<T>(
+    &self,
+    mut operation: impl FnMut(&StdUdpSocket) -> io::Result<T>,
+  ) -> io::Result<T> {
+    ready_io(&self.fd, IoDirection::Read, |socket| operation(socket)).await
+  }
+
+  /// Sends one complete datagram in one syscall. A short successful count is
+  /// returned as reported by the operating system.
+  pub async fn send_to(&self, buf: &[u8], address: SocketAddr) -> io::Result<usize> {
+    ready_io(&self.fd, IoDirection::Write, |socket| {
+      socket.send_to(buf, address)
+    })
+    .await
+  }
+
+  /// Receives one datagram into the initialized buffer and returns its source.
+  /// A datagram larger than `buf` is truncated by the operating system.
+  pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    ready_io(&self.fd, IoDirection::Read, |socket| socket.recv_from(buf)).await
+  }
+}
+
+impl fmt::Debug for UdpSocket {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("UdpSocket").finish_non_exhaustive()
+  }
+}
+
+#[cfg(unix)]
+mod unix {
+  use super::*;
+  use std::os::unix::net::{
+    UnixDatagram as StdUnixDatagram, UnixListener as StdUnixListener, UnixStream as StdUnixStream,
+  };
+
+  /// Registered nonblocking Unix stream.
+  pub struct UnixStream {
+    pub(super) fd: AsyncFd<StdUnixStream>,
+    read_waiter: Option<OwnedReadiness<StdUnixStream>>,
+    write_waiter: Option<OwnedReadiness<StdUnixStream>>,
+  }
+
+  impl UnixStream {
+    /// Registers an existing stream and enables nonblocking mode.
+    pub fn from_std(
+      stream: StdUnixStream,
+      reactor: &ReactorHandle,
+    ) -> Result<Self, FromStdError<StdUnixStream>> {
+      reactor
+        .register(stream)
+        .map(|fd| Self {
+          fd,
+          read_waiter: None,
+          write_waiter: None,
+        })
+        .map_err(FromStdError::from_register)
+    }
+    /// The underlying standard stream.
+    #[must_use]
+    pub fn get_ref(&self) -> &StdUnixStream {
+      self.fd.get_ref()
+    }
+    /// Reads once after readable readiness.
+    pub async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+      stream_read(&self.fd, buf).await
+    }
+    /// Reads once into initialized buffers after readable readiness.
+    pub async fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+      stream_read_vectored(&self.fd, bufs).await
+    }
+    /// Writes once after writable readiness.
+    pub async fn write(&self, buf: &[u8]) -> io::Result<usize> {
+      stream_write(&self.fd, buf).await
+    }
+    /// Writes once from initialized buffers after writable readiness.
+    pub async fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+      stream_write_vectored(&self.fd, bufs).await
+    }
+    /// Flushes the direct socket writer.
+    pub async fn flush(&self) -> io::Result<()> {
+      super::ready_operation(|| Ok(())).await
+    }
+    /// Shuts down the local write half.
+    pub async fn shutdown(&self) -> io::Result<()> {
+      super::ready_operation(|| self.get_ref().shutdown(std::net::Shutdown::Write)).await
+    }
+
+    /// Cancels readiness waits retained by [`AsyncRead`] or [`AsyncWrite`]
+    /// after their poll futures were dropped. Call after dropping those
+    /// futures; named async methods cancel their waits when dropped.
+    pub fn cancel_io_waits(&mut self) {
+      self.read_waiter = None;
+      self.write_waiter = None;
+    }
+
+    #[cfg(test)]
+    pub(super) fn read_waiter_is_none(&self) -> bool {
+      self.read_waiter.is_none()
+    }
+  }
+
+  impl AsyncRead for UnixStream {
+    fn poll_read(
+      self: Pin<&mut Self>,
+      cx: &mut Context<'_>,
+      buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+      let this = self.get_mut();
+      if buf.is_empty() {
+        return super::super::asynchronous::poll_cooperative(cx, |_| {
+          drop(this.read_waiter.take());
+          Poll::Ready(Ok(0))
+        });
+      }
+      super::poll_io_with_retry(
+        cx,
+        &this.fd,
+        &mut this.read_waiter,
+        super::IoDirection::Read,
+        |stream| (&*stream).read(buf),
+      )
+    }
+
+    fn poll_read_vectored(
+      self: Pin<&mut Self>,
+      cx: &mut Context<'_>,
+      bufs: &mut [IoSliceMut<'_>],
+    ) -> Poll<io::Result<usize>> {
+      let this = self.get_mut();
+      super::poll_vectored_io_with_retry(
+        cx,
+        &this.fd,
+        &mut this.read_waiter,
+        super::IoDirection::Read,
+        |stream| match stream {
+          None => read_vectored_len(bufs).map(|len| {
+            if len == 0 {
+              super::VectoredCall::Empty
+            } else {
+              super::VectoredCall::Offered(len)
+            }
+          }),
+          Some(stream) => {
+            let mut stream = stream;
+            stream.read_vectored(bufs).map(super::VectoredCall::Count)
+          }
+        },
+      )
+    }
+  }
+
+  impl AsyncWrite for UnixStream {
+    fn poll_write(
+      self: Pin<&mut Self>,
+      cx: &mut Context<'_>,
+      buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+      let this = self.get_mut();
+      if buf.is_empty() {
+        return super::super::asynchronous::poll_cooperative(cx, |_| {
+          drop(this.write_waiter.take());
+          Poll::Ready(Ok(0))
+        });
+      }
+      super::poll_io_with_retry(
+        cx,
+        &this.fd,
+        &mut this.write_waiter,
+        super::IoDirection::Write,
+        |stream| (&*stream).write(buf),
+      )
+    }
+
+    fn poll_write_vectored(
+      self: Pin<&mut Self>,
+      cx: &mut Context<'_>,
+      bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+      let this = self.get_mut();
+      super::poll_vectored_io_with_retry(
+        cx,
+        &this.fd,
+        &mut this.write_waiter,
+        super::IoDirection::Write,
+        |stream| match stream {
+          None => write_vectored_len(bufs).map(|len| {
+            if len == 0 {
+              super::VectoredCall::Empty
+            } else {
+              super::VectoredCall::Offered(len)
+            }
+          }),
+          Some(stream) => {
+            let mut stream = stream;
+            stream.write_vectored(bufs).map(super::VectoredCall::Count)
+          }
+        },
+      )
+    }
+
+    fn is_write_vectored(&self) -> bool {
+      true
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+      super::super::asynchronous::poll_cooperative(cx, |_| Poll::Ready(Ok(())))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+      let this = self.get_mut();
+      super::super::asynchronous::poll_cooperative(cx, |_| {
+        Poll::Ready(this.get_ref().shutdown(std::net::Shutdown::Write))
+      })
+    }
+  }
+  impl fmt::Debug for UnixStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      f.debug_struct("UnixStream").finish_non_exhaustive()
+    }
+  }
+
+  /// Registered nonblocking Unix listener.
+  pub struct UnixListener {
+    pub(super) fd: AsyncFd<StdUnixListener>,
+    reactor: ReactorHandle,
+  }
+  impl UnixListener {
+    /// Registers an existing listener and enables nonblocking mode.
+    pub fn from_std(
+      listener: StdUnixListener,
+      reactor: &ReactorHandle,
+    ) -> Result<Self, FromStdError<StdUnixListener>> {
+      reactor
+        .register(listener)
+        .map(|fd| Self {
+          fd,
+          reactor: reactor.clone(),
+        })
+        .map_err(FromStdError::from_register)
+    }
+    /// Accepts one connection; registration failure returns the accepted socket.
+    pub async fn accept(
+      &self,
+    ) -> Result<(UnixStream, std::os::unix::net::SocketAddr), UnixAcceptError> {
+      let (stream, address) = super::ready_io(&self.fd, super::IoDirection::Read, |listener| {
+        listener.accept()
+      })
+      .await
+      .map_err(UnixAcceptError::Io)?;
+      let stream =
+        UnixStream::from_std(stream, &self.reactor).map_err(UnixAcceptError::Registration)?;
+      Ok((stream, address))
+    }
+  }
+  impl fmt::Debug for UnixListener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      f.debug_struct("UnixListener").finish_non_exhaustive()
+    }
+  }
+  #[derive(Debug)]
+  pub enum UnixAcceptError {
+    Io(io::Error),
+    Registration(FromStdError<StdUnixStream>),
+  }
+  impl fmt::Display for UnixAcceptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      match self {
+        Self::Io(e) => e.fmt(f),
+        Self::Registration(e) => e.fmt(f),
+      }
+    }
+  }
+  impl std::error::Error for UnixAcceptError {}
+
+  /// Registered nonblocking Unix datagram socket.
+  pub struct UnixDatagram {
+    pub(super) fd: AsyncFd<StdUnixDatagram>,
+  }
+  impl UnixDatagram {
+    /// Registers an existing datagram socket and enables nonblocking mode.
+    pub fn from_std(
+      socket: StdUnixDatagram,
+      reactor: &ReactorHandle,
+    ) -> Result<Self, FromStdError<StdUnixDatagram>> {
+      reactor
+        .register(socket)
+        .map(|fd| Self { fd })
+        .map_err(FromStdError::from_register)
+    }
+    /// The underlying standard datagram socket.
+    #[must_use]
+    pub fn get_ref(&self) -> &StdUnixDatagram {
+      self.fd.get_ref()
+    }
+    /// Sends one datagram in one syscall.
+    pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+      datagram_send(&self.fd, buf).await
+    }
+    /// Sends one datagram to a filesystem Unix socket path.
+    pub async fn send_to(&self, buf: &[u8], path: &std::path::Path) -> io::Result<usize> {
+      super::ready_io(&self.fd, super::IoDirection::Write, |socket| {
+        socket.send_to(buf, path)
+      })
+      .await
+    }
+    /// Receives one datagram in one syscall.
+    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+      datagram_recv(&self.fd, buf).await
+    }
+    /// Receives one datagram and returns its source address.
+    pub async fn recv_from(
+      &self,
+      buf: &mut [u8],
+    ) -> io::Result<(usize, std::os::unix::net::SocketAddr)> {
+      super::ready_io(&self.fd, super::IoDirection::Read, |socket| {
+        socket.recv_from(buf)
+      })
+      .await
+    }
+  }
+  impl fmt::Debug for UnixDatagram {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      f.debug_struct("UnixDatagram").finish_non_exhaustive()
+    }
+  }
+
+  async fn stream_read(fd: &AsyncFd<StdUnixStream>, buf: &mut [u8]) -> io::Result<usize> {
+    if buf.is_empty() {
+      return super::ready_operation(|| Ok(0)).await;
+    }
+    super::ready_io(fd, super::IoDirection::Read, |stream| (&*stream).read(buf)).await
+  }
+  async fn stream_write(fd: &AsyncFd<StdUnixStream>, buf: &[u8]) -> io::Result<usize> {
+    if buf.is_empty() {
+      return super::ready_operation(|| Ok(0)).await;
+    }
+    super::ready_io(fd, super::IoDirection::Write, |stream| {
+      (&*stream).write(buf)
+    })
+    .await
+  }
+  async fn datagram_send(fd: &AsyncFd<StdUnixDatagram>, buf: &[u8]) -> io::Result<usize> {
+    super::ready_io(fd, super::IoDirection::Write, |socket| socket.send(buf)).await
+  }
+  async fn datagram_recv(fd: &AsyncFd<StdUnixDatagram>, buf: &mut [u8]) -> io::Result<usize> {
+    super::ready_io(fd, super::IoDirection::Read, |socket| socket.recv(buf)).await
+  }
+
+  pub use self::UnixAcceptError as PublicUnixAcceptError;
+  pub use self::UnixDatagram as PublicUnixDatagram;
+  pub use self::UnixListener as PublicUnixListener;
+  pub use self::UnixStream as PublicUnixStream;
+}
+
+#[cfg(unix)]
+pub use unix::{
+  PublicUnixAcceptError as UnixAcceptError, PublicUnixDatagram as UnixDatagram,
+  PublicUnixListener as UnixListener, PublicUnixStream as UnixStream,
+};
+
+enum VectoredCall {
+  Empty,
+  Offered(usize),
+  Count(usize),
+}
+
+fn poll_vectored_io_with_retry<T>(
+  cx: &mut Context<'_>,
+  fd: &AsyncFd<T>,
+  waiter: &mut Option<OwnedReadiness<T>>,
+  direction: IoDirection,
+  mut operation: impl FnMut(Option<&T>) -> io::Result<VectoredCall>,
+) -> Poll<io::Result<usize>> {
+  let mut attempts = 0;
+  loop {
+    if attempts == IO_BUDGET {
+      cx.waker().wake_by_ref();
+      return Poll::Pending;
+    }
+    let mut stale_would_block = false;
+    let attempt = super::asynchronous::poll_cooperative(cx, |cx| {
+      let offered = match operation(None) {
+        Ok(VectoredCall::Offered(offered)) => offered,
+        Ok(VectoredCall::Empty) => {
+          drop(waiter.take());
+          return Poll::Ready(Some(Ok(0)));
+        }
+        Ok(VectoredCall::Count(_)) => {
+          drop(waiter.take());
+          return Poll::Ready(Some(Err(io::ErrorKind::InvalidData.into())));
+        }
+        Err(error) => {
+          drop(waiter.take());
+          return Poll::Ready(Some(Err(error)));
+        }
+      };
+      if waiter.is_none() {
+        *waiter = Some(match direction {
+          IoDirection::Read => fd.readable_owned(),
+          IoDirection::Write => fd.writable_owned(),
+        });
+      }
+      let readiness = match waiter.as_mut() {
+        Some(readiness) => Pin::new(readiness).poll(cx),
+        None => unreachable!("readiness waiter was just created"),
+      };
+      match readiness {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Err(error)) => {
+          drop(waiter.take());
+          Poll::Ready(Some(Err(error)))
+        }
+        Poll::Ready(Ok(guard)) => {
+          drop(waiter.take());
+          match guard.try_io(|value| operation(Some(value))) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Poll::Ready(None),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+              stale_would_block = true;
+              Poll::Pending
+            }
+            Ok(VectoredCall::Count(count)) => {
+              Poll::Ready(Some(checked_vectored_count(count, offered)))
+            }
+            Ok(VectoredCall::Empty | VectoredCall::Offered(_)) => {
+              Poll::Ready(Some(Err(io::ErrorKind::InvalidData.into())))
+            }
+            Err(error) => Poll::Ready(Some(Err(error))),
+          }
+        }
+      }
+    });
+    match attempt {
+      Poll::Pending if stale_would_block => attempts += 1,
+      Poll::Pending => return Poll::Pending,
+      Poll::Ready(None) => attempts += 1,
+      Poll::Ready(Some(result)) => return Poll::Ready(result),
+    }
+  }
+}
+
+async fn ready_io<T, R>(
+  fd: &AsyncFd<T>,
+  direction: IoDirection,
+  mut operation: impl FnMut(&T) -> io::Result<R>,
+) -> io::Result<R> {
+  let mut waiter = None;
+  poll_fn(|cx| poll_io_with_retry(cx, fd, &mut waiter, direction, &mut operation)).await
+}
+
+async fn ready_operation<R>(operation: impl FnOnce() -> R) -> R {
+  let mut operation = Some(operation);
+  poll_fn(|cx| {
+    super::asynchronous::poll_cooperative(cx, |_| {
+      let operation = match operation.take() {
+        Some(operation) => operation,
+        None => unreachable!("cooperative operation completes in one poll"),
+      };
+      Poll::Ready(operation())
+    })
+  })
+  .await
+}
+
+fn read_vectored_len(bufs: &[IoSliceMut<'_>]) -> io::Result<usize> {
+  bufs.iter().try_fold(0_usize, |total, buf| {
+    total
+      .checked_add(buf.len())
+      .ok_or_else(|| io::ErrorKind::InvalidInput.into())
+  })
+}
+
+fn write_vectored_len(bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+  bufs.iter().try_fold(0_usize, |total, buf| {
+    total
+      .checked_add(buf.len())
+      .ok_or_else(|| io::ErrorKind::InvalidInput.into())
+  })
+}
+
+fn checked_vectored_count(count: usize, offered: usize) -> io::Result<usize> {
+  if count <= offered {
+    Ok(count)
+  } else {
+    Err(io::ErrorKind::InvalidData.into())
+  }
+}
+
+async fn stream_read_vectored<T>(fd: &AsyncFd<T>, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize>
+where
+  for<'a> &'a T: Read,
+{
+  let mut waiter = None;
+  poll_fn(|cx| {
+    poll_vectored_io_with_retry(
+      cx,
+      fd,
+      &mut waiter,
+      IoDirection::Read,
+      |stream| match stream {
+        None => read_vectored_len(bufs).map(|len| {
+          if len == 0 {
+            VectoredCall::Empty
+          } else {
+            VectoredCall::Offered(len)
+          }
+        }),
+        Some(stream) => {
+          let mut stream = stream;
+          stream.read_vectored(bufs).map(VectoredCall::Count)
+        }
+      },
+    )
+  })
+  .await
+}
+
+async fn stream_write_vectored<T>(fd: &AsyncFd<T>, bufs: &[IoSlice<'_>]) -> io::Result<usize>
+where
+  for<'a> &'a T: Write,
+{
+  let mut waiter = None;
+  poll_fn(|cx| {
+    poll_vectored_io_with_retry(
+      cx,
+      fd,
+      &mut waiter,
+      IoDirection::Write,
+      |stream| match stream {
+        None => write_vectored_len(bufs).map(|len| {
+          if len == 0 {
+            VectoredCall::Empty
+          } else {
+            VectoredCall::Offered(len)
+          }
+        }),
+        Some(stream) => {
+          let mut stream = stream;
+          stream.write_vectored(bufs).map(VectoredCall::Count)
+        }
+      },
+    )
+  })
+  .await
+}
+
+#[cfg(all(test, not(loom)))]
+mod vectored_tests {
+  use std::future::Future;
+  use std::io::{IoSlice, IoSliceMut, Read, Write};
+  use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
+  use std::pin::pin;
+  use std::task::{Context, Poll, Waker};
+  use std::thread;
+  use std::time::{Duration, Instant};
+
+  use super::*;
+  use crate::runtime::io::{AsyncReadExt, AsyncWriteExt};
+  use crate::runtime::reactor::{Reactor, ReactorConfig};
+
+  const TIMEOUT: Duration = Duration::from_secs(5);
+
+  fn reactor() -> Reactor {
+    Reactor::new(ReactorConfig {
+      max_registrations: 2,
+      max_waiters: 8,
+    })
+    .unwrap()
+  }
+
+  fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+      match future.as_mut().poll(&mut cx) {
+        Poll::Ready(output) => return output,
+        Poll::Pending => {
+          assert!(
+            Instant::now() < deadline,
+            "vectored network operation timed out"
+          );
+          thread::sleep(Duration::from_millis(1));
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn tcp_trait_vectored_io_uses_scatter_gather_readiness_paths() {
+    let reactor = reactor();
+    let handle = reactor.handle();
+    let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    let peer_address = listener.local_addr().unwrap();
+    let mut stream =
+      TcpStream::from_std(StdTcpStream::connect(peer_address).unwrap(), &handle).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    peer.set_read_timeout(Some(TIMEOUT)).unwrap();
+    peer.set_write_timeout(Some(TIMEOUT)).unwrap();
+
+    let outgoing = [IoSlice::new(b"tcp-"), IoSlice::new(b"vectors")];
+    assert!(stream.is_write_vectored());
+    assert_eq!(
+      block_on(AsyncWriteExt::write_vectored(&mut stream, &outgoing)).unwrap(),
+      11
+    );
+    let mut received = [0_u8; 11];
+    peer.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"tcp-vectors");
+
+    let mut first = [0_u8; 7];
+    let mut second = [0_u8; 5];
+    let mut incoming = [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)];
+    {
+      let mut waiting = Box::pin(AsyncReadExt::read_vectored(&mut stream, &mut incoming));
+      let mut cx = Context::from_waker(Waker::noop());
+      assert!(waiting.as_mut().poll(&mut cx).is_pending());
+    }
+    assert!(stream.read_waiter.is_some());
+    stream.cancel_io_waits();
+    assert!(stream.read_waiter.is_none());
+
+    peer.write_all(b"scatter-read").unwrap();
+    assert_eq!(
+      block_on(AsyncReadExt::read_vectored(&mut stream, &mut incoming)).unwrap(),
+      12
+    );
+    assert_eq!(&incoming[0][..], b"scatter");
+    assert_eq!(&incoming[1][..], b"-read");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn unix_inherent_vectored_io_uses_scatter_gather_readiness_paths() {
+    use std::os::unix::net::UnixStream as StdUnixStream;
+
+    let reactor = reactor();
+    let handle = reactor.handle();
+    let (registered, mut peer) = StdUnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(TIMEOUT)).unwrap();
+    peer.set_write_timeout(Some(TIMEOUT)).unwrap();
+    let stream = UnixStream::from_std(registered, &handle).unwrap();
+
+    let outgoing = [IoSlice::new(b"unix"), IoSlice::new(b"-vectors")];
+    assert!(stream.is_write_vectored());
+    assert_eq!(block_on(stream.write_vectored(&outgoing)).unwrap(), 12);
+    let mut received = [0_u8; 12];
+    peer.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"unix-vectors");
+
+    peer.write_all(b"unix-scatter").unwrap();
+    let mut first = [0_u8; 4];
+    let mut second = [0_u8; 8];
+    let mut incoming = [IoSliceMut::new(&mut first), IoSliceMut::new(&mut second)];
+    assert_eq!(block_on(stream.read_vectored(&mut incoming)).unwrap(), 12);
+    assert_eq!(&incoming[0][..], b"unix");
+    assert_eq!(&incoming[1][..], b"-scatter");
+  }
+}

@@ -1,0 +1,26 @@
+[package]
+name = "allocatbelt-bench"
+description = "Throughput and RSS comparison of allocatbelt against the system allocator and secure mimalloc, and of allocatbelt-runtime's bounded executor against Tokio's blocking pool."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Compiles the external-pressure comparison family. allocatbelt compiles
+# resource feedback with `runtime` either way; fixed-policy runs turn the
+# default service off explicitly.
+resource-feedback = ["allocatbelt/resource-feedback"]
+
+[dependencies]
+allocatbelt = { workspace = true, features = ["io-uring", "runtime"] }
+allocatbelt-profile.workspace = true
+allocatbelt-runtime.workspace = true
+allocatbelt-app-ports.workspace = true
+mimalloc.workspace = true
+tokio.workspace = true
+rustix = { workspace = true, features = ["fs", "thread", "time"] }
+
+[lints]
+workspace = true

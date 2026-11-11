@@ -1,0 +1,16 @@
+[package]
+name = "allocatbelt-qualification-tools"
+description = "Unpublished deterministic offline analyzer for application qualification traces."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+autobins = false
+
+[[bin]]
+name = "application-analyze"
+path = "src/main.rs"
+
+[lints]
+workspace = true

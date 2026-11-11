@@ -1,0 +1,2328 @@
+# Experimental resource-aware runtime
+
+`allocatbelt::runtime` is an optional module of the single published package,
+compiled by the additive `runtime` feature. The unpublished
+`allocatbelt-runtime` crate forwards to the same implementation for development
+and compiles that source directly for Loom. It provides bounded blocking and
+owned-future worker pools, a current-thread executor for local futures, and
+cooperative managed-storage ledgers. Full Tokio capability parity and native
+performance qualification remain pending. It is
+not recommended for production. `allocatbelt` remains the only package intended for publication; enabling the
+module does not install a global allocator or change allocator-only defaults.
+
+This page specifies the milestone contract. Verification and qualification
+status is recorded in the linked research report.
+
+## Initialized-buffer asynchronous I/O
+
+`runtime::io` defines safe `AsyncRead`, `AsyncWrite` and `AsyncSeek` traits
+over initialized caller-owned slices. Named futures provide read, write,
+read-exact, write-all, flush, shutdown and seek operations. `SliceReader` and
+`SliceWriter` supply in-memory implementations. These are explicit ports:
+Tokio's uninitialized-buffer and seek APIs are not source compatible.
+
+`copy_with_buffer` borrows a caller-supplied buffer, flushes at EOF and when
+the reader waits after writing, and exposes transferred and unwritten bytes
+for cancellation recovery. The transferred count saturates at `u64::MAX`.
+Exact reads, full writes and copies retain partial progress across polls;
+dropping them does not restore stream position. Helpers reject an endpoint's
+reported count when it exceeds the offered slice, retry interrupted calls,
+and yield with a self-wake after 64 endpoint calls in one poll. This requests
+rescheduling without guaranteeing another task's turn. Simple helpers do not
+allocate or implicitly reserve managed-storage charges. TCP and Unix stream
+endpoints implement these traits. `read_vectored` and `write_vectored` borrow
+initialized `IoSliceMut` and `IoSlice` arrays. Trait defaults forward only the
+first nonempty slice and validate the count against that slice; TCP, Unix
+streams and in-memory slices use scatter/gather implementations. The helpers
+check the combined offered length, reject overflow with `InvalidInput`, and
+validate the returned count. Vectored helpers retry interruptions within the
+same 64-call budget; ordinary single-operation scalar helpers return them.
+Empty vectored helpers return zero without polling the endpoint. These
+operations do not allocate buffers or reserve implicit managed charges.
+
+`AsyncReadExt::read_to_end_bounded` and `AsyncBufReadExt::read_until_bounded`
+copy into a fixed initialized slice and return the filled count plus a stop
+reason that distinguishes delimiter, EOF and capacity. A full destination
+(including an empty one) returns Capacity immediately: the future makes no
+lookahead poll, so an exact fit cannot be distinguished from additional input.
+Delimiter reads include the delimiter and consume only bytes copied, leaving
+the buffered tail untouched. Each future exposes progress while pending or
+before cancellation; completed I/O and consumed bytes are not rolled back.
+Endpoint errors retain their kind and report partial progress. Each future
+polls its endpoint at most 64 times per poll, including Interrupted retries,
+then self-wakes and returns Pending.
+
+`read_line_bounded` includes LF when present, while
+`read_to_string_bounded` reads a whole stream. Line reads validate UTF-8 at
+delimiter, EOF or capacity; whole-stream string reads validate at EOF or
+capacity. They write into byte slices rather than growing a `String`. Invalid
+UTF-8, including a code point cut by capacity, returns InvalidData with the
+filled count while preserving the bytes in the destination. These helpers
+provide bounded application ports, not global automatic cooperation for
+arbitrary direct I/O polls.
+
+`copy_bidirectional_with_buffers` borrows two endpoints that each implement
+`AsyncRead` and `AsyncWrite`, plus two nonempty caller-owned initialized
+slices, one per direction; either empty slice fails with InvalidInput before
+any endpoint is polled. Each direction reads, writes everything it read, and at
+source EOF flushes and then shuts down its destination's write side. The
+reverse direction keeps copying while one direction waits, finishes or has a
+pending shutdown, and the future completes only after both shutdowns succeed.
+A completed flush or shutdown is not repeated. When a source waits after
+writes that were not yet flushed, the direction owes a flush: it keeps that
+flush across polls, including after an exhausted budget or a pending flush,
+and polls it before reading or writing again until it succeeds, without
+polling the waiting source again in the same poll. Half-close is only as
+strong as the endpoint's `poll_shutdown`: registered TCP streams shut down
+their write half, while an adapter whose shutdown closes the whole endpoint
+ends or fails the reverse direction. The helper is a serial state machine
+that alternates one endpoint call per direction and starts the next poll with the direction
+whose turn came next. All reads, writes, flushes, shutdowns and Interrupted
+retries of both directions share one 64-call budget per poll; it self-wakes
+only when that budget runs out with work left, not when both directions wait
+on their endpoints. Any other error, including WouldBlock, ends both
+directions without further polls. The future exposes the bytes each
+destination accepted (saturating at `u64::MAX`) and the unwritten range in
+each slice, updated as each count is validated and still readable after an
+error; dropping it keeps accepted bytes, completed flushes and shutdowns, and
+unwritten bytes in the caller's slices without rollback or replay. Polling it
+after completion panics. It allocates nothing, reserves no managed charges and
+needs no endpoint split. Scripted native tests and a loopback TCP relay cover
+these rules; they do not establish performance.
+
+`AsyncReadExt::take` owns a reader and caps reads at a replaceable remaining
+byte allowance without consuming bytes beyond it. `chain` owns two readers
+and switches to the second only after a nonempty first read reports EOF.
+Empty reads poll neither inner reader and do not switch sides; first EOF is
+sticky, while Pending and errors do not switch. Both adapters require `Unpin`
+endpoints for polling, expose recovery of their original endpoints and use
+the trait's scalar vectored-read fallback. They also implement `AsyncBufRead`:
+`take` caps the slice returned by `poll_fill_buf` and clamps `consume` to that
+slice and its remaining limit, while `chain` returns the first available
+buffer and routes consumption to that side. Pending and errors leave the
+current side unchanged; an empty first buffer marks sticky EOF before the
+second is polled. Pending reads do not spend the take limit, and cancellation
+does not undo completed reads or a completed switch. Direct mutable access can
+bypass the logical limit.
+
+`empty`, `sink` and `repeat` are allocation-free ready endpoints. `Empty`
+implements buffered reading, writing and seeking: it reports EOF, accepts and
+discards all offered bytes, and returns position zero for every seek. Its
+flush and shutdown are no-ops and later writes remain valid. `Sink` provides
+the same stateless write behavior; `Repeat` fills initialized buffers with
+its byte and needs an explicit limit for operations that wait for EOF. These
+ports do not reserve managed storage or create any background work.
+
+`runtime::buffered_io` supplies `BufferedReader`, `BufferedWriter` and
+`AsyncBufRead`. Constructors take a nonempty, uniquely owned `ManagedBuf` and
+return both original inputs on rejection. Readers and writers use this fixed
+initialized storage; they do not allocate a separate byte buffer. `into_parts`
+returns the endpoint, charged storage and exact unread or unwritten range for
+recovery. Consuming too much reader data is clamped to the available length.
+
+Buffered operations share a local budget of 64 endpoint calls per poll,
+including flush and shutdown. On runtime-owned outer polls, each completed
+buffered operation also uses the shared cooperative budget. Cached reader data,
+empty reads and writes, and already completed shutdowns pass through that gate
+before returning; composed endpoint operations preserve their descendant
+charges without charging twice. Manual polls and polls by another executor do
+not use automatic accounting. Interrupted calls count toward the local bound;
+other errors, including `WouldBlock`, propagate. Shutdown retains a completed
+flush phase across budget yields and pending shutdown calls. Accepting
+subsequent writes starts a fresh flush/shutdown sequence. Dropping a writer does
+not flush it; bytes already accepted by the underlying endpoint remain
+committed.
+
+`runtime::split_io::split` pins one bidirectional endpoint and returns unique
+read and write halves. It supports borrowed, local and `!Unpin` endpoints.
+Poll methods on the endpoint are serialized; a busy direction records one
+bounded waiter and is woken after the active poll releases the endpoint.
+Endpoint methods, waker callbacks and destruction run outside the shared
+state mutex. `is_write_vectored` reports the capability queried at split time.
+
+`reunite` accepts only halves from the same split and returns `Pin<Box<T>>`
+without moving the endpoint. A mismatch returns both original halves.
+Dropping one half retains the endpoint; dropping the last releases it without
+implicit flush or shutdown. Endpoint-owned managed charges stay with the
+endpoint through reunite and end when its storage is actually released.
+The pinning box and fixed shared metadata are ordinary allocations. Six
+native tests cover pinning, ownership, callbacks and panic cleanup; one
+actual-source Loom model checks poll exclusion and busy-waiter notification.
+
+`runtime::io::pipes::pipe` accepts one nonempty, uniquely owned `ManagedBuf`
+and returns unique reader/writer endpoints. `duplex` accepts two such buffers,
+one per direction, and returns two bidirectional endpoints. Constructor
+rejection returns every original buffer unchanged. Rings never grow or allocate
+additional payload storage; their fixed shared metadata uses ordinary
+allocations. Each buffer remains charged until both endpoints release it.
+
+Reads and writes copy at most two contiguous ring spans under one direction's
+mutex. A full ring waits for reads; an empty ring waits for writes or closure.
+Writer shutdown closes only its outgoing direction: accepted bytes drain before
+EOF, and duplex reverse reads remain usable. Dropping a duplex endpoint also
+closes its incoming reader, discards that direction's queued bytes, and wakes
+blocked peer writers to observe `BrokenPipe`. Empty admitted reads/writes
+return zero and clear only their own retained waiter. Flush is immediately
+ready and provides no durability guarantee.
+
+A dropped borrowing future leaves accepted bytes committed and may retain one
+bounded direction waiter. A later corresponding read or write poll that
+completes, explicit `cancel_io_waits`, or endpoint drop releases it. Waker cloning, callbacks and destruction run
+outside ring locks with panic containment. These endpoints participate in the
+runtime's shared cooperative budget before changing state. Native tests cover
+zero-budget preservation and bounded hot loops; three actual-source Loom
+models cover ring transitions and lost-wake registration, not TLS budgeting.
+The endpoints use scalar I/O and its vectored fallback; they do not expose a
+borrowed buffered ring view across lock release.
+
+## I/O adapter pool
+
+`runtime::IoPool` is a pool with a fixed number of worker threads and its
+own FIFO queue, outstanding-job bound, declared resource capacity and
+shutdown. It runs only the per-operation jobs of the asynchronous front ends
+over blocking calls: `blocking_io` readers and writers, the standard-stream
+helpers, `FsHandle` (including its FIFO and directory-walk operations),
+`fs_io::AsyncFile`, and `NetHandle::connect` and `NetHandle::resolve`. These
+take a cloneable `IoPoolHandle`, not a user blocking `Handle`.
+`IoPoolHandle` has no public submission method, so a caller cannot queue its
+own closure on the I/O pool, and these front ends cannot be built over a user
+pool. The caller's `Read` and `Write` implementations passed to the stream
+adapters do run on I/O pool workers, inside the adapter's jobs. The only
+jobs on a user pool are closures its user submitted. The I/O pool does not
+grow, does not borrow or lend workers to another pool, and offers no listing
+of its operations and no call that acts on all of them.
+
+The two pools never share a queue. A user `Runtime::shutdown(CancelPending)`
+drops only that pool's queued closures; queued adapter operations stay
+queued and run on the I/O pool. No I/O pool shutdown or drop discards an
+admitted operation or signals an operation's token.
+`IoPool::shutdown()` takes no mode: it closes admission, lets every queued
+and running operation finish, and waits for the workers. It can therefore
+wait indefinitely for a blocking stream, for example a stdin read with no
+input; make such streams return (close or write to their peer) before
+shutting down. An `IoPool` shutdown does not affect user closures.
+
+Dropping an `IoPool` detaches it instead: admission closes and the caller
+does not wait. Each worker runs the queued operations it reaches, each
+keeping its owned stream, file, buffer and permits until it completes. This
+has two limits. Operations queued behind a worker that is blocked in a call
+stay queued: their `Job`s stay pending, and their permits, managed buffers,
+tenant charges and the pool's waiter share stay held until that worker
+returns. Detached workers also end when the process exits, so a queued
+operation such as a stdout flush can be lost if `main` returns first; a
+caller that needs it must shut the pool (or the driver) down and wait.
+
+One job can be cancelled through its own `Job` handle (`Job::cancel`); there
+is no pool-wide cancellation. Dropping an adapter future or a returned `Job`
+detaches the operation rather than cancelling it.
+
+Internally the I/O pool reuses the blocking runtime's scheduler and worker
+loop as a separate instance, so admission, `WouldBlock` rejection by the
+adapters, cancelling one job through its own `Job` handle, `Job` joins, the
+`WouldDeadlock` and `Deadlock` checks, resource-domain Tasks/CPU/Control
+accounting and worker CPU parking behave as they do for a user pool, per
+pool. Its workers are named `allocatbelt-io-<index>`. Size it for the
+adapters alone: a worker blocked in a stream call, such as a stdin read,
+holds that worker until the call returns, and the I/O pool's
+`max_outstanding` and `capacity` bound adapter operations separately from
+the user pool's bounds. A closed I/O pool rejects new adapter operations
+with `BrokenPipe`, which is terminal; capacity rejection stays `WouldBlock`.
+
+### Migrating from adapters on the user blocking pool
+
+- `DriverBuildError::FilesystemNeedsBlocking` is renamed
+  `FilesystemNeedsIoPool`; `.filesystem()` needs `.io_pool(config)`, also
+  when a blocking pool is selected. `DriverBuildError::IoPool` and
+  `DriverShutdownError::IoPool` report I/O pool failures.
+- `FsHandle::new`, `NetHandle::new`, `blocking_io::reader`, `writer`,
+  `stdin_reader`, `stdout_writer` and `stderr_writer` take an
+  `IoPoolHandle` (from `IoPool::handle` or a driver's `io_pool()`) instead
+  of a user `Handle`.
+- A user pool's `CancelPending` shutdown does not shorten adapter work:
+  queued copies, walks and other operations on the I/O pool all run, and the
+  tokens of running walks are not signalled by any pool shutdown.
+- Selecting both pools starts both sets of worker threads, charges a second
+  pool payload to `Control` and reserves a second waiter share.
+- A blocking closure that joins a filesystem or network job waits for it
+  instead of getting `WouldDeadlock`, because the job runs on another pool;
+  join cycles between the two pools are not detected.
+- Caller-supplied `Read` and `Write` implementations given to the stream
+  adapters run on I/O pool workers.
+
+## Blocking streams and standard I/O
+
+`runtime::blocking_io::reader` and `writer` adapt owned `Read + Send + 'static`
+and `Write + Send + 'static` streams to initialized-buffer asynchronous I/O.
+Streams may be `!Sync` or `!Unpin`: each adapter boxes its stream and owns a
+nonempty, uniquely owned caller-supplied `ManagedBuf`. Constructor rejection
+returns both original inputs. The adapter uses a supplied `IoPoolHandle` and
+explicit per-operation `Resources`; it creates no worker or per-endpoint queue,
+and its jobs never share a queue with user blocking closures.
+There is at most one retained job per endpoint. Each job performs at most five
+underlying read, write or flush calls: the first attempt and four bounded
+Interrupted retries. Other I/O errors retain their kind.
+
+A reader uses its fixed staging buffer for read-ahead, retaining unread bytes
+when a borrowing read future is cancelled or a later destination changes size.
+A writer accepts bytes into its staging buffer only after job admission and
+returns their accepted count in that same poll. Later polls drain the previous
+job and unwritten suffix before accepting another input; they never attribute
+cancelled-call progress to a new input slice. Partial writes commit only the
+counts the underlying stream reports. Errors retain an unwritten suffix;
+external side effects that a generic `Write` does not report cannot be rolled
+back. Flush runs as a separate retained job after accepted writes drain.
+Shutdown flushes and permanently stops new writes on this adapter.
+
+Admission or resource-capacity rejection returns `WouldBlock`, restores the
+adapter's owned inputs, and accepts no write bytes. There is no asynchronous
+I/O pool capacity notification; applications must explicitly retry or
+abandon the operation. A closed I/O pool returns `BrokenPipe` with the
+`Submission(Closed)` cause instead; it does not reopen, so do not retry. Dropping a borrowing future retains its job and progress.
+Dropping an endpoint detaches the job: stream and charged staging storage remain
+owned until actual completion and result cleanup. Neither pool's shutdown
+discards a queued adapter job, so an endpoint does not lose its stream to a
+shutdown. Started blocking calls cannot be preempted, so a read can delay the
+I/O pool's draining shutdown indefinitely. Operation panics and recursive
+destructor-panic payloads follow the existing contained blocking-job cleanup
+path.
+
+`stdin_reader`, `stdout_writer` and `stderr_writer` use the standard library's
+process-global handles and locking/buffering. Those global buffers, boxes and
+fixed job metadata are ordinary allocations outside managed-memory accounting.
+Staging storage stays charged to its actual owners. Logical writer shutdown
+never closes a global descriptor. An I/O pool with every worker blocked on
+stdin cannot service its queued adapter jobs, filesystem operations included,
+until a read returns; size the I/O pool with that in mind. User blocking
+pools are not held by these reads. These endpoints participate
+in automatic per-poll cooperation; native tests cover ownership, cancellation,
+rejection, partial/error progress, bounded retries and zero-budget preservation.
+They do not establish a shutdown latency bound or performance benefit.
+
+## General Unix pipes
+
+`runtime::unix_pipe::pipe` creates an anonymous Linux pipe with
+`CLOEXEC | NONBLOCK` and registers both descriptors with the caller's
+`ReactorHandle`. If either registration fails, this constructor drops both
+new descriptors and reclaims any registration it already made. `PipeReader`
+and `PipeWriter` implement initialized-buffer `AsyncRead` and `AsyncWrite`,
+including vectored operations, with the reactor's registration and waiter
+bounds. They do not allocate userspace payload buffers or charge the kernel
+pipe buffer to a managed-memory scope.
+
+`from_owned_fd` imports one endpoint at a time. It checks FIFO type and
+compatible access mode before changing flags or registering; it also rejects
+`O_PATH` and writer descriptors with Linux packet-mode `O_DIRECT`. A refusal
+returns the original `OwnedFd`; a registration refusal separately reports
+any failure to restore the original flags. For a separately imported reader,
+Linux does not expose packet mode on the imported read descriptor, so the
+caller must ensure that its writer peer is not in packet mode. Imported
+descriptors share `O_NONBLOCK` status with aliases; aliases must coordinate
+flags for the entire endpoint lifetime: they must not remove nonblocking mode
+or enable packet mode. Opening a FIFO path and importing the result is not descriptor-relative path confinement.
+
+Each trait poll uses the same active-poll cooperative budget as other
+allocatbelt primitives and then delegates to the bounded child-pipe readiness
+poll. A pending read or write waiter remains owned by the endpoint after a
+dropped poll; a completing poll in that direction (including an empty-buffer
+poll), `cancel_io_waits`, endpoint drop, or writer shutdown releases it. Flush
+does not clear a retained write waiter. Writer shutdown closes only that
+descriptor. EOF waits until all writer descriptors and aliases close. Writes with no readers follow the
+process's current `SIGPIPE` disposition; the module never changes signal
+handling process-wide. Native regressions cover fd type/access recovery,
+registration rollback, partial transfer, EOF, backpressure, waiter
+cancellation, cooperative gating and the inherited signal policy.
+
+## Named Unix FIFOs
+
+`FsHandle::create_fifo`, `open_fifo_receiver` and `open_fifo_sender` use the
+handle's bounded I/O pool and disk-operation ledger. Creation validates
+permission bits before admission and returns the original path and mode on
+rejection. Opens use `NONBLOCK | CLOEXEC | NOCTTY`, validate the resulting
+descriptor as a FIFO, and register it with the supplied reactor before
+publishing the endpoint. Import or registration failure returns the opened
+descriptor. The disk permit survives through that operation and registration;
+the endpoint then uses the reactor's registration and waiter bounds.
+
+A read-only open succeeds without a writer. A raw nonblocking read may return
+EOF before any writer has opened, while the readiness-backed `AsyncRead` may
+remain pending until writer activity because Linux emits no initial readiness
+event. The same reader can receive later data. A write-only open without a
+reader returns `ENXIO`. `FifoOpenOptions::read_write(true)` selects Linux
+`O_RDWR`: the descriptor keeps its own peer open, suppressing ordinary EOF and
+allowing a writer open without an external reader. These are explicit peer
+semantics, and endpoint shutdown still closes only its descriptor.
+
+Queued cancellation prevents the operation from starting. Dropping an admitted
+job detaches it; a started syscall retains its inputs and disk permit until
+completion. Kernel path resolution, symlink traversal and process umask apply.
+No operation unlinks a path on failure, confines path resolution, or replays an
+attempted syscall. Kernel pipe buffers remain outside managed storage.
+Native tests cover rejection recovery, FIFO type checks, registration recovery,
+queued cancellation, peer modes and data after the initial no-writer state.
+
+## Managed buffers and operation permits
+
+`runtime::managed::ResourceScope` provides a separate shared ledger for managed
+buffer capacity and concurrent disk/network operation permits. `ManagedBuf`
+clones share one charge, held until the last owner frees the storage, including
+when a job returns the buffer or the runtime shuts down. Shrinking retains its
+capacity and charge. Growth reserves the full replacement while the old storage
+is still live; the peak must fit the budget before replacement proceeds.
+
+This is cooperative accounting of explicit managed storage and operation slots.
+It excludes allocator metadata, the shared buffer header, physical rounding,
+RSS and arbitrary allocations. It supplies neither CPU quotas nor byte-rate
+limits. The declared `Resources` reservations of the user blocking pool and
+of the I/O pool remain separate from this ledger.
+
+`AsyncRuntime::scope_with_resources(&ledger)` and
+`scope_with_config_and_resources(config, &ledger)` explicitly bind a managed
+ledger to an owned Send scope. `LocalRuntime::scope_with_resources(&ledger)`
+does the same for local tasks. Construction borrows the caller's ledger handle;
+rejection retains that handle. Existing runtime roots and unbound scope
+constructors keep their unbound behavior. `LocalSendHandle` imports into its
+unbound local root.
+
+During a bound task's poll and runtime-owned cleanup,
+`try_current_resource_scope()` returns a clone of its ledger;
+`current_resource_scope()` panics if no ledger is bound. This context also
+covers producer-side destruction of detached results. Spawning follows the
+target handle's explicit scope binding, never the spawning task's current
+ledger. Rejection returns the unchanged future without installing the target
+context. Nested calls and unwind restore the enclosing resource context.
+
+A bound `AsyncHandle::block_on` exposes that handle's ledger to its borrowed
+root, with no task ID. Runtime-root `block_on` clears the resource context
+during its borrowed root and restores an enclosing context afterward. Values
+returned to user code become caller-owned; dropping them later does not install
+their producer's task context. Managed charges still follow their buffers and
+permits through task completion, scope close and final release. Binding alone
+charges no storage and imposes no accounting on ordinary allocations.
+
+## Owned filesystem operations
+
+`runtime::fs::FsHandle` submits work to an explicit `IoPoolHandle`. Each
+accepted operation holds a disk permit while queued or running; rejection
+returns its original inputs, queued cancellation drops captures before permit
+release, and detaching a running job retains its resources until completion.
+Returned managed buffers keep their storage charge until the final owner drops.
+
+An `OwnedFile` moves into each read, write, seek or synchronization job and
+returns in its outcome, preserving cursor sequencing and ownership on I/O
+errors. Reads and writes use at most 64 KiB per syscall and check cancellation
+between calls; a blocked syscall cannot be preempted. Positional operations
+preserve the cursor. Linux append-open files still append during `write_at`,
+regardless of its supplied offset. `flush` is not a durability operation;
+`sync_data` and `sync_all` forward the filesystem's synchronization calls.
+
+`OwnedFile::from_std` and `into_std` transfer ownership without I/O or a
+disk-operation reservation. Existing descriptor aliases remain the caller's
+responsibility; direct standard-file operations bypass the I/O pool and ledger.
+Open-file metadata, length and permission jobs return the same file on I/O
+error. Metadata remains available after unlink; truncation preserves the
+sequential cursor even beyond the new EOF. Once a one-call mutation starts,
+its side effects cannot be cancelled or rolled back.
+
+Path jobs include canonicalization, existence checks that preserve errors,
+hard and symbolic links, permission changes, single-file copying and
+empty-directory removal. Copy follows `std::fs::copy` behavior and returns the
+copied byte count. It overwrites destination contents, follows a source
+symbolic link, and follows an existing destination symbolic link. An I/O error
+can leave a partially modified destination. Queued cancellation prevents the
+copy from starting; a running copy cannot be interrupted or rolled back and
+retains its disk permit until completion.
+They retain standard filesystem semantics, including relative symlink
+targets and path races. Canonicalization and existence are snapshots, not
+security checks for later operations.
+
+Directory iteration yields one entry per job. Entry metadata and type wrappers
+also use disk permits. Returned raw `std::fs::DirEntry` methods can perform
+blocking I/O directly if callers bypass these wrappers. Paths and open options
+retain standard-library semantics; this API supplies no path sandbox, descriptor
+quota, IOPS, bandwidth or disk-space enforcement. It does not collect whole
+files or directories implicitly.
+
+`FsHandle::walk_dir` and `walk_next` provide a depth-first path stream. The
+caller sets finite entry, depth and path-byte ceilings and supplies a uniquely
+owned charged `ManagedBuf` for each emitted path. The root is the first entry
+at depth zero; symlinks are emitted but not descended. An entry-limit result
+means traversal may be incomplete, while completion reports whether a
+depth-limited directory was left unopened. The cursor bounds logical path
+lengths and directory-frame count, while standard-library allocation rounding,
+iterator state and temporary entry names remain uncharged. The output paths are
+raw Unix bytes, so non-UTF-8 names are preserved. These ordinary path-based
+operations reject a symlink at the final root component even with a trailing
+slash, but an earlier component such as `link/.` can still resolve through a
+symlink. Path replacement races remain, so this is not descriptor-relative
+confinement. A `walk_next` call processes at most 64 frame/iterator steps;
+terminal cleanup may additionally drop the bounded stack of up to 257 frames.
+
+`runtime::fs_io::AsyncFile` implements initialized-buffer read/write/seek
+traits over one `OwnedFile`, an explicit `FsHandle` and two caller-sized,
+nonempty, uniquely owned managed staging buffers. Constructor rejection
+returns every original input. It targets ordinary seekable files: the owned
+read operation fills staging until full, EOF or error, so device/FIFO partial
+availability does not imply completion. Use readiness-backed pipes for those
+streams. Writes are accepted into fixed staging and submitted by flush,
+buffer pressure, seek, read-after-write or shutdown.
+
+The adapter retains admitted jobs and progress when a borrowing future is
+dropped. Reading after accepted writes first completes those writes.
+Write-after-read and relative seeks compensate for unread read-ahead to
+preserve the logical cursor. Successful seeks discard old staging; failed
+seeks retain it for retry. Partial write errors preserve only the unsent
+suffix, so subsequent flush/shutdown does not replay committed bytes.
+Pre-admission I/O pool or disk-budget rejection restores the file/buffer and
+returns `WouldBlock` with the typed submission cause; retry after capacity
+becomes available.
+
+Starting shutdown permanently rejects other operations. Retrying shutdown
+drains accepted bytes and performs the underlying flush before closing;
+admission or write errors retain retryable state. Once closed, later polls
+return `BrokenPipe`. Dropping the adapter does not flush unsubmitted staging.
+An already admitted operation retains its owned file, buffer and permit until
+actual completion. No pool shutdown discards those queued inputs: the I/O
+pool's shutdown drains them, and a user pool never holds them. If an
+admitted job still ends without returning its inputs, the adapter reports a
+terminal service error. Managed charges follow the
+final buffer owner, including detached jobs. Job metadata and error values
+are outside byte accounting. Native tests cover cursor ordering,
+partial/error retry, future cancellation, draining I/O pool shutdown with
+queued operations, shutdown and panicking waker destruction.
+
+## Bounded epoll readiness
+
+`runtime::reactor::Reactor` owns a Linux epoll service thread and explicit
+registration/waiter bounds. `ReactorHandle::register` returns `AsyncFd<T>` or
+the original value on rejection. It watches an owned duplicate with checked
+generation tokens, sets nonblocking mode while preserving other flags, and
+releases the duplicate before reclaiming registration capacity. Nonblocking
+mode affects every descriptor sharing that open-file description. The caller's
+`AsFd` must keep identifying the same underlying descriptor while registered.
+
+Read and write waits use separate FIFO queues. Level-triggered one-shot
+interest arms only directions with waiters and no cached readiness. Readiness
+is a hint: `ReadinessGuard::try_io` calls the operation exactly once and clears
+its cached direction on `WouldBlock`. Hang-up and error notify both directions;
+rearm failures complete waiting futures. Cancelled and forgotten waits are
+reclaimed when their registrations are released; generation tags reject stale
+events after reuse. Idle writable descriptors do not cause continuous polling.
+
+External close waits for claimed callback drains before returning; callbacks
+closing their own reactor and the service thread avoid waiting for themselves.
+External shutdown also joins the service; shutdown inside a callback or on a
+service thread returns `WouldDeadlock`.
+Callbacks run outside driver and callback-tracking locks, including during
+thread-local teardown. Registration, waiter, dispatch and callback-scratch
+tables are preallocated. Callback tracking uses a fixed shared table and fixed
+thread-local identity fallback; nested drains reuse scratch or claim one
+waiter at a time without allocating a new waker vector. `new_in_tenant` charges
+declared owner, shared, registration and worker-capture payloads to `Control`;
+retained handles keep their fees until final release. These fees exclude
+allocator headers, thread stacks and opaque thread-local backing, and are not
+a total memory budget. Socket wrappers and their
+I/O-trait integration are provided by the network module. Owned readiness
+futures and guards retain an `AsyncFd` clone, keeping the registration and
+underlying value alive until their final release. Dropping a pending owned
+future cancels its waiter. Reactor protocol behavior is
+covered by native tests, not by the current Loom helper models.
+
+## Network endpoints and DNS
+
+`runtime::net` supplies explicitly registered TCP, UDP and Unix endpoints.
+UDP endpoints support connected `send`/`recv` and non-consuming `peek` and
+`peek_from`. Select the peer through the underlying standard socket's
+`connect`, before or after registration; the kernel then filters received
+peers. Empty sends produce datagrams, empty receives consume them, and peeks
+retain the original message even when the supplied buffer is empty or short.
+Named-method cancellation releases its readiness waiter. Descriptor aliases
+can still compete for messages or change the connected peer.
+Named read, write, accept and datagram methods preserve partial progress,
+EOF and message boundaries. They retry interrupted calls and stale readiness
+after clearing `WouldBlock`, yielding after 64 endpoint calls per poll.
+Dropping a pending named method removes its waiter; transferred bytes remain
+transferred. Binding and standard-stream socket options use standard-library
+calls directly; `TcpSocket` also exposes safe, synchronous Rustix-backed options.
+Filesystem-path Unix datagram APIs do not support abstract addresses.
+
+`NetHandle::connect` keeps its blocking-call behavior on the I/O pool. The additive
+`connect_nonblocking` and `connect_socket` methods instead use one explicitly
+created or supplied nonblocking TCP socket, register it with the reactor, then
+issue one connect syscall and wait for writable readiness. `TcpSocket` supports
+IPv4/IPv6 creation, binding, local-address inspection, and import/recovery of
+owned descriptors. `TcpSocket::listen` accepts a kernel backlog and returns a
+registered `TcpListener`; an unbound IPv4/IPv6 socket may be autobound by the
+kernel. Negative backlog values return the unchanged socket before the syscall.
+A listen syscall error returns the same descriptor, but the syscall was
+attempted and its kernel state may have changed; no rollback or retry occurs.
+If reactor registration fails after listen succeeds, the error returns the
+listening standard-library socket for recovery or later registration. The
+kernel may clamp backlog to `somaxconn`; it describes the pending-connection
+queue and does not reserve runtime operations or managed memory.
+
+`TcpSocket` exposes `SO_REUSEADDR`, Linux `SO_REUSEPORT`, `SO_KEEPALIVE`,
+`TCP_NODELAY`, send/receive buffer sizes and `take_error`. Setters act on the
+socket immediately; descriptor aliases observe the same kernel state. Buffer
+sizes are requested and reported in bytes, but getters return kernel-observed
+sizes, which may be clamped or adjusted (Linux may double them for bookkeeping).
+Kernel socket buffers are not `ManagedBuf` storage and are not charged to
+`ResourceScope`. `take_error` reads and clears `SO_ERROR`, so aliases must
+coordinate that observation. These methods make no runtime-capacity or
+buffer-accounting promise.
+
+Supplied-socket connect admission or registration rejection returns the
+original socket; after connect is attempted, errors close it and never replay
+the syscall. Cancellation drops the readiness waiter and local socket, then
+releases its network-operation permit. It cannot undo a handshake already
+observed by the remote peer. Imported descriptors must be nonblocking,
+close-on-exec, unconnected TCP stream sockets that are not listening. The
+runtime cannot detect an external alias with an earlier connect in progress or
+one that consumes `SO_ERROR`; callers must coordinate aliases. These methods
+perform no DNS, address retry or timeout policy.
+
+`TcpStream::quickack` and `set_quickack` expose Linux `TCP_QUICKACK`; the kernel
+may reset it after later socket operations, and aliases observe the same
+setting. `TcpSocket` also exposes IPv4 TOS, IPv6 traffic class, interface
+binding and `SO_LINGER`; `TcpStream` exposes `SO_LINGER` as well. Traffic-class
+values are restricted to `0..=255`: Linux preserves the previously installed
+low two ECN bits and applies the requested upper six bits. Interface names
+must be shorter than `IFNAMSIZ` and contain no embedded NUL; binding may require
+a network capability. Returned interface-name vectors are ordinary caller-owned
+metadata outside managed-memory accounting. Linger is synchronous: a positive
+duration can block close or drop despite nonblocking socket mode, while zero
+linger requests an abortive close that discards unsent data. Ordinary write-side
+`SHUT_WR` does not perform that close-time linger wait. Duration rounding is the
+Rustix adapter's contract. These socket options reserve no runtime capacity or
+managed memory.
+
+The blocking `connect` and DNS resolver use the explicit bounded I/O pool
+handle (`IoPoolHandle`), never a user blocking pool. A network permit remains held while work is queued or running;
+detaching a future retains worker captures until actual cleanup. DNS rejection
+returns the original hostname and port. Registration rejection from blocking
+connect returns the connected socket for recovery.
+
+DNS output pre-reserves `(address_limit + 1) * 27` managed bytes. Fixed records
+preserve both address families and IPv6 flow and scope identifiers. An overflow
+returns the bounded observed prefix, including one extra address, and result
+clones retain the storage charge until their final release. Caller hostname
+storage and the resolver's internal allocations are outside that charge.
+This bounds collected output and operation concurrency; it supplies no total
+DNS memory, network bandwidth or descriptor quota beyond reactor admission.
+TCP and Unix streams implement the initialized-buffer I/O traits. A pending
+trait read/write retains one waiter of that direction in the endpoint. Dropping
+the borrowing helper leaves this waiter available to a subsequent read/write
+poll. Completing an endpoint trait poll for that direction, including an
+empty-buffer endpoint poll, removes it. Scalar and vectored extension helpers
+may return for empty input or a length error without polling the endpoint;
+those short circuits retain any waiter already stored in the endpoint.
+`cancel_io_waits` or endpoint drop also removes both directions' waiters. Flush
+and shutdown do not remove a pending read/write waiter. Named async methods
+keep their immediate waiter cancellation on future drop.
+
+## Message channels
+
+`runtime::channel::channel` constructs a bounded multi-sender, single-receiver
+channel with separate message and sender-waiter limits. Private permits reserve
+slots through enqueue until receive. Slot admission is FIFO; concurrently
+granted sends may enqueue in a different scheduling order. `try_send` rejects
+immediately, and named `send` futures wait within the waiter bound. Rejections
+return the original value. An unsubmitted send retains its value across polls;
+`into_inner` recovers it, while cancellation drops it outside queue locks.
+`reserve` waits for capacity before the caller constructs a message and returns
+a borrowed permit; `reserve_owned` retains a sender clone and returns an owned
+permit. Both permit forms return capacity when dropped. The owned form borrows
+the original sender to create its clone, so a failed or cancelled reservation
+does not consume the caller's handle. A permit's `send` returns the original
+value if the receiver was dropped.
+
+Receiver close rejects new sends and reservations, wakes `Sender::closed`
+waiters, and allows queued messages to drain. A permit issued before that
+close remains valid; EOF waits until each such permit is used or dropped. This
+keeps `queue length + issued permits` within capacity. Receiver destruction
+closes admission, revokes unused permits, and drops messages individually
+outside locks, containing destructor panics. Receive futures remove their
+stored waker on cancellation. `Sender::closed` uses its own bounded waiter
+table, with the same configured waiter limit; registration can fail with
+`ClosedWaitError::WaitersFull`, and cancellation removes only that waiter's
+generation. EOF follows the last sender, unfinished owned send future, and
+outstanding issued permits; a completed retained send future does not delay
+EOF. Managed-buffer charges survive pending sends, queued messages and returned
+results until final release. Queue metadata and arbitrary message allocations
+are outside that ledger.
+
+`runtime::oneshot::channel` transfers one value through a consuming synchronous
+sender and an awaitable receiver. Send rejection returns the value unchanged.
+Receiver close retains an already-sent value; receiver destruction discards it
+outside the state lock. Dropping an unused sender wakes the receiver with
+closure. `Sender::closed` uses a mutable borrow to bound closure notification to
+one waiter, and dropping that future removes its waker.
+
+Native tests cover message uniqueness, FIFO admission, cancellation, borrowed
+and owned reservations, close/drain, EOF, bounded closure waiters, reentrant
+and panicking callbacks, retained charges and Send/Sync bounds. Actual-source
+Loom models cover queue close versus enqueue, reservation publication, permit
+resolution versus receiver drop, EOF wakeup and closure-wait registration. They
+do not model every channel/executor combination or arbitrary user callback
+behavior.
+
+`runtime::watch::channel` retains the latest value in an owned `Arc` and fixes
+the receiver bound at construction. Construction failures preserve the initial
+value. `subscribe` starts at the current version; receiver `try_clone` copies
+the observed version. `borrow` returns an owned snapshot without consuming a
+change, while `borrow_and_update`, receiver marking and successful `changed`
+calls control observation. Updates coalesce. An unread final version remains
+observable once before closure or version exhaustion.
+
+`send` rejects without receivers and returns its unchanged input; `send_replace`
+can retain a new value for later subscribers. `Sender::closed` has a separate
+waiter table with the same configured bound as receivers. Completion and
+cancellation promptly release its slots; repeated closure/reopen notifications
+yield after 64 rearms. Predicate `wait_for` executes outside locks, drops rejected
+snapshots before waiting and yields after 64 rejected candidates. Cancellation
+at that yield does not consume the next unexamined update.
+
+These snapshots require `T: Send + Sync` for threaded use. Local borrowed values
+need no `'static` bound. They keep managed-storage charges through final release,
+including after replacement or channel destruction; arbitrary values and
+metadata remain outside that ledger. This port uses owned snapshots instead of
+Tokio's lock guards and omits mutation callbacks under a lock. Twenty native
+tests, two compile-fail examples and five actual-source Loom models cover
+observation, replacement, cancellation, closure registration and trait bounds.
+
+## Broadcast channels
+
+`runtime::broadcast::channel` fixes a nonzero message capacity and receiver
+bound, including receiver slots still releasing their unread values. Every
+receiver has one cursor and one pending receive waker. New subscriptions and
+`resubscribe` begin at the current send sequence; lagged receivers report the
+exact number skipped before resuming at the oldest retained message. Closing
+or dropping the last sender allows each receiver to drain retained messages
+before EOF. Sequence counters are checked and receiver generations retire.
+
+Sending with no receivers, after closure or at sequence exhaustion returns
+the unchanged input. Message slots retain owned `Arc<T>` values; receiving
+clones `T` outside the state lock and protects a concurrently overwritten
+replacement from the previous receive's bookkeeping. Retained snapshots and
+managed payload clones keep their charges until final release. Cloning,
+formatting, waking and payload destruction happen outside the state lock.
+Metadata is ordinary storage rather than a managed charge; threaded handles
+require `T: Send + Sync`, while local values need no `'static` bound.
+
+`Sender::closed` observes zero active receivers and uses a separate bounded
+notification table with the same ceiling as receivers. Completion and
+cancellation release their waiter immediately; repeated zero-receiver and
+resubscription races yield after 64 rearms. Closure notification is published
+before unread payload destruction, while the dropping receiver slot remains
+reserved until cleanup completes. A new receiver can reopen this condition
+while senders remain alive. Explicit channel closure does not complete this
+wait until all active receivers leave.
+
+This port uses the exact requested ring capacity; subscriptions reject after
+channel closure. It currently has no weak-sender API. Native and actual-source
+Loom checks cover lag, drain, cancellation, reentrant cloning and destruction,
+retained managed charges, receiver registration and closure lost wakes.
+
+## Bounded notifications
+
+`runtime::notify::Notify` reserves its complete waiter table at construction.
+Named owned futures capture the broadcast generation when created; `enable`
+arms a future before the caller checks its condition. Table exhaustion returns
+`Full`. `notify_one` assigns the oldest waiter and `notify_last` the newest;
+canceling an unobserved assignment transfers it using the same order. With no
+waiter, either operation stores one coalescing permit.
+
+`notify_waiters` completes futures created before the broadcast, including
+unpolled futures, without storing a new permit. A broadcast is observed before
+an existing single permit, preserving that permit for another future. Close
+rejects unobserved single assignments while preserving prior broadcast
+eligibility. Broadcast generations are checked and waiter slots retire rather
+than wrap; exhaustion is explicit. Waker callbacks and debug formatting run
+outside the ledger lock. The fixed metadata is outside the managed-buffer
+ledger. Seventeen native tests and four actual-source Loom models cover
+registration, cancellation order, close races and generation reuse.
+
+## Bounded reusable barrier
+
+`runtime::barrier::Barrier` fixes a nonzero participant count and a waiter-table
+capacity large enough for one complete round. Wait futures enroll on first
+poll. Unobserved completed results still occupy slots, and `Full` rejects an
+arrival without counting it. Each completed round returns its checked round
+number and exactly one leader.
+
+Canceling an enrolled wait before completion breaks that round: its peers
+receive `Broken` and the barrier advances to a fresh round. Explicit application
+ports must handle that result and retry or abandon their operation. Tokio's
+barrier wait is not cancellation safe and retains canceled arrivals; this
+interface deliberately has different cancellation and zero-participant
+behavior. Close rejects unfinished rounds but preserves completed successes.
+Round counters do not wrap. Waiter slots retire rather than reuse a wrapped
+generation; if usable capacity drops below the participant count, unfinished
+waits receive `Exhausted` instead of waiting for an impossible round.
+
+Metadata is preallocated ordinary runtime storage. Waker callbacks and debug
+formatting run outside the ledger lock; wake panics and panicking payload
+destructors are contained. Twelve native tests cover rounds, bounds, cleanup,
+retirement and reentrant callbacks. Three actual-source Loom models exercise
+cancellation/arrival, close/completion and round separation races.
+
+## Bounded fair semaphore
+
+`runtime::semaphore::Semaphore` has an explicit preallocated waiter bound.
+FIFO requests prevent both later waiters and immediate acquisitions from
+passing a head request that needs more permits. A full waiter table returns
+`Full`; cancellation removes a request and restores any unobserved grant.
+Zero-sized requests are valid and obey the same queue order.
+
+Closing resolves queued and granted but unobserved acquisitions as `Closed`.
+Issued permits remain valid and return their count on drop; `forget` removes
+that count permanently. Checked `add_permits` can increase the total while
+open. These are cooperative units, independent of the managed resource ledger.
+The waiter bound excludes shared helper metadata and arbitrary caller storage.
+Callbacks run outside the ledger lock. Close publishes terminal outcomes but
+does not wait for callbacks already claimed on other threads.
+
+Native tests and four Loom models exercise the production ledger, immediate
+acquisition, queued cancellation/grant races, close and slot-generation reuse.
+The models do not cover arbitrary user waker behavior or every scheduler path.
+
+An issued semaphore `Permit::split` transfers a checked count to another
+owned token without acquiring or releasing permits or waking waiters. Invalid
+splits preserve the original token; zero-count splits are valid. Each token
+returns its own count independently, including after close. Native tests and
+a Loom release/close race check conservation of split permits.
+
+## Bounded asynchronous mutex
+
+`runtime::mutex::AsyncMutex` uses a private one-permit FIFO semaphore with an
+explicit waiter bound. It returns borrowed or owned lock futures and guards;
+full or closed admission returns a typed error. Constructor failures return
+the original protected value. Closing rejects queued and granted-but-unclaimed
+locks, while already-issued guards remain valid.
+
+The guard owns the protected value during access. Unlock restores that value
+under a short standard mutex lock, releases the lock, then returns the permit.
+No standard lock survives an await or covers caller code or callbacks. A guard
+can move between threads when the value is `Send`, without requiring `Sync`;
+owned guards and futures keep the mutex state alive. This interface does not
+promise a stable address for the protected value. User panics while holding a
+guard do not poison the mutex; forgetting a guard can leak the value and prevent
+further acquisition.
+
+Metadata uses ordinary runtime storage outside the managed-buffer ledger.
+Native tests cover FIFO order, queued/granted cancellation, close, reentrant
+unlock wakes, panic cleanup and ownership. A Loom model uses the actual mutex
+and semaphore implementation to check serialized updates.
+
+## Bounded asynchronous read/write lock
+
+`runtime::rwlock::AsyncRwLock` fixes a nonzero reader ceiling and FIFO waiter
+bound at construction. Readers reserve one private permit; writers reserve
+the whole ceiling, forming a barrier to later readers. Queued and granted
+acquisitions can be cancelled. Close rejects unclaimed acquisitions while
+issued guards remain valid. Reported construction errors return the original
+value; shared headers follow ordinary Rust allocation-failure handling.
+
+Borrowed and owned guards provide shared reads or exclusive mutation. Reader
+guards drop their value references before releasing permits; writers restore
+the value before releasing theirs. The writer uses the existing unique `Arc`
+and allocates no replacement header per acquisition. Downgrade retains one
+reader permit and restores shared access before returning the others, without
+an intervening writer. Owned guards and futures may outlive the handle.
+
+This Arc-based implementation requires `T: Send + Sync` for its lock, guards
+and futures to move between threads. It provides no upgrade operation or
+stable-address promise. Native tests and compile-fail examples cover FIFO
+barriers, cancellation, close, downgrade, owned lifetimes and trait boundaries;
+an actual-source Loom model checks reader/writer exclusivity. Metadata is
+outside the managed-buffer ledger.
+
+## Bounded asynchronous initialization
+
+`runtime::once_cell::AsyncOnceCell` publishes one successful value and returns
+owned `Arc` snapshots. It uses a private one-permit FIFO semaphore with an
+explicit waiter bound. Factories run lazily only after an empty-cell recheck
+under issued admission. Admission failure returns the original uncalled
+factory; application initialization errors are distinct. Immediate `set`
+returns the unchanged value when already initialized or busy.
+
+Errors, cancellation and panics leave an empty cell retryable. Cleanup drops
+initializer futures and remaining factory captures before releasing admission.
+A completed initializer's destructor must finish before publication; if it
+panics, its proposed value is discarded and later initialization can retry.
+Primary panics resume after cleanup, while secondary panic payload destruction
+is contained. Completed futures release admission immediately. Recursive
+initialization can wait for itself and deadlock.
+
+Live initialization futures share the runtime's cooperative operation budget,
+including the path that returns an already initialized snapshot. An exhausted
+poll schedules a wake and leaves admission, the factory, the initializer and
+publication untouched. Calls into supported primitives from a factory or
+initializer retain their own charges, including when initialization remains
+pending or unwinds. Polling a completed future returns its existing error
+without this gate; manual polls outside the runtime bypass automatic accounting.
+
+This explicit port returns owned snapshots instead of Tokio references and
+provides no cell clone, reset, mutable-reference or constant-construction API.
+Threaded cells and snapshots require `T: Send + Sync`; local values can borrow
+data and need no `'static` bound. Metadata is ordinary storage; managed values
+retain their charges through the final snapshot. Nine native tests, two
+compile-fail examples and three actual-source Loom models cover cleanup,
+recovery, competing publishers and thread boundaries.
+
+## Process-wide signals
+
+`runtime::signal::SignalDriver` shares one process-wide dispatcher and a fixed
+listener table. The first published bridge fixes the ceiling; later drivers
+must request the same value. A dispatcher startup failure is cached without
+installing handlers. Invalid kinds and full listener admission make no handler
+installation attempt. Listener capacity is reserved before a new kind's first
+registration. A reported registry error may already have changed disposition;
+that attempt is cached and its callback state remains permanently valid.
+
+Each listener coalesces delivery to one unseen event. `recv` consumes that
+event only when ready; dropping a pending receive removes its waker without
+consuming an unseen event. Dropping a listener releases its table slot, whose
+generation is checked and retired on exhaustion. Multiple drivers and runtimes
+share the same process-wide ceiling. `ctrl_c` creates an interrupt subscription.
+
+The permanent handler only updates a pending bitmap and writes one byte to a
+nonblocking descriptor. An ordinary dedicated thread dispatches into the table
+and invokes callbacks outside locks. Registration chains previous handlers and
+preserves errno. Dropping all subscriptions does not restore default signal
+behavior; the bridge, handlers and dispatcher remain for the process lifetime.
+No API here is intended to be called from an application signal handler.
+Unrelated concurrent handler replacement retains the registry's race limits.
+This is a coalescing event port, with no exact signal-count or payload queue.
+Metadata and the kernel socket buffer are outside managed-storage accounting.
+Registration preserves the previous handler's calling convention, but does
+not preserve every `sigaction` flag or an ignored disposition. In particular,
+registering `SIGCHLD` must be coordinated with process wait ownership and any
+existing auto-reap policy.
+Eight native tests, five real-signal subprocess cases and four actual-table
+Loom models qualify the implemented contract; they do not model kernel delivery
+or arbitrary application handlers.
+
+## Child processes
+
+`runtime::process::ProcessDriver` reserves a fixed child slot before spawning
+an owned standard `Command`. Full or closed admission returns the untouched
+command. After an accepted spawn, setup failure retains the child and uses a
+25-millisecond polling fallback if pidfd readiness cannot be registered.
+A dedicated reaper owns admitted children independently of executor workers,
+blocking-pool saturation, driver drop and application handle lifetime.
+
+Dropping `ProcessChild` detaches by default; `set_kill_on_drop` opts into a
+termination request. Explicit driver shutdown closes admission and either
+waits or requests termination before waiting for actual reaping. A running
+child or kernel operation can delay shutdown indefinitely. A slot remains
+occupied through reaping, then becomes reusable while old handles retain
+their own stable completion record. Dropping a pending `wait` removes its
+waiter; a later wait still observes the cached terminal result.
+
+`wait` closes stdin still owned by the handle, whereas `try_wait` does not.
+The latter reads cached status rather than probing the kernel and may lag
+exit by the fallback polling interval. `id` retains the original numeric PID
+after reaping for diagnostics; the OS may reuse it. Handle kill methods use
+the driver's guarded ownership checks. Pipe accessors transfer standard
+handles. `runtime::process::pipe` converts them into `AsyncChildStdin`,
+`AsyncChildStdout` and `AsyncChildStderr` through a supplied bounded reactor.
+Callers must drain piped stdout and stderr concurrently to avoid blocking the
+child. `runtime::process::output` supplies an owned bounded collector.
+
+Pipe endpoints use initialized scalar and vectored I/O without allocating
+userspace byte buffers. Each poll limits interrupted/readiness retries to
+64 calls and retains one direction waiter when pending. Terminal or empty
+read/write endpoint polls, explicit `cancel_io_waits`, endpoint drop and
+stdin shutdown release the waiter. Flush has no buffered work and does not
+cancel an earlier write waiter. Shutdown closes stdin to deliver EOF; it does
+not stop or reap the child. Registration rejection returns the original
+standard handle and reports both the primary error and any failure to restore
+its original status flags. Five native tests cover simultaneous large output
+drains, vector progress/EOF, stdin shutdown, waiter reuse and input recovery.
+
+The output collector takes the child, both registered output endpoints and
+two uniquely owned `ManagedBuf`s. Rejected construction returns every input
+before closing stdin or reading a pipe. Accepted construction closes stdin
+still owned by the child, then alternates bounded reads from stdout/stderr
+and keeps its completion waiter until publication or cancellation. Returned
+buffers retain their managed charges; no growable output allocation is used.
+
+An exact-capacity output succeeds when a one-byte probe observes EOF. On
+overflow, `ReturnPartial` returns the child, endpoints, retained prefixes and
+the consumed probe byte so the caller can resume without losing data.
+`KillAndWait` requests termination and drains excess output through fixed
+stack storage before reporting reaped status and truncation. It preserves
+the first overflow probe across both streams. Errors return recoverable
+owned inputs and progress. Dropping a pending collector removes its waiters
+and follows the child's configured detach/kill-on-drop policy; the process
+slot remains owned by the reaper until actual reaping. A descendant that
+retains pipe writers or a blocked kernel operation can delay collection
+indefinitely. Nine native tests and independent wake-driven cases cover
+simultaneous drains, exact/zero capacities, recovery, cleanup and charges.
+
+The driver requires exclusive child wait ownership. Foreign `waitpid`, a
+chained `SIGCHLD` handler that reaps children, and `SIG_IGN` or `SA_NOCLDWAIT`
+auto-reaping are outside that contract. Observed `ECHILD` produces a tracking
+error and releases the slot; it cannot prove the identity of a post-spawn
+pidfd after foreign reaping permits PID reuse. Ordinary signal subscriptions
+that do not reap children can coexist with the driver. Child memory, command
+arguments/environment, standard pipes and fixed service metadata are outside
+managed-storage accounting; the configured bound counts unreaped children.
+
+Fourteen native tests cover lifecycle and completion, including saturation,
+pidfd fallback, retained status, cancellation and reentrant waker destruction.
+Three Loom models compile the production completion ledger and cover waiter
+registration, publication, cancellation and retained completion identity.
+They do not model OS spawn/wait/kill, pidfd identity or the reaper slot table.
+
+## Composing futures
+
+`runtime::concurrency` supplies `join2`, `try_join2` and `select2` for borrowed,
+local or owned futures. Each input has one ordinary pinned-box allocation;
+there is no `Send`, `'static` or `Unpin` requirement. Each active input is
+polled at most once per helper poll. Join helpers poll in argument order and
+never repoll completed inputs. `select2` chooses either argument-order bias or
+deterministic round-robin priority, alternating after polls where both inputs
+remain pending. This is a two-input port; it does not provide arbitrary-arity
+macros or disabled select branches. Both inputs are constructed by the caller
+and owned immediately.
+
+`runtime::concurrency_many` adds homogeneous `join_all`, `try_join_all` and
+`select_many` with an explicit branch ceiling up to 1,024. Rejection returns
+the original input vector before consuming any element. Empty joins complete
+immediately; an empty or wholly disabled selection is rejected. Disabled
+futures are owned but never polled, and are destroyed before result
+publication. Selection returns the original branch index and supports biased,
+round-robin or seeded randomized starting priority.
+
+These helpers reserve ordinary bookkeeping and result-vector storage before
+consuming inputs, then pin each active future in an ordinary box. Bookkeeping
+reservation failure is recoverable; box allocation follows ordinary Rust
+allocation-failure behavior. Managed storage is not implicitly charged.
+Native tests cover ownership, ordering, pinning, rejection, randomized starting
+priority and panic cleanup. `SelectionRng` supports reproducible seeds and a
+fallible kernel-entropy constructor. The default fairness seed is independent
+of allocator hardening and is not a cryptographic randomness contract.
+
+A completed input is destroyed before its output is retained. Failure or
+selection destroys unfinished inputs and unused partial outputs before
+returning the selected result. Cancellation drops the owned inputs; earlier side
+effects remain committed. Poll panics resume after cleanup, with secondary
+cleanup panics contained. When normal cleanup first panics, that primary panic
+resumes after all other values are disposed. Cleanup during an existing unwind
+preserves that unwind. Fifteen native tests cover polling order, cancellation,
+borrowed and pinned inputs, retained terminal helpers and adversarial cleanup.
+
+`runtime::concurrency_macros` exports `join!`, `try_join!`, `select!` and the
+standard stack `pin!` macro. The composition macros also appear at the crate
+root and accept two to sixteen heterogeneous branches. Joins return flat
+tuples in source order; error joins require one error type. Their default
+polling order rotates after pending polls; `biased;` keeps source-order
+priority. Each branch is
+pinned in one ordinary box and partial join outputs are retained independently
+until final tuple publication. No managed storage is implicitly reserved.
+
+Selection uses bracketed branch groups and randomized priority by default.
+An explicit policy can override it:
+
+```rust,ignore
+let result = allocatbelt::select! {
+  round_robin;
+  [
+    (value = first_future, if first_enabled => use_first(value).await),
+    (value = second_future => use_second(value).await),
+  ];
+  else => no_enabled_branch(),
+}.await;
+```
+
+Patterns use Rust's normal pattern syntax, including refutable patterns. A
+ready value that fails its branch pattern disables that branch for this
+selection; pending siblings are polled at most once during that outer poll.
+Handlers must produce one common result type.
+`biased;` starts in source order; `round_robin;` rotates priority among enabled
+original branch indices after pending polls. `randomized;` uses the default
+fairness seed, and `randomized(seed);` accepts a `SelectionRng` for repeatable
+priority. All branch futures, including
+disabled ones, are constructed and owned; disabled futures are never polled.
+Every branch future is disposed before the winning handler or mandatory
+all-disabled `else` runs. Handlers can borrow shared state and await. Captures
+used only by losing handlers or `else` follow the enclosing async future's
+lifetime and are not released early by selection.
+
+These macros evaluate expressions once during their first poll, in source
+order; selection evaluates each future before its enabled guard. Construction
+expression/guard panics and captured values dropped before first poll follow
+ordinary Rust cleanup. Once the complete branch set is owned, polling,
+cancellation and branch/output cleanup contain secondary destructor panics
+and preserve the primary panic. Published output tuples become caller-owned
+and follow ordinary Rust destruction. Fourteen native tests include bounded
+arity, pinning, trait propagation, disabled-branch rotation and subprocess
+regressions for multiple panicking partial outputs. This syntax requires an
+explicit application port; it does not claim Tokio macro compatibility.
+
+## Owned asynchronous tasks
+
+`runtime::asynchronous::AsyncRuntime` runs owned `Send + 'static` futures on a
+fixed worker pool. An outstanding bound covers queued, polling, sleeping and
+cancellation-cleanup tasks. A separate scope bound includes the implicit root
+scope. Rejection returns the original future. Ready work uses per-dispatcher
+FIFO lanes with bounded helper seat adoption. Ordering across tasks is not
+guaranteed. A future that never returns from `poll` cannot be preempted.
+
+An in-progress spawn reserves its task slot and scope unfinished-task count
+before domain admission and task construction. Such reservations count toward
+`max_outstanding` and the alive-task gauge immediately, so concurrent spawns can
+observe `Full` earlier and close waits for publication or rollback. Reservation
+takes the admission mutex once and only clears the slot's free bit and updates
+the admitted and scope task counts; it consumes no slot generation and locks
+no slot, so a reserved slot is not admitted and close's slot scan skips it.
+Tenant domain reservations still run outside scheduler locks. Construction
+and publication take the slot mutex once, the spawn's only slot lock: that
+lock consumes the generation, rechecks runtime/scope closure, and installs
+the task. If close wins that check, rejection returns the original unpolled,
+undropped future. Rollback returns the free bit and the admitted and scope
+task counts under the admission mutex alone; no generation was consumed, so
+failed spawns cannot exhaust slot generations. Free slots are kept in one bitmap
+under the admission mutex and scanned from the lowest word and bit, preserving
+lowest-index reuse. The bitmap's first word is stored inline with the admission
+state, so reuse among the first 64 slots touches no separate table. Each spawn
+scans up to `ceil(max_outstanding / 64)` bitmap words, so lookup cost grows
+with the configured outstanding-task bound.
+
+The executor appends newly ready, self-woken, requeued and quota-released
+tasks to a lane chosen by the inserting thread's rotating start index and the
+parked mask. Each thread keeps its own index, starts at a different value and
+advances it once per insertion, so producers and dispatchers do not share a
+counter. Dead seats are excluded; among live seats it skips parked
+dispatchers unless all are parked. The choice loads each parked-mask word
+once and scans its bits from the start index, in the same cyclic order as a
+lane-by-lane scan; a runtime with a single lane uses it without a scan. A
+dispatcher takes its own front entry,
+then searches other lanes in a pseudo-random order, then takes one shared
+overflow entry.
+Searching and spinning admit a fixed number of dispatchers at once (see
+`max_searching_dispatchers` below). An idle dispatcher can take a busy
+lane's oldest entries, including a single remaining one. A steal takes the
+oldest entry, or the oldest bounded half (at most 32) of a larger lane. A
+stealer dispatches a lone stolen entry directly without placing it on its
+own lane, and moves a larger chain to its lane's tail, preserving order. A
+multi-entry victim keeps at least one entry. Inserting ready work onto a
+lane whose dispatcher is awake wakes one parked dispatcher, if available,
+even for a lone entry. An insertion that claims a parked lane wakes only
+that lane's dispatcher. This applies to spawns, idle task wakes and quota
+transfers or releases. A task's own end-of-poll requeue wakes nobody; the
+finishing dispatcher continues searching. Work remaining after a pop or
+steal wakes one parked dispatcher, if available. Taking a lane's last entry
+wakes nobody. These wake decisions use the searching state described for
+`max_searching_dispatchers` below; a wake first checks whether any live
+lane is parked and does nothing more when none is. Each lane publishes its
+depth under its lane lock for the park rescan, the steal pre-check and the
+remaining-work check, which only test whether a lane is empty: a change
+between empty and non-empty is a SeqCst store, a change that stays
+non-empty is a Relaxed store that keeps the metric exact, and an unchanged
+depth is not stored. There is no per-task lane affinity or
+global scope rotation. A larger ready scope can receive proportionally more
+polls, and scope readiness order can change across lanes. Each task still
+polls exclusively, and ready tasks make progress if every poll returns;
+there is no time bound.
+
+A binding scope keeps quota-blocked entries in FIFO order. Each release passes
+its permit directly to the oldest blocked entry, which reenters a lane without
+reacquiring the permit. At most `max_outstanding - 1` other scope tasks receive
+a permit before it. Cancellation cleanup consumes no poll permit; ready cleanup
+entries go to shared overflow and wake one parked dispatcher. Abandoning a seat
+drains its lane to overflow one entry at a time before another thread may adopt
+it. Scheduler locks never cover polling, user destruction or waker calls. Timer
+and reactor work stays on its existing service threads.
+
+`AsyncRuntime::block_on` and `AsyncHandle::block_on` poll one root future on
+the caller's thread; that future may borrow local data and need not be `Send`.
+Spawned futures remain owned, `Send + 'static` tasks. The caller parks between
+pending polls, so workers can progress and wake it. Nested `block_on` calls on
+one thread and calls from executor workers return explicit errors. `enter`
+sets a thread-local current handle. The current value is the most recently
+entered still-live guard; dropping guards out of order removes only the
+dropped context. A guard returned from `block_on` remains current until that
+guard is dropped. Worker polls also enter the runtime's implicit root handle.
+`current` panics without an entered context, while `try_current` returns
+`None`.
+
+Tenant-bound async and local entry nodes reserve their declared payload before
+allocation or context installation. `AsyncHandle::try_enter` and
+`LocalHandle::try_enter` return typed admission errors; `enter` panics if that
+admission fails. Guard parent chains retain fees until their final owner drops,
+and scoped current handles retain their original tenant binding after scope
+closure. Borrowed-root entry failure preserves the prior context without
+polling the future.
+
+Worker and handoff-helper entry storage is reserved before naming callbacks
+or thread startup. Local task and external-request admission also reserves a
+cleanup node, so cancellation can restore its context after tenant closure or
+metadata exhaustion without requesting another charge.
+
+`yield_now` schedules one self-wake and completes on the next poll; it does not
+guarantee another task runs first. `consume_budget` is an opt-in checkpoint
+that consumes from the shared per-poll budget and yields when the combined
+primitive/checkpoint budget is exhausted. It cannot preempt code that does not
+await it, and it does not impose a fairness or latency bound.
+
+Runtime-owned outer polls also use a shared 64-operation budget for ready
+`channel` send/receive/reservation/closed-wait, oneshot receive/close,
+semaphore acquisition, mutex acquisition, reader-writer-lock acquisition and
+live asynchronous initialization
+polls, plus `Notify`, watch change/closure, broadcast receive/closure and
+barrier waits, managed-pipe, Unix-pipe and blocking-stream I/O polls,
+`Sleep`, `Timeout` and interval tick polls, and asynchronous or blocking job
+result polls. Job polls gate before cloning a waker, examining the completion
+slot or consuming its output; an exhausted poll preserves an already-published
+result for a later poll. An asynchronous job poll clones its waker only on its
+first registration or when the stored waker would not wake the caller
+(`Waker::will_wake`), and never once the outcome is published; a repeated poll
+with the same waker stores nothing. For a distributed task that check is one
+load of the task word and a read of the stored waker; local jobs take their
+join lock once.
+Synchronous job observers remain unchanged.
+Concrete TCP/Unix stream reads and writes, socket shutdown/flush, listener
+accepts, UDP/Unix datagram send/receive operations and UDP peeks also gate
+readiness and syscall attempts. An interrupted syscall spends its unit;
+stale `WouldBlock` refunds
+it and rearms readiness before waiting. Their independent per-poll retry caps
+also apply to manual polls. Connect polling retains a separate ceiling of 64
+physical endpoint calls, including its initial attempt and completion probes.
+A synchronous primitive-to-primitive
+chain charges once; a primitive poll that returns `Pending` restores its
+provisional charge. `Timeout` checks the budget before touching its timer or
+inner future. Its ready result consumes one unit unless a ready supported
+primitive inside the inner future already consumed one; charges made by inner
+primitives remain spent when the timeout poll returns `Pending` or unwinds.
+Live `AsyncOnceCell` initialization polls use the same composed accounting:
+a ready result charges once unless a supported descendant already spent a
+unit, while descendant charges remain spent on `Pending` or unwinding. Once
+exhausted, the next supported primitive arranges a wake and returns `Pending`
+before it dequeues a message, accepts a send, or transfers a permit/lock guard.
+This applies only while the runtime is polling an owned Send/local task or a
+borrowed `block_on` root.
+Manual polls and futures driven by external executors bypass automatic
+accounting. Other arbitrary futures are not automatically cooperative; long-running
+work outside the listed primitives still needs explicit checkpoints or its own
+bounded polling. Registered child-pipe `AsyncRead` and `AsyncWrite` trait
+polls also use the shared budget: ready fast paths and each readiness-plus-
+syscall attempt are gated, `Interrupted` spends a unit, and stale
+`WouldBlock` refunds it. Each such poll keeps a local 64-attempt retry cap.
+Public `Readiness`, `OwnedReadiness`, `ChildWait` and `SignalRecv` futures
+share this automatic budget during runtime-owned polls. Readiness-plus-syscall
+adapters suppress nested charges. The concrete
+`runtime::buffered_io` `BufferedReader` and `BufferedWriter` poll methods are
+covered below, including cached and empty/completed paths. This does not make
+arbitrary `AsyncBufRead` or `AsyncWrite` implementations, synchronous consume
+or observers, or manual/external-executor polls automatically cooperative.
+Looping I/O helpers and buffered endpoints retain their local 64-call-per-poll
+limits.
+
+`AsyncJob` is awaitable; dropping it detaches, while `abort` requests cleanup
+after any in-flight poll returns. Owned scopes cancel their children on drop;
+`close` waits for cleanup, result publication and scope-slot reclamation.
+Future cleanup and admission release precede join publication. Scheduler locks
+never cover user polling, destructors or completion callbacks. Generation tags
+make retained stale abort handles harmless without retaining completed futures.
+Each task object has one atomic word with running, notified and complete
+bits and two join bits; a notified task that is not running owns exactly one
+queue entry. A task's word is created notified, holding the first queue
+entry, which publication inserts; spawning needs no separate wake. A
+wake is one read-modify-write on that word and takes no slot mutex: if it
+finds the task idle it inserts the queue entry; if the task is running it
+leaves the notified bit for the poll's finish; a queued or complete task is
+unchanged. A pending poll's finish is also one word operation without the
+slot mutex: it goes idle, or, when notified during the poll, requeues the
+task through the usual lane choice. Completion and cancellation cleanup
+take the slot mutex, where the generation, admission and abort state live;
+abort sets the slot's cleanup flag under that mutex and then marks the word
+like a wake, so a running task is requeued by its finish and the next
+dispatch selects cleanup. Dispatch takes the slot mutex unless the task's
+polls take no permit (a root-scope task while the root scope neither binds
+nor counts): publication then records the task's pointer beside the slot,
+under the slot mutex and before the first queue entry is inserted, and a
+dispatcher that dequeued the task's entry begins the turn on the word
+through that record without the mutex. It then reads the cleanup flag and
+takes the slot mutex only when the flag is set, where the abort is decided.
+An abort whose wake reaches the word before the turn begins is therefore
+always seen by that dispatch, and one that reaches it during the turn
+requeues the task to cleanup, so every abort is decided under the slot mutex
+before the task is polled again. The final turn, and shutdown cleanup of a
+task no turn holds, clear the record under the slot mutex when the slot
+gives the task up; shutdown cleanup first marks the word running for good,
+so no later turn can begin. The task object is never reused, and its final
+turn keeps the word running from the slot's release until publication marks
+it complete, so a retained stale waker cannot queue a reused slot.
+The join handle of a distributed task works on the same word. The outcome
+(the output, or the cancelled, panicked or resource error) is stored once in
+the task allocation by the final turn, before the slot is released;
+publication, after admission release, sets the complete bit with one
+read-modify-write. Join interest is set while the one join handle exists;
+dropping the handle clears it. The join-waker bit says that the join waker
+cell holds the wakers that publication will wake: the handle writes the
+cell only while that bit is clear and the task is not complete, and
+publication only reads it. Publication therefore wakes each registered waker
+exactly once, for every outcome, and returns the outcome to the publishing
+worker for destruction when the handle was dropped before publication; a
+handle dropped after publication destroys the outcome itself, and the waker is
+dropped by whichever side finishes with it last. Abort and scope or runtime
+cancellation change only the slot's abort state and the scheduling bits; they
+never read or write the join bits or call the join waker. As for local jobs,
+the handle has two fixed waker slots, one for joining and one for
+`poll_finished`, both written only by the handle behind the join-waker bit;
+each registration replaces only its own slot, and publication wakes the
+completion-only waiter and then the join waiter, once each. If publication
+lands while the handle is replacing one slot, the handle wakes the other
+slot's waiter itself, since publication found no waker to wake. No scheduler lock is held while outcomes or wakers are
+dropped.
+Each slot owns its task through one reference, and dispatch lends that
+reference to the turn without a reference-count update: beginning the turn
+sets the running bit with one compare-and-swap, and while it is set the slot
+neither drops nor gives up its reference except to that turn. A pending poll
+ends the loan with its one word operation; the final turn takes the slot's
+reference over for publication, so no dispatcher keeps a reference after its
+turn. The poll's `Context` carries a waker borrowed from that reference; only
+a clone that user code keeps holds its own reference count. Requeues still go
+through the usual lane choice, and queue entries remain slot indices.
+The task allocation is a pinned `sys` cell (`Pin<Arc<TaskCell>>`) that
+stores the user future inline next to the runtime's bookkeeping; its atomic
+claim serializes polling and in-place destruction, and its pinned-only API is
+what makes polling the inline future sound (see
+[the unsafe inventory](unsafe-boundary.md)). The same claim covers storing the
+outcome: the final turn drops the future and writes the outcome under one
+claim, and publication requires that claim to be released first. A pending
+poll reads no task state after the future returns. Tasks constructed without a tenant
+skip tenant-only cleanup locks; this choice depends only on tenant absence,
+not on current resource limits.
+
+`AsyncJob::abort_handle` returns a clonable thread-safe control handle,
+including for local jobs whose outputs are `!Send`. For native worker tasks,
+abort handles and scheduler wakers retain the shared task bookkeeping allocation
+and its `Control` charge; the job itself holds one reference to that allocation
+for both its join and its abort side, and an abort handle adds one only when
+requested. It contains one inline outcome slot and one join waker slot: the
+result remains there until the join consumes it or is dropped; a result
+detached before publication is discarded by the publishing worker. Completion drops the inline user future in place
+before publication; its storage is part of the one task allocation and stays
+charged with it. Retained handles keep the empty slot's and future's storage
+and the bookkeeping charged, without keeping a consumed or discarded result
+value or a dropped future alive. Local jobs retain separate cancellation metadata. If the
+last runtime owner drops while native tasks are still admitted, that thread
+cancels them and publishes their outcomes, without an ambient task context if
+its thread-locals are already destroyed. `is_finished` becomes true when the
+terminal outcome is published after future destruction and admission release.
+Detaching a join alone leaves it false. It does not wait for completion callbacks,
+discarded-output destruction or the later scope-close publication/reclamation.
+`AsyncJob::id` and `AbortHandle::id` return the same opaque process-wide
+`TaskId`, retained after completion and task-slot reuse. Native, owner-local
+and cross-thread local submissions share a checked nonwrapping identifier
+allocator; accepted cross-thread handles already have an ID before import.
+Exhaustion rejects submission with the original future, and rejected attempts
+may leave numeric gaps. `try_task_id` reports the spawned task during polling,
+future cleanup and producer-side discarded-result cleanup; `task_id` panics outside that
+context. Borrowed `block_on` roots have no spawned-task ID and restore an
+inherited context afterward. Task IDs are distinct from `SetTaskId` membership
+tokens. Four native identity tests and independent detached-cleanup cases
+verify this contract; existing Loom models do not prove numeric uniqueness
+or counter exhaustion.
+The completion flag has native publication and cross-thread cancellation tests.
+Loom models race join-waker and completion-only registrations,
+re-registration, handle drop and a cancellation request against publication through the task word's own
+transitions, checking one wake, one outcome destruction and one waker
+destruction; they do not model the executor's entire cleanup and scope-close
+sequence. Local jobs keep their join state and its own Loom models.
+
+The blocking pool's `Job` is also a future, so an asynchronous caller can await
+blocking work without blocking an executor worker. Its existing consuming
+`join` and deadlock checks remain available.
+
+Loom exercises production task transition helpers and managed-ledger methods.
+Some scope models are capped at 10,000 permutations and use a small generation
+table. Full queues, worker parking, actual wakers, ownership and scope pointer
+identity are outside those models; native lifecycle tests cover these paths.
+The separately constructed epoll reactor and timer driver can wake executor
+tasks; their registration limits are configured independently.
+
+## Completion sets
+
+`runtime::asynchronous::TaskSet` owns at most its configured number of async
+joins, including completed but unconsumed results. Its table and notification
+queue are reserved at construction. `try_insert` returns the original join
+when full; `try_spawn` checks set capacity before executor admission and
+returns the original future on either rejection. Slot generations and set
+identities do not wrap; exhausted slots retire.
+
+`join_next` yields a set-scoped ID and outcome in completion-notification queue
+order. Simultaneous completions have no wall-clock ordering guarantee. Results
+remain in their original join state until consumed, including any managed
+buffer charges. A separate `poll_finished` observer supports notification
+without consuming an `AsyncJob` result. Dropping a pending `join_next` removes
+its parent waker and retains the jobs.
+
+`abort_all` requests every cancellation, containing callback panics separately.
+Set destruction requests all aborts before individually dropping the joins and
+their retained results outside queue locks. Cancellation cleanup is asynchronous;
+destruction does not wait for task cleanup or scope closure. Helper metadata
+and caller results are outside the managed-buffer budget unless their storage
+is explicitly managed.
+
+Native tests cover publication/registration races, rejection, ordering, stale
+generations, retained charges and panicking callbacks/destructors. Two Loom
+models exercise the actual queue's notification coalescing and release race.
+A separate join-state model covers completion-observer registration against
+publication; these models do not cover the entire completion-set lifecycle.
+
+## Current-thread local tasks
+
+`runtime::asynchronous::LocalRuntime` polls owned local futures on the thread
+that constructs it. Local futures and outputs may be `!Send`, but spawned
+futures must be `'static`; the root future passed to `block_on` may borrow
+caller data. The runtime, local handles, scopes, joins with local outputs, and
+entry guards are thread-affine. `block_on` rejects nesting shared with the
+multi-thread runtime.
+
+`LocalHandle::enter` sets a separate local current context. The current value
+is the most recently entered still-live guard, and dropping nested guards out
+of order removes only the dropped context. During a spawned task's poll and
+cleanup, `LocalHandle::current` refers to that task's scope.
+Queued external tasks cancelled before import enter the root local context
+while their futures are dropped.
+
+`LocalConfig::max_outstanding` is one bound shared by local admissions and
+queued cross-thread submissions. `max_scopes` includes the root scope. The
+external `LocalSendHandle` accepts only `Send + 'static` futures and outputs;
+its bounded channel is imported by the owner while `block_on` progresses. A
+send handle cannot make progress when the owner is not polling. Rejected
+submissions return the original future.
+
+Each scope keeps FIFO order for tasks becoming ready, and ready scopes rotate
+after one poll turn. Repeated wakes coalesce while a task is queued or polling.
+Aborting requests cleanup after an active poll returns. Dropping a scope
+requests cancellation; `close` waits for child cleanup, result publication
+and scope-slot reclamation.
+Dropping the runtime synchronously cancels and drops imported local futures on
+its owner thread, so their destructors may run user code. All task polling,
+future/output destruction, and join callbacks happen outside scheduler and
+admission locks. The separately constructed epoll reactor can wake local tasks
+while the owner polls the runtime. Borrowed spawned tasks, preemption and
+CPU-time quotas remain outside the executor contract.
+Future cleanup occurs on the owner thread. A join with a `Send` output can
+move to another thread, where that output may be observed or dropped.
+
+Native tests cover local FIFO/round-robin dispatch, stale task wakers, close
+publication order and retained parking notifications. Existing Loom models
+exercise shared task transition helpers; the local owner loop, admission gate
+and notifier integration are not fully modeled.
+
+The local runtime and its task-scoped types are deliberately `!Send`:
+
+```compile_fail
+use allocatbelt::runtime::asynchronous::LocalRuntime;
+
+fn require_send<T: Send>() {}
+require_send::<LocalRuntime>();
+```
+
+## Task-local values
+
+`runtime::task_local::TaskLocalKey` supports synchronous `sync_scope` closures
+and named asynchronous `scope` futures. `with` reads the active value and
+`try_with` returns `None` without a value or after TLS destruction. Nested
+scopes restore their enclosing value, including on panic. User closures and
+destructors run outside TLS map borrows.
+
+An async scope installs its value only during polling and inner-future cleanup.
+The inner future is destroyed immediately on readiness, or during cancellation,
+with its own value installed; then the enclosing context is restored. The
+wrapper retains its value until wrapper destruction. If TLS is unavailable
+during thread teardown, inner cleanup falls back to ordinary destruction
+without an installed value. Synchronous entry rejects unavailable TLS before
+running its closure.
+
+The scope future can move between threads when its value and inner future are
+`Send`; its value need not be `Sync`. Local `!Send` values remain supported.
+Checked key IDs do not wrap. A pinned inner-future box, temporary synchronous,
+per-poll or cleanup `Rc` allocations, and the TLS map are ordinary utility storage outside
+the managed-buffer ledger. Native tests cover context and destructor ordering,
+panic restoration, migration and real TLS teardown; compile-fail examples
+check `!Send` relationships.
+
+## Bounded timers
+
+Driver close drains sleeps that remain registered. Already-fired sleeps keep
+their published success, and their service-thread callbacks may continue after
+driver drop returns. External `shutdown` joins the service thread and waits for
+those callbacks; service-thread shutdown closes and returns `WouldDeadlock`.
+
+`runtime::time::TimerDriver` owns one timer service thread. Its clonable handle
+creates sleeps, timeouts and intervals under an explicit registration bound.
+The indexed minimum heap, registration table and free-slot list are reserved
+at construction. Sleeps allocate shared state separately; the registration
+bound is not a total heap or RSS budget. Equal deadlines fire in arming order.
+
+Reset updates the current generation in place. Dropping a sleep cancels its
+registration, and stale generations cannot complete a reset or reused slot.
+Capacity is released before completion publication. Waker registration and
+publication share a slot lock; cloning, waking and dropping wakers occur
+outside timer locks. Callback panics are contained under unwinding.
+
+Timeout polls the deadline first and gives it ties, dropping the losing future
+when it completes. Intervals support Burst, Delay and Skip; lateness greater
+than five milliseconds activates the selected policy. `reset` schedules one
+period from now, while `reset_immediately` schedules now. Reset failures retain
+the prior interval schedule. Real clocks can fire late due to scheduling.
+
+Driver shutdown closes admission and drains pending sleeps with `Closed`,
+using a single drain owner and fixed-size callback batches. Concurrent close
+callers wait for that drain. A service-thread caller avoids waiting on an
+external closer that might be joining it; joining the service from its own
+callback returns `WouldDeadlock`. Dropping the driver closes without joining.
+
+Two Loom models exercise the production slot publication/registration helpers
+and indexed-queue generation transitions. Service-thread scheduling, condition
+variable waits, ownership and close-drain callbacks are outside those models;
+native tests cover them.
+
+`TimerDriver::new_paused` returns a driver and clonable `ManualClock`.
+`TimerHandle::now` exposes its current time; real elapsed time does not move it.
+`advance` updates that driver's time monotonically and publishes due outcomes
+through fixed batches on the advancing thread. Creation, reset, timeouts and
+all interval policies use the same clock. It does not poll executor tasks or
+automatically jump time when tasks are idle. `TimerHandle::pause` and `resume`
+switch between manual and real time without moving time backwards. If resumed
+real time exceeds `Instant`'s representable range, it freezes at its last
+instant; `is_clock_saturated` reports this and later real-time resume returns
+`ClockSaturated`. Concurrent and reentrant advances
+serialize clock updates; already-claimed callbacks can continue, and concurrent
+close can resolve remaining registrations with `Closed`. Native tests cover
+these behaviors; clock control is outside the two helper Loom models.
+
+An owning `CurrentThreadBuilder` can select `ClockMode::PausedAuto`. It advances
+to the next registered deadline only after the local executor observes
+quiescence and commits an unchanged idle epoch. Task wakes, imports, timer
+changes and associated blocking or I/O pool admissions invalidate that epoch
+before their transition. Work on the facade's blocking pool or I/O pool
+inhibits advancement through closure and capture cleanup; an unrelated
+standalone blocking pool or I/O pool has no such association.
+Explicit inhibit guards cover other work the application needs to hold open.
+`MultiThreadBuilder` rejects automatic paused time. This clock affects timer
+semantics; byte refill and shutdown deadlines continue using real time.
+The epoch Loom model covers event-versus-commit ordering, while native fixtures
+cover executor quiescence, lost notifications and blocking ownership.
+
+## First milestone contract
+
+Each submission declares a `Resources` vector. Admission reserves every
+dimension under one scheduler mutex, or rejects the submission without running
+it. A rejected submission returns ownership of the closure. Reservations cover
+queued, running and cancellation-cleanup jobs; `max_outstanding` independently
+bounds their count.
+
+Construction reserves queue storage for all `max_outstanding` entries before
+starting workers, so admitted queue insertion does not grow storage under the
+scheduler mutex. With the current 64-bit entry layout this requests roughly
+48 bytes per configured slot, even for an idle runtime, plus allocator overhead
+and separate worker storage. This capacity is outside the declared `Resources`
+budget; it does not reserve closure payloads or results and is not a resident
+physical-memory limit. Choose the outstanding bound with this upfront cost in
+mind. Capacity overflow or failure to reserve queue or worker storage returns
+`OutOfMemory` before workers start.
+
+The crate forbids unsafe code. Jobs and results are owned `Send + 'static`
+values; jobs receive a cooperative cancellation token. Rejections distinguish
+closed admission, a full outstanding window, temporarily insufficient resources
+and requests exceeding capacity. Nonblocking means no waiting for capacity,
+not lock-free operation: submission can contend on the scheduler mutex.
+
+| Dimension | Meaning | Not provided |
+|---|---|---|
+| `cpu` | Declared concurrent work units | CPU-time quota, affinity, or preemption |
+| `memory` | Declared working-memory bytes | Enforced allocations, RSS or cgroup limit |
+| `disk` | Declared concurrent disk-operation units | Disk space, IOPS or bandwidth quota |
+| `network` | Declared concurrent network-operation units | Socket reactor or bandwidth quota |
+
+The worker count bounds simultaneous execution separately from admission.
+For example, eight CPU units and four workers admits eight one-unit jobs but
+runs at most four at once. A zero vector is valid: the job count still bounds
+admission. A request greater than capacity is invalid; arithmetic must not wrap
+even at `usize::MAX`.
+
+These are **cooperative declarations**, not measurement or OS enforcement.
+Allocate large working buffers inside admitted jobs, not in their captured
+closures. Caller allocations, thread stacks, scheduler metadata and completed
+results retained by callers are outside the declared memory budget. Returning
+a result that retains a job's buffers also takes them outside that budget.
+A job must declare its entire peak working set honestly.
+
+## Ownership and lifecycle
+
+- Submission is nonblocking. Full queues and temporarily exhausted resources
+  cause explicit rejection rather than an unbounded waiter queue.
+- Dropping a join handle detaches its job. Cancellation is explicit and
+  cooperative for running jobs; it never terminates a thread.
+- A queued cancellation that wins the start transition prevents execution.
+  Its reservation can remain held until the queue entry and closure are dropped.
+- Work, user-owned values and allocator park hooks run outside scheduler locks.
+  With unwinding, ordinary job panics become join errors. Containment must also
+  cover cancellation cleanup and discarded results; a destructor panicking
+  during another unwind can still abort. `panic = "abort"` cannot be recovered.
+- Drain shutdown closes admission, finishes admitted work and joins workers.
+  Cancel-pending shutdown also cancels queued work and requests cancellation
+  of running work. Noncooperative jobs can delay explicit shutdown indefinitely.
+- Dropping the runtime closes and cancels without waiting for running work;
+  detached workers can outlive it. Queued capture destructors run synchronously
+  and can themselves block the dropping thread. Use explicit shutdown when
+  completion is required and keep captured resources alive through owned values.
+- Blocking joins and shutdown from a worker of its own runtime must be rejected
+  rather than deadlock. Do not depend on nested synchronous work in a saturated
+  pool. Allocator fork support does not make inherited runtime workers usable
+  in a forked child.
+
+An unfinished same-runtime join returns `JoinError::WouldDeadlock` from a
+worker (including its thread-local destructors at exit) or queued-job cleanup
+on the shutting-down thread. Nested cleanup retains each runtime's identity.
+It consumes and detaches the handle; it does not cancel the job. Already finished
+jobs can be joined there. `Snapshot::cancelling` counts removed queued jobs during
+cleanup, and `outstanding = queued + running + cancelling`. Completed shutdown is a
+no-op in either mode; it does not change completed jobs' cancellation tokens.
+
+Every admitted job has exactly one terminal outcome and releases its vector
+and outstanding slot exactly once after execution or cancellation cleanup.
+Cancellation requested is not capacity released. Cancel-pending shutdown and
+runtime drop remove queued entries; drain leaves them to workers. Joiners
+observe cancellation only after cleanup, not merely after a token is signaled.
+
+Workers prefer allocator shards at startup and return allocator caches before
+parking and at exit. The crate does not install a global allocator. With system
+allocation or mimalloc these hooks do not alter those allocators.
+
+## Per-scope active polling
+
+`AsyncRuntime::scope_with_config(AsyncScopeConfig { max_active_polls })`
+adds a nonzero simultaneous-poll limit to an owned Send scope. Existing scope
+construction uses the worker count. A configured limit above that count is
+accepted. At most `W` dispatcher seats run at once; up to `B` handed-off polls
+retain their scope slots while their closures run.
+`OwnedTaskScope::snapshot` reports unfinished tasks, reserved poll slots and
+the configured limit. The executor uses the scope quota lock when the limit
+is below `W + B` (workers plus handoff helpers); otherwise it cannot bind and
+uses a relaxed
+diagnostic count. The root limit does not bind without handoffs. Unfinished-task
+counts may change concurrently. A slot is reserved before dispatch and held
+through the future's poll return, so it can include work about to enter
+`Future::poll`.
+
+Per-scope poll limits are exact. A saturated scope keeps blocked work in a
+per-scope FIFO without spinning, passing released slots in that order.
+Cancellation cleanup bypasses the quota and consumes no poll slot. Entries
+made ready for cancellation cleanup go to the shared overflow queue and wake
+one parked dispatcher, if available, so a busy
+dispatcher's poll does not hold them on that dispatcher's lane. Overflow is
+still searched last, one entry at a time. Cancelling a task already polling
+still waits for that poll to return.
+The slot is released before future destruction or completion publication,
+including panic cleanup. Outstanding-task admission remains charged through
+future cleanup and is released before join publication; it is a separate
+limit. Scope unfinished-task bookkeeping completes after publication.
+
+This bounds simultaneous polling, not CPU time. A future can block a worker
+inside a poll, and destructors can block during quota-free cleanup. There is
+no preemption or implicit managed-storage reservation. An idle dispatcher can
+steal a single ready entry behind a busy dispatcher's poll.
+Blocking all available dispatchers can still prevent progress. Current-thread
+local execution already polls one future at a time. Native tests exercise
+saturation, cross-scope progress, FIFO quota transfer, cancellation, shutdown,
+slot reuse and cleanup; a same-source Loom model checks poll-slot acquire/release transitions.
+
+The same-source Loom models cover lane park/push, stealing versus owner pop
+and push, search admission versus a denied dispatcher's park, quota gating
+and transfer, abort and close versus spawn, lane depth publication
+(pushes and pops, including Relaxed updates of a non-empty lane, versus a
+dispatcher's steal pre-check and park rescan), and the permit-free dispatch
+start: a turn begun on the task word racing an abort and an external wake,
+an abort during the turn decided on the requeue, the final turn's release
+and slot reuse racing a second dispatcher and a stale waker, and the turn's
+value access against an idle take and an access without a slot. They use
+the shipped admission counter, parked mask, depth publication,
+park-advertise/rescan helper, dispatch start and task word, and mirror the
+engine's wake decision and slot handling. They use tiny queues and do not
+model real condvar timing, OS threads, metrics, Control charges or task
+internals. Native tests
+cover those integration paths. `global_queue_depth` sums lane, blocked and
+overflow depths; samples are independent and can briefly omit an entry
+moving between queues.
+
+## Explicit cgroup controls
+
+`runtime::cgroup::CgroupV2` accepts an owned directory descriptor for a
+caller-supplied cgroup v2 group and finite `CgroupCeilings`. The application
+must arrange delegation and isolation. The library checks the filesystem and
+descriptor, but does not discover or mount a host root, attach processes,
+prove delegation, or change controls on construction. Control names are fixed
+and opened relative to that descriptor with symlink following disabled.
+
+`set_cpu_max`, `set_memory_high`, `set_memory_max` and `set_io_max` validate
+requests before writing and return bounded readback. CPU quotas are compared
+as ratios; memory limits must be aligned to the actual kernel page size.
+Validation excludes kernel numeric unlimited sentinels and device-number
+aliases. I/O requests validate the entire batch against explicit per-device
+ceilings before its first write. Readback accepts at most 16 distinct devices
+and 4096 bytes per control; larger or malformed records return typed errors.
+The finite ranges follow the Linux 7.0 implementations of
+[CPU bandwidth controls](https://github.com/torvalds/linux/blob/v7.0/kernel/sched/core.c),
+[memory page counters](https://github.com/torvalds/linux/blob/v7.0/mm/page_counter.c)
+and [I/O throttling](https://github.com/torvalds/linux/blob/v7.0/block/blk-throttle.c).
+
+Ceilings restrict submitted values; they do not establish limits for existing
+or unmentioned controls. Each control record uses one write, without replaying
+a suffix after a short write or error. Setters are separate kernel effects,
+and a multi-device update can fail after earlier entries were accepted. Typed
+errors retain the requested control, accepted-entry count and any available
+observed state. `observed = None` means state is unknown. There is no rollback
+or automatic restoration on drop. The kernel still checks permissions,
+controller availability and additional control constraints.
+
+Snapshots read four controls separately and are not atomic. Concurrent setters
+or other processes may change values during or after readback. These APIs are
+synchronous: memory limit writes can reclaim, block or trigger OOM handling
+in the supplied group. Applications should use a bounded blocking lane where
+appropriate. Fixed control buffers, descriptors and kernel resources are
+outside the managed-storage ledger. Ten parser and validation tests do not
+write host controls. An isolated native Linux cgroup-namespace integration
+check verified CPU and memory writes/readback in a delegated descendant group,
+and unchanged readback after invalid requests. The namespace root correctly
+rejected a control write. Positive device I/O writes remain unqualified;
+controller and deployment-specific behavior requires further integration
+checks. These checks establish correctness, not application performance.
+
+## Measurement gate
+
+Compare blocking jobs with Tokio's blocking pool and owned asynchronous tasks
+with its multithread executor. Use identical jobs, worker counts, outstanding
+windows and completed-job checksums. Cross both runtimes with the same global
+allocator to distinguish allocator costs from scheduling costs. Results from
+one lane do not qualify the other.
+
+For uniform jobs, set capacity to the outstanding window times the job's
+request, so the common window enforces equivalent admission. This is not an
+overload or heterogeneous-resource experiment. Future overload comparisons
+must match resource rejection and cancellation policy, count rejected work,
+and measure end-to-end tail latency. Tokio's blocking-thread limit is a ceiling,
+not an eagerly started fixed pool; distinguish startup from warmed execution.
+
+`scripts/bench-runtime.sh` records repeated fresh-process runs. Fully touching
+working buffers is required. A sequential checksum reference is outside the
+job timing; whole-process profiles include it and runtime startup.
+Record each host and toolchain separately, alternate run order, and report
+dispersion as well as medians. KVM guests execute native instructions, but
+uncontrolled host scheduling and frequency remain confounders. Hosted CI and
+qemu timings do not qualify an optimization.
+
+The default `--start warm` submits simultaneous warm-up jobs and waits for all
+configured workers before timing. `--start cold` excludes bounded-pool
+construction but includes Tokio's lazy blocking-worker creation, so it is an
+asymmetric startup experiment, not a steady-state comparison. The script uses
+a balanced Williams run-order design; use a complete balancing cycle (six
+repetitions for the full three-allocator/two-executor matrix).
+
+See [the runtime research report](research/runtime-foundation.md) for results
+and [profiling](research/profiling.md) for CPU, RSS and per-function tools.
+Admission counters are not resource-usage measurements.
+
+The latency binaries also provide `--lane async --executor bounded|tokio`
+with `ready`, `yielding` and `mixed` workloads. Both executors run the same
+future body: immediate deterministic results, eight self-waking yield turns,
+or eight yields with fully touched ordinary vector chunks. Mixed storage uses
+each binary's global allocator, with no implicit managed-buffer reservation.
+Choose `--workers`, `--window`, `--bytes`, `--jobs` and `--arrival-rate`
+explicitly. The window cannot exceed the requested job count. Warm-up admits
+at most the smaller of the window and worker counts and cleans up partial
+failures. `yielding` with `--window` below `--workers` exercises under-subscribed
+self-yields. `head-of-line` makes job zero block inside its poll for
+`--block-us` microseconds (default 2000), while subsequent jobs return short
+results. Its p50/p95/p99 columns exclude job zero and measure short-task
+intended-arrival-to-first-poll latency; other totals include it. CSV records
+the admission window and byte count.
+The bounded async executor uses distributed dispatch and supports bounded
+handoffs via `--handoffs N`. Use `--workload yielding --handoffs 1` to measure the
+binding root quota, keeping its default limit. `--workload handoff --workers 4
+--handoffs 2` runs blocking sections of `--block-us` microseconds on the
+original threads. Its p50/p95/p99 columns measure closure-end-to-restored-seat
+latency, excluding loan retries and the blocking section; all jobs still count
+toward completion and checksums. CSV columns stay unchanged. Record the handoff
+bound alongside the invocation when comparing runs.
+
+An independent producer uses intended arrival deadlines and a separate observer
+polls each public join to ready. One common external admission window remains
+held until that observation on either executor, including panic outcomes.
+Latency includes producer lateness; rejections and lateness are reported
+separately. Throughput mode avoids per-result latency samples but retains the
+specified arrival schedule, so it measures completed work at that offered load
+rather than establishing an executor's maximum capacity. Metadata, collector
+and workload allocations contribute to whole-process CPU/RSS. These probes
+require fresh native processes and the preregistered per-host confirmation
+gates; functional tests and output smokes establish no speedup.
+
+`--mode capacity` is available only for the blocking and async lanes. It
+keeps the configured outstanding window full without an arrival schedule,
+refilling only after the observer sees a public join ready and releases its
+handle. A full window waits on a condition variable. Both executors run cooperative warm-up tasks and the same job body; any rejection, panic, checksum mismatch or
+completion loss fails the run. Blocking capacity accepts `--window`; paced
+blocking retains its existing admission bound. Capacity rejects an explicit
+arrival rate and reports `NA` for arrival rate, lateness, timer overhead and
+all percentiles. Its throughput includes submission and collection costs.
+It establishes no p99 result; use the separate paced latency lane for tails.
+
+The harness notifies its event queue and capacity window only while a thread
+waits on them (`--harness-notify waiting`, the default); `--harness-notify
+always` restores a notification on every event, which adds a wake system call
+per event to both executors' measurements. `--harness-observer-spin N`
+(default 0) makes the observer spin up to N rounds of 64 spin-loop hints on an
+empty event queue before it sleeps, so executors can be compared without the
+harness's own sleep and wake cost. `--executor inline` (async lane)
+runs every future to completion on the producer thread and measures the
+harness alone. `--pin-workers CPUS` pins each executor thread to one CPU by
+its construction index, and `--pin-harness CPU,CPU` pins the producer and
+observer threads; both are fixed for the run and Linux only.
+
+`scripts/bench-latency.sh` supports these lanes and validates all 22 binary
+CSV fields, checksums and explicit worker/window/byte configuration. It
+alternates fresh-process comparator order and records source and binary
+fingerprints. Supplying `--bin-dir` labels rows as unverified prebuilt evidence,
+even when functional validation passes. Capacity tests and small process
+smokes verify accounting and cleanup, including cleanup before window refill;
+they are not native performance qualification.
+
+`scripts/bench-latency.sh --observer-spin 0,16` runs each executor at each
+listed `--harness-observer-spin` value as interleaved variants, adds a
+`harness_observer_spin` column and writes `summary.tsv` with median tasks/s,
+the bounded/Tokio ratio and interquartile ranges per spin value.
+`scripts/bench-executor-compare.sh` repeats this over several
+workload/worker/window loads in async capacity mode and combines one table.
+Its spin 0 rows measure end to end, including the observer's sleep and wake;
+its spin 16 rows compare the executors without that harness cost. Multi-worker
+results depend on the harness condition, so report both rows.
+
+## Bounded original-thread blocking handoff
+
+`AsyncRuntime::new_with_handoffs(AsyncConfig, HandoffConfig)` prestarts a fixed
+number of helpers. Ordinary `new` keeps its original worker count and disables
+handoff. `try_block_in_place` runs its closure on the calling thread, accepting
+borrowed or `!Send` closures and results. Disabled/full/local-executor rejection
+returns the uncalled closure. Outside owned dispatcher execution it runs inline;
+entering a local handle alone does not constitute local execution.
+
+`AsyncRuntimeOptions` combines handoff, park-spin and thread options for
+`AsyncRuntime::new_with_options`. Helpers adopt a vacant dispatcher seat and
+serve its lane using the same search: own lane, bounded stealing, then one
+overflow entry. Other holders may steal from a vacant seat's lane under the
+usual bounds, including its last entry.
+
+`AsyncRuntimeOptions::park_spin(ParkSpin::fixed(rounds))` controls the
+lock-free ready-hint checks before a distributed dispatcher attempts to
+park. The round limit is fixed at construction and defaults to 128; zero
+disables spinning. `AsyncRuntimeOptions::max_spinning_dispatchers(K)` fixes
+an additional cap on simultaneously spinning dispatchers, defaulting to the
+worker count. Spinning also requires search admission, so by default at most
+half the workers, rounded up, spin. A spinner cap at or above the worker
+count adds no limit. Zero skips spinning. A dispatcher that cannot acquire a
+spinner slot proceeds directly to the existing park handshake. A guard
+releases its slot on every spin exit, including work, closing, handoff
+yield, exhaustion and unwinding. Releasing a slot sends no wake. Closing and
+handoff yield hints stop the spin early. The condvar park remains untimed.
+Loom builds omit spinning and the spinner slot counter; search admission and
+wake decisions remain.
+
+`AsyncRuntimeOptions::max_searching_dispatchers(K)` fixes the cap on
+dispatchers searching other lanes and spinning at once. The default is half
+the workers, rounded up, fixed at construction. A cap at or above the worker
+count leaves entry unlimited; wake suppression still applies.
+A dispatcher checks its own lane before attempting entry. An admitted
+dispatcher then steals, checks overflow and spins for the fixed configured
+rounds, subject also to the spinner cap. A denied dispatcher checks overflow
+and parks without spinning. A dispatcher stops searching before running a
+task or parking. Closing and handoff yield stop the search.
+
+While a dispatcher is searching, or a dispatcher woken to search has not yet
+made its entry decision, new work does not wake another dispatcher. The
+woken dispatcher makes its own admission attempt; a kick grants no search
+entry. When the last searcher finds work and work remains queued in any lane
+or overflow, it wakes one parked dispatcher. A search-woken dispatcher that
+takes its own lane's work acknowledges its kick without entering searching;
+if no searcher covers remaining queued work, it attempts one search wake
+before polling. A yielding dispatcher also checks for queued work and
+attempts a search wake after releasing its search slot and acknowledging any
+kick, including when it left searching before observing the yield hint.
+These wake attempts use the same suppression while searching or waking is
+non-zero, and retain no deferred wake. Non-last exits send no wake. An empty
+search checks all lanes and overflow before parking, without sending a wake.
+After advertising its parked seat, a denied dispatcher rechecks whether
+search admission could now succeed. If so, it also rescans other lanes and
+restarts when work remains; otherwise it checks only its own lane and
+overflow. A retry either enters searching or finds the cap full again, with
+an active searcher covering the queued work. Lane selection, parked lane
+owner notifications and close notifications are unchanged. Zero disables
+searching other lanes, spinning and search kicks; an entry can then wait
+behind a blocking poll on its own lane until that poll returns.
+
+For `--lane async --executor bounded`, the latency benchmark accepts
+`--park-spin fixed:N`, `--max-spinners K` and `--max-searchers K`. CSV
+columns are unchanged; record the selected flags alongside benchmark
+results.
+
+With `W` workers and `B` helpers, at most `W` dispatcher turns and `B` handed-off
+closures are active. Reserving a loan precedes releasing the dispatcher permit.
+The original task retains admission, its running state and its scope poll quota
+throughout the closure. A still-pending same-scope dependency cannot make
+progress if the scope quota is exhausted; use a separate scope or an explicit
+higher quota. The default root quota remains `W`. With handoffs enabled,
+`W < W + B`, so root polls acquire the root scope mutex for quota acquisition
+and release (twice per ordinary poll). This cost is accepted. The
+dispatcher bound covers owned dispatch, not CPU time, nested borrowed roots or
+external threads.
+
+Return or panic reacquires a dispatcher permit, retaining the loan until
+restoration. Restorers take any vacant seat or a helper's seat at its next
+poll boundary; other worker seats keep dispatching. If a helper-origin loan
+outlives the worker's loan and no helper holds a seat, a worker yields
+between polls and resumes after the restoration; helpers also yield to
+resuming workers. A waiting restorer is prioritised only at seat boundaries,
+so a helper blocked waiting on that restorer's task can deadlock. The restored
+thread then serves its new seat's lane. With one worker restorers precede
+queued work; this also works after admission closes. Helpers can hand off under the
+same fixed bound, while nested handoff on the original already-loaned thread
+runs inline. Task identity, explicit resource binding, task-local values and
+runtime-worker shutdown identity remain intact. The closure may call a
+nested handle `block_on`; its borrowed root has no task ID, and
+budget/context markers restore on return or unwind.
+
+Abort and cancelling shutdown cannot preempt the closure. Explicit shutdown
+joins every worker/helper and may wait indefinitely; worker-origin shutdown
+returns `WouldDeadlock`, including from a handed-off closure. Runtime drop
+closes admission and detaches. Thread caches flush before handoff/parking.
+Native lifecycle tests and bounded same-source coordinator Loom models qualify
+these semantics. The models cover permit/loan accounting, not the full
+scheduler, condition variables, TLS or a performance benefit.
+
+## Owned-buffer runtime io_uring
+
+The separate `runtime-io-uring` feature implies `runtime` and exposes
+`runtime::uring`. `UringRuntime::start(UringConfig, ResourceScope)` starts a
+dedicated issuer and completes its setup/probe/restriction handshake before
+returning a handle. Capacity must be in `1..=1024`. Setup denial returns a typed
+stage/error before admission; no automatic fallback or allocator purge-policy
+change occurs. `CompiledCapabilities::runtime_io_uring` reports compiled code,
+while successful startup establishes that this driver was permitted.
+
+`try_read_at` and `try_write_at` take an owned regular-file descriptor, unique
+`ManagedBuf` and checked offset, returning the original inputs on admission
+rejection. Direct/path-only descriptors, incompatible access, observed append
+writes, shared buffers and overflowing extents are refused. The caller must
+keep shared file-status flags stable through all descriptor aliases while the
+service owns the descriptor. Each request is one positional operation, and a
+short completion returns its byte count and original owners without replay.
+Zero-length accepted operations finish locally.
+
+Fixed admission slots count queued, claimed, published, completing and
+completed-unclaimed requests. Dropping a queued future cancels before claim;
+after claim, dropping detaches observation and retains inputs until the original
+CQE. Disk operation permits are released after actual I/O cleanup and before
+completion publication; managed memory remains charged through the final
+buffer owner, including returned results. Slot generations retire on exhaustion.
+Waker callbacks and payload destruction run outside the ledger lock.
+
+Explicit `shutdown` closes admission, drains accepted work and joins the issuer;
+it can wait indefinitely for kernel I/O and rejects issuer-thread self-joining.
+Dropping the service closes admission and detaches while the issuer drains.
+Closing a ring descriptor is not a synchronous buffer-release barrier. If
+published ownership becomes uncertain, the initial backend aborts the process
+before kernel-visible owners can drop. It does not cancel, recreate, quarantine
+or replay uncertain operations. Fake-driver and slot-protocol Loom tests cover
+bounded lifecycle transitions, not kernel execution. Real-kernel tests with
+`ALLOCATBELT_REQUIRE_IO_URING=1` fail on denied setup, distinguishing permission
+failure from a successful kernel transfer/fail-stop qualification. No native
+performance benefit has been established for this optional service.
+
+The standalone [`runtime-uring-denied` example](../crates/allocatbelt/examples/runtime-uring-denied.rs)
+checks the public startup path under an externally imposed setup denial. It
+requires a non-root process with no capabilities, no-new-privileges and seccomp
+enabled, and accepts only the typed `Ring` error at phase `setup` with `EPERM`.
+It checks that caller-held managed memory and a disk permit remain unchanged,
+that their budgets can be reused after drop, and that the failed issuer leaves
+no thread. Build it with `--no-default-features --features runtime-io-uring`;
+the caller must impose the denial and bound the complete process externally.
+Its marker alone does not establish which policy caused the denial or prove
+process cleanup; qualification also checks the installed policy and terminal
+process state.
+
+## Explicit adaptive cgroup feedback
+
+`runtime::adaptive::AdaptiveController` takes an already-delegated `CgroupV2`
+capability and copies two to sixteen strictly increasing finite CPU/
+`memory.high` tiers. All CPU periods must match. Every tier is validated
+against the capability's immutable caller ceilings and the already-established
+finite `memory.max`, which must itself fit its caller ceiling. Startup only
+reads controls and requires the current CPU/high pair to match a configured
+tier. The controller never changes `memory.max` or I/O limits.
+
+The caller supplies measured p99 and CPU/memory utilization on a monotonic
+`Instant` clock. High/low bands, sustained sample counts, minimum sampling
+interval, maximum gap and nonzero bounded cooldown limit oscillation. A
+sustained breach raises one tier; sustained healthy recovery lowers one tier;
+neutral samples and long gaps reset streaks. The floor and ceiling stop further
+changes. Invalid/early/stale samples do not advance policy; explicit resume
+retains the timestamp watermark and resets interval/cooldown requirements.
+No sensor or background thread is created, and this policy has not established
+a p99 improvement.
+
+Before a transition, readback must still match the tracked tier and original
+`memory.max`. CPU is applied before `memory.high`, as separate synchronous
+writes with separate nontransactional snapshots. Lowering memory.high may
+reclaim or block. Any failed setter, readback, cross-control mismatch or drift
+latches the controller faulted, preserving confirmed partial progress and the
+last observed snapshot separately from unknown current state. Later automatic
+observations cannot write until explicit `resume_from_readback` finds a known
+tier with the original memory.max. No rollback, retry or replay occurs.
+The caller must coordinate descriptor aliases and other writers: readback can
+detect observed drift but cannot prevent a race between different control
+files. Pure policy/fault-injection tests cover these limits. A correctness-only
+native integration in a private container cgroup descendant verified actual
+CPU and `memory.high` promotion/recovery, cooldown, floor/ceiling, drift faulting
+without replay and explicit readback recovery. The fixture uses synthetic
+caller-clock samples and does not establish response under real resource
+pressure or a native application benefit.
+
+`allocatbelt-bench::adaptive_feedback` supplies a bounded caller-side adapter
+for source experiments. It reads fixed CPU, memory, event and PSI files from
+an explicitly supplied cgroup directory descriptor, retains the bytes and
+read chronology, computes quota-normalized CPU and fixed-original-
+`memory.max` ratios, and forms feedback only from nonempty completed-response
+windows. It reports raw CPU ratios above 100% separately from the clamped
+controller input. Missing or malformed sensors, changed controls, counter
+regressions, empty latency windows and memory safety events do not produce a
+feedback sample. `bench-adaptive-pressure` consumes an externally supervised
+event stream and never creates work or moves processes. Native qualification
+passed formatting, all-target compilation, strict all-target/all-feature
+Clippy, 22 adapter tests, six CLI tests and the full release workspace suite.
+Real pressure transitions, recovery and performance remain unqualified.
+Work events carry actual callback timestamps in the same host `CLOCK_MONOTONIC`
+domain as the adapter's separately recorded receipt timestamps. Event delivery
+older than 250 ms, a future timestamp, or an unproven clock relationship is
+ineligible for feedback. The offered schedule is sealed before dispatch; final
+drain permits starts and terminal events for already admitted work, while new
+offers and admissions remain closed.
+Each `cpu.stat`, `cpu.pressure` and `memory.pressure` read retains its own
+monotonic start/end bracket. CPU and PSI denominators use per-file bracket
+midpoints and refuse samples whose conservative read uncertainty exceeds
+10 ms. A pre-dispatch schedule seal and acknowledgement watermark are stored
+immutably for each offered ID. New callbacks must follow their ID's own
+acknowledgement; buffered callbacks for carried IDs remain valid against their
+original watermark across later windows and final drain. The final drain performs a real
+sensor/control safety boundary before success and refuses success when the
+final read is unavailable or the invocation-wide memory safety counters changed.
+Every successful carried or drained completion contributes its unchanged
+source-time `finish - scheduled` latency once. A buffered carryover is recorded
+in the active ledger window when accepted, even if its source completion
+predates that window's sensor boundary; per-ID chronology and receipt-delay
+limits remain separate, and no response is censored or retimestamped.
+
+## Path toward replacing Tokio
+
+The [capability and acceptance ledger](research/runtime-capability-status.md)
+links implemented operations and focused fixtures to their remaining migration
+and qualification requirements.
+
+Task utilities, resource-bound polling, the synchronization families,
+processes, signals, concurrency helpers and explicit cgroup feedback are
+implemented with the contracts above. The stable-Linux capability inventory
+was recorded against Tokio 1.53.1. The current development and comparison
+dependency baseline is Tokio 1.53.3; this patch update does not change the
+inventory's API scope or historical traces. The listed capabilities still
+require these implementation and qualification steps:
+
+1. Qualify the implemented cooperative progress paths, including public
+   readiness, child waits and signal receives, and preserve the documented
+   manual-poll and arbitrary-future limits. Verify application ports across the
+   explicit-address nonblocking connect, listen and Linux socket-option
+   capabilities.
+2. Qualify application migrations through the implemented bounded I/O ports:
+   owned blocking and standard streams, anonymous pipes and named FIFOs,
+   managed simplex/duplex pipes, caller-buffered bidirectional copy,
+   initialized-buffer utilities and bounded delimiter/line and whole-stream
+   reads. Preserve their explicit partial-progress and peer-close contracts.
+3. Extend application qualification to realistic workloads and matched Tokio
+   comparisons. The CPU, memory, limited TCP/HTTP and disk ports cover bounded
+   rejection recovery, cancellation, retained storage and driver/process
+   cleanup; these functional checks do not establish application performance.
+4. Retain the [source-specific correctness evidence](research/runtime-capability-status.md#signed-runtime-correctness-qualification)
+   and the completed isolated core Miri campaign recorded in the same ledger.
+   Rerun the relevant platform, feature, package, security and model checks when
+   their covered inputs change, preserving failures and model-coverage limits.
+   Complete per-host retained-memory, allocator, executor and application
+   gates against both mimalloc baselines and matched-allocator Tokio, separating
+   saturated capacity from open-loop tail-latency workloads.
+5. Qualify adaptive controls under real resource pressure, overload and
+   readback failures. Synthetic policy samples and control-write integration
+   establish correctness, not pressure response or application performance.
+   Promote scheduler, allocator and ISA candidates only after their required
+   correctness and native throughput, tail-latency and memory gates pass.
+
+No default algorithm or ISA dispatch is promoted by this milestone. The
+[platform contract](platform.md), including the allocator's x86-64-v3 floor,
+and [design constraints](design-constraints.md) are unchanged.
+
+## Patent-risk discipline
+
+The constraints are a preliminary technical screen, **not freedom to operate**.
+Rust, familiar primitives and independent implementation do not establish
+non-infringement. Do not copy another library's code without checking its license.
+
+Any allocator change breaking a listed constraint needs its specified review
+before implementation. Runtime admission, scheduling, reactors and adaptive
+control also need claim-level patent review for the jurisdictions and deployment
+in question. Keep sensitive comparisons and unpublished findings in an
+authorized private checkout, not this repository.
+
+A patent non-aggression program is not a patent application and does not grant
+a patent for this implementation or clear patents outside its licensed scope.
+The [OIN 2.0 agreement](https://openinventionnetwork.com/license-agreement-2/)
+describes the OIN patent license and participant cross-license, including
+Linux System scope and good-standing conditions for 2.0 coverage (sections
+1.1–1.2.1). This project makes no membership or coverage claim. Counsel should
+verify the agreement and [Linux System definition](https://openinventionnetwork.com/linux-system/)
+before relying on it. Sources consulted 2026-10-04; no agreement was submitted.
+
+## Application-byte admission
+
+`runtime::byte_rate::ByteRateLimit` provides a finite real-clock bucket for
+application-byte admission. Construct it with a nonzero replenishment rate,
+burst and maximum retained reservations. `try_reserve` removes tokens before
+I/O; a retained `ByteReservation` owns the bucket until `commit` settles actual
+progress. Committing refunds the unused suffix; dropping before I/O refunds
+the whole reservation. After a successful syscall, commit its byte count before
+dropping the owner or returning to a cancellation point. Detached operations
+must retain this owner until their actual completion. The bucket cannot infer
+I/O that its caller performed.
+
+Oversized datagrams are refused rather than split. Zero-byte reservations consume
+no reservation entry. Reconfiguration stays within construction-time ceilings,
+accounts elapsed time at the old rate and never creates tokens merely because
+a burst ceiling rises. Fractional replenishment survives short real intervals;
+full-bucket clamping discards accumulated surplus. Shared clones observe the
+same reservation count and byte balance.
+
+Available admission tokens are bounded by the current burst. Live owners keep
+their admitted bytes while tokens refill; lowering a burst does not revoke
+those owners. Their total retained bytes are bounded by their count times the
+construction-time burst ceiling, with the count bounded by the construction-time
+reservation cap. Zero-byte admission creates no owner. Trace verification checks
+these bounds separately rather than adding available and retained balances.
+
+These buckets account application-byte admission, not physical disk traffic,
+wire bandwidth or operation-slot permits. `runtime::rate_io::RateLimitedIo`
+reserves available credit before each initialized stream poll and refunds
+unused credit on pending/error/partial completion. Its timer must use an
+immutable real clock. Owning-facade `rate_io` adapters use download credit for
+reads and upload credit for writes; `disk_io` uses the shared disk bucket.
+
+A selected `disk_rate` also binds the owning filesystem handle. Sequential
+and positional reads/writes reserve before each byte syscall. Rate-selected
+copy uses bounded managed scratch, charges both reads and writes, preserves
+source creation permissions and existing nonregular-destination permissions,
+and observes cancellation between calls. Direct standard-library I/O remains
+outside this contract.
+
+`runtime::rate_datagram::RateLimitedUdp` reserves exact datagram or receive-
+buffer credit, then one network operation permit before socket I/O. Pending
+receives retain both owners; cancellation removes their readiness waiter and
+refunds credit. Oversized sends return an error before sending any fragment,
+and callers retain their complete borrowed input. Empty buffers still send
+or consume empty datagrams. Receives preserve kernel truncation behavior and
+charge copied application bytes. Constructor failures recover every owned
+input. Clones share a charged metadata owner and optional committed-byte
+meters until the final owner is dropped.
+
+## Owning driver facades
+
+`runtime::driver::CurrentThreadBuilder` and `MultiThreadBuilder` construct typed
+local and worker-pool owners for explicitly selected timer, readiness, blocking,
+I/O pool, filesystem, process and signal services. Existing low-level
+constructors remain available. The facade binds the executor's existing
+implicit root, borrowed root polls, owned children and local cross-thread
+imports to the same managed resource ledger; a second scope is not needed when
+`max_scopes = 1`. `.blocking(config)` selects the pool for caller closures and
+`.io_pool(config)` selects the separate I/O adapter pool. The filesystem
+handle uses the selected I/O pool and that ledger, so `.filesystem()` needs
+`.io_pool(...)`; without it the build fails with
+`DriverBuildError::FilesystemNeedsIoPool`, also when only a blocking pool is
+selected. The driver's `io_pool()` returns an `IoPoolHandle` for building
+blocking stream adapters. Signal installation is last during startup because
+its process-global bridge remains permanent.
+
+`request_shutdown` closes executor admission. `try_shutdown` reports
+`ShutdownProgress::Pending` while task cleanup, blocking work, adapter work,
+child reaping, callbacks or service threads remain owned. Async/local work
+finishes first, followed by the blocking pool, then the I/O pool in its own
+step, then child reaping; timer and readiness services close last so admitted
+drains retain their dependencies. The I/O pool step starts only after the
+blocking pool's step has completed, so blocking closures still running under
+`Drain` can use the filesystem handle, stream adapters and connector. The
+I/O pool step always drains; `CurrentShutdown` and `MultiShutdown` have no
+I/O pool mode, and the blocking pool's `CancelPending` (the default) drops
+only that pool's queued closures. Because the step drains, a driver whose
+adapter is blocked in a read with no input, such as stdin, stays `Pending`
+until that read returns. Make such a stream return before or during
+shutdown (for example by closing its peer), or drop the driver owner, which
+detaches the I/O pool's workers instead of waiting. A detached pool keeps
+operations queued behind a blocked worker, with their permits, buffers,
+tenant charges and waiter share, until that worker returns, and its workers
+end with the process, so a queued write such as a stdout flush can be lost
+if `main` returns first; shut the driver down and wait when it must
+complete. Thread owners use bounded join monitors to observe actual completion through thread-local cleanup;
+polling does not join an unfinished worker on the caller. A failed monitor
+launch retains the original handle and returns a retryable typed error.
+`DriverShutdownError::is_retryable` distinguishes these failures from sticky
+worker failures. Status calls retain joined
+worker panic payloads and return sticky typed failures instead of running their
+destructors on the caller. Explicit cleanup and owner destruction contain
+payload destructor panics, but a blocking destructor can still delay them.
+
+Local future and queued-blocking capture cleanup is explicit through
+`drive_shutdown_step`. Each call drops at most one queued job of the user
+blocking pool and separately advances the I/O pool's drain once that pool's
+step has been requested; it never discards an I/O pool operation. It can invoke arbitrary caller code and has no finite
+wall-time guarantee. Keep an unfinished facade owner alive until cleanup
+completes. Process-wide signal bridge lifetime is not included in
+`ShutdownProgress::Complete`. Its permanent tables and dispatcher metadata
+are outside tenant `Control`; subscriptions reuse fixed global slots. A bound
+facade includes its inline `SignalDriver` value in its own metadata charge.
+When a tenant resource domain is bound, root
+polls, owned tasks, blocking execution and I/O pool execution share its CPU
+and task admission. Each pool reserves its own waiter share and its own
+scheduler, queue and owner metadata under `Control`, so selecting both pools
+charges two pool payloads.
+Declared scheduler payloads, owning facades, controlled scopes, queues, metrics,
+flags, waiter owners, byte buckets and feedback state retain Control charges
+through their final handles. A native worker task reserves its one task
+allocation at admission: the shared bookkeeping with the user future stored
+inline (a caller's own box is moved in, not boxed again). Scheduler wakers
+reuse that allocation without another allocation or first-poll charge.
+Completion drops the user future in place without changing the allocation;
+the whole allocation, including one inline output slot and the dropped
+future's storage, remains charged until the last join, abort handle or
+scheduler waker is dropped. Consuming or dropping the join releases
+the result value (a detached result is discarded by the publishing worker),
+even while stale wakers or abort handles retain the empty slot's storage.
+Bound filesystem requests reserve their shared
+input-and-mutex payload before disk or job admission; that charge survives
+queued cancellation and detached execution. Caller-owned allocations reachable
+from an input remain outside this declared-payload charge. This accounting excludes
+physical allocator overhead, arbitrary application allocations and OS stacks.
+Separately constructed providers retain their documented metadata boundaries.
+In particular, the owning builders do not select `UringRuntime::start`; its
+standalone ring tables, issuer state and backend owner storage remain outside
+tenant `Control`, together with opaque kernel mappings and OS metadata.
+
+`runtime::cpu_gate::CpuGate` provides the same domain admission to external
+executors. A wrapped future holds a CPU ticket for each inner poll; `run` holds
+one through a synchronous closure. Its bounded waiter share, wrapper, boxed
+future payload and blocking waker have declared Control charges. Temporary
+exhaustion registers a real wake or parks the blocking caller; reentrant work
+on the same active domain fails promptly if capacity is exhausted. The gate
+does not account an external executor's opaque task allocations or control CPU
+time. Original futures and closures are recovered if initial admission fails.
+
+Resource feedback is compiled with the `runtime` feature (which enables
+`resource-feedback`, kept as an alias) and is on by default for drivers bound
+to a resource domain. When a `CurrentThreadBuilder` or `MultiThreadBuilder`
+has a `resource_domain` whose global CPU soft limit is nonzero, the build
+starts the default service of `driver::default_feedback()`, described in
+[resource-feedback.md](resource-feedback.md), on that global CPU soft limit.
+
+**What the default service changes.** Bound runtimes take one CPU unit of
+their domain for each active poll or blocking call
+([resource-domain.md](resource-domain.md)), so this limit bounds the
+simultaneous polls and blocking calls of every runtime bound to the domain,
+across all of its drivers and tenants, not only explicit `CpuGate` users.
+After three dense readings at or above 80% of process CPU time over the CPU
+capacity (the standard library's available parallelism, read once per
+build), the service lowers the limit by a tenth of its current value. A limit
+below ten does not fall, so one that starts at ten or more stops at nine. At
+or below 40% it raises a lowered limit by one slot, at most once per second,
+never above the value it found at start. When it stops it returns the limit
+to that value, only if the limit is still the last value it wrote. The
+reading is process-wide, so the default services of several domains in one
+process react to the same readings. Behaviour under real pressure is not
+qualified.
+
+**What it costs.** Each default service keeps a `Control` charge on the
+building tenant while it runs (including
+`ResourceFeedbackService::owner_payload_bytes()` of owner payload), runs two
+threads (the sampler and a join monitor), so a current-thread driver's
+process is no longer single-threaded, and keeps one `/proc/self/stat`
+descriptor open, read every 100 ms on the real clock even when the driver's
+clock is paused. Shutdown waits for the sampler to stop, so an idle driver's
+shutdown no longer completes on its first poll. Setting the CPU soft limit
+while the service runs latches it as external drift; reconcile with
+`request_feedback_reconcile` or build with `without_feedback()`.
+
+`.without_feedback()` on either builder turns this off; nothing is then
+started. Startup of the default service is best effort: a failure (for
+example, too little tenant `Control` headroom, an unreadable process CPU
+sensor or a domain another default service already controls) leaves the
+driver built without feedback, and `feedback_status()` reports what the build
+did. A domain has at most one default service at a time: a later explicit
+`default_feedback()` on the same domain fails with
+`DefaultDomainAlreadyControlled`, and a driver dropped without shutdown
+releases the domain only when its detached sampler exits. The default service
+allocates no byte meter. An explicitly selected `feedback_sources` factory
+replaces the default selection; its errors fail the build, and each such
+build creates fresh source contexts and directional application-byte meters.
+The sampler
+uses real monotonic time, bounded policy state, explicit floors and ceilings,
+readback verification and fixed diagnostics. Missing, sparse or stale telemetry
+freezes its affected control. Shutdown closes executor admission immediately
+and continues local or async cleanup, while feedback shutdown completes before
+the driver requests shutdown of blocking workers, managed processes, timers or
+the readiness reactor. Those services remain available to feedback callbacks
+until the feedback owner has stopped.
+These source and ownership fixtures do not establish native performance or
+complete replacement qualification.
+
+`AsyncThreadOptions`, also accepted by `MultiThreadBuilder::thread_options`,
+configures executor names, stack sizes and start, stop, park and unpark hooks.
+Hooks receive stable physical worker/helper identities and run outside runtime
+locks and TLS borrows. Hook panics are contained and counted. Park attempts
+that skip a condition wait still pair callbacks; metrics count actual waits.
+`RuntimeMetrics` remains readable after shutdown and distinguishes primary
+dispatch capacity from physical helper threads. A retained metrics handle holds
+only a weak reference to the scheduler, which the scheduler clears when its
+last owner drops, so the handle keeps no scheduler state or storage alive after
+shutdown. Each physical thread timestamps
+busy time at the start of its first dispatched turn after installation or a
+condition wait, and after successful handoff restoration. The period stays
+open across consecutive turns, including cleanup, queue searches and spinning
+between them. It is timestamped and published just before a lane or seat
+condition wait, after a successful handoff before invoking its closure, or on
+dispatcher exit before the stop hook (including unwind). An open period also
+publishes every 64 completed consecutive turns, with one clock read per 64
+turns. This interval is a fixed compile-time constant, independent of load,
+timing and history. Parking, handed-off closures and restoration
+waits are excluded, as is the initial search after a wait until a turn starts.
+Reads may lag by up to 64 consecutive turns of an open busy period.
+This remains solely a per-thread wall-time diagnostic; it never feeds spin,
+park, wake or quota decisions.
+The alive-task gauge is the scheduler's admitted count, read under the
+admission mutex, so each read is exact at that instant rather than a lagging
+copy. It includes reserved spawns until publication or rollback, including
+in-progress spawns before domain admission or task construction, and a
+published task stays counted through future cleanup until its slot is
+released, which precedes join publication. It reads zero once the scheduler's
+last owner has dropped. Scalar and per-thread reads allocate nothing;
+`try_snapshot` reports reservation failure, while the convenience snapshot
+allocates ordinary metadata. Fields are sampled independently rather than
+transactionally. Counter updates and monotonic timestamps are present even
+when the application does not read metrics, and require native performance
+qualification.

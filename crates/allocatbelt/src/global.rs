@@ -1,0 +1,563 @@
+//! The `GlobalAlloc` adapter: turns the core's offsets into pointers through
+//! `sys` and holds the `unsafe` that the `GlobalAlloc` contract itself
+//! requires (the trait impl, zero-filling and the `realloc` copy), the
+//! arena and the per-thread caches. The maintenance thread is in
+//! `maintenance` (feature `maintenance`).
+
+use std::alloc::{GlobalAlloc, Layout};
+use std::io::Write as _;
+use std::ptr::{self, NonNull};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::time::{Duration, Instant};
+
+use crate::arch::{CpuFeatures, KernelSet};
+use crate::core::{
+  ARENA_SIZE, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, SEGMENT_SIZE, ThreadCache,
+};
+use crate::core::{
+  CacheStats, HeapUsage, MaintenanceStats, ReclaimStatus, ReclaimTargets, Retention, SearchStats,
+};
+use crate::sys::{Capabilities, MetaArena, Region};
+
+pub(crate) struct Arena {
+  pub(crate) user: Region,
+  meta: MetaArena<MAX_SEGMENTS>,
+  /// Origin of the heap's clock (see `Os::now_ms`).
+  start: Instant,
+  /// What the kernel probe found before the arena was reserved.
+  platform: Capabilities,
+}
+
+/// Initialised on the first allocation. `OnceLock` blocks on a futex and
+/// never allocates; the initialiser only issues syscalls.
+static ARENA: OnceLock<Option<Arena>> = OnceLock::new();
+
+pub(crate) fn arena() -> Option<&'static Arena> {
+  ARENA
+    .get_or_init(|| {
+      // A missing mandatory facility is a platform the allocator does not
+      // support, not an out-of-memory condition: say so and stop.
+      let platform = crate::sys::probe().unwrap_or_else(|e| LinuxOs.fatal(e.message()));
+      // Allocation-free (cpuid, getauxval or riscv_hwprobe). Allocations
+      // before this point, and on the way here, use the baseline kernels.
+      let _ = crate::arch::initialize_dispatch();
+      let arena = Arena {
+        user: Region::reserve(ARENA_SIZE, SEGMENT_SIZE)?,
+        meta: MetaArena::reserve(META_WORDS)?,
+        start: Instant::now(),
+        platform,
+      };
+      // Before any allocation: every heap call goes through `arena` first.
+      HEAP.set_seed(seed());
+      // glibc's `pthread_atfork` allocates with its own `malloc`, not
+      // through us, so registering here does not re-enter the allocator.
+      let _ = crate::sys::register_atfork(fork_prepare, fork_parent, fork_child);
+      Some(arena)
+    })
+    .as_ref()
+}
+
+/// `fork` handlers: the forking thread takes every heap lock, so that no
+/// lock is held by a thread that does not exist in the child.
+extern "C" fn fork_prepare() {
+  // A fork while another thread is still reserving the arena would leave
+  // the child waiting for that thread forever.
+  let _ = ARENA.wait();
+  HEAP.fork_prepare();
+}
+
+extern "C" fn fork_parent() {
+  HEAP.fork_parent();
+}
+
+extern "C" fn fork_child() {
+  HEAP.fork_child();
+  // The maintenance thread (if any) did not survive the fork, and the child
+  // should not share the parent's placement secret.
+  #[cfg(feature = "maintenance")]
+  crate::maintenance::fork_child();
+  #[cfg(not(feature = "maintenance"))]
+  crate::report::fork_child();
+  HEAP.set_seed(seed());
+}
+
+/// A secret for randomized placement: from the kernel CSPRNG, or, if its
+/// pool is not ready yet (early boot), from ASLR and the time.
+fn seed() -> u64 {
+  if let Some(s) = crate::sys::random_u64()
+    && s != 0
+  {
+    return s;
+  }
+  let local = 0u8;
+  let aslr =
+    (&raw const local).addr() as u64 ^ (seed as fn() -> u64 as usize as u64).rotate_left(32);
+  let time = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map_or(0, |d| d.as_nanos() as u64);
+  (aslr ^ time.rotate_left(17)) | 1
+}
+
+/// The [`Os`] of the global heap. It is only reached after [`arena`]
+/// succeeded, because the heap is only entered with an arena offset or on an
+/// allocation that initialised the arena first.
+pub(crate) struct LinuxOs;
+
+impl LinuxOs {
+  pub(crate) fn arena(&self) -> &'static Arena {
+    match ARENA.get() {
+      Some(Some(a)) => a,
+      _ => self.fatal("allocatbelt: heap used before the arena was reserved"),
+    }
+  }
+}
+
+impl Os for LinuxOs {
+  fn commit(&self, offset: usize, len: usize) -> bool {
+    self.arena().user.commit(offset, len)
+  }
+
+  fn decommit(&self, offset: usize, len: usize) -> bool {
+    // SAFETY: the `Os` contract of the core guarantees the heap
+    // only decommits ranges holding no live allocation, so no pointer we
+    // handed out refers into the range.
+    #[expect(unsafe_code, reason = "returning unused memory to the kernel")]
+    unsafe {
+      self.arena().user.decommit(offset, len)
+    }
+  }
+
+  fn purge(&self, offset: usize, len: usize) -> bool {
+    // SAFETY: as for `decommit`, the range holds no live allocation.
+    #[expect(unsafe_code, reason = "returning unused memory to the kernel")]
+    unsafe {
+      self.arena().user.purge(offset, len)
+    }
+  }
+
+  fn guard(&self, offset: usize, len: usize) -> bool {
+    // SAFETY: the `Os` contract of the core: the heap only guards
+    // ranges holding no live allocation and hands nothing out of them
+    // until it has unguarded and committed them again.
+    #[expect(unsafe_code, reason = "installing a guard page")]
+    unsafe {
+      self.arena().user.guard(offset, len)
+    }
+  }
+
+  fn unguard(&self, offset: usize, len: usize) {
+    self.arena().user.unguard(offset, len);
+  }
+
+  fn commit_meta(&self, segment: usize) -> Option<&[AtomicU64]> {
+    self.arena().meta.commit(segment)
+  }
+
+  fn meta(&self, segment: usize) -> Option<&[AtomicU64]> {
+    self.arena().meta.get(segment)
+  }
+
+  fn futex_wait(&self, word: &AtomicU32, expected: u32, timeout_ms: Option<u64>) {
+    crate::sys::futex_wait(word, expected, timeout_ms);
+  }
+
+  fn futex_wake(&self, word: &AtomicU32) {
+    crate::sys::futex_wake(word);
+  }
+
+  fn now_ms(&self) -> u64 {
+    // `Instant::now` reads the vDSO clock and does not allocate.
+    u64::try_from(self.arena().start.elapsed().as_millis()).unwrap_or(u64::MAX)
+  }
+
+  #[cfg(feature = "experimental-rseq")]
+  #[inline]
+  fn shard_hint(&self) -> Option<usize> {
+    crate::rseq::shard_hint()
+  }
+
+  fn age_kernel(&self) -> Option<crate::core::AgeKernel> {
+    crate::arch::age_kernel()
+  }
+
+  fn fatal(&self, msg: &'static str) -> ! {
+    // `Stderr` is unbuffered; writing a `&str` does not allocate.
+    let _ = std::io::stderr().write_all(msg.as_bytes());
+    let _ = std::io::stderr().write_all(b"\n");
+    std::process::abort()
+  }
+}
+
+pub(crate) static HEAP: Heap<LinuxOs> = Heap::new(LinuxOs);
+
+std::thread_local! {
+    // `const`-initialised and without `Drop`: no lazy init and no destructor
+    // registration, so touching it never allocates or re-enters us, and it
+    // stays usable while other thread-local destructors run.
+    static CACHE: ThreadCache = const { ThreadCache::new() };
+    // Zero-sized, with a `Drop` that hands the cache back at thread exit.
+    // Touched once per thread, when the cache is attached.
+    static RETIRE: Retire = const { Retire };
+}
+
+struct Retire;
+
+impl Drop for Retire {
+  fn drop(&mut self) {
+    let _ = CACHE.try_with(|tc| guarded(|| HEAP.retire(tc)));
+  }
+}
+
+/// Runs `f` with the calling thread's cache, attaching it first if needed.
+/// Falls back to a detached cache (the uncached paths) if the thread-local
+/// is unavailable.
+#[inline]
+fn with_cache<R>(f: impl FnOnce(&ThreadCache) -> R) -> R {
+  let mut f = Some(f);
+  let r = CACHE.try_with(|tc| {
+    if tc.is_detached() {
+      attach(tc);
+    }
+    f.take().map(|f| f(tc))
+  });
+  match r {
+    Ok(Some(r)) => r,
+    _ => match f {
+      Some(f) => f(&ThreadCache::new()),
+      None => LinuxOs.fatal("allocatbelt: cache callback lost"),
+    },
+  }
+}
+
+#[cold]
+fn attach(tc: &ThreadCache) {
+  // Registering the destructor may allocate (it does not go through us on
+  // glibc, but nothing guarantees that); until `attach` returns, such
+  // allocations take the uncached paths.
+  tc.begin_attach();
+  if RETIRE.try_with(|_| ()).is_ok() {
+    HEAP.attach(tc);
+  }
+}
+
+/// Aborts the process if dropped during unwinding: unwinding out of a
+/// `GlobalAlloc` method is undefined behaviour, and a panic in the heap can
+/// only mean a bug in it.
+struct AbortOnUnwind;
+
+impl Drop for AbortOnUnwind {
+  fn drop(&mut self) {
+    LinuxOs.fatal("allocatbelt: internal panic");
+  }
+}
+
+pub(crate) fn guarded<R>(f: impl FnOnce() -> R) -> R {
+  let bomb = AbortOnUnwind;
+  let r = f();
+  std::mem::forget(bomb);
+  r
+}
+
+/// The allocatbelt global allocator.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Allocatbelt;
+
+impl Allocatbelt {
+  /// Allocates memory for `layout`, or returns `None` when out of memory.
+  /// Safe: it only hands out fresh memory.
+  #[must_use]
+  pub fn allocate(self, layout: Layout) -> Option<NonNull<u8>> {
+    self.allocate_block(layout).map(|(p, _)| p)
+  }
+
+  /// As [`Allocatbelt::allocate`], also reporting whether the block is
+  /// already known to read as zero.
+  fn allocate_block(self, layout: Layout) -> Option<(NonNull<u8>, bool)> {
+    guarded(|| {
+      let a = arena()?;
+      let Block { offset, zeroed } =
+        with_cache(|tc| HEAP.alloc_cached(tc, layout.size(), layout.align()))?;
+      Some((a.user.ptr(offset)?, zeroed))
+    })
+  }
+
+  /// Usable size of a live allocation made by this allocator.
+  #[must_use]
+  pub fn usable_size(self, ptr: NonNull<u8>) -> usize {
+    guarded(|| HEAP.usable_size(offset_of(ptr.as_ptr())))
+  }
+
+  /// Returns all freed-but-unpurged memory to the OS. Purging also happens
+  /// automatically once the dirty budget is exceeded; call this from a
+  /// maintenance task to return freed memory promptly after load drops.
+  /// This lowers RSS only by the pages that were resident: live blocks,
+  /// other threads' caches and metadata stay, and the OS decides the rest.
+  ///
+  /// Blocks cached by the calling thread are returned first; other
+  /// threads' caches (a few words per size class each) are not touched.
+  pub fn purge(self) {
+    if arena().is_some() {
+      guarded(|| {
+        let _ = CACHE.try_with(|tc| HEAP.flush(tc));
+        HEAP.purge();
+      });
+    }
+  }
+
+  /// What the start-up probe found about the running kernel, for
+  /// diagnostics. Initialises the allocator if nothing has allocated yet;
+  /// `None` if its address space could not be reserved.
+  #[must_use]
+  pub fn platform(self) -> Option<Capabilities> {
+    arena().map(|a| a.platform)
+  }
+
+  /// The ISA extensions detected on this CPU, for diagnostics. A detected
+  /// feature does not mean allocatbelt has a kernel that uses it; see
+  /// [`Allocatbelt::kernel_set`].
+  #[must_use]
+  pub fn cpu_features(self) -> CpuFeatures {
+    crate::arch::detected_features()
+  }
+
+  /// The architecture kernels in use: [`KernelSet::Baseline`] until the
+  /// first allocation has initialised the allocator, and afterwards unless
+  /// [`crate::Policy::experimental_isa`] selects an experimental set that
+  /// is compiled in and supported here. No kernel set other than the
+  /// baseline has been measured or is selected by default.
+  #[must_use]
+  pub fn kernel_set(self) -> KernelSet {
+    crate::arch::kernel_set()
+  }
+
+  /// Segments (4 MiB) currently taken from the arena, for diagnostics.
+  #[must_use]
+  pub fn segments_in_use(self) -> usize {
+    HEAP.segments_in_use()
+  }
+
+  /// Bytes of freed pages still resident, waiting for a purge, for
+  /// diagnostics.
+  #[must_use]
+  pub fn dirty_bytes(self) -> usize {
+    HEAP.dirty_pages() * PAGE_SIZE
+  }
+
+  /// Sets how long freed memory stays resident before it is returned to the
+  /// OS (1 s by default). Memory is also returned early once more than the
+  /// trigger (32 MiB by default, see [`Allocatbelt::set_reclaim_targets`])
+  /// is waiting. A sweep in progress keeps the delay it started with.
+  pub fn set_purge_delay(self, delay: Duration) {
+    HEAP.set_purge_delay_ms(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+  }
+
+  /// Sets the thresholds on freed memory waiting for a purge: past the
+  /// trigger a budget cycle starts and purges down to the low target; past
+  /// the emergency threshold freeing threads reclaim themselves even with
+  /// a maintenance thread. Defaults: low 0, trigger 32 MiB, emergency
+  /// 64 MiB ([`ReclaimTargets::DEFAULT`]). They bound the freed pages the
+  /// allocator tracks, not the process's RSS. Does not initialise the
+  /// allocator.
+  pub fn set_reclaim_targets(self, targets: ReclaimTargets) {
+    HEAP.set_reclaim_targets(targets);
+  }
+
+  /// The thresholds in force (see [`Allocatbelt::set_reclaim_targets`]).
+  #[must_use]
+  pub fn reclaim_targets(self) -> ReclaimTargets {
+    HEAP.reclaim_targets()
+  }
+
+  /// Sets how long decay keeps freed memory: exactly the purge delay
+  /// ([`Retention::Fixed`], the default), or, opt-in, up to
+  /// [`crate::MAX_RETENTION`] times it while freed memory keeps being
+  /// reused ([`Retention::Adaptive`]). The thresholds of
+  /// [`Allocatbelt::set_reclaim_targets`] apply either way.
+  pub fn set_retention(self, retention: Retention) {
+    HEAP.set_retention(retention);
+  }
+
+  /// Where reclamation stands: thresholds, the sweep in progress, whether a
+  /// budget cycle is pending or deferred, and the retention in force, for
+  /// diagnostics. Allocation-free.
+  #[must_use]
+  pub fn reclaim_status(self) -> ReclaimStatus {
+    HEAP.reclaim_status()
+  }
+
+  /// Returns every block the calling thread's cache holds (the rest of a
+  /// claimed bitmap word per size class, and up to 64 words of buffered
+  /// frees) to the shared heap, where other threads can use them. The
+  /// cache stays usable. Call it before a worker thread parks or ends an
+  /// idle phase: a thread that sleeps holds its cache until it runs again.
+  ///
+  /// Bounded (one update per word held, under the lock of the shard that
+  /// owns its page); purges nothing. Does not initialise the allocator or a cache
+  /// the thread has not used, and allocates nothing. Not async-signal-safe:
+  /// do not call it from a signal handler.
+  pub fn flush_thread_cache(self) {
+    if ARENA.get().is_some_and(Option::is_some) {
+      guarded(|| {
+        let _ = CACHE.try_with(|tc| HEAP.flush(tc));
+      });
+    }
+  }
+
+  /// Asks every thread's cache to return what it holds to the shared heap,
+  /// and returns at once. Each thread drains its own cache, completely, the
+  /// next time it takes one of the allocator's slower paths (a cache refill,
+  /// a large allocation or free, a free that starts a new buffered word;
+  /// a thread that only frees reaches the last within 4096 small frees). A
+  /// thread that sleeps, blocks or stops calling the allocator does not
+  /// drain, so there is no time bound: pair it with
+  /// [`Allocatbelt::flush_thread_cache`] in workers before they park. For
+  /// memory-pressure handlers, with [`Allocatbelt::request_purge`].
+  /// Lock-free and allocation-free.
+  pub fn request_cache_return(self) {
+    HEAP.request_cache_return();
+  }
+
+  /// Asks the maintenance thread to return all freed memory and empty
+  /// segments to the OS, and returns without waiting: for memory-pressure
+  /// handlers. Without a maintenance thread it purges inline, like
+  /// [`Allocatbelt::purge`] (which always runs on the calling thread).
+  pub fn request_purge(self) {
+    if arena().is_some() {
+      guarded(|| HEAP.request_purge());
+    }
+  }
+
+  /// Counters of the housekeeping passes and the bounded slices they run
+  /// in: how many each kind ran on the maintenance thread and inline, and
+  /// the work they did (pages inspected, runs purged or refused, pages
+  /// returned), for diagnostics.
+  #[must_use]
+  pub fn maintenance_stats(self) -> MaintenanceStats {
+    HEAP.maintenance_stats()
+  }
+
+  /// How the heap found memory for small-block refills and page runs
+  /// (searches, segments visited, stale hints, growth), summed over its
+  /// shards, for diagnostics. Allocation-free.
+  #[must_use]
+  pub fn search_stats(self) -> SearchStats {
+    HEAP.search_stats()
+  }
+
+  /// What the memory taken from the arena is used for: handed out, free in
+  /// the shared bitmaps, dirty (awaiting a purge) or clean, for
+  /// diagnostics. A walk over the segments in use, allocation-free; not the
+  /// process's RSS (see [`HeapUsage`]). Does not initialise the allocator.
+  #[must_use]
+  pub fn heap_usage(self) -> HeapUsage {
+    if ARENA.get().is_some_and(Option::is_some) {
+      guarded(|| HEAP.usage())
+    } else {
+      HeapUsage::default()
+    }
+  }
+
+  /// What the calling thread's cache holds and how it flushed its buffered
+  /// frees, for diagnostics. After thread exit retired the cache it reports
+  /// `attached: false` and holds nothing; `None` only if the thread-local
+  /// cannot be reached. Other threads' caches can only be read by their
+  /// own threads. Allocation-free.
+  #[must_use]
+  pub fn thread_cache_stats(self) -> Option<CacheStats> {
+    CACHE.try_with(|tc| HEAP.cache_stats(tc)).ok()
+  }
+
+  /// Makes the calling thread prefer shard `shard % 64` for its cache
+  /// refills and uncached allocations, in place of the one it got when its
+  /// cache was attached (consecutive threads get consecutive shards). For
+  /// runtimes that number their worker threads: giving worker `i` shard
+  /// `i` spreads a fixed pool evenly over the shards, whatever other
+  /// threads started in between. With the `experimental-rseq` policy
+  /// active, the `mm_cid` hint still comes first.
+  ///
+  /// Only a preference: every shard is locked when used, so any value is
+  /// correct, and threads may share a shard. Attaches the thread's cache
+  /// if it is not attached yet (which may allocate once, to register its
+  /// thread-exit hook); allocation-free afterwards. Lasts until the thread
+  /// exits; [`CacheStats::shard`] reads it back.
+  pub fn set_thread_shard(self, shard: usize) {
+    guarded(|| with_cache(|tc| HEAP.set_preferred_shard(tc, shard)));
+  }
+}
+
+fn offset_of(ptr: *const u8) -> usize {
+  match arena().and_then(|a| a.user.offset_of(ptr)) {
+    Some(o) => o,
+    None => LinuxOs.fatal("allocatbelt: pointer was not allocated by allocatbelt"),
+  }
+}
+
+// SAFETY: every method upholds the `GlobalAlloc` contract: returned blocks
+// are fresh (the heap never hands out a live block twice), sized and aligned
+// for the layout (checked by the core's model tests), and never
+// unwind (`guarded`). Deallocation trusts the caller's contract that `ptr`
+// came from this allocator, and additionally aborts on invalid/double frees.
+#[expect(unsafe_code, reason = "GlobalAlloc is an unsafe trait")]
+unsafe impl GlobalAlloc for Allocatbelt {
+  #[expect(unsafe_code, reason = "GlobalAlloc method")]
+  unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+    self
+      .allocate(layout)
+      .map_or(ptr::null_mut(), NonNull::as_ptr)
+  }
+
+  #[expect(unsafe_code, reason = "GlobalAlloc method")]
+  unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+    let Some((p, zeroed)) = self.allocate_block(layout) else {
+      return ptr::null_mut();
+    };
+    // Fresh or purged memory already reads as zero; skipping the memset
+    // also keeps untouched pages of a large `calloc` out of RSS.
+    if zeroed {
+      return p.as_ptr();
+    }
+    // SAFETY: `p` is a fresh allocation valid for `layout.size()` bytes
+    // that nothing else references yet.
+    #[expect(unsafe_code, reason = "zero-fill of a fresh block")]
+    unsafe {
+      p.as_ptr().write_bytes(0, layout.size());
+    }
+    p.as_ptr()
+  }
+
+  #[expect(unsafe_code, reason = "GlobalAlloc method")]
+  unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+    guarded(|| {
+      let off = offset_of(ptr);
+      with_cache(|tc| HEAP.dealloc_cached(tc, off));
+    });
+  }
+
+  #[expect(unsafe_code, reason = "GlobalAlloc method")]
+  unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    let off = offset_of(ptr);
+    // Keeps a block that still fits, and grows or trims page and segment
+    // runs where they are.
+    if guarded(|| HEAP.resize_in_place(off, new_size)) {
+      return ptr;
+    }
+    // The caller guarantees `new_size` rounded to `layout.align()` does
+    // not overflow `isize`, so this layout is valid.
+    let Ok(new_layout) = Layout::from_size_align(new_size, layout.align()) else {
+      return ptr::null_mut();
+    };
+    let Some(new) = self.allocate(new_layout) else {
+      return ptr::null_mut();
+    };
+    // SAFETY: `ptr` is live for `layout.size()` bytes (caller contract),
+    // `new` is a fresh, distinct block of at least `new_size` bytes, so
+    // the regions do not overlap and both are valid for the copy length.
+    #[expect(unsafe_code, reason = "moving the contents to the new block")]
+    unsafe {
+      ptr::copy_nonoverlapping(ptr, new.as_ptr(), layout.size().min(new_size));
+    }
+    guarded(|| with_cache(|tc| HEAP.dealloc_cached(tc, off)));
+    new.as_ptr()
+  }
+}

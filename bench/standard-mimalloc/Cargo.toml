@@ -1,0 +1,36 @@
+[package]
+name = "allocatbelt-standard-mimalloc-bench"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.0"
+license = "Apache-2.0"
+publish = false
+
+# An independent dependency graph is necessary: Cargo otherwise unifies the
+# workspace's secure mimalloc feature into the standard baseline.
+[workspace]
+
+[features]
+# Compiles the external-pressure comparison family. allocatbelt compiles
+# resource feedback with `runtime` either way; fixed-policy runs turn the
+# default service off explicitly.
+resource-feedback = ["allocatbelt/resource-feedback"]
+
+[dependencies]
+allocatbelt = { path = "../../crates/allocatbelt", features = ["io-uring", "runtime"] }
+allocatbelt-app-ports = { path = "../../crates/allocatbelt-app-ports" }
+mimalloc = { version = "=0.1.52", default-features = false }
+tokio = { version = "=1.53.3", default-features = false, features = ["rt", "rt-multi-thread", "sync", "net", "io-util", "time"] }
+# Keep the shared process-CPU measurement available in this isolated graph.
+rustix = { version = "=1.1.5", default-features = false, features = ["time"] }
+
+[[bin]]
+name = "bench-latency-standard"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench-application-standard-mimalloc"
+path = "src/application.rs"
+
+[lints.rust]
+unsafe_code = "deny"

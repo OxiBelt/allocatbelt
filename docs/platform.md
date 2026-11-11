@@ -1,0 +1,139 @@
+# Platform contract
+
+allocatbelt is a Linux-only allocator for a fixed set of 64-bit CPUs. This page is the contract; the code that enforces it is in [`crates/allocatbelt/src/sys/platform.rs`](../crates/allocatbelt/src/sys/platform.rs), and [`scripts/check-platform-gates.sh`](../scripts/check-platform-gates.sh) checks it in CI (the `platform-gates` job).
+
+| | Supported | Rejected |
+|---|---|---|
+| Operating system | Linux 7.0 or newer | everything else (FreeBSD, macOS, bare metal, wasm, ...), at compile time |
+| Architecture | x86_64, aarch64, riscv64 | x86/i686, arm/armv7, riscv32, powerpc*, s390x, loongarch*, wasm* and all others |
+| Userspace | 64-bit, little-endian, with 64-bit atomics | 32-bit and ILP32 ABIs (x32), big-endian |
+| x86_64 | x86-64-v3 or newer (`-C target-cpu=x86-64-v3`) | x86-64-v1/v2 builds, at compile time |
+| aarch64 | any AArch64 Linux target (`aarch64_be` is rejected as big-endian) | |
+| riscv64 | RV64GC (`riscv64gc-unknown-linux-gnu`); Zbb optional | riscv32 |
+
+The gates are `compile_error!`s, so an unsupported build fails before anything runs, with a message that names the problem. `scripts/check-platform-gates.sh` checks one or more representatives of every rejected row: i686, armv7, x32, riscv32, wasm32, powerpc64le, loongarch64, s390x and FreeBSD. 32-bit targets stop at the `core` module's own 64-bit gate; everything else stops in the `sys` module. Both are always compiled as part of the one `allocatbelt` package, so the gates are always reached.
+
+## x86-64-v3 is the floor
+
+Every x86_64 build must enable the x86-64-v3 feature set: AVX, AVX2, BMI1, BMI2, F16C, FMA, LZCNT, MOVBE and XSAVE, on top of the v2 set (CMPXCHG16B, POPCNT, SSE3, SSSE3, SSE4.1, SSE4.2). The `sys` module checks each of these with `cfg(target_feature = ...)`, so `-C target-cpu=x86-64-v4`, `-C target-cpu=native` on a v3 machine, or an explicit `-C target-feature=...` list all pass, and a generic build does not.
+
+- **Inside this repository**, `.cargo/config.toml` adds `-C target-cpu=x86-64-v3` for every x86_64 target (`rustflags`, and `rustdocflags` for doctests on the gnu and musl triples). A `RUSTFLAGS` (or `RUSTDOCFLAGS`) environment variable *replaces* those flags rather than adding to them, so it must carry the CPU flag itself, for example `RUSTFLAGS="-C target-cpu=x86-64-v3 -C debuginfo=2"`. Builds of the core alone through `allocatbelt-core-check` (the loom, fuzz and mutation jobs) are not gated.
+- **In a crate that depends on allocatbelt** (from crates.io, or OxiBelt's `oxibelt-allocator`), this repository's `.cargo/config.toml` is not read, and publishing does not change that: the package does not contain it. The dependent workspace must build x86_64 artifacts with `-C target-cpu=x86-64-v3` (or newer) in its own `.cargo/config.toml` or `RUSTFLAGS`, and name them accordingly (for example `...-x86_64-v3-linux-gnu`, `...-x86_64-v3-linux-musl`). Without it the build fails with the gate's message.
+- **There is no friendly run-time error on an older CPU.** A binary compiled for x86-64-v3 may execute v3 instructions before any of its own code can check the CPU, so on a v1/v2 machine it dies with `SIGILL`. The build baseline is the compatibility mechanism. If a clear error is ever needed, it belongs in a separate generic launcher that checks the CPU and then `exec`s the v3 binary, not in a lowered allocatbelt build.
+- Higher ISA levels (AVX-512 and newer) are for later phases: they will be used only through run-time detection and per-kernel dispatch backed by benchmarks, never by raising the build floor.
+
+## Linux 7.0 or newer
+
+Linux 7.0 is the oldest kernel the project supports and tests against. The kernel version is **not** what the allocator checks, though: a version string says nothing reliable about backports, sandboxes or emulators. Instead, before it reserves its arena, the allocator runs `sys::probe()` once. The probe works on a private 64 KiB scratch reservation and checks the facilities the allocator cannot run without:
+
+| Facility | Mandatory | Checked by | Without it |
+|---|---|---|---|
+| Anonymous `PROT_NONE`, `MAP_NORESERVE` reservation | yes | reserving the scratch range | abort with a message |
+| `mprotect(PROT_READ \| PROT_WRITE)` commit | yes | committing it | abort with a message |
+| `madvise(MADV_DONTNEED)` returning zero-filled pages | yes | writing a byte, purging, reading back `0` | abort with a message: purged memory backs `alloc_zeroed` without a memset |
+| Guard markers (`MADV_GUARD_INSTALL`, Linux 6.13+) | no | installing markers and checking that populating the range faults | guard pages use `mprotect(PROT_NONE)`; qemu-user takes this path |
+| `getrandom(2)` without blocking | no | reading 8 bytes | the placement secret falls back to ASLR and the time |
+
+A missing mandatory facility aborts the process with a one-line `allocatbelt: ...` message on stderr instead of returning null from the first allocation, which Rust would report only as a generic allocation failure. The probe issues only syscalls and does not allocate; afterwards the scratch range is `PROT_NONE` again and holds no memory.
+
+The probe also reads the kernel release from `uname(2)`. `Allocatbelt::platform()` returns everything the probe found (`Capabilities`: kernel version, guard markers, getrandom) for diagnostics, and `KernelVersion::meets_minimum()` compares a release against 7.0. An older kernel is not rejected as long as every mandatory facility is present: that keeps the allocator usable under qemu-user and on CI hosts whose kernel is older than the contract, and a run there is outside the supported configuration, not a different code path. As later phases start to rely on Linux 7.0 interfaces, each one is added to the probe as a mandatory facility, so the check stays tied to what the allocator actually uses. The io_uring purge ring (phase 8) is not one of them: it is opt-in, uses `IORING_SETUP_SQ_REWIND` only when the kernel accepts it, and falls back to `madvise` when io_uring is unavailable (below).
+
+## RISC-V
+
+The baseline is RV64GC, as before. Zbb is optional: building with `-C target-feature=+zbb` turns the bitmap scans' `trailing_zeros`/`count_ones`/`leading_zeros` into single `ctz`/`cpop`/`clz` instructions, and CI tests both builds under qemu-user. The V extension is not required. It is used only by the experimental RVV kernel (`experimental-riscv-rvv`), selected at run time; a stable naked assembly leaf scopes V locally, so the build itself never enables V. `CpuFeatures::RVV` reports `riscv_hwprobe` hardware support across all online CPUs. Dispatch additionally checks `PR_RISCV_V_GET_CONTROL` on the calling thread and falls back if the query fails or current vector state is not ON (for example, `sysctl abi.riscv_v_default_allow = 0` can leave current-thread V state off, where a first vector instruction would raise `SIGILL`). Feature detection with `riscv_hwprobe` belongs to the architecture capability layer (phase 2), not to this contract.
+
+## CPU features and kernel dispatch (the `arch` module)
+
+Above the build floor, the `arch` module (`crates/allocatbelt/src/arch/`) finds out at run time which ISA extensions the CPU and kernel support, and publishes which set of architecture kernels the allocator may use. It is the only place architecture-specific `unsafe` may go; the `core` module never sees vector types.
+
+| Architecture | Tracked features (`CpuFeatures`) | Source | Checked against |
+|---|---|---|---|
+| x86_64 | `X86_64_V3` (the whole v3 set), `AVX2`, `AVX512F`, `AVX512CD`, `AVX512BW`, `AVX512DQ`, `AVX512VL`, `AVX512VPOPCNTDQ` | `cpuid` leaves 1, 7 and 0x80000001, plus `xgetbv` for the XMM/YMM and opmask/ZMM state the OS enables | `std::arch::is_x86_feature_detected!` in the unit tests |
+| aarch64 | `ASIMD`, `SVE`, `SVE2` | `getauxval(AT_HWCAP)`, `getauxval(AT_HWCAP2)` | `std::arch::is_aarch64_feature_detected!` in the unit tests |
+| riscv64 | `ZBB`, `RVV` (the V extension) | `riscv_hwprobe(RISCV_HWPROBE_KEY_IMA_EXT_0)` over all online CPUs | the `+zbb` CI build must detect Zbb (`is_riscv_feature_detected!` is unstable); qemu-user `-cpu max` reports Zbb and V |
+
+The kernel constants (HWCAP bits, hwprobe key, bits and syscall number) come from the Linux v7.0 UAPI headers, because the `libc` crate does not have all of them.
+
+Dispatch follows the plan's reentrancy rule:
+
+```text
+allocations before initialize_dispatch()  -> KernelSet::Baseline (always correct)
+initialize_dispatch()                     -> probe once (allocation-free), cache in an atomic
+afterwards                                -> kernel_set(): Baseline, or an experimental
+                                             set if compiled, detected and selected
+```
+
+The adapter calls `initialize_dispatch()` while it initialises the arena, right after the kernel probe. Detection issues only `cpuid`/`xgetbv`, reads libc's saved auxiliary vector, or makes one syscall; it never allocates, which `crates/allocatbelt/src/arch/allocation_free.rs` checks with a counting global allocator (the global allocator of the library's unit-test binary). The result is cached in an `AtomicU32`, with no `OnceLock` or lazy framework; `kernel_set()` derives the set from it and the policy word, so a policy change takes effect at once and never races with a separate published value. RVV also queries the calling thread's vector permission before reporting a selected kernel. `Allocatbelt::cpu_features()` and `Allocatbelt::kernel_set()` expose both for diagnostics.
+
+A detected feature does not mean a kernel exists for it. A kernel becomes a default only with benchmark evidence that it speeds up a measured allocator cost, and the Phase 5 qualification admitted none ([research/simd-benchmarks.md](research/simd-benchmarks.md#phase-5-promotion-decision-2026-09-28)). So the default is `KernelSet::Baseline`, and every CPU runs the same code as before. The experimental `Sve` and `Sve2` sets (Cargo features `experimental-aarch64-sve` and `-sve2`, directive Phase F) and `Rvv` (`experimental-riscv-rvv`, Phase G) are selected only when compiled in, reported by `AT_HWCAP`/`AT_HWCAP2` or `riscv_hwprobe`, and asked for with `Policy::experimental_isa` `Prefer` or `Require`; they compute the same results as the baseline ([features.md](features.md#experimental-isa-kernels)).
+
+| Capability | Compiled feature | Probe | Default policy | Fallback | `Require` failure |
+|---|---|---|---|---|---|
+| SVE/SVE2 age-scan kernels | `experimental-aarch64-sve`, `experimental-aarch64-sve2` (aarch64) | `getauxval(AT_HWCAP)`, `getauxval(AT_HWCAP2)` | `Auto`: baseline | baseline kernels | `configure` returns `NotCompiled` or `Unavailable { step: "cpu features or thread permission" }` |
+| RVV age-scan kernel | `experimental-riscv-rvv` (riscv64, stable) | `riscv_hwprobe` (`IMA_V` on all online CPUs), `prctl(PR_RISCV_V_GET_CONTROL)` | `Auto`: baseline | baseline kernels | as above |
+
+## Scalar bit instructions
+
+The allocator's hot scans work on one `u64` bitmap word at a time with `trailing_zeros`, `count_ones` and `leading_zeros`. The right primitive for one word is a single scalar instruction, not a vector, so before any SIMD work `scripts/check-scalar-isa.sh` (CI job `scalar-isa`) checks that these operations lower to one:
+
+| Operation | Where the allocator uses it | x86-64-v3 | riscv64 + Zbb | riscv64 (rv64gc) |
+|---|---|---|---|---|
+| `trailing_zeros` | `bits::find_run_aligned`, bitmap scans | `tzcnt`, never `bsf` | `ctz` | no `ctz`: a multi-instruction sequence |
+| `count_ones` | free counters (`proto.rs`), dirty-page accounting (`heap.rs`), `bits::pick_bit` (rank selection) | `popcnt` | `cpop` | no `cpop` |
+| `leading_zeros` | `class::class_of` | `lzcnt`, never `bsr` | `clz` | no `clz` |
+
+These helpers are small enough that LLVM inlines them into their callers, so they have no symbol of their own. The script builds `crates/allocatbelt-codegen-probes`, which holds one out-of-line wrapper per operation around the real helper of the `core` module (through `allocatbelt-core-check`), with the allocator's own flags, emits assembly, and looks only at those four function bodies, which keeps it independent of scheduling and inlining elsewhere. The rv64gc column is a control: without Zbb none of the three instructions may appear, which shows the check can tell the builds apart and why `-C target-feature=+zbb` matters. A generic x86-64 (v1) build of the probes uses `bsf`/`bsr` and a software popcount, which the check would reject; the platform gate already rules that build out for the allocator itself.
+
+The x86/RISC-V matrix needs only `rustup target add riscv64gc-unknown-linux-gnu`, no linker or qemu, since it stops at assembly. Native ARM64 CI checks `clz`, `rbit`/`clz` and NEON `cnt` with a lane reduction; it needs only the host target. These checks verify instruction selection only; whether a kernel is faster requires native benchmarks.
+
+## Not covered yet
+
+Phases 1 to 5 of the Linux 7 / ISA / SIMD plan changed no allocator algorithm: phase 4 measured SIMD candidates and phase 5 promoted none of them. Phase 6 made the heap locks sleep on a futex, phase 7 moved housekeeping to a `SCHED_BATCH` maintenance thread and phase 8 added an opt-in io_uring purge ring for it (below). Phase 9 added an experimental, off-by-default shard selection by the rseq `mm_cid` (below), without measurements.
+
+## Optional capabilities at a glance
+
+Everything below is optional: the allocator is correct without any of it, and each row can be compiled out, refused by the system or left unselected. A Cargo feature compiles a capability in; the run-time policy (`Allocatbelt::configure`, docs/features.md) selects it; the probe decides whether the system allows it. `Allocatbelt::report()` shows all three.
+
+| Capability | Compiled feature | Probe | Default policy | Fallback | `Require` failure |
+|---|---|---|---|---|---|
+| Maintenance thread | `maintenance` (default) | spawning the thread in `start_maintenance_thread()` | not started until the application calls it | allocating threads run housekeeping inline | no policy field: `start_maintenance_thread` returns the spawn error |
+| `SCHED_BATCH` for that thread | `scheduler` (default, implies `maintenance`) | `sched_setscheduler(SCHED_BATCH)` when the thread starts | `Auto`: ask, keep the default policy if refused | the default scheduling policy; `maintenance_is_batch()` is `false` | `start_maintenance_thread` returns `Unsupported` wrapping `PolicyError::Unavailable`; no thread runs |
+| io_uring purge ring | `io-uring` (implies `maintenance`) | setting up the restricted ring and probing `IORING_OP_MADVISE` when the thread starts | `Auto`: `madvise` | `madvise` purges; `io_uring_error()` names the step and errno | as for `SCHED_BATCH` |
+| rseq `mm_cid` shard hints | `experimental-rseq` | glibc's `__rseq_size`, `getauxval(AT_RSEQ_FEATURE_SIZE)` | `Auto`: off | the TLS per-thread shards | `configure` fails with `Unavailable { step }` (`not glibc`, `not registered`, `no mm_cid`), `set_rseq_policy` with that `RseqUnavailable` |
+| SVE/SVE2 age-scan kernels | `experimental-aarch64-sve`, `-sve2` (aarch64) | `getauxval(AT_HWCAP)`, `getauxval(AT_HWCAP2)` | `Auto`: baseline | baseline kernels | `configure` fails: `NotCompiled`, or `Unavailable { step: "cpu features or thread permission" }` |
+| RVV age-scan kernel | `experimental-riscv-rvv` (riscv64, stable) | `riscv_hwprobe` (`IMA_V` on all online CPUs), `prctl(PR_RISCV_V_GET_CONTROL)` | `Auto`: baseline | baseline kernels | as for SVE |
+
+A `Require` for a capability the build lacks fails in `configure` with `PolicyError::NotCompiled`.
+
+## Maintenance thread scheduling
+
+`Allocatbelt::start_maintenance_thread` (Cargo feature `maintenance`, default) starts the thread that runs purge passes (docs/research/README.md §4). With the feature `scheduler` (default), and unless the policy's `scheduler` is `Disable` (docs/features.md), the thread moves itself to `SCHED_BATCH` with `sched_setscheduler` (`sys::set_batch_scheduling`); without it, the thread keeps the default policy, keeping the process's nice value, and the adapter reports whether that worked (`Allocatbelt::maintenance_is_batch`). If a sandbox refuses the call, the thread keeps the default policy. It is never real-time and never pinned to a CPU: it must not delay the process's own threads, and a pin would tie it to a CPU that may be busy (plan §11.2–11.3). It sleeps on a futex with a timeout (the next decay deadline) and wakes early when a freeing thread records work. The thread is named `allocatbelt-mnt` (Linux keeps 15 bytes of a thread name).
+
+## io_uring purge ring
+
+Compiled in only with the Cargo feature `io-uring` (not default, docs/features.md), which is also the only one that turns on rustix's `io_uring` bindings. When the policy's `io_uring` is `Prefer` or `Require` (`Allocatbelt::configure`, or the shorthand `set_io_uring(true)`), the maintenance thread purges the page runs of each pass in batches through its own io_uring (`sys::PurgeRing`, plan §10) instead of one `madvise` per run. `madvise` stays the default because the ring has not won in measurements yet (docs/research/benchmarks.md, Phase 8). The ring:
+
+- is created by the maintenance thread with `IORING_SETUP_R_DISABLED`, `SINGLE_ISSUER`, `DEFER_TASKRUN` and `NO_SQARRAY`, plus `SQ_REWIND` on Linux 7.0 (the setup is retried without it when the kernel rejects the flag), and never with `SQPOLL`;
+- registers restrictions before it is enabled: only `IORING_OP_MADVISE`, no SQE flags, and no later `io_uring_register` call but `ENABLE_RINGS` (listed so newer kernels restrict registration at all; an enabled ring refuses it anyway); a test submits a `NOP` and expects `-EACCES`; it registers no files or buffers, so allocator memory is never pinned;
+- caps the kernel's io-wq workers at one, since `IORING_OP_MADVISE` always runs on a worker and parallel purges of one address space only contend;
+- waits for every completion of a batch before the pass ends the pages' claim, so no purge is in flight after a pass (in particular not across `fork`, whose handler takes the purge lock first), and only a completion with result 0 marks pages clean.
+
+If io_uring is unavailable (`kernel.io_uring_disabled`, a seccomp filter, qemu-user's `ENOSYS`) or `IORING_OP_MADVISE` is missing, the thread purges with `madvise`; `Allocatbelt::purge_backend` and `Allocatbelt::io_uring_error` say which and why. A forked child inherits the descriptor (close-on-exec) but never uses it: its own maintenance thread, if started, creates a new ring.
+
+## rseq `mm_cid` shard selection (experimental)
+
+Built only with the Cargo feature `experimental-rseq` and used only when the policy's `rseq` is `Prefer` or `Require` (`Allocatbelt::configure`, or `set_rseq_policy`); the default policy, `Auto`, does not select it (plan §12, Phase 9). It has not been benchmarked: whether it helps is left to a later qualification against real workloads, such as OxiBelt under load, so `Auto` stays off until then. With it, a thread's cache refills and other uncached allocations prefer the shard numbered by its current `mm_cid` instead of the shard its cache got when attached. The cached fast path does not change.
+
+- **Ownership of the rseq area.** A thread can register one rseq area, and glibc (2.35+) registers one for every thread it creates. allocatbelt never registers its own: it reads glibc's, at the thread pointer plus `__rseq_offset`. It is available when glibc registered areas (`__rseq_size != 0`) and the kernel fills in `mm_cid` (`AT_RSEQ_FEATURE_SIZE >= 28`, Linux 6.3+); a thread whose own registration failed (negative `cpu_id`) keeps its per-thread shard. When glibc's registration is off or refused, glibc sets `__rseq_size` to 0 and allocatbelt reports `NotRegistered`, even if another library (librseq, a runtime) then registered an area of its own: that area belongs to its registrant, and allocatbelt does not look for it. `RseqStatus::available` says why it is unavailable (`NotGlibc`, `NotRegistered` for qemu-user, a seccomp filter or `GLIBC_TUNABLES=glibc.pthread.rseq=0`, `NoMmCid`).
+- **musl.** musl registers no rseq area, and allocatbelt deliberately does not register one for it (directive §9.2: no second registration made blindly), so on musl the feature is compiled but always falls back (`NotGlibc`). Registering from the allocator would take the one registration per thread away from the application or a library that wants it (their `rseq` call would then fail with `EINVAL` or `EBUSY`), and it would have to be undone before each thread exits: musl unmaps a detached thread's stack and TLS before the thread's last system call, and the kernel would keep writing to an area registered there. musl's own support, if it comes, would be read the way glibc's is.
+- **Fallback.** Wherever `mm_cid` cannot be read, and under `Auto` or `Disable`, cache refills use the shard each thread's cache got when it was attached (the TLS per-thread shards), exactly as a build without the feature. Threads created with a raw `clone` and no C library thread setup are not supported by allocatbelt at all (the per-thread cache lives in TLS), rseq or not.
+- **Migration and aborts.** The shard is only a preference: the shard is locked as before, so a thread that moves to another CPU (and `mm_cid`) between reading it and taking the lock costs locality, never correctness, and there is no rseq critical section to abort. No system call happens in between.
+- **VMs and containers.** `mm_cid` is the guest kernel's view: dense over the vCPUs and cpuset the process may use, which is the scheduling identity that matters here; nothing tries to find the host CPU. A process limited to one CPU (a cpuset, or `sched_setaffinity` before `fork`) sees only `mm_cid` 0, whatever its thread count (`tests/rseq_process.rs`).
+- **fork.** The child inherits the policy and the forking thread's registration; its `mm_cid` values are those of its new address space. `tests/rseq_process.rs` forks while four threads pick shards by `mm_cid` and checks that each child reads `mm_cid`, allocates on new threads and reports the parent's status; `tests/fork.rs` also runs with the policy on when the feature is built.
+- **Concurrency.** The `rseq` policy is two bits of the policy word (docs/features.md); switching it only changes which shard the next refill prefers, so it is switchable at any time. `tests/rseq_process.rs` switches it between `Prefer`, `Disable` and `Auto` continuously while sixteen threads allocate and check their blocks. The probe result is computed once (`OnceLock`, allocation-free).
+- **Diagnostics.** `Allocatbelt::rseq_status` reports the policy, availability and whether it is in use; `Allocatbelt::mm_cid` returns the calling thread's value; `report()` prints a `rseq:` row with the failed step.
+- **Checks.** `scripts/check-rseq.sh` (CI job "Experimental rseq mm_cid", x86_64 and arm64 runners) runs the rseq tests with glibc's registration, with `glibc.pthread.rseq=0` and on static musl, each asserting the expected availability (`ALLOCATBELT_EXPECT_RSEQ`); `tests/rseq_process.rs` re-executes itself under that tunable and under a seccomp filter that fails `rseq` with `EPERM`. The riscv64 qemu-user job runs them where qemu refuses `rseq`. Correctness only: no benchmark was run.
+
+## No portability layer
+
+Because Linux is a hard requirement, the crates do not carry generic-Unix abstractions or old-kernel compatibility paths. The one fallback that remains, `mprotect(PROT_NONE)` guard pages, is not for older kernels (every supported kernel has guard markers) but for environments that accept `MADV_GUARD_INSTALL` without implementing it, such as qemu-user, which the guard code detects with a populate check. The only `cfg(target_os = "linux")` left are on the package's own dependencies (`libc`, `rustix`) and on its `no_std` attribute (the crate is `no_std` off Linux, so a bare-metal target without `std` also reaches the gate's message), so that a build for another OS stops at the gate's message instead of at a dependency that does not build there.

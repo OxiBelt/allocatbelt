@@ -1,0 +1,113 @@
+[package]
+name = "allocatbelt"
+description = "A Linux global allocator whose allocation logic is safe Rust over offsets, with unsafe confined to the syscall, CPU-detection, GlobalAlloc and region boundaries."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository = "https://github.com/OxiBelt/allocatbelt"
+readme = "../../README.md"
+keywords = ["allocator", "global-allocator", "malloc", "linux"]
+categories = ["memory-management", "os::linux-apis"]
+include = ["/src/**/*.rs", "/tests/**/*.rs", "/examples/**/*.rs", "/LICENSE"]
+# The only package of this workspace that is published; every other one is a
+# development tool (`publish = false` from `[workspace.package]`).
+
+# docs.rs does not read this repository's `.cargo/config.toml`, so it gets
+# the x86-64-v3 flag the platform gate requires (docs/platform.md) here.
+# One target: the API is the same on every supported architecture, apart
+# from the per-architecture `CpuFeatures` constants.
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+rustc-args = ["-C", "target-cpu=x86-64-v3"]
+rustdoc-args = ["-C", "target-cpu=x86-64-v3"]
+
+# Linux only, so that a build for another OS reaches the platform gates in
+# `src/sys/platform.rs` instead of failing inside a dependency.
+[target.'cfg(target_os = "linux")'.dependencies]
+# Only for what rustix does not cover: guard-marker `madvise` advice,
+# `pthread_atfork`, `sched_setscheduler` and `getauxval`.
+libc.workspace = true
+rustix.workspace = true
+signal-hook-registry = { workspace = true, optional = true }
+
+# Cargo features choose which optional parts are compiled in (a ceiling);
+# which of them a process uses is chosen at run time. All are additive and
+# build on stable Rust. See docs/features.md and `CompiledCapabilities`.
+[features]
+default = ["maintenance", "scheduler"]
+# Safe runtime foundations and readiness; allocator-only defaults are unchanged.
+# Resource feedback is part of the runtime: a driver bound to a resource
+# domain starts the default service unless its builder turns it off.
+runtime = ["rustix/std", "rustix/event", "rustix/fs", "rustix/net", "rustix/param", "rustix/pipe", "rustix/process", "dep:signal-hook-registry", "resource-feedback"]
+# Alias kept for existing manifests: it selects `runtime`, which compiles
+# resource feedback.
+resource-feedback = ["runtime"]
+# The background maintenance thread (`start_maintenance_thread`). Without
+# it, allocating threads run every housekeeping pass inline.
+maintenance = []
+# The maintenance thread runs as `SCHED_BATCH` (best effort).
+scheduler = ["maintenance"]
+# Batched purges through a restricted io_uring on the maintenance thread,
+# off until `set_io_uring(true)`; falls back to `madvise`.
+io-uring = ["maintenance", "rustix/io_uring"]
+# Independent owned-buffer runtime file operations; no allocator purge policy.
+runtime-io-uring = ["runtime", "rustix/io_uring"]
+# Experimental (Phase 9): shard selection by the rseq `mm_cid`, off unless
+# selected with `Allocatbelt::set_rseq_policy`. Links glibc's
+# `__rseq_offset` and `__rseq_size` (glibc 2.35 or newer). See
+# docs/platform.md.
+experimental-rseq = []
+# Experimental (directive Phase F): the decay pass's page-age scan compiled
+# for SVE (and SVE2), selected only with `Policy::experimental_isa` set to
+# `Prefer` or `Require` on a CPU that exposes the extension. Stable Rust;
+# nothing is compiled on other architectures. Not measured, never default.
+# See docs/features.md.
+experimental-aarch64-sve = []
+experimental-aarch64-sve2 = ["experimental-aarch64-sve"]
+# Experimental (directive Phase G): the same age scan compiled for the
+# RISC-V V extension, selected only with `Policy::experimental_isa` on a
+# CPU whose `riscv_hwprobe` reports V and whose kernel lets this process
+# use it. Stable naked assembly enables V locally on riscv64. Nothing is
+# compiled on other architectures. Not measured, never default.
+experimental-riscv-rvv = []
+
+# The tests of an optional part run only when it is compiled in.
+[[test]]
+name = "maintenance"
+required-features = ["maintenance"]
+
+[[test]]
+name = "purge_thread"
+required-features = ["maintenance"]
+
+[[test]]
+name = "policy"
+required-features = ["maintenance"]
+
+[[test]]
+name = "fork_maintenance"
+required-features = ["maintenance"]
+
+[[test]]
+name = "rseq_process"
+required-features = ["experimental-rseq"]
+
+[dev-dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "runtime_allocator"
+required-features = ["runtime"]
+
+[[test]]
+name = "runtime_task_allocation"
+required-features = ["runtime"]
+
+[[example]]
+name = "runtime-uring-denied"
+required-features = ["runtime-io-uring"]

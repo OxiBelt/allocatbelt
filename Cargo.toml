@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/allocatbelt",
+  "crates/allocatbelt-codegen-probes",
+  "crates/allocatbelt-core-check",
+  "crates/allocatbelt-runtime",
+  "crates/allocatbelt-tokio",
+  "crates/allocatbelt-app-ports",
+  "crates/allocatbelt-qualification-tools",
+  "bench",
+  "bench/profile",
+  "bench/simd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.0"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+allocatbelt = { path = "crates/allocatbelt" }
+allocatbelt-core-check = { path = "crates/allocatbelt-core-check" }
+allocatbelt-profile = { path = "bench/profile" }
+allocatbelt-app-ports = { path = "crates/allocatbelt-app-ports" }
+allocatbelt-runtime = { path = "crates/allocatbelt-runtime" }
+libc = { version = "0.2.189", default-features = false }
+# Baseline only: OxiBelt currently ships secure mimalloc on x86_64 Linux.
+mimalloc = { version = "0.1.52", default-features = false, features = ["secure"] }
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+rustix = { version = "1.1.5", default-features = false, features = ["mm", "rand", "system", "thread"] }
+signal-hook-registry = "1.4.8"
+# Development-only runtime hooks and benchmarks; the published allocator
+# has no Tokio dependency in its normal or build graph.
+tokio = { version = "1.53.3", default-features = false, features = ["rt", "rt-multi-thread", "sync", "net", "io-util", "time"] }
+
+# Mirrors the OxiBelt workspace lint baseline so the crates can be dropped in unchanged.
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+# `--cfg loom` model-checks the atomic protocols of the core.
+# `loom`: the loom models, `allocatbelt_core_check` and `allocatbelt_model`:
+# set by allocatbelt-core-check's build script for the core's tests and model.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(allocatbelt_core_check)", "cfg(allocatbelt_model)"] }
+
+[workspace.lints.clippy]
+chunks_exact_to_as_chunks = "allow"
+manual_contains = "deny"
+manual_find = "deny"
+manual_is_ascii_check = "deny"
+manual_memcpy = "deny"
+manual_slice_fill = "deny"
+missing_safety_doc = "deny"
+multiple_unsafe_ops_per_block = "deny"
+needless_range_loop = "deny"
+result_large_err = "allow"
+undocumented_unsafe_blocks = "deny"
+
+[profile.bench]
+debug = true

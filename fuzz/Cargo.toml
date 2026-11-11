@@ -1,0 +1,25 @@
+# Fuzzing the core of `allocatbelt` (through `allocatbelt-core-check`) with cargo-fuzz (nightly): see `README.md`.
+# A separate workspace, so the main one needs no nightly and no libFuzzer.
+[package]
+rust-version = "1.99.0"
+name = "allocatbelt-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+allocatbelt-core-check = { path = "../crates/allocatbelt-core-check", features = ["model"] }
+libfuzzer-sys = "0.4.10"
+
+[[bin]]
+name = "heap_ops"
+path = "fuzz_targets/heap_ops.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
