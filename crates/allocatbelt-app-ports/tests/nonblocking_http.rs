@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use allocatbelt::runtime::asynchronous::{
-  AsyncConfig, AsyncJoinError, AsyncRuntime, AsyncShutdown,
+  AsyncConfig, AsyncJoinError, AsyncRuntime, AsyncShutdown, OwnedTaskScope,
 };
 use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
 use allocatbelt::runtime::net::{NetHandle, TcpConnectError, TcpConnectRejectKind, TcpSocket};
@@ -34,6 +34,23 @@ fn registration_rejection_cleans_up_the_scope_owned_http_server() {
     "registration_rejection_cleans_up_the_scope_owned_http_server",
     registration_rejection,
   );
+}
+
+/// Waits for the scope's task count to reach zero. A finished task publishes
+/// its result before its scope count falls, so a join can return first.
+fn await_scope_accounting(scope: &OwnedTaskScope) {
+  let deadline = Instant::now() + Duration::from_secs(5);
+  loop {
+    let active_tasks = scope.snapshot().active_tasks;
+    if active_tasks == 0 {
+      return;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "scope task accounting did not reach zero before the deadline; active_tasks={active_tasks}"
+    );
+    thread::yield_now();
+  }
 }
 
 fn within_watchdog(test_name: &str, run: fn()) {
@@ -145,7 +162,7 @@ fn nonblocking_exchange() {
     assert_eq!(blocking_handle.snapshot().outstanding, 1);
   }
 
-  assert_eq!(scope.snapshot().active_tasks, 0);
+  await_scope_accounting(&scope);
   runtime
     .block_on(scope.close())
     .expect("HTTP scope should close");
@@ -277,7 +294,7 @@ fn registration_rejection() {
       .expect("server cancellation must finish"),
     Err(AsyncJoinError::Cancelled)
   ));
-  assert_eq!(scope.snapshot().active_tasks, 0);
+  await_scope_accounting(&scope);
   let sentinel = scope
     .spawn(async { 17 })
     .expect("cancelled server slot must be reusable");
@@ -288,7 +305,7 @@ fn registration_rejection() {
       .expect("sentinel should complete"),
     17
   );
-  assert_eq!(scope.snapshot().active_tasks, 0);
+  await_scope_accounting(&scope);
   runtime
     .block_on(scope.close())
     .expect("HTTP scope should close");
