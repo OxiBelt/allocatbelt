@@ -3,8 +3,12 @@
 //!
 //! Each endpoint owns one nonempty, uniquely owned [`ManagedBuf`] for its
 //! fixed staging storage and submits at most one operation at a time to an
-//! existing blocking [`Handle`]. There is no private worker or per-endpoint
-//! queue. The caller declares the [`Resources`] reserved by each submitted
+//! existing [`IoPool`](crate::runtime::IoPool) through its [`IoPoolHandle`].
+//! That pool has its own workers and queue, separate from any user blocking
+//! [`Runtime`](crate::runtime::Runtime); there is no private worker or
+//! per-endpoint queue. A user pool cannot run these jobs and a user pool's
+//! shutdown does not affect them. The caller declares the [`Resources`]
+//! reserved by each submitted
 //! operation; those declarations are runtime accounting, not measurements or
 //! enforcement. The staging buffer is charged independently by its
 //! [`ResourceScope`](crate::runtime::managed::ResourceScope).
@@ -13,15 +17,19 @@
 //! discard its progress. The adapter keeps the job and its read-ahead or
 //! accepted write suffix for a later poll. Dropping the endpoint detaches the
 //! job; its stream and buffer remain owned until the blocking call and result
-//! cleanup finish. A queued job cancelled by `ShutdownMode::CancelPending`
-//! loses its captured stream and buffer before it starts, so that endpoint
-//! becomes terminal. A started `Read` or `Write` call cannot be interrupted;
-//! draining shutdown can wait indefinitely for a blocking stream.
+//! cleanup finish. No shutdown or drop of the I/O pool discards a queued job:
+//! its shutdown drains, so it can wait indefinitely for a blocking stream,
+//! and dropping the pool detaches its workers, which run the queued jobs
+//! they reach while the process lives (see
+//! [`IoPool`](crate::runtime::IoPool)). A started `Read` or `Write` call
+//! cannot be interrupted.
 //!
 //! Admission and resource-capacity rejection is reported as `WouldBlock`.
 //! The endpoint restores its stream and buffer, and a rejected write accepts
-//! no bytes. Because the blocking handle has no asynchronous capacity
-//! notification, the caller must retry after capacity becomes available.
+//! no bytes. Because the I/O pool handle has no asynchronous capacity
+//! notification, the caller must retry after capacity becomes available. A
+//! closed I/O pool is reported as `BrokenPipe` with the `Submission(Closed)`
+//! cause; the stream and buffer are restored, and retrying cannot succeed.
 //!
 //! Each worker job calls the underlying `read` or `write` at most once, with a
 //! small fixed retry bound for `Interrupted`. Partial writes advance the
@@ -35,9 +43,10 @@
 //!
 //! The standard-stream helpers wrap `std::io`'s process-global handles. Their
 //! internal locking and buffering are standard-library behavior and are not
-//! separately charged. A pool whose workers all block on stdin cannot run
-//! queued work until those reads return, so choose the pool size and task
-//! topology with that blocking behavior in mind.
+//! separately charged. An I/O pool whose workers all block on stdin cannot
+//! run queued adapter work, including filesystem operations, until those
+//! reads return, so choose the I/O pool size and task topology with that
+//! blocking behavior in mind. User blocking pools are not affected.
 //!
 //! Boxed stream metadata and runtime job metadata use ordinary Rust
 //! allocations; only the caller's `ManagedBuf` storage is managed-memory
@@ -59,7 +68,7 @@ use crate::runtime::error::{JoinError, SubmitErrorKind};
 use crate::runtime::io::{AsyncRead, AsyncWrite};
 use crate::runtime::job::Job;
 use crate::runtime::managed::ManagedBuf;
-use crate::runtime::{Handle, Resources};
+use crate::runtime::{IoPoolHandle, Resources};
 
 const INTERRUPTED_RETRIES: usize = 4;
 
@@ -126,9 +135,11 @@ impl<S: 'static> std::error::Error for BlockingIoInitError<S> {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BlockingIoErrorKind {
-  /// The existing blocking runtime refused admission.
+  /// The I/O pool refused admission.
   Submission(SubmitErrorKind),
-  /// A queued operation was cancelled before it started.
+  /// The operation's job ended without running or its outcome was already
+  /// taken. No I/O pool shutdown or drop produces this; it remains for a job
+  /// cancelled before it started, which the adapters do not do themselves.
   Cancelled,
   /// The operation closure panicked and lost its owned stream.
   Panicked,
@@ -194,7 +205,7 @@ fn validate_buffer<S>(
 /// An owned blocking reader exposed through the runtime-neutral `AsyncRead`
 /// trait.
 pub struct BlockingReader<R> {
-  handle: Handle,
+  handle: IoPoolHandle,
   resources: Resources,
   reader: Option<Box<R>>,
   buffer: Option<ManagedBuf>,
@@ -215,11 +226,11 @@ struct ReadOutput<R> {
   result: io::Result<usize>,
 }
 
-/// Creates an owned reader. `resources` is the blocking runtime's declared
-/// request for each actual blocking read. Buffer storage remains managed
+/// Creates an owned reader. `resources` is the I/O pool's declared request
+/// for each actual blocking read. Buffer storage remains managed
 /// charged independently.
 pub fn reader<R: Read + Send + 'static>(
-  handle: Handle,
+  handle: IoPoolHandle,
   resources: Resources,
   stream: R,
   buffer: ManagedBuf,
@@ -394,7 +405,7 @@ impl<R: Read + Send + 'static> AsyncRead for BlockingReader<R> {
 /// An owned blocking writer exposed through the runtime-neutral `AsyncWrite`
 /// trait.
 pub struct BlockingWriter<W> {
-  handle: Handle,
+  handle: IoPoolHandle,
   resources: Resources,
   writer: Option<Box<W>>,
   buffer: Option<ManagedBuf>,
@@ -434,11 +445,11 @@ struct WriteOutput<W> {
   result: WriteResult,
 }
 
-/// Creates an owned writer. `resources` is the blocking runtime's declared
-/// request for each write or flush operation. Buffer storage remains managed
+/// Creates an owned writer. `resources` is the I/O pool's declared request
+/// for each write or flush operation. Buffer storage remains managed
 /// charged independently.
 pub fn writer<W: Write + Send + 'static>(
-  handle: Handle,
+  handle: IoPoolHandle,
   resources: Resources,
   stream: W,
   buffer: ManagedBuf,
@@ -748,7 +759,7 @@ pub type StderrWriter = BlockingWriter<std::io::Stderr>;
 
 /// Creates a managed-buffered adapter over the process-global stdin handle.
 pub fn stdin_reader(
-  handle: Handle,
+  handle: IoPoolHandle,
   resources: Resources,
   buffer: ManagedBuf,
 ) -> Result<StdinReader, BlockingIoInitError<std::io::Stdin>> {
@@ -757,7 +768,7 @@ pub fn stdin_reader(
 
 /// Creates a managed-buffered adapter over the process-global stdout handle.
 pub fn stdout_writer(
-  handle: Handle,
+  handle: IoPoolHandle,
   resources: Resources,
   buffer: ManagedBuf,
 ) -> Result<StdoutWriter, BlockingIoInitError<std::io::Stdout>> {
@@ -766,7 +777,7 @@ pub fn stdout_writer(
 
 /// Creates a managed-buffered adapter over the process-global stderr handle.
 pub fn stderr_writer(
-  handle: Handle,
+  handle: IoPoolHandle,
   resources: Resources,
   buffer: ManagedBuf,
 ) -> Result<StderrWriter, BlockingIoInitError<std::io::Stderr>> {
@@ -827,8 +838,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn submission_error(kind: SubmitErrorKind) -> io::Error {
+  // A closed I/O pool never admits again; report it as terminal, as the
+  // filesystem adapter does, so retry loops stop.
+  let error_kind = if kind == SubmitErrorKind::Closed {
+    ErrorKind::BrokenPipe
+  } else {
+    ErrorKind::WouldBlock
+  };
   io::Error::new(
-    ErrorKind::WouldBlock,
+    error_kind,
     BlockingIoError {
       kind: BlockingIoErrorKind::Submission(kind),
     },

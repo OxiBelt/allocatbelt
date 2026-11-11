@@ -1256,7 +1256,7 @@ fn run_with_plan(
       };
       if matches!(options.workload, Workload::Disk | Workload::Mixed) {
         builder = builder
-          .blocking(BlockingConfig {
+          .io_pool(BlockingConfig {
             workers: plan.async_workers,
             max_outstanding: WINDOW,
             capacity: allocatbelt::runtime::Resources {
@@ -1282,10 +1282,10 @@ fn run_with_plan(
       let handle = scope.handle();
       warm_bounded_for(&handle, plan.async_workers)?;
       if matches!(options.workload, Workload::Disk | Workload::Mixed) {
-        let blocking = driver.blocking().ok_or_else(|| {
-          "owning driver omitted its selected blocking filesystem pool".to_owned()
-        })?;
-        disk_lane::warm_native_workers(&blocking, &handle, plan.async_workers)?;
+        let io_pool = driver
+          .io_pool()
+          .ok_or_else(|| "owning driver omitted its selected filesystem I/O pool".to_owned())?;
+        disk_lane::warm_native_workers(&io_pool, &handle, plan.async_workers)?;
       }
       let observer = Observer::Bounded(handle.clone());
       (

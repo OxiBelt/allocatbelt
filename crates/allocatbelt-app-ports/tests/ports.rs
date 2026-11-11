@@ -8,9 +8,7 @@ use allocatbelt::runtime::asynchronous::{AsyncConfig, AsyncRuntime, AsyncShutdow
 use allocatbelt::runtime::fs::FsHandle;
 use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
 use allocatbelt::runtime::reactor::{Reactor, ReactorConfig};
-use allocatbelt::runtime::{
-  Config as BlockingConfig, Resources, Runtime as BlockingRuntime, ShutdownMode,
-};
+use allocatbelt::runtime::{Config as BlockingConfig, IoPool, Resources};
 use allocatbelt_app_ports::cpu::{self, CpuConfig};
 use allocatbelt_app_ports::disk::{self, DiskConfig, MAX_DISK_BYTES};
 use allocatbelt_app_ports::http::{self, HttpConfig, MAX_REQUEST_BYTES};
@@ -123,12 +121,12 @@ fn owned_scope_cancellation_drops_managed_captures_before_close_returns() {
 
 #[test]
 fn loopback_http_uses_reactor_tcp_and_releases_all_charges() {
-  let mut blocking = BlockingRuntime::new(BlockingConfig {
+  let mut blocking = IoPool::new(BlockingConfig {
     workers: 1,
     max_outstanding: 4,
     capacity: Resources::ZERO,
   })
-  .expect("blocking runtime should start");
+  .expect("I/O pool should start");
   let reactor = Reactor::new(ReactorConfig {
     max_registrations: 3,
     max_waiters: 6,
@@ -165,7 +163,7 @@ fn loopback_http_uses_reactor_tcp_and_releases_all_charges() {
     .shutdown(AsyncShutdown::Drain)
     .expect("async shutdown should finish");
   blocking
-    .shutdown(ShutdownMode::Drain)
+    .shutdown()
     .expect("blocking shutdown should finish");
   reactor.shutdown().expect("reactor shutdown should finish");
   let snapshot = ledger.snapshot();
@@ -175,12 +173,12 @@ fn loopback_http_uses_reactor_tcp_and_releases_all_charges() {
 
 #[test]
 fn id_aware_loopback_uses_the_shared_client_and_server_transaction_kernels() {
-  let mut blocking = BlockingRuntime::new(BlockingConfig {
+  let mut blocking = IoPool::new(BlockingConfig {
     workers: 1,
     max_outstanding: 4,
     capacity: Resources::ZERO,
   })
-  .expect("blocking runtime should start");
+  .expect("I/O pool should start");
   let reactor = Reactor::new(ReactorConfig {
     max_registrations: 3,
     max_waiters: 6,
@@ -216,9 +214,7 @@ fn id_aware_loopback_uses_the_shared_client_and_server_transaction_kernels() {
   runtime
     .shutdown(AsyncShutdown::Drain)
     .expect("async runtime should stop");
-  blocking
-    .shutdown(ShutdownMode::Drain)
-    .expect("blocking runtime should stop");
+  blocking.shutdown().expect("I/O pool should stop");
   reactor.shutdown().expect("reactor should stop");
   let snapshot = ledger.snapshot();
   assert_eq!(snapshot.managed_memory, 0);
@@ -227,12 +223,12 @@ fn id_aware_loopback_uses_the_shared_client_and_server_transaction_kernels() {
 
 #[test]
 fn disk_transaction_uses_owned_offsets_syncs_reads_back_and_removes_temp_tree() {
-  let mut blocking = BlockingRuntime::new(BlockingConfig {
+  let mut blocking = IoPool::new(BlockingConfig {
     workers: 1,
     max_outstanding: 4,
     capacity: Resources::ZERO,
   })
-  .expect("blocking runtime should start");
+  .expect("I/O pool should start");
   let runtime = async_runtime(4);
   let ledger = resources(2 * MAX_DISK_BYTES, 1, 0);
   let scope = runtime
@@ -262,7 +258,7 @@ fn disk_transaction_uses_owned_offsets_syncs_reads_back_and_removes_temp_tree() 
     .shutdown(AsyncShutdown::Drain)
     .expect("async shutdown should finish");
   blocking
-    .shutdown(ShutdownMode::Drain)
+    .shutdown()
     .expect("filesystem workers should finish");
   let snapshot = ledger.snapshot();
   assert_eq!(snapshot.managed_memory, 0);

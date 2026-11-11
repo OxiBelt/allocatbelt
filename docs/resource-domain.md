@@ -37,7 +37,14 @@ drop, bounding retained tenant-owner metadata and preventing stale handles
 from reopening a reused generation. Generation exhaustion never wraps.
 
 Runtime builders reserve disjoint shares of the waiter table before starting
-workers. Each admitted task, blocking job or borrowed root call leases one
+workers. Each pool reserves a share of its `max_outstanding`, so a
+tenant-bound driver needs waiter capacity for at least the sum of the
+executor's, the blocking pool's and the I/O adapter pool's
+`max_outstanding`. A table that is too small fails the build; when the I/O
+pool's share is the one refused, the error is `DriverBuildError::IoPool`
+wrapping `DomainError::WaitersFull`. Each adapter
+job's blocking call takes one CPU unit as a blocking closure does. Each
+admitted task, blocking job or borrowed root call leases one
 generation-stamped waiter slot. The share remains reserved while its pool or
 any live waiter retains it. CPU release and CPU soft-limit increases wake
 eligible waiters outside the domain lock. A waiter keeps its FIFO place across

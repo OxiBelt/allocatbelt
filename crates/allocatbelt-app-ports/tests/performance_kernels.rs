@@ -1,9 +1,7 @@
 use allocatbelt::runtime::asynchronous::{AsyncConfig, AsyncRuntime, AsyncShutdown};
 use allocatbelt::runtime::fs::FsHandle;
 use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
-use allocatbelt::runtime::{
-  Config as BlockingConfig, Resources, Runtime as BlockingRuntime, ShutdownMode,
-};
+use allocatbelt::runtime::{Config as BlockingConfig, IoPool, Resources};
 use allocatbelt_app_ports::disk::{self, DiskConfig};
 use allocatbelt_app_ports::memory::{self, MemoryConfig};
 
@@ -75,12 +73,12 @@ fn original_memory_run_still_requires_an_idle_scope_and_checks_replacement() {
 
 #[test]
 fn disk_kernel_runs_concurrently_without_per_operation_global_zero_checks() {
-  let mut blocking = BlockingRuntime::new(BlockingConfig {
+  let mut blocking = IoPool::new(BlockingConfig {
     workers: 4,
     max_outstanding: 8,
     capacity: Resources::ZERO,
   })
-  .expect("blocking runtime should start");
+  .expect("I/O pool should start");
   let runtime = AsyncRuntime::new(AsyncConfig {
     workers: 4,
     max_outstanding: 8,
@@ -180,9 +178,7 @@ fn disk_kernel_runs_concurrently_without_per_operation_global_zero_checks() {
   runtime
     .shutdown(AsyncShutdown::Drain)
     .expect("async runtime should stop");
-  blocking
-    .shutdown(ShutdownMode::Drain)
-    .expect("blocking runtime should stop");
+  blocking.shutdown().expect("I/O pool should stop");
   assert_eq!(ledger.snapshot().managed_memory, 0);
   assert_eq!(ledger.snapshot().disk_ops, 0);
 }

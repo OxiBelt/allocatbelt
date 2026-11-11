@@ -29,6 +29,7 @@ use super::protocol::{PollFinish, PollProtocol};
 use super::task::{DomainCpuAdmission, drop_contained};
 use crate::runtime::blocking::Handle as BlockingHandle;
 use crate::runtime::cpu_execution::{CpuExecutionGuard, active_for_domain};
+use crate::runtime::io_pool::IoPoolHandle;
 use crate::runtime::managed::ResourceScope;
 use crate::runtime::resource_domain::{
   ControlCharge, DomainError, DomainReservation, DomainResource, DomainResources, DomainWaitPool,
@@ -1368,6 +1369,7 @@ pub struct LocalRuntime {
 struct IdleClock {
   timer: TimerHandle,
   blocking: Option<BlockingHandle>,
+  io_pool: Option<IoPoolHandle>,
 }
 
 enum IdleStep {
@@ -1553,9 +1555,20 @@ impl LocalRuntime {
     Arc::clone(&self.core.coordinator)
   }
 
-  pub(crate) fn attach_idle_clock(&mut self, timer: TimerHandle, blocking: Option<BlockingHandle>) {
+  /// Lets the paused-auto clock advance only while both the user blocking
+  /// pool and the I/O adapter pool, when present, have no admitted work.
+  pub(crate) fn attach_idle_clock(
+    &mut self,
+    timer: TimerHandle,
+    blocking: Option<BlockingHandle>,
+    io_pool: Option<IoPoolHandle>,
+  ) {
     debug_assert!(Arc::ptr_eq(&self.core.coordinator, timer.coordinator()));
-    self.idle_clock = Some(IdleClock { timer, blocking });
+    self.idle_clock = Some(IdleClock {
+      timer,
+      blocking,
+      io_pool,
+    });
   }
 
   /// Returns a cross-thread handle that accepts only `Send` futures and
@@ -1759,10 +1772,15 @@ impl LocalRuntime {
       Err(TryRecvError::Disconnected) => return IdleStep::Retry,
       Err(TryRecvError::Empty) => {}
     }
-    let blocking_inhibited = idle_clock.blocking.as_ref().is_some_and(|blocking| {
+    let blocking_busy = idle_clock.blocking.as_ref().is_some_and(|blocking| {
       let snapshot = blocking.snapshot();
       snapshot.outstanding != 0 || snapshot.running != 0
     });
+    let io_pool_busy = idle_clock.io_pool.as_ref().is_some_and(|io_pool| {
+      let snapshot = io_pool.snapshot();
+      snapshot.outstanding != 0 || snapshot.running != 0
+    });
+    let blocking_inhibited = blocking_busy || io_pool_busy;
     match idle_clock
       .timer
       .auto_advance_if_idle(quiescent, blocking_inhibited)

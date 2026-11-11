@@ -6,7 +6,8 @@
 //! readiness guard. They do not start a runtime or a blocking pool.
 //!
 //! Standard endpoint creation and binding are synchronous. `NetHandle::connect`
-//! uses its explicitly supplied blocking runtime; the named nonblocking TCP
+//! and `NetHandle::resolve` run on its explicitly supplied I/O adapter pool
+//! ([`IoPoolHandle`]), never on a user blocking pool; the named nonblocking TCP
 //! connect methods register before initiating one connect syscall and wait on
 //! the explicit reactor. `from_std` takes ownership only on success; a
 //! rejected socket is returned intact. Registering sets `O_NONBLOCK` on the
@@ -50,9 +51,9 @@ use rustix::fs::{self as rfs, OFlags};
 use rustix::io::{Errno, FdFlags};
 use rustix::net::{self as rnet, AddressFamily, SocketFlags, SocketType};
 
-use super::blocking::Handle as BlockingHandle;
 use super::error::{JoinError, SubmitErrorKind};
 use super::io::{AsyncRead, AsyncWrite};
+use super::io_pool::IoPoolHandle;
 use super::managed::{ManagedBuf, OperationPermit, OperationRequest, ResourceError, ResourceScope};
 use super::reactor::{AsyncFd, OwnedReadiness, ReactorHandle, RegisterError};
 #[cfg(test)]
@@ -896,12 +897,12 @@ impl fmt::Display for AcceptError {
 
 impl std::error::Error for AcceptError {}
 
-/// A network operation that uses the explicitly supplied blocking runtime and
+/// A network operation that uses the explicitly supplied I/O adapter pool and
 /// scope. The operation slot is held by its worker closure until the blocking
 /// syscall (including resolver iteration) has actually stopped.
 #[derive(Clone)]
 pub struct NetHandle {
-  blocking: BlockingHandle,
+  io_pool: IoPoolHandle,
   scope: ResourceScope,
   reactor: ReactorHandle,
   max_dns_addresses: usize,
@@ -913,7 +914,7 @@ pub struct NetHandle {
 pub enum NetworkError {
   /// The scope refused the network operation slot.
   Resource(ResourceError),
-  /// The blocking runtime refused the job.
+  /// The I/O pool refused the job.
   Runtime(SubmitErrorKind),
   /// The job was cancelled before it started or panicked.
   Join(JoinError),
@@ -1021,7 +1022,7 @@ pub struct ResolveSubmissionError {
 pub enum ResolveSubmissionKind {
   /// The scope could not reserve output memory or a network operation slot.
   Resource(ResourceError),
-  /// The blocking runtime rejected the request.
+  /// The I/O pool rejected the request.
   Runtime(SubmitErrorKind),
 }
 
@@ -1136,13 +1137,13 @@ impl Iterator for ResolvedAddressesIter<'_> {
 impl ExactSizeIterator for ResolvedAddressesIter<'_> {}
 
 impl NetHandle {
-  /// Uses an existing blocking pool, resource scope, and reactor. DNS output
+  /// Uses an existing I/O adapter pool, resource scope, and reactor. DNS output
   /// is capped at `max_dns_addresses`; one additional observed address is
   /// retained on the explicit overflow error. The bounded result records use
   /// managed storage. The standard resolver's own internal allocations are
   /// platform-controlled and are not accounted here.
   pub fn new(
-    blocking: BlockingHandle,
+    io_pool: IoPoolHandle,
     scope: ResourceScope,
     reactor: ReactorHandle,
     max_dns_addresses: usize,
@@ -1157,21 +1158,21 @@ impl NetHandle {
       ));
     }
     Ok(Self {
-      blocking,
+      io_pool,
       scope,
       reactor,
       max_dns_addresses,
     })
   }
 
-  /// Opens a TCP connection on the supplied blocking pool, then registers it
+  /// Opens a TCP connection on the supplied I/O pool, then registers it
   /// with this handle's reactor. Dropping this future detaches the job; the
   /// network permit remains held until the blocking connect has completed.
   pub async fn connect(&self, address: SocketAddr) -> Result<TcpStream, NetworkError> {
     let permit = self.acquire()?;
     let reactor = self.reactor.clone();
     let job = self
-      .blocking
+      .io_pool
       .try_spawn(Resources::ZERO, move |_token| {
         let _permit = permit;
         let stream = StdTcpStream::connect(address)?;
@@ -1289,7 +1290,7 @@ impl NetHandle {
     Ok(attempt.finish())
   }
 
-  /// Resolves `(host, port)` on the supplied blocking pool and collects no
+  /// Resolves `(host, port)` on the supplied I/O pool and collects no
   /// more than the configured cap plus one address into memory charged to the
   /// resource scope. If rejected before the worker accepts it, the original
   /// hostname and port are returned inside [`ResolveError::Submission`]. The
@@ -1329,7 +1330,7 @@ impl NetHandle {
       permit,
     })));
     let worker_request = Arc::clone(&request);
-    let job = match self.blocking.try_spawn(Resources::ZERO, move |_token| {
+    let job = match self.io_pool.try_spawn(Resources::ZERO, move |_token| {
       let ResolveRequest {
         host,
         port,

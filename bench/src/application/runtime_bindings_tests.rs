@@ -395,7 +395,7 @@ fn calibrated_native_and_tokio_bindings_match_directional_buckets_receipts_and_c
   .disk_rate(rates.disk)
   .upload_rate(rates.upload)
   .download_rate(rates.download)
-  .blocking(allocatbelt::runtime::Config {
+  .io_pool(allocatbelt::runtime::Config {
     workers: 4,
     max_outstanding: 8,
     capacity: allocatbelt::runtime::Resources {

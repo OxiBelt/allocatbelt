@@ -371,18 +371,22 @@ pub async fn run(
 }
 
 #[cfg(test)]
+#[path = "../tests/support/io_gate.rs"]
+mod io_gate;
+
+#[cfg(test)]
 mod tests {
   use std::fs;
   use std::future::Future;
   use std::pin::Pin;
   use std::sync::atomic::{AtomicU64, Ordering};
-  use std::sync::mpsc;
   use std::task::{Context, Poll, Waker};
-  use std::time::Duration;
+
+  use super::io_gate::IoGate;
 
   use allocatbelt::runtime::fs::FsHandle;
   use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
-  use allocatbelt::runtime::{Config, Resources, Runtime, ShutdownMode};
+  use allocatbelt::runtime::{Config, IoPool, Resources};
 
   use super::{MAX_TEMP_DIR_TRIES, TempDir, open_prepared_file, payload_byte};
 
@@ -457,26 +461,14 @@ mod tests {
 
   #[test]
   fn dropping_queued_async_open_cannot_recreate_a_cleaned_temp_path() {
-    let mut runtime = Runtime::new(Config {
+    let mut runtime = IoPool::new(Config {
       workers: 1,
       max_outstanding: 3,
       capacity: Resources::ZERO,
     })
-    .expect("blocking runtime should start");
+    .expect("I/O pool should start");
     let handle = runtime.handle();
-    let (started_tx, started_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    let blocker = handle
-      .try_spawn(Resources::ZERO, move |_| {
-        started_tx.send(()).expect("test receiver remains alive");
-        release_rx
-          .recv_timeout(Duration::from_secs(5))
-          .expect("test should release blocked filesystem worker");
-      })
-      .expect("blocking worker should accept its gate job");
-    started_rx
-      .recv_timeout(Duration::from_secs(5))
-      .expect("gate job should occupy filesystem worker");
+    let blocker = IoGate::occupy(&handle);
 
     let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
@@ -512,16 +504,15 @@ mod tests {
     drop(opening_absent);
     drop(temp);
     assert!(!path.exists());
-    release_tx.send(()).expect("gate job is still waiting");
+    blocker.release();
     runtime
-      .shutdown(ShutdownMode::Drain)
+      .shutdown()
       .expect("queued non-creating open should finish after cleanup");
     assert!(!path.exists());
     assert!(absent_dir_path.is_dir());
     assert!(!absent_file_path.exists());
     drop(absent_temp);
     assert!(!absent_dir_path.exists());
-    blocker.join().expect("gate job should complete normally");
   }
 
   #[test]

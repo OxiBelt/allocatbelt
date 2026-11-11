@@ -146,11 +146,11 @@ fn clone_owner_keeps_meter_registered_and_records_only_committed_bytes() {
 fn actual_file_read_and_positional_write_use_the_configured_bucket() {
   use crate::runtime::fs::{FsHandle, OwnedFile};
   use crate::runtime::managed::{ResourceLimits, ResourceScope};
-  use crate::runtime::{Config, Resources, Runtime, ShutdownMode};
+  use crate::runtime::{Config, IoPool, Resources};
   use std::fs::OpenOptions;
   use std::io::{Seek, SeekFrom};
 
-  let mut runtime = Runtime::new(Config {
+  let mut runtime = IoPool::new(Config {
     workers: 1,
     max_outstanding: 4,
     capacity: Resources::ZERO,
@@ -210,17 +210,17 @@ fn actual_file_read_and_positional_write_use_the_configured_bucket() {
   assert!(scope.snapshot().managed_memory > 0);
   drop(outcome);
   assert_eq!(scope.snapshot().managed_memory, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
 fn configured_copy_charges_both_directions_and_recovers_memory_refusal() {
   use crate::runtime::fs::{FsHandle, FsSubmissionErrorKind};
   use crate::runtime::managed::{ResourceLimits, ResourceScope};
-  use crate::runtime::{Config, Resources, Runtime, ShutdownMode};
+  use crate::runtime::{Config, IoPool, Resources};
   use std::os::unix::fs::PermissionsExt;
 
-  let mut runtime = Runtime::new(Config {
+  let mut runtime = IoPool::new(Config {
     workers: 1,
     max_outstanding: 4,
     capacity: Resources::ZERO,
@@ -281,7 +281,7 @@ fn configured_copy_charges_both_directions_and_recovers_memory_refusal() {
   std::fs::remove_file(source).unwrap();
   std::fs::remove_file(destination).unwrap();
   std::fs::remove_dir(base).unwrap();
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[cfg(unix)]

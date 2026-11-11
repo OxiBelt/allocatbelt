@@ -22,7 +22,7 @@ use allocatbelt::runtime::io::{
 use allocatbelt::runtime::managed::{ManagedBuf, ResourceLimits, ResourceScope};
 use allocatbelt::runtime::reactor::{Reactor, ReactorConfig, ReactorHandle};
 use allocatbelt::runtime::unix_pipe::{PipeReader, PipeWriter};
-use allocatbelt::runtime::{Config, Resources, Runtime, ShutdownMode};
+use allocatbelt::runtime::{Config, IoPool, Resources};
 
 const WAIT: Duration = Duration::from_secs(15);
 const BLOCKING_GATE_WAIT: Duration = Duration::from_secs(10);
@@ -121,13 +121,13 @@ fn resource_scope(memory: usize, disk: usize) -> ResourceScope {
   })
 }
 
-fn blocking_runtime(workers: usize, capacity: Resources) -> Runtime {
-  Runtime::new(Config {
+fn blocking_runtime(workers: usize, capacity: Resources) -> IoPool {
+  IoPool::new(Config {
     workers,
     max_outstanding: 8,
     capacity,
   })
-  .expect("bounded blocking runtime should start")
+  .expect("bounded I/O pool should start")
 }
 
 fn reactor(max_registrations: usize) -> (Reactor, ReactorHandle) {
@@ -276,7 +276,7 @@ fn fifo_admission_rejection_enxio_late_data_and_self_peer_are_explicit() {
   drop(filesystem);
   drop(exhausted);
   runtime
-    .shutdown(ShutdownMode::Drain)
+    .shutdown()
     .expect("all FIFO-open workers should have finished");
   _reactor
     .shutdown()
@@ -378,7 +378,7 @@ fn buffered_fifo_line_resumes_split_utf8_and_capacity_without_replay() {
   assert_eq!(reactor.registrations(), 0);
   assert_eq!(reactor.waiters(), 0);
   runtime
-    .shutdown(ShutdownMode::Drain)
+    .shutdown()
     .expect("FIFO-open workers should be idle");
   _reactor
     .shutdown()
@@ -965,7 +965,7 @@ fn blocking_writer_cancellation_keeps_worker_permit_and_recovers_without_replay(
   drop(writer);
   assert_eq!(resources.snapshot().managed_memory, 0);
   runtime
-    .shutdown(ShutdownMode::Drain)
+    .shutdown()
     .expect("released worker should allow bounded runtime shutdown");
 }
 

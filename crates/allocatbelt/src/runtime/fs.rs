@@ -1,14 +1,17 @@
-//! Bounded, owned filesystem operations for the blocking runtime.
+//! Bounded, owned filesystem operations on the I/O adapter pool.
 //!
 //! Every submitted operation first reserves one disk permit from its
 //! [`ResourceScope`] and then one job slot from the explicitly supplied
-//! blocking [`Handle`]. The permit stays with the queued request or running
+//! [`IoPoolHandle`]. Filesystem jobs queue on that
+//! [`IoPool`](crate::runtime::IoPool), separately from the closures of any
+//! user blocking [`Runtime`](crate::runtime::Runtime), so a user pool's
+//! shutdown does not cancel them. The permit stays with the queued request or running
 //! closure until that request completes or is dropped during cancellation.
 //! Rejected submissions return their input unchanged. Dropping a returned
 //! [`Job`] detaches the operation; cancelling a queued job prevents the
 //! operation from starting.
 //!
-//! Most submitted filesystem operations use `std::fs` on the blocking pool;
+//! Most submitted filesystem operations use `std::fs` on the I/O pool;
 //! named FIFO creation/open uses safe Rustix syscalls to request nonblocking,
 //! close-on-exec descriptors before reactor registration. This module does
 //! not start a runtime or restrict paths. Its recursive walk has
@@ -19,7 +22,7 @@
 //! a managed-buffer copy. Metadata remains outside that byte contract. Direct
 //! standard-library calls bypass it.
 //! Returned standard-library `DirEntry` values can perform further blocking
-//! I/O when their methods are called directly; those calls bypass the pool
+//! I/O when their methods are called directly; those calls bypass the I/O pool
 //! and its disk permits.
 //!
 //! [`OwnedFile`] is deliberately not `Clone`. Each file operation takes
@@ -38,10 +41,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
-use crate::runtime::blocking::Handle;
 #[cfg(not(loom))]
 use crate::runtime::byte_rate::ByteRateLimit;
 use crate::runtime::error::SubmitErrorKind;
+use crate::runtime::io_pool::IoPoolHandle;
 use crate::runtime::job::{CancellationToken, Job};
 use crate::runtime::managed::{
   ManagedBuf, OperationPermit, OperationRequest, ResourceError, ResourceScope,
@@ -97,7 +100,7 @@ pub enum FsSubmissionErrorKind {
   InvalidInput,
   /// The scope could not reserve one disk-operation slot.
   Resource(ResourceError),
-  /// The blocking runtime rejected the job.
+  /// The I/O pool rejected the job.
   Runtime(SubmitErrorKind),
   /// The tenant could not retain the declared request metadata.
   Domain(DomainError),
@@ -231,21 +234,22 @@ pub struct DirectoryEntryOutcome {
   pub entry: io::Result<Option<fs::DirEntry>>,
 }
 
-/// A filesystem front end using an existing blocking pool and resource scope.
+/// A filesystem front end using an existing I/O adapter pool and resource
+/// scope.
 #[derive(Clone)]
 pub struct FsHandle {
-  blocking: Handle,
+  io_pool: IoPoolHandle,
   scope: ResourceScope,
   #[cfg(not(loom))]
   byte_rate: Option<FsRateControl>,
 }
 
 impl FsHandle {
-  /// Uses the explicitly supplied blocking pool and resource ledger.
+  /// Uses the explicitly supplied I/O adapter pool and resource ledger.
   #[must_use]
-  pub fn new(blocking: Handle, scope: ResourceScope) -> Self {
+  pub fn new(io_pool: IoPoolHandle, scope: ResourceScope) -> Self {
     Self {
-      blocking,
+      io_pool,
       scope,
       #[cfg(not(loom))]
       byte_rate: None,
@@ -266,7 +270,7 @@ impl FsHandle {
       None,
     )?;
     Ok(Self {
-      blocking: self.blocking.clone(),
+      io_pool: self.io_pool.clone(),
       scope: self.scope.clone(),
       byte_rate: Some(byte_rate),
     })
@@ -282,7 +286,7 @@ impl FsHandle {
   ) -> Result<Self, DomainError> {
     let byte_rate = FsRateControl::new(bucket, self.scope.tenant_domain(), Some(meter))?;
     Ok(Self {
-      blocking: self.blocking.clone(),
+      io_pool: self.io_pool.clone(),
       scope: self.scope.clone(),
       byte_rate: Some(byte_rate),
     })
@@ -711,7 +715,7 @@ impl FsHandle {
     self.submit((from, to), |(from, to), _token| fs::rename(from, to))
   }
 
-  /// Copies one file using [`std::fs::copy`] semantics on the blocking pool.
+  /// Copies one file using [`std::fs::copy`] semantics on the I/O pool.
   ///
   /// The operation returns the number of bytes copied. It follows symbolic
   /// links for the source, overwrites destination contents, and copies the
@@ -775,7 +779,7 @@ impl FsHandle {
     self.submit(path, |path, _token| fs::read_link(path))
   }
 
-  /// Resolves an absolute canonical path on the blocking pool. The result is
+  /// Resolves an absolute canonical path on the I/O pool. The result is
   /// a snapshot, not a path-security or subsequent-operation guarantee.
   pub fn canonicalize(
     &self,
@@ -875,7 +879,7 @@ impl FsHandle {
       _control: control,
     });
     let worker_request = Arc::clone(&request);
-    match self.blocking.try_spawn(Resources::ZERO, move |token| {
+    match self.io_pool.try_spawn(Resources::ZERO, move |token| {
       let ReservedInput { input, permit } = take_request(&worker_request);
       let result = operation(input, token);
       drop(permit);

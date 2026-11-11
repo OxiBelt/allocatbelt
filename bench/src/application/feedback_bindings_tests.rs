@@ -441,7 +441,7 @@ fn native_pressure_factory_uses_the_owning_driver_feedback_service() {
   .disk_rate(rates.disk)
   .upload_rate(rates.upload)
   .download_rate(rates.download)
-  .blocking(BlockingConfig {
+  .io_pool(BlockingConfig {
     workers: 2,
     max_outstanding: 8,
     capacity: allocatbelt::runtime::Resources {

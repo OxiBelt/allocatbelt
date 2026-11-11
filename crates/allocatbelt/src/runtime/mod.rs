@@ -69,6 +69,16 @@
 //! runtime-controlled waits; they do not promise progress for arbitrary user
 //! locks or channels. Dropping a [`Runtime`] does not join its workers (see
 //! [`Runtime`]).
+//!
+//! # I/O adapter pool
+//!
+//! The asynchronous front ends over blocking calls ([`blocking_io`], [`fs`],
+//! `fs_io` and the connect and name resolution of `net::NetHandle`) submit
+//! their operations to an [`IoPool`], never to a user [`Runtime`], so a user
+//! pool holds only closures its user submitted. The two pools have separate
+//! workers, queues, bounds and shutdowns: cancelling a user pool's queued
+//! jobs leaves adapter operations intact, and the I/O pool's shutdown only
+//! drains. A caller cannot queue its own closure through [`IoPoolHandle`].
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::expect_used, clippy::unwrap_used))]
@@ -100,6 +110,7 @@ pub mod fs;
 #[cfg(not(loom))]
 pub mod fs_io;
 pub mod io;
+mod io_pool;
 mod job;
 pub mod managed;
 #[cfg(all(test, loom))]
@@ -171,6 +182,7 @@ pub use crate::runtime::driver::{
   DriverShutdownError, MultiShutdown, MultiThreadBuilder, MultiThreadDriver, ShutdownProgress,
 };
 pub use crate::runtime::error::{JoinError, SubmitError, SubmitErrorKind};
+pub use crate::runtime::io_pool::{IoPool, IoPoolHandle};
 pub use crate::runtime::job::{CancellationToken, Job};
 pub use crate::runtime::resources::Resources;
 pub use crate::runtime::scheduler::Snapshot;

@@ -1,11 +1,11 @@
 use super::{FifoOpenError, FifoOpenOptions, FsHandle};
 use crate::runtime::JoinError;
-use crate::runtime::blocking::{Config, Runtime, ShutdownMode};
 use crate::runtime::fs::FsSubmissionErrorKind;
 use crate::runtime::io::{AsyncReadExt, AsyncWriteExt};
 use crate::runtime::managed::{ResourceLimits, ResourceScope};
 use crate::runtime::reactor::{Reactor, ReactorConfig};
 use crate::runtime::resources::Resources;
+use crate::runtime::{Config, IoPool};
 use rustix::fs::{OFlags, fcntl_getfl};
 use rustix::io::{FdFlags, fcntl_getfd};
 use std::future::Future;
@@ -73,8 +73,8 @@ fn block_on<F: Future>(future: F) -> F::Output {
   }
 }
 
-fn runtime(workers: usize, max_outstanding: usize) -> Runtime {
-  Runtime::new(Config {
+fn runtime(workers: usize, max_outstanding: usize) -> IoPool {
+  IoPool::new(Config {
     workers,
     max_outstanding,
     capacity: Resources::ZERO,
@@ -171,7 +171,7 @@ fn create_fifo_open_transfer_and_close_writer() {
   block_on(writer.shutdown()).unwrap();
   assert_eq!(block_on(reader.read(&mut bytes)).unwrap(), 0);
   assert_eq!(scope.snapshot().disk_ops, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -214,7 +214,7 @@ fn default_reader_can_receive_data_after_initial_eof() {
 
   block_on(writer.shutdown()).unwrap();
   assert_eq!(block_on(reader.read(&mut bytes)).unwrap(), 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -270,7 +270,7 @@ fn sender_without_reader_reports_enxio_and_linux_read_write_mode_self_peers() {
   assert_eq!(&bytes[..read], b"self-peer");
   drop(writer);
   drop(reader);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -296,7 +296,7 @@ fn invalid_mode_and_disk_rejection_return_the_exact_path_without_creation() {
   assert_eq!(mode, 0o600);
   assert!(!returned.exists());
   assert_eq!(no_disk.snapshot().disk_ops, 0);
-  runtime_initial.shutdown(ShutdownMode::Drain).unwrap();
+  runtime_initial.shutdown().unwrap();
 
   let mut runtime_with_full_queue = runtime(1, 1);
   let (started_tx, started_rx) = mpsc::channel();
@@ -324,9 +324,7 @@ fn invalid_mode_and_disk_rejection_return_the_exact_path_without_creation() {
   assert_eq!(scope.snapshot().disk_ops, 0);
   release_tx.send(()).unwrap();
   blocker.join().unwrap();
-  runtime_with_full_queue
-    .shutdown(ShutdownMode::Drain)
-    .unwrap();
+  runtime_with_full_queue.shutdown().unwrap();
 }
 
 #[test]
@@ -348,34 +346,11 @@ fn queued_create_cancel_and_registration_failure_retain_expected_owners() {
   let filesystem = FsHandle::new(runtime_before_cancel.handle(), queued_scope.clone());
   let job = filesystem.create_fifo(path.clone(), 0o600).unwrap();
   assert_eq!(queued_scope.snapshot().disk_ops, 1);
-  let probe_handle = runtime_before_cancel.handle();
-  let shutdown = thread::spawn(move || {
-    let mut runtime = runtime_before_cancel;
-    runtime.shutdown(ShutdownMode::CancelPending)
-  });
-  let deadline = Instant::now() + TIMEOUT;
-  loop {
-    match probe_handle.try_spawn(Resources::ZERO, |_| ()) {
-      Ok(probe) => {
-        drop(probe);
-        assert!(
-          Instant::now() < deadline,
-          "shutdown did not close admission"
-        );
-      }
-      Err(error) if error.kind == crate::runtime::SubmitErrorKind::Closed => break,
-      Err(error) if error.kind == crate::runtime::SubmitErrorKind::Full => {
-        assert!(
-          Instant::now() < deadline,
-          "shutdown did not cancel queued work"
-        );
-        thread::yield_now();
-      }
-      Err(error) => panic!("unexpected submission failure during shutdown: {error}"),
-    }
-  }
+  // Only the job's own handle cancels it; pool shutdown would drain it.
+  job.cancel();
   release_tx.send(()).unwrap();
-  shutdown.join().unwrap().unwrap();
+  let mut pool_before_cancel = runtime_before_cancel;
+  pool_before_cancel.shutdown().unwrap();
   assert!(matches!(job.join(), Err(JoinError::Cancelled)));
   blocker.join().unwrap();
   assert!(!path.exists());
@@ -433,5 +408,5 @@ fn queued_create_cancel_and_registration_failure_retain_expected_owners() {
     }
     FifoOpenError::Open(error) => panic!("unexpected open error: {error}"),
   }
-  runtime_after_cancel.shutdown(ShutdownMode::Drain).unwrap();
+  runtime_after_cancel.shutdown().unwrap();
 }

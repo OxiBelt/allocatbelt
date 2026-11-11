@@ -407,7 +407,9 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
   let mut feedback_trace;
   let local_limits = domain.local_limits();
   let rate_configs = domain.rate_configs();
-  let blocking_workers = if options.workload == Workload::Mixed {
+  // The I/O pool runs the connector and, in the mixed workload, the
+  // filesystem operations; it keeps the sizing the shared pool had.
+  let io_workers = if options.workload == Workload::Mixed {
     plan.async_workers
   } else {
     1
@@ -419,8 +421,8 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
   })
   .resources(local_limits)
   .resource_domain(domain.tenant())
-  .blocking(BlockingConfig {
-    workers: blocking_workers,
+  .io_pool(BlockingConfig {
+    workers: io_workers,
     max_outstanding: if options.workload == Workload::Mixed {
       TASK_LIMIT
     } else {
@@ -501,37 +503,22 @@ fn run_bounded(options: Options, settings: Settings, plan: ArrivalPlan) -> Resul
   } else {
     None
   };
-  let blocking_handle = async_runtime
-    .blocking()
-    .ok_or_else(|| "owning HTTP runtime omitted its connector pool".to_owned())?;
-  if options.workload == Workload::Mixed {
-    super::disk_lane::warm_native_workers(&blocking_handle, &async_handle, blocking_workers)
-      .map_err(|error| format!("HTTP native blocking worker warm-up failed: {error}"))?;
-  }
+  let io_pool_handle = async_runtime
+    .io_pool()
+    .ok_or_else(|| "owning HTTP runtime omitted its connector I/O pool".to_owned())?;
+  // Starts every I/O worker, the connector's included.
+  super::disk_lane::warm_native_workers(&io_pool_handle, &async_handle, io_workers)
+    .map_err(|error| format!("HTTP native I/O worker warm-up failed: {error}"))?;
   let app_submitter = (options.workload == Workload::Mixed).then(|| super::Submitter::Bounded {
     handle: async_handle.clone(),
     disk: filesystem_handle,
   });
 
-  let warm_job = blocking_handle
-    .try_spawn(Resources::ZERO, |_token| thread::current().id())
-    .map_err(|error| format!("allocatbelt connector warm-up submit failed: {error:?}"))?;
-  let connector_thread = async_handle
-    .block_on(warm_job)
-    .map_err(|error| format!("allocatbelt connector warm-up root failed: {error}"))?
-    .map_err(|error| format!("allocatbelt connector warm-up task failed: {error}"))?;
-  let _connector_worker_started = connector_thread;
-
   let reactor_handle = async_runtime
     .reactor()
     .ok_or_else(|| "owning HTTP runtime omitted its selected reactor".to_owned())?;
-  let net = NetHandle::new(
-    blocking_handle,
-    resources.clone(),
-    reactor_handle.clone(),
-    1,
-  )
-  .map_err(|error| format!("allocatbelt network handle setup failed: {error}"))?;
+  let net = NetHandle::new(io_pool_handle, resources.clone(), reactor_handle.clone(), 1)
+    .map_err(|error| format!("allocatbelt network handle setup failed: {error}"))?;
   let (listener, address) = native_address(&reactor_handle)?;
 
   let (roles_tx, roles_rx) = channel::channel(WINDOW, WINDOW)
@@ -2933,7 +2920,7 @@ mod tests {
     TcpSocket as NativeTcpSocket,
   };
   use allocatbelt::runtime::reactor::{Reactor, ReactorConfig};
-  use allocatbelt::runtime::{Config as BlockingConfig, Resources, Runtime, ShutdownMode};
+  use allocatbelt::runtime::{Config as BlockingConfig, IoPool, Resources};
   use std::future::Future;
   use std::io;
   use std::net::{SocketAddr, TcpListener, TcpStream as StdTcpStream};
@@ -3119,7 +3106,7 @@ mod tests {
     .expect("async runtime");
     let task_scope = async_runtime.scope().expect("task scope");
     let async_handle = task_scope.handle();
-    let mut blocking = Runtime::new(BlockingConfig {
+    let mut blocking = IoPool::new(BlockingConfig {
       workers: 1,
       max_outstanding: 1,
       capacity: Resources::ZERO,
@@ -3195,9 +3182,7 @@ mod tests {
     assert_eq!(reactor.handle().waiters(), 0);
     drop(refusal_socket);
     shutdown_bounded_runtime(async_handle, task_scope, async_runtime);
-    blocking
-      .shutdown(ShutdownMode::Drain)
-      .expect("runtime shutdown");
+    blocking.shutdown().expect("I/O pool shutdown");
   }
 
   #[test]
@@ -3274,7 +3259,7 @@ mod tests {
     .expect("async runtime");
     let task_scope = async_runtime.scope().expect("task scope");
     let async_handle = task_scope.handle();
-    let mut blocking = Runtime::new(BlockingConfig {
+    let mut blocking = IoPool::new(BlockingConfig {
       workers: 1,
       max_outstanding: 1,
       capacity: Resources::ZERO,
@@ -3338,9 +3323,7 @@ mod tests {
     drop(listener);
     assert_eq!(reactor.handle().registrations(), 0);
     shutdown_bounded_runtime(async_handle, task_scope, async_runtime);
-    blocking
-      .shutdown(ShutdownMode::Drain)
-      .expect("runtime shutdown");
+    blocking.shutdown().expect("I/O pool shutdown");
   }
 
   #[test]

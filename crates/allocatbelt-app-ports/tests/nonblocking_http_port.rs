@@ -14,18 +14,16 @@ use allocatbelt::runtime::asynchronous::{
 use allocatbelt::runtime::managed::{OperationRequest, ResourceLimits, ResourceScope};
 use allocatbelt::runtime::reactor::{Reactor, ReactorConfig, ReactorHandle};
 use allocatbelt::runtime::time::{TimeoutError, TimerDriver, TimerError};
-use allocatbelt::runtime::{
-  Config as BlockingConfig, Resources, Runtime as BlockingRuntime, ShutdownMode,
-};
+use allocatbelt::runtime::{Config as BlockingConfig, IoPool, Resources};
 use allocatbelt_app_ports::http::{self, HttpConfig, MAX_BODY_BYTES, MAX_REQUEST_BYTES};
 
-fn blocking_runtime() -> BlockingRuntime {
-  BlockingRuntime::new(BlockingConfig {
+fn blocking_runtime() -> IoPool {
+  IoPool::new(BlockingConfig {
     workers: 1,
     max_outstanding: 2,
     capacity: Resources::ZERO,
   })
-  .expect("blocking runtime should start")
+  .expect("I/O pool should start")
 }
 
 fn async_runtime(max_outstanding: usize) -> AsyncRuntime {
@@ -250,9 +248,7 @@ fn reusable_http_registration_rejection_aborts_server_and_frees_listener_case() 
   runtime
     .shutdown(AsyncShutdown::Drain)
     .expect("async runtime should stop");
-  blocking
-    .shutdown(ShutdownMode::Drain)
-    .expect("blocking runtime should stop");
+  blocking.shutdown().expect("I/O pool should stop");
   reactor.shutdown().expect("reactor should stop");
 }
 
@@ -368,9 +364,7 @@ fn reusable_http_preoccupied_network_admission_is_clean_case() {
   runtime
     .shutdown(AsyncShutdown::Drain)
     .expect("async runtime should stop");
-  blocking
-    .shutdown(ShutdownMode::Drain)
-    .expect("blocking runtime should stop");
+  blocking.shutdown().expect("I/O pool should stop");
   reactor.shutdown().expect("reactor should stop");
 }
 
@@ -408,9 +402,7 @@ fn reusable_http_capacity_one_refuses_two_live_endpoints_case() {
   runtime
     .shutdown(AsyncShutdown::Drain)
     .expect("async runtime should stop");
-  blocking
-    .shutdown(ShutdownMode::Drain)
-    .expect("blocking runtime should stop");
+  blocking.shutdown().expect("I/O pool should stop");
   reactor.shutdown().expect("reactor should stop");
 }
 
@@ -448,9 +440,7 @@ fn reusable_http_rejects_invalid_body_before_listener_registration_case() {
   runtime
     .shutdown(AsyncShutdown::Drain)
     .expect("async runtime should stop");
-  blocking
-    .shutdown(ShutdownMode::Drain)
-    .expect("blocking runtime should stop");
+  blocking.shutdown().expect("I/O pool should stop");
   reactor.shutdown().expect("reactor should stop");
 }
 
@@ -508,9 +498,7 @@ fn reusable_http_full_scope_rejects_server_and_drops_listener_case() {
   runtime
     .shutdown(AsyncShutdown::Drain)
     .expect("async runtime should stop");
-  blocking
-    .shutdown(ShutdownMode::Drain)
-    .expect("blocking runtime should stop");
+  blocking.shutdown().expect("I/O pool should stop");
   reactor.shutdown().expect("reactor should stop");
 }
 
@@ -589,9 +577,7 @@ fn reusable_http_cancellation_after_connect_admission_reclaims_server_task_case(
   runtime
     .shutdown(AsyncShutdown::Drain)
     .expect("async runtime should stop");
-  blocking
-    .shutdown(ShutdownMode::Drain)
-    .expect("blocking runtime should stop");
+  blocking.shutdown().expect("I/O pool should stop");
   reactor.shutdown().expect("reactor should stop");
 }
 
@@ -640,9 +626,7 @@ fn reusable_http_timer_full_refuses_before_listener_or_task_admission_case() {
   runtime
     .shutdown(AsyncShutdown::Drain)
     .expect("async runtime should stop");
-  blocking
-    .shutdown(ShutdownMode::Drain)
-    .expect("blocking runtime should stop");
+  blocking.shutdown().expect("I/O pool should stop");
   reactor.shutdown().expect("reactor should stop");
 }
 
@@ -713,9 +697,7 @@ fn reusable_http_timeout_cleans_admitted_transaction_case() {
   runtime
     .shutdown(AsyncShutdown::Drain)
     .expect("async runtime should stop");
-  blocking
-    .shutdown(ShutdownMode::Drain)
-    .expect("blocking runtime should stop");
+  blocking.shutdown().expect("I/O pool should stop");
   reactor.shutdown().expect("reactor should stop");
 }
 
@@ -779,9 +761,7 @@ fn reusable_http_timeout_preserves_timer_closed_error_case() {
   runtime
     .shutdown(AsyncShutdown::Drain)
     .expect("async runtime should stop");
-  blocking
-    .shutdown(ShutdownMode::Drain)
-    .expect("blocking runtime should stop");
+  blocking.shutdown().expect("I/O pool should stop");
   reactor.shutdown().expect("reactor should stop");
 }
 

@@ -1,7 +1,7 @@
 use super::*;
-use crate::runtime::blocking::{Config, Runtime, ShutdownMode};
 use crate::runtime::io::{AsyncReadExt, AsyncWriteExt};
 use crate::runtime::managed::{ResourceLimits, ResourceScope};
+use crate::runtime::{Config, IoPool};
 use std::cell::Cell;
 use std::future::Future;
 use std::io::{Cursor, Read, Write};
@@ -14,8 +14,8 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn runtime(workers: usize, max_outstanding: usize) -> Runtime {
-  Runtime::new(Config {
+fn runtime(workers: usize, max_outstanding: usize) -> IoPool {
+  IoPool::new(Config {
     workers,
     max_outstanding,
     capacity: Resources {
@@ -102,7 +102,7 @@ impl Drop for ReleaseGate {
   }
 }
 
-fn block_worker(runtime: &Runtime) -> (Job<()>, Receiver<()>, Arc<Gate>, ReleaseGate) {
+fn block_worker(runtime: &IoPool) -> (Job<()>, Receiver<()>, Arc<Gate>, ReleaseGate) {
   let gate = Arc::new(Gate::default());
   let (started_tx, started_rx) = mpsc::channel();
   let worker_gate = Arc::clone(&gate);
@@ -261,7 +261,7 @@ fn read_ahead_survives_cancelled_borrow_and_later_buffer_size() {
   assert_eq!(scope.snapshot().managed_memory, 4);
   drop(reader);
   assert_eq!(scope.snapshot().managed_memory, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -284,7 +284,7 @@ fn reader_supports_send_non_sync_non_unpin_streams() {
     6
   );
   assert_eq!(&output, b"pinned");
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -321,7 +321,7 @@ fn constructor_rejection_returns_original_stream_and_buffer() {
   let (_writer, returned) = rejected.into_parts();
   assert_eq!(returned.len(), 8);
   drop(other);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -356,7 +356,7 @@ fn writer_retries_interrupted_and_drains_partial_suffix_before_flush() {
       .kind(),
     ErrorKind::BrokenPipe
   );
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -381,7 +381,7 @@ fn partial_write_error_preserves_suffix_without_replaying_committed_bytes() {
   assert_eq!(state.lock().unwrap().bytes, b"ab");
   block_on(AsyncWriteExt::flush(&mut writer)).unwrap();
   assert_eq!(state.lock().unwrap().bytes, b"abcd");
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -410,7 +410,7 @@ fn admission_rejection_accepts_no_write_bytes_and_can_be_retried() {
   );
   block_on(AsyncWriteExt::flush(&mut writer)).unwrap();
   assert_eq!(state.lock().unwrap().bytes, b"data");
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -445,11 +445,11 @@ fn cancelled_borrow_does_not_credit_an_old_write_to_new_input() {
   block_on(AsyncWriteExt::write_all(&mut writer, b"c")).unwrap();
   block_on(AsyncWriteExt::flush(&mut writer)).unwrap();
   assert_eq!(state.lock().unwrap().bytes, b"ac");
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
-fn queued_cancel_pending_makes_endpoint_terminal_and_releases_buffer() {
+fn io_pool_shutdown_drains_queued_endpoint_operation_without_cancelling_it() {
   let mut runtime = runtime(1, 3);
   let (blocker, blocker_started, gate, _release) = block_worker(&runtime);
   started(&blocker_started);
@@ -469,30 +469,31 @@ fn queued_cancel_pending_makes_endpoint_terminal_and_releases_buffer() {
   assert_eq!(scope.snapshot().managed_memory, 4);
 
   let handle = runtime.handle();
-  let shutdown = thread::spawn(move || runtime.shutdown(ShutdownMode::CancelPending));
+  let shutdown = thread::spawn(move || runtime.shutdown());
   let deadline = Instant::now() + Duration::from_secs(5);
   while !handle.snapshot().closed {
-    assert!(Instant::now() < deadline, "runtime did not begin shutdown");
+    assert!(Instant::now() < deadline, "I/O pool did not begin shutdown");
     thread::sleep(Duration::from_millis(5));
   }
-  while scope.snapshot().managed_memory != 0 {
-    assert!(
-      Instant::now() < deadline,
-      "queued adapter input was not cancelled"
-    );
-    thread::sleep(Duration::from_millis(5));
-  }
+  // The queued write keeps its stream and buffer while shutdown waits.
+  assert_eq!(handle.snapshot().queued, 1);
+  assert_eq!(scope.snapshot().managed_memory, 4);
   gate.release();
   shutdown.join().unwrap().unwrap();
   assert_eq!(blocker.join().unwrap(), ());
-  assert_eq!(scope.snapshot().managed_memory, 0);
+  assert_eq!(state.lock().unwrap().bytes, b"data");
+  // The write ran; a later operation sees the closed pool as terminal.
+  let error = block_on(AsyncWriteExt::flush(&mut writer)).unwrap_err();
+  assert_eq!(error.kind(), ErrorKind::BrokenPipe);
   assert_eq!(
-    block_on(AsyncWriteExt::flush(&mut writer))
-      .unwrap_err()
-      .kind(),
-    ErrorKind::BrokenPipe
+    error
+      .get_ref()
+      .and_then(|source| source.downcast_ref::<BlockingIoError>())
+      .map(BlockingIoError::kind),
+    Some(BlockingIoErrorKind::Submission(SubmitErrorKind::Closed))
   );
-  assert!(state.lock().unwrap().bytes.is_empty());
+  drop(writer);
+  assert_eq!(scope.snapshot().managed_memory, 0);
 }
 
 #[test]
@@ -527,7 +528,7 @@ fn dropping_endpoint_retains_managed_buffer_until_running_call_finishes() {
     assert!(Instant::now() < deadline, "managed buffer charge leaked");
     thread::sleep(Duration::from_millis(5));
   }
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -539,7 +540,7 @@ fn stdio_constructors_wrap_global_handles_without_reading_stdin() {
   let error = stderr_writer(runtime.handle(), Resources::ZERO, managed(&scope, 1)).unwrap();
   drop((input, output, error));
   assert_eq!(scope.snapshot().managed_memory, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -579,7 +580,7 @@ fn reader_retries_only_the_bounded_interrupted_budget() {
     1
   );
   assert_eq!(output, [b'z']);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -631,7 +632,7 @@ fn exhausted_runtime_coop_budget_does_not_accept_or_submit_a_write() {
   asynchronous.block_on(task).unwrap().unwrap().unwrap();
   assert_eq!(state.lock().unwrap().bytes, b"x");
   asynchronous.shutdown(AsyncShutdown::Drain).unwrap();
-  blocking.shutdown(ShutdownMode::Drain).unwrap();
+  blocking.shutdown().unwrap();
 }
 
 #[test]
@@ -693,7 +694,7 @@ fn invalid_stream_counts_become_errors_and_preserve_writer_suffix() {
   drop((reader, writer));
   assert_eq!(read_scope.snapshot().managed_memory, 0);
   assert_eq!(write_scope.snapshot().managed_memory, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -752,7 +753,7 @@ fn panicking_stream_job_becomes_terminal_and_releases_managed_buffer() {
       .kind(),
     ErrorKind::BrokenPipe
   );
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -804,7 +805,7 @@ fn operation_panic_survives_panicking_stream_drop() {
   assert_eq!(kind, Some(BlockingIoErrorKind::Panicked));
   assert!(dropped.load(Ordering::SeqCst));
   assert_eq!(scope.snapshot().managed_memory, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -836,7 +837,7 @@ fn invalid_declared_resources_reject_before_write_acceptance() {
   );
   assert!(state.lock().unwrap().bytes.is_empty());
   assert_eq!(scope.snapshot().managed_memory, 2);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -860,5 +861,5 @@ fn unix_stream_peer_receives_only_flushed_accepted_bytes() {
   peer.read_exact(&mut received).unwrap();
   assert_eq!(&received, b"pipe-data");
   drop(writer);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }

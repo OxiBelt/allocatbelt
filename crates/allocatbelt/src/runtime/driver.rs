@@ -81,6 +81,7 @@ use super::resource_feedback_policy::FeedbackResource;
 use super::signal::{SignalDriver, SignalError};
 use super::time::{ClockMode, IdleCoordinator, TimerDriver, TimerError, TimerHandle};
 use super::{Config as BlockingConfig, Handle as BlockingHandle, Runtime as BlockingRuntime};
+use super::{IoPool, IoPoolHandle};
 
 /// A successful shutdown request is still waiting for some owned work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +111,8 @@ pub enum DriverShutdownError {
   Async(AsyncError),
   /// A blocking worker or cleanup step failed.
   Blocking(io::ErrorKind),
+  /// An I/O adapter pool worker or cleanup step failed.
+  IoPool(io::ErrorKind),
   /// Process reaping or its private reactor failed.
   Process(ProcessShutdownError),
   /// Timer service or close worker failed.
@@ -132,6 +135,7 @@ impl DriverShutdownError {
       Self::CloseThread(_)
         | Self::Async(AsyncError::JoinMonitorSpawnFailed)
         | Self::Blocking(io::ErrorKind::WouldBlock)
+        | Self::IoPool(io::ErrorKind::WouldBlock)
         | Self::Process(ProcessShutdownError::JoinMonitorSpawn)
         | Self::Timer(TimerError::JoinMonitorSpawn)
         | Self::Reactor(ReactorError::JoinMonitorSpawn)
@@ -159,6 +163,7 @@ impl fmt::Display for DriverShutdownError {
       Self::Local(error) => error.fmt(f),
       Self::Async(error) => error.fmt(f),
       Self::Blocking(kind) => write!(f, "blocking shutdown failed: {kind}"),
+      Self::IoPool(kind) => write!(f, "I/O pool shutdown failed: {kind}"),
       Self::Process(error) => error.fmt(f),
       Self::Timer(error) => error.fmt(f),
       Self::Reactor(error) => error.fmt(f),
@@ -176,14 +181,16 @@ impl std::error::Error for DriverShutdownError {}
 pub enum DriverBuildError {
   /// One or more requested bounds are zero, out of range, or overflow.
   InvalidConfiguration(&'static str),
-  /// Filesystem services require an owned blocking pool.
-  FilesystemNeedsBlocking,
+  /// Filesystem services require an owned I/O adapter pool.
+  FilesystemNeedsIoPool,
   /// Local executor storage could not be reserved.
   Local(LocalError),
   /// Async executor storage or thread startup failed.
   Async(AsyncError),
   /// Blocking pool construction failed.
   Blocking(io::Error),
+  /// I/O adapter pool construction failed.
+  IoPool(io::Error),
   /// Timer construction failed.
   Timer(TimerError),
   /// Reactor construction failed.
@@ -206,12 +213,13 @@ impl fmt::Display for DriverBuildError {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
       Self::InvalidConfiguration(reason) => write!(f, "invalid runtime configuration: {reason}"),
-      Self::FilesystemNeedsBlocking => {
-        f.write_str("filesystem services require a configured blocking pool")
+      Self::FilesystemNeedsIoPool => {
+        f.write_str("filesystem services require a configured I/O pool")
       }
       Self::Local(error) => error.fmt(f),
       Self::Async(error) => error.fmt(f),
       Self::Blocking(error) => write!(f, "blocking pool construction failed: {error}"),
+      Self::IoPool(error) => write!(f, "I/O pool construction failed: {error}"),
       Self::Timer(error) => error.fmt(f),
       Self::Reactor(error) => write!(f, "reactor construction failed: {error}"),
       Self::Process(error) => error.fmt(f),
@@ -229,7 +237,7 @@ impl std::error::Error for DriverBuildError {
     match self {
       Self::Local(error) => Some(error),
       Self::Async(error) => Some(error),
-      Self::Blocking(error) | Self::Reactor(error) => Some(error),
+      Self::Blocking(error) | Self::IoPool(error) | Self::Reactor(error) => Some(error),
       Self::Process(error) => Some(error),
       Self::Signal(error) => Some(error),
       Self::Timer(error) => Some(error),
@@ -237,7 +245,7 @@ impl std::error::Error for DriverBuildError {
       Self::ResourceDomain(error) => Some(error),
       #[cfg(feature = "resource-feedback")]
       Self::Feedback(error) => Some(error),
-      Self::InvalidConfiguration(_) | Self::FilesystemNeedsBlocking => None,
+      Self::InvalidConfiguration(_) | Self::FilesystemNeedsIoPool => None,
     }
   }
 }
@@ -482,6 +490,7 @@ struct ServiceOptions {
   rate_timer_registrations: Option<usize>,
   reactor: Option<ReactorConfig>,
   blocking: Option<BlockingConfig>,
+  io_pool: Option<BlockingConfig>,
   filesystem: bool,
   process_children: Option<usize>,
   signal_listeners: Option<usize>,
@@ -531,6 +540,11 @@ impl ServiceOptions {
         .ok_or(DriverBuildError::InvalidConfiguration(
           "blocking metadata exceeds its facade",
         ))?;
+    }
+    if self.io_pool.is_some() {
+      bytes = bytes.checked_sub(std::mem::size_of::<IoPool>()).ok_or(
+        DriverBuildError::InvalidConfiguration("I/O pool metadata exceeds its facade"),
+      )?;
     }
     if tenant.is_some() {
       if self.reactor.is_some() {
@@ -611,8 +625,15 @@ impl ServiceOptions {
         "blocking workers and outstanding capacity must be nonzero",
       ));
     }
-    if self.filesystem && self.blocking.is_none() {
-      return Err(DriverBuildError::FilesystemNeedsBlocking);
+    if let Some(config) = self.io_pool
+      && (config.workers == 0 || config.max_outstanding == 0)
+    {
+      return Err(DriverBuildError::InvalidConfiguration(
+        "I/O pool workers and outstanding capacity must be nonzero",
+      ));
+    }
+    if self.filesystem && self.io_pool.is_none() {
+      return Err(DriverBuildError::FilesystemNeedsIoPool);
     }
     if self
       .process_children
@@ -709,6 +730,10 @@ impl ServiceOptions {
           .map_err(DriverBuildError::Blocking)?,
       );
     }
+    if let Some(config) = self.io_pool {
+      startup.io_pool =
+        Some(IoPool::with_resources(config, resources.clone()).map_err(DriverBuildError::IoPool)?);
+    }
     if let Some(max_registered) = self.timer_registrations {
       startup.timer = Some(
         TimerDriver::new_for_runtime(
@@ -749,11 +774,11 @@ impl ServiceOptions {
       );
     }
     let filesystem = if self.filesystem {
-      let blocking = startup
-        .blocking
+      let io_pool = startup
+        .io_pool
         .as_ref()
-        .ok_or(DriverBuildError::FilesystemNeedsBlocking)?;
-      Some(FsHandle::new(blocking.handle(), resources.clone()))
+        .ok_or(DriverBuildError::FilesystemNeedsIoPool)?;
+      Some(FsHandle::new(io_pool.handle(), resources.clone()))
     } else {
       None
     };
@@ -882,14 +907,34 @@ macro_rules! service_builder_methods {
         self
       }
 
-      /// Selects the blocking worker pool used by blocking jobs and optional
-      /// filesystem operations.
+      /// Selects the blocking worker pool that runs caller closures. Adapter
+      /// operations never run on it; see [`Self::io_pool`].
       pub fn blocking(mut self, config: BlockingConfig) -> Self {
         self.services.blocking = Some(config);
         self
       }
 
-      /// Adds the filesystem front end. A blocking pool must also be selected.
+      /// Selects the I/O adapter pool: a fixed set of workers and its own
+      /// queue for the filesystem front end, the blocking stream adapters
+      /// and network connect and name resolution, separate from the
+      /// blocking pool. It shuts down in its own step, after the blocking
+      /// pool's step has completed and before child processes. That step
+      /// always drains: admitted adapter operations finish, so a stream
+      /// blocked in a read (such as stdin) keeps shutdown pending until the
+      /// read returns.
+      ///
+      /// With a `resource_domain`, the pool reserves a waiter share of its
+      /// `max_outstanding` in addition to the executor's and the blocking
+      /// pool's, so the domain's waiter table must hold their sum; a table
+      /// that is too small fails the build with `DriverBuildError::IoPool`
+      /// wrapping `DomainError::WaitersFull`.
+      pub fn io_pool(mut self, config: BlockingConfig) -> Self {
+        self.services.io_pool = Some(config);
+        self
+      }
+
+      /// Adds the filesystem front end. An I/O pool must also be selected
+      /// with [`Self::io_pool`].
       pub fn filesystem(mut self) -> Self {
         self.services.filesystem = true;
         self
@@ -990,6 +1035,7 @@ impl CurrentThreadBuilder {
         rate_timer_registrations: None,
         reactor: None,
         blocking: None,
+        io_pool: None,
         filesystem: false,
         process_children: None,
         signal_listeners: None,
@@ -1083,11 +1129,15 @@ impl CurrentThreadBuilder {
     self.services.start_signal(&mut startup)?;
     if let Some(timer) = startup.timer.as_ref().map(TimerDriver::handle) {
       let blocking_handle = startup.blocking.as_ref().map(BlockingRuntime::handle);
+      let io_pool_handle = startup.io_pool.as_ref().map(IoPool::handle);
       if let Some(blocking) = startup.blocking.as_mut() {
         blocking.bind_clock(timer.clone());
       }
+      if let Some(io_pool) = startup.io_pool.as_mut() {
+        io_pool.bind_clock(timer.clone());
+      }
       if let Some(local) = startup.local.as_mut() {
-        local.attach_idle_clock(timer, blocking_handle);
+        local.attach_idle_clock(timer, blocking_handle, io_pool_handle);
       }
     }
     Ok(CurrentThreadDriver {
@@ -1097,6 +1147,7 @@ impl CurrentThreadBuilder {
       rate_timer: startup.rate_timer.take(),
       reactor: startup.reactor.take(),
       blocking: startup.blocking.take(),
+      io_pool: startup.io_pool.take(),
       filesystem,
       process: startup.process.take(),
       signal: startup.signal.take(),
@@ -1112,6 +1163,7 @@ impl CurrentThreadBuilder {
       shutdown: None,
       shutdown_failure: None,
       blocking_shutdown_requested: false,
+      io_pool_shutdown_requested: false,
       process_shutdown_requested: false,
       io_shutdown_requested: false,
       _control: owner_control,
@@ -1152,6 +1204,7 @@ impl MultiThreadBuilder {
         rate_timer_registrations: None,
         reactor: None,
         blocking: None,
+        io_pool: None,
         filesystem: false,
         process_children: None,
         signal_listeners: None,
@@ -1279,10 +1332,13 @@ impl MultiThreadBuilder {
       &mut owner_control,
     )?;
     self.services.start_signal(&mut startup)?;
-    if let Some(timer) = startup.timer.as_ref().map(TimerDriver::handle)
-      && let Some(blocking) = startup.blocking.as_mut()
-    {
-      blocking.bind_clock(timer);
+    if let Some(timer) = startup.timer.as_ref().map(TimerDriver::handle) {
+      if let Some(blocking) = startup.blocking.as_mut() {
+        blocking.bind_clock(timer.clone());
+      }
+      if let Some(io_pool) = startup.io_pool.as_mut() {
+        io_pool.bind_clock(timer);
+      }
     }
     Ok(MultiThreadDriver {
       asynchronous: startup
@@ -1294,6 +1350,7 @@ impl MultiThreadBuilder {
       rate_timer: startup.rate_timer.take(),
       reactor: startup.reactor.take(),
       blocking: startup.blocking.take(),
+      io_pool: startup.io_pool.take(),
       filesystem,
       process: startup.process.take(),
       signal: startup.signal.take(),
@@ -1309,6 +1366,7 @@ impl MultiThreadBuilder {
       shutdown: None,
       shutdown_failure: None,
       blocking_shutdown_requested: false,
+      io_pool_shutdown_requested: false,
       process_shutdown_requested: false,
       io_shutdown_requested: false,
       _control: owner_control,
@@ -1323,6 +1381,7 @@ struct StartupGuard {
   local: Option<LocalRuntime>,
   asynchronous: Option<AsyncRuntime>,
   blocking: Option<BlockingRuntime>,
+  io_pool: Option<IoPool>,
   timer: Option<TimerDriver>,
   rate_timer: Option<TimerDriver>,
   reactor: Option<Reactor>,
@@ -1361,6 +1420,9 @@ impl Drop for StartupGuard {
     if let Some(blocking) = self.blocking.as_mut() {
       let _ = blocking.shutdown(ShutdownMode::CancelPending);
     }
+    if let Some(io_pool) = self.io_pool.as_mut() {
+      let _ = io_pool.shutdown();
+    }
     if let Some(asynchronous) = self.asynchronous.take() {
       let _ = asynchronous.shutdown(AsyncShutdown::CancelPending);
     }
@@ -1378,6 +1440,7 @@ pub struct CurrentThreadDriver {
   rate_timer: Option<TimerDriver>,
   reactor: Option<Reactor>,
   blocking: Option<BlockingRuntime>,
+  io_pool: Option<IoPool>,
   filesystem: Option<FsHandle>,
   process: Option<ProcessDriver>,
   signal: Option<SignalDriver>,
@@ -1393,6 +1456,7 @@ pub struct CurrentThreadDriver {
   shutdown: Option<CurrentShutdown>,
   shutdown_failure: Option<DriverShutdownError>,
   blocking_shutdown_requested: bool,
+  io_pool_shutdown_requested: bool,
   process_shutdown_requested: bool,
   io_shutdown_requested: bool,
   _control: ControlCharge,
@@ -1457,7 +1521,15 @@ impl CurrentThreadDriver {
     self.blocking.as_ref().map(BlockingRuntime::handle)
   }
 
-  /// The filesystem front end over this runtime's blocking pool and ledger.
+  /// A handle to the selected I/O adapter pool, if present, for building
+  /// blocking stream adapters. A caller cannot queue its own closure
+  /// through it.
+  #[must_use]
+  pub fn io_pool(&self) -> Option<IoPoolHandle> {
+    self.io_pool.as_ref().map(IoPool::handle)
+  }
+
+  /// The filesystem front end over this runtime's I/O pool and ledger.
   #[must_use]
   pub fn filesystem(&self) -> Option<FsHandle> {
     self.filesystem.clone()
@@ -1595,8 +1667,9 @@ impl CurrentThreadDriver {
 
   /// Closes local admission and requests cancellation according to `policy`.
   /// Supporting services remain open while owner-thread future cleanup,
-  /// blocking work and child reaping finish. Repeating the same request is
-  /// safe; a different policy is rejected.
+  /// blocking work, I/O adapter work and child reaping finish, in that
+  /// order. Repeating the same request is safe; a different policy is
+  /// rejected.
   pub fn request_shutdown(&mut self, policy: CurrentShutdown) -> Result<(), DriverShutdownError> {
     if self.shutdown.is_some_and(|current| current != policy) {
       return Err(DriverShutdownError::PolicyAlreadyFixed);
@@ -1623,6 +1696,21 @@ impl CurrentThreadDriver {
         .map_err(|error| DriverShutdownError::Blocking(error.kind()))?;
     }
     self.blocking_shutdown_requested = true;
+    Ok(())
+  }
+
+  /// The I/O pool's own shutdown step, separate from the blocking pool's.
+  /// It always drains: admitted adapter operations are never discarded.
+  fn request_io_pool_shutdown(&mut self) -> Result<(), DriverShutdownError> {
+    if self.io_pool_shutdown_requested {
+      return Ok(());
+    }
+    if let Some(io_pool) = self.io_pool.as_mut() {
+      io_pool
+        .request_shutdown()
+        .map_err(|error| DriverShutdownError::IoPool(error.kind()))?;
+    }
+    self.io_pool_shutdown_requested = true;
     Ok(())
   }
 
@@ -1696,8 +1784,24 @@ impl CurrentThreadDriver {
       }
     }
 
-    let mut process_complete = false;
+    let mut io_pool_complete = false;
     if blocking_complete && feedback_complete {
+      self.request_io_pool_shutdown()?;
+      if let Some(io_pool) = self.io_pool.as_mut() {
+        match io_pool.poll_shutdown() {
+          Ok(done) => io_pool_complete = done,
+          Err(error) => {
+            failure.get_or_insert(DriverShutdownError::IoPool(error.kind()));
+            io_pool_complete = io_pool.shutdown_complete();
+          }
+        }
+      } else {
+        io_pool_complete = true;
+      }
+    }
+
+    let mut process_complete = false;
+    if io_pool_complete && feedback_complete {
       if let Some(policy) = self.shutdown {
         self.request_process_shutdown(policy)?;
       }
@@ -1749,8 +1853,12 @@ impl CurrentThreadDriver {
     if let Some(error) = self.shutdown_failure {
       return Err(error);
     }
-    let complete =
-      local_complete && blocking_complete && process_complete && io_complete && feedback_complete;
+    let complete = local_complete
+      && blocking_complete
+      && io_pool_complete
+      && process_complete
+      && io_complete
+      && feedback_complete;
     Ok(if complete {
       ShutdownProgress::Complete
     } else {
@@ -1758,9 +1866,11 @@ impl CurrentThreadDriver {
     })
   }
 
-  /// Runs one owner-thread task cleanup and one blocking-pool cleanup step,
-  /// then checks all services. Local future destructors and queued job
-  /// captures can take unbounded time while this explicit method runs.
+  /// Runs one owner-thread task cleanup and drops at most one queued job of
+  /// the user blocking pool, then checks all services. That check advances
+  /// the I/O pool's draining step once it has been requested; it never
+  /// discards an I/O pool operation. Local future destructors and queued
+  /// job captures can take unbounded time while this explicit method runs.
   pub fn drive_shutdown_step(&mut self) -> Result<ShutdownProgress, DriverShutdownError> {
     if self.shutdown.is_none() {
       return Err(DriverShutdownError::NotRequested);
@@ -1792,6 +1902,7 @@ pub struct MultiThreadDriver {
   rate_timer: Option<TimerDriver>,
   reactor: Option<Reactor>,
   blocking: Option<BlockingRuntime>,
+  io_pool: Option<IoPool>,
   filesystem: Option<FsHandle>,
   process: Option<ProcessDriver>,
   signal: Option<SignalDriver>,
@@ -1807,6 +1918,7 @@ pub struct MultiThreadDriver {
   shutdown: Option<MultiShutdown>,
   shutdown_failure: Option<DriverShutdownError>,
   blocking_shutdown_requested: bool,
+  io_pool_shutdown_requested: bool,
   process_shutdown_requested: bool,
   io_shutdown_requested: bool,
   _control: ControlCharge,
@@ -1859,7 +1971,15 @@ impl MultiThreadDriver {
     self.blocking.as_ref().map(BlockingRuntime::handle)
   }
 
-  /// The filesystem front end over this runtime's blocking pool and ledger.
+  /// A handle to the selected I/O adapter pool, if present, for building
+  /// blocking stream adapters. A caller cannot queue its own closure
+  /// through it.
+  #[must_use]
+  pub fn io_pool(&self) -> Option<IoPoolHandle> {
+    self.io_pool.as_ref().map(IoPool::handle)
+  }
+
+  /// The filesystem front end over this runtime's I/O pool and ledger.
   #[must_use]
   pub fn filesystem(&self) -> Option<FsHandle> {
     self.filesystem.clone()
@@ -1995,10 +2115,11 @@ impl MultiThreadDriver {
       .map(|feedback| feedback.request_reconcile(resource))
   }
 
-  /// Closes executor admission. Blocking jobs continue first, then managed
-  /// children are reaped, and timer/reactor services close only after both
-  /// stages finish. This keeps dependencies available to already-admitted
-  /// async work and its completion chain.
+  /// Closes executor admission. Blocking jobs continue first, then the I/O
+  /// adapter pool drains in its own step, then managed children are reaped,
+  /// and timer/reactor services close only after those stages finish. This
+  /// keeps dependencies available to already-admitted async work, blocking
+  /// closures that use adapters, and their completion chain.
   pub fn request_shutdown(&mut self, policy: MultiShutdown) -> Result<(), DriverShutdownError> {
     if self.shutdown.is_some_and(|current| current != policy) {
       return Err(DriverShutdownError::PolicyAlreadyFixed);
@@ -2025,6 +2146,21 @@ impl MultiThreadDriver {
         .map_err(|error| DriverShutdownError::Blocking(error.kind()))?;
     }
     self.blocking_shutdown_requested = true;
+    Ok(())
+  }
+
+  /// The I/O pool's own shutdown step, separate from the blocking pool's.
+  /// It always drains: admitted adapter operations are never discarded.
+  fn request_io_pool_shutdown(&mut self) -> Result<(), DriverShutdownError> {
+    if self.io_pool_shutdown_requested {
+      return Ok(());
+    }
+    if let Some(io_pool) = self.io_pool.as_mut() {
+      io_pool
+        .request_shutdown()
+        .map_err(|error| DriverShutdownError::IoPool(error.kind()))?;
+    }
+    self.io_pool_shutdown_requested = true;
     Ok(())
   }
 
@@ -2097,8 +2233,24 @@ impl MultiThreadDriver {
       }
     }
 
-    let mut process_complete = false;
+    let mut io_pool_complete = false;
     if blocking_complete && feedback_complete {
+      self.request_io_pool_shutdown()?;
+      if let Some(io_pool) = self.io_pool.as_mut() {
+        match io_pool.poll_shutdown() {
+          Ok(done) => io_pool_complete = done,
+          Err(error) => {
+            failure.get_or_insert(DriverShutdownError::IoPool(error.kind()));
+            io_pool_complete = io_pool.shutdown_complete();
+          }
+        }
+      } else {
+        io_pool_complete = true;
+      }
+    }
+
+    let mut process_complete = false;
+    if io_pool_complete && feedback_complete {
       if let Some(policy) = self.shutdown {
         self.request_process_shutdown(policy)?;
       }
@@ -2150,8 +2302,12 @@ impl MultiThreadDriver {
     if let Some(error) = self.shutdown_failure {
       return Err(error);
     }
-    let complete =
-      async_complete && blocking_complete && process_complete && io_complete && feedback_complete;
+    let complete = async_complete
+      && blocking_complete
+      && io_pool_complete
+      && process_complete
+      && io_complete
+      && feedback_complete;
     Ok(if complete {
       ShutdownProgress::Complete
     } else {
@@ -2159,9 +2315,11 @@ impl MultiThreadDriver {
     })
   }
 
-  /// Drops at most one queued blocking job, then checks all services. A job
-  /// capture's destructor can take unbounded time while this explicit cleanup
-  /// step runs.
+  /// Drops at most one queued job of the user blocking pool, then checks all
+  /// services. That check advances the I/O pool's draining step once it has
+  /// been requested; it never discards an I/O pool operation. A job capture's
+  /// destructor can take unbounded time while this explicit cleanup step
+  /// runs.
   pub fn drive_shutdown_step(&mut self) -> Result<ShutdownProgress, DriverShutdownError> {
     if self.shutdown.is_none() {
       return Err(DriverShutdownError::NotRequested);
@@ -2944,7 +3102,7 @@ mod tests {
     std::fs::write(&path, b"drain").unwrap_or_else(|error| panic!("fixture write failed: {error}"));
     let mut driver = MultiThreadBuilder::new(async_config())
       .resources(limits(16))
-      .blocking(BlockingConfig {
+      .io_pool(BlockingConfig {
         workers: 1,
         max_outstanding: 4,
         capacity: Resources::ZERO,
@@ -3094,6 +3252,7 @@ mod tests {
       rate_timer: None,
       reactor: None,
       blocking: Some(blocking),
+      io_pool: None,
       filesystem: None,
       process: None,
       signal: None,
@@ -3109,6 +3268,7 @@ mod tests {
       shutdown: None,
       shutdown_failure: None,
       blocking_shutdown_requested: false,
+      io_pool_shutdown_requested: false,
       process_shutdown_requested: false,
       io_shutdown_requested: false,
     };
@@ -3224,7 +3384,274 @@ mod tests {
       .build()
       .err()
       .unwrap_or_else(|| panic!("filesystem without a pool unexpectedly built"));
-    assert!(matches!(error, DriverBuildError::FilesystemNeedsBlocking));
+    assert!(matches!(error, DriverBuildError::FilesystemNeedsIoPool));
+    assert_eq!(
+      error.to_string(),
+      "filesystem services require a configured I/O pool"
+    );
+  }
+
+  #[test]
+  fn filesystem_with_only_a_blocking_pool_needs_an_io_pool() {
+    let pool = BlockingConfig {
+      workers: 1,
+      max_outstanding: 1,
+      capacity: Resources::ZERO,
+    };
+    let current = CurrentThreadBuilder::new(local_config())
+      .blocking(pool)
+      .filesystem()
+      .build()
+      .err()
+      .unwrap_or_else(|| panic!("filesystem over a blocking pool unexpectedly built"));
+    assert!(matches!(current, DriverBuildError::FilesystemNeedsIoPool));
+    let multi = MultiThreadBuilder::new(async_config())
+      .blocking(pool)
+      .filesystem()
+      .build()
+      .err()
+      .unwrap_or_else(|| panic!("filesystem over a blocking pool unexpectedly built"));
+    assert!(matches!(multi, DriverBuildError::FilesystemNeedsIoPool));
+    let empty = MultiThreadBuilder::new(async_config())
+      .io_pool(BlockingConfig {
+        workers: 0,
+        max_outstanding: 1,
+        capacity: Resources::ZERO,
+      })
+      .build()
+      .err()
+      .unwrap_or_else(|| panic!("a zero-worker I/O pool unexpectedly built"));
+    assert!(matches!(empty, DriverBuildError::InvalidConfiguration(_)));
+  }
+
+  /// Drives a driver with a blocking pool and an I/O pool through shutdown
+  /// and checks the documented order: the blocking pool drains first while
+  /// the I/O pool stays open for the closures that use adapters, then the
+  /// I/O pool closes in its own step, and child processes come after it.
+  macro_rules! assert_pool_shutdown_order {
+    ($driver:expr, $policy:expr) => {{
+      let driver = &mut $driver;
+      let path = std::env::temp_dir().join(format!(
+        "allocatbelt-driver-pool-order-{}-{}",
+        std::process::id(),
+        NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+      ));
+      std::fs::write(&path, b"order").unwrap();
+      let filesystem = driver.filesystem().unwrap();
+      let (blocking_started_tx, blocking_started_rx) = mpsc::channel::<()>();
+      let (blocking_release_tx, blocking_release_rx) = mpsc::channel::<()>();
+      let metadata_path = path.clone();
+      let blocking_job = driver
+        .blocking()
+        .unwrap()
+        .try_spawn(Resources::ZERO, move |_| {
+          blocking_started_tx.send(()).unwrap();
+          blocking_release_rx
+            .recv_timeout(DRIVER_TEST_WATCHDOG)
+            .unwrap();
+          filesystem
+            .metadata(metadata_path)
+            .unwrap_or_else(|_| panic!("I/O pool closed before the blocking pool drained"))
+            .join()
+            .unwrap()
+            .unwrap()
+            .len()
+        })
+        .unwrap_or_else(|error| panic!("blocking admission failed: {}", error.kind));
+      blocking_started_rx
+        .recv_timeout(DRIVER_TEST_WATCHDOG)
+        .unwrap();
+
+      driver.request_shutdown($policy).unwrap();
+      let deadline = Instant::now() + DRIVER_TEST_WATCHDOG;
+      while !driver.blocking_shutdown_requested {
+        assert_eq!(
+          driver.drive_shutdown_step().unwrap(),
+          ShutdownProgress::Pending
+        );
+        assert!(
+          Instant::now() < deadline,
+          "blocking pool step was not reached"
+        );
+        std::thread::yield_now();
+      }
+      assert!(driver.blocking.as_ref().unwrap().snapshot().closed);
+      assert!(!driver.io_pool_shutdown_requested);
+      assert!(!driver.io_pool.as_ref().unwrap().snapshot().closed);
+      assert!(!driver.process_shutdown_requested);
+
+      // Hold one I/O worker so the I/O pool step stays visible.
+      let (io_release_tx, io_release_rx) = mpsc::channel::<()>();
+      let io_job = driver
+        .io_pool
+        .as_ref()
+        .unwrap()
+        .try_spawn(Resources::ZERO, move |_| {
+          let _ = io_release_rx.recv_timeout(DRIVER_TEST_WATCHDOG);
+        })
+        .unwrap_or_else(|error| panic!("I/O admission failed: {}", error.kind));
+      blocking_release_tx.send(()).unwrap();
+      assert_eq!(blocking_job.join().unwrap(), 5);
+      while !driver.io_pool_shutdown_requested {
+        assert_eq!(
+          driver.drive_shutdown_step().unwrap(),
+          ShutdownProgress::Pending
+        );
+        assert!(Instant::now() < deadline, "I/O pool step was not reached");
+        std::thread::yield_now();
+      }
+      assert!(driver.blocking.as_ref().unwrap().shutdown_complete());
+      assert!(driver.io_pool.as_ref().unwrap().snapshot().closed);
+      assert_eq!(
+        driver.drive_shutdown_step().unwrap(),
+        ShutdownProgress::Pending
+      );
+      assert!(!driver.process_shutdown_requested);
+
+      io_release_tx.send(()).unwrap();
+      io_job.join().unwrap();
+      while driver.drive_shutdown_step().unwrap() != ShutdownProgress::Complete {
+        assert!(Instant::now() < deadline, "driver did not stop");
+        std::thread::yield_now();
+      }
+      assert!(driver.io_pool.as_ref().unwrap().shutdown_complete());
+      assert!(driver.process_shutdown_requested);
+      std::fs::remove_file(path).unwrap();
+    }};
+  }
+
+  fn order_pool(workers: usize) -> BlockingConfig {
+    BlockingConfig {
+      workers,
+      max_outstanding: 4,
+      capacity: Resources::ZERO,
+    }
+  }
+
+  #[test]
+  fn current_driver_shuts_down_blocking_then_io_pool_then_processes() {
+    let mut driver = CurrentThreadBuilder::new(local_config())
+      .resources(limits(16))
+      .blocking(order_pool(1))
+      .io_pool(order_pool(2))
+      .filesystem()
+      .processes(1)
+      .build()
+      .unwrap();
+    assert_pool_shutdown_order!(
+      driver,
+      CurrentShutdown {
+        blocking: ShutdownMode::Drain,
+        processes: ProcessShutdownMode::Wait,
+      }
+    );
+  }
+
+  #[test]
+  fn multi_driver_shuts_down_blocking_then_io_pool_then_processes() {
+    let mut driver = MultiThreadBuilder::new(async_config())
+      .resources(limits(16))
+      .blocking(order_pool(1))
+      .io_pool(order_pool(2))
+      .filesystem()
+      .processes(1)
+      .build()
+      .unwrap();
+    assert_pool_shutdown_order!(
+      driver,
+      MultiShutdown {
+        tasks: AsyncShutdown::Drain,
+        blocking: ShutdownMode::Drain,
+        processes: ProcessShutdownMode::Wait,
+      }
+    );
+  }
+
+  #[test]
+  fn driver_blocking_cancel_pending_leaves_queued_filesystem_operations() {
+    let mut driver = MultiThreadBuilder::new(async_config())
+      .resources(limits(16))
+      .blocking(order_pool(1))
+      .io_pool(order_pool(1))
+      .filesystem()
+      .build()
+      .unwrap();
+    let path = std::env::temp_dir().join(format!(
+      "allocatbelt-driver-pool-cancel-{}-{}",
+      std::process::id(),
+      NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, b"kept").unwrap();
+    let blocking = driver.blocking().unwrap();
+    let (blocking_started_tx, blocking_started_rx) = mpsc::channel::<()>();
+    let (blocking_release_tx, blocking_release_rx) = mpsc::channel::<()>();
+    let blocking_gate = blocking
+      .try_spawn(Resources::ZERO, move |_| {
+        blocking_started_tx.send(()).unwrap();
+        let _ = blocking_release_rx.recv_timeout(DRIVER_TEST_WATCHDOG);
+      })
+      .unwrap_or_else(|error| panic!("blocking admission failed: {}", error.kind));
+    blocking_started_rx
+      .recv_timeout(DRIVER_TEST_WATCHDOG)
+      .unwrap();
+    let queued_closure = blocking
+      .try_spawn(Resources::ZERO, |_| ())
+      .unwrap_or_else(|error| panic!("blocking admission failed: {}", error.kind));
+    let (io_release_tx, io_release_rx) = mpsc::channel::<()>();
+    let io_gate = driver
+      .io_pool
+      .as_ref()
+      .unwrap()
+      .try_spawn(Resources::ZERO, move |_| {
+        let _ = io_release_rx.recv_timeout(DRIVER_TEST_WATCHDOG);
+      })
+      .unwrap_or_else(|error| panic!("I/O admission failed: {}", error.kind));
+    let queued_metadata = driver
+      .filesystem()
+      .unwrap()
+      .metadata(path.clone())
+      .unwrap_or_else(|_| panic!("filesystem admission failed"));
+
+    driver
+      .request_shutdown(MultiShutdown {
+        tasks: AsyncShutdown::CancelPending,
+        blocking: ShutdownMode::CancelPending,
+        processes: ProcessShutdownMode::Wait,
+      })
+      .unwrap();
+    let deadline = Instant::now() + DRIVER_TEST_WATCHDOG;
+    while !driver.blocking_shutdown_requested {
+      assert_eq!(driver.try_shutdown().unwrap(), ShutdownProgress::Pending);
+      assert!(
+        Instant::now() < deadline,
+        "blocking pool step was not reached"
+      );
+      std::thread::yield_now();
+    }
+    blocking_release_tx.send(()).unwrap();
+    blocking_gate.join().unwrap();
+    while !queued_closure.is_finished() {
+      driver.drive_shutdown_step().unwrap();
+      assert!(
+        Instant::now() < deadline,
+        "queued closure was not abandoned"
+      );
+      std::thread::yield_now();
+    }
+    assert!(matches!(
+      queued_closure.join(),
+      Err(crate::runtime::JoinError::Cancelled)
+    ));
+    // The blocking pool's cancel-pending shutdown left the adapter job queued.
+    assert!(!queued_metadata.is_finished());
+    io_release_tx.send(()).unwrap();
+    io_gate.join().unwrap();
+    assert_eq!(queued_metadata.join().unwrap().unwrap().len(), 4);
+    while driver.drive_shutdown_step().unwrap() != ShutdownProgress::Complete {
+      assert!(Instant::now() < deadline, "driver did not stop");
+      std::thread::yield_now();
+    }
+    std::fs::remove_file(path).unwrap();
   }
 
   #[test]
@@ -3422,6 +3849,104 @@ mod tests {
         .poll(&mut Context::from_waker(Waker::noop()))
         .is_ready()
     );
+  }
+
+  #[test]
+  fn facade_io_pool_admission_inhibits_auto_advance_until_execution_finishes() {
+    let driver = CurrentThreadBuilder::new(local_config())
+      .clock(ClockMode::PausedAuto, 2)
+      .io_pool(BlockingConfig {
+        workers: 1,
+        max_outstanding: 2,
+        capacity: Resources::ZERO,
+      })
+      .build()
+      .unwrap_or_else(|error| panic!("current-thread build failed: {error}"));
+    let clock = driver.clock().unwrap_or_else(|| panic!("clock is missing"));
+    let start = clock.now();
+    let mut sleep = clock.sleep(Duration::from_secs(3)).unwrap();
+    let io_pool = driver
+      .io_pool
+      .as_ref()
+      .unwrap_or_else(|| panic!("I/O pool is missing"));
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let job = io_pool
+      .try_spawn(Resources::ZERO, move |_| {
+        let _ = started_tx.send(());
+        let _ = release_rx.recv();
+      })
+      .unwrap_or_else(|error| panic!("blocking job admission failed: {error}"));
+    started_rx
+      .recv_timeout(Duration::from_secs(2))
+      .unwrap_or_else(|error| panic!("blocking job did not start: {error}"));
+
+    let coordinator = clock.coordinator().clone();
+    let epoch = coordinator.epoch().unwrap();
+    let quiescent = coordinator
+      .quiescent(epoch)
+      .unwrap_or_else(|| panic!("clock idle epoch changed unexpectedly"));
+    assert!(matches!(
+      clock.auto_advance_if_idle(quiescent, false),
+      super::super::time::AutoAdvance::Inhibited
+    ));
+    assert_eq!(clock.now(), start);
+
+    release_tx
+      .send(())
+      .unwrap_or_else(|error| panic!("blocking job release failed: {error}"));
+    job
+      .join()
+      .unwrap_or_else(|error| panic!("blocking job failed: {error}"));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+      let epoch = coordinator.epoch().unwrap();
+      let Some(quiescent) = coordinator.quiescent(epoch) else {
+        std::thread::yield_now();
+        continue;
+      };
+      match clock.auto_advance_if_idle(quiescent, false) {
+        super::super::time::AutoAdvance::Advanced => break,
+        super::super::time::AutoAdvance::Inhibited => {
+          assert!(
+            Instant::now() < deadline,
+            "I/O pool inhibitor was not released"
+          );
+          std::thread::yield_now();
+        }
+        state => panic!("unexpected auto-advance state after job completion: {state:?}"),
+      }
+    }
+    assert_eq!(clock.now(), start + Duration::from_secs(3));
+    assert!(
+      Pin::new(&mut sleep)
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_ready()
+    );
+  }
+
+  #[test]
+  fn startup_failure_after_an_io_pool_started_joins_it() {
+    let _permanent_signal =
+      SignalDriver::new(1).unwrap_or_else(|error| panic!("signal setup failed: {error}"));
+    let error = MultiThreadBuilder::new(async_config())
+      .io_pool(BlockingConfig {
+        workers: 2,
+        max_outstanding: 1,
+        capacity: Resources::ZERO,
+      })
+      .filesystem()
+      .timer(1)
+      .signals(2)
+      .build()
+      .err()
+      .unwrap_or_else(|| panic!("mismatched process signal ceiling unexpectedly built"));
+    // The I/O pool started before the signal step failed; the rollback drains
+    // and joins it before `build` returns.
+    assert!(matches!(
+      error,
+      DriverBuildError::Signal(SignalError::ConfigurationMismatch)
+    ));
   }
 
   #[cfg(not(loom))]
@@ -4418,7 +4943,7 @@ mod tests {
     };
     let mut local = CurrentThreadBuilder::new(local_config())
       .resources(limits(64))
-      .blocking(blocking)
+      .io_pool(blocking)
       .filesystem()
       .disk_rate(rate)
       .build()
@@ -4431,7 +4956,7 @@ mod tests {
     shutdown_current_driver(&mut local);
     let mut multi = MultiThreadBuilder::new(async_config())
       .resources(limits(64))
-      .blocking(blocking)
+      .io_pool(blocking)
       .filesystem()
       .disk_rate(rate)
       .build()
@@ -4470,7 +4995,7 @@ mod tests {
     let mut driver = CurrentThreadBuilder::new(local_config())
       .resources(limits(64))
       .resource_domain(tenant)
-      .blocking(BlockingConfig {
+      .io_pool(BlockingConfig {
         workers: 1,
         max_outstanding: 4,
         capacity: Resources::ZERO,

@@ -1,3 +1,7 @@
+mod support {
+  pub mod io_gate;
+}
+
 use std::future::{self, Future};
 use std::os::fd::AsRawFd;
 use std::process::{Child, Command};
@@ -11,11 +15,10 @@ use allocatbelt::runtime::asynchronous::{
 use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
 use allocatbelt::runtime::net::{NetHandle, TcpConnectError, TcpConnectRejectKind, TcpSocket};
 use allocatbelt::runtime::reactor::{Reactor, ReactorConfig};
-use allocatbelt::runtime::{
-  Config as BlockingConfig, Resources, Runtime as BlockingRuntime, ShutdownMode,
-};
+use allocatbelt::runtime::{Config as BlockingConfig, IoPool, Resources};
 use allocatbelt_app_ports::http::{self, HttpConfig, MAX_BODY_BYTES, MAX_REQUEST_BYTES};
 use allocatbelt_app_ports::memory::{checksum, pattern_byte};
+use support::io_gate::IoGate;
 
 #[test]
 fn nonblocking_socket_http_progresses_with_a_full_blocking_pool() {
@@ -89,26 +92,14 @@ impl Drop for WatchdogChild {
 }
 
 fn nonblocking_exchange() {
-  let mut blocking = BlockingRuntime::new(BlockingConfig {
+  let mut blocking = IoPool::new(BlockingConfig {
     workers: 1,
     max_outstanding: 1,
     capacity: Resources::ZERO,
   })
-  .expect("blocking runtime should start");
+  .expect("I/O pool should start");
   let blocking_handle = blocking.handle();
-  let (started_tx, started_rx) = mpsc::channel();
-  let (release_tx, release_rx) = mpsc::channel();
-  let blocker = blocking_handle
-    .try_spawn(Resources::ZERO, move |_| {
-      started_tx.send(()).expect("gate receiver remains live");
-      release_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("exchange finishes before the blocking gate is released");
-    })
-    .expect("gate should occupy the only blocking admission slot");
-  started_rx
-    .recv_timeout(Duration::from_secs(5))
-    .expect("blocking worker should enter its gate");
+  let blocker = IoGate::occupy(&blocking_handle);
 
   let reactor = Reactor::new(ReactorConfig {
     max_registrations: 3,
@@ -162,26 +153,21 @@ fn nonblocking_exchange() {
   assert_eq!(resources.snapshot().network_ops, 0);
   assert_eq!(reactor_handle.registrations(), 0);
   assert_eq!(reactor_handle.waiters(), 0);
-  release_tx
-    .send(())
-    .expect("blocking gate should remain held");
-  blocker.join().expect("blocking gate should finish");
+  blocker.release();
   runtime
     .shutdown(AsyncShutdown::Drain)
     .expect("async runtime should stop");
-  blocking
-    .shutdown(ShutdownMode::Drain)
-    .expect("blocking runtime should stop");
+  blocking.shutdown().expect("I/O pool should stop");
   reactor.shutdown().expect("reactor should stop");
 }
 
 fn registration_rejection() {
-  let mut blocking = BlockingRuntime::new(BlockingConfig {
+  let mut blocking = IoPool::new(BlockingConfig {
     workers: 1,
     max_outstanding: 1,
     capacity: Resources::ZERO,
   })
-  .expect("blocking runtime should start");
+  .expect("I/O pool should start");
   let reactor = Reactor::new(ReactorConfig {
     max_registrations: 1,
     max_waiters: 2,
@@ -313,8 +299,6 @@ fn registration_rejection() {
   runtime
     .shutdown(AsyncShutdown::Drain)
     .expect("async runtime should stop");
-  blocking
-    .shutdown(ShutdownMode::Drain)
-    .expect("blocking runtime should stop");
+  blocking.shutdown().expect("I/O pool should stop");
   reactor.shutdown().expect("reactor should stop");
 }

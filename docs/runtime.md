@@ -175,14 +175,89 @@ models cover ring transitions and lost-wake registration, not TLS budgeting.
 The endpoints use scalar I/O and its vectored fallback; they do not expose a
 borrowed buffered ring view across lock release.
 
+## I/O adapter pool
+
+`runtime::IoPool` is a pool with a fixed number of worker threads and its
+own FIFO queue, outstanding-job bound, declared resource capacity and
+shutdown. It runs only the per-operation jobs of the asynchronous front ends
+over blocking calls: `blocking_io` readers and writers, the standard-stream
+helpers, `FsHandle` (including its FIFO and directory-walk operations),
+`fs_io::AsyncFile`, and `NetHandle::connect` and `NetHandle::resolve`. These
+take a cloneable `IoPoolHandle`, not a user blocking `Handle`.
+`IoPoolHandle` has no public submission method, so a caller cannot queue its
+own closure on the I/O pool, and these front ends cannot be built over a user
+pool. The caller's `Read` and `Write` implementations passed to the stream
+adapters do run on I/O pool workers, inside the adapter's jobs. The only
+jobs on a user pool are closures its user submitted. The I/O pool does not
+grow, does not borrow or lend workers to another pool, and offers no listing
+of its operations and no call that acts on all of them.
+
+The two pools never share a queue. A user `Runtime::shutdown(CancelPending)`
+drops only that pool's queued closures; queued adapter operations stay
+queued and run on the I/O pool. No I/O pool shutdown or drop discards an
+admitted operation or signals an operation's token.
+`IoPool::shutdown()` takes no mode: it closes admission, lets every queued
+and running operation finish, and waits for the workers. It can therefore
+wait indefinitely for a blocking stream, for example a stdin read with no
+input; make such streams return (close or write to their peer) before
+shutting down. An `IoPool` shutdown does not affect user closures.
+
+Dropping an `IoPool` detaches it instead: admission closes and the caller
+does not wait. Each worker runs the queued operations it reaches, each
+keeping its owned stream, file, buffer and permits until it completes. This
+has two limits. Operations queued behind a worker that is blocked in a call
+stay queued: their `Job`s stay pending, and their permits, managed buffers,
+tenant charges and the pool's waiter share stay held until that worker
+returns. Detached workers also end when the process exits, so a queued
+operation such as a stdout flush can be lost if `main` returns first; a
+caller that needs it must shut the pool (or the driver) down and wait.
+
+One job can be cancelled through its own `Job` handle (`Job::cancel`); there
+is no pool-wide cancellation. Dropping an adapter future or a returned `Job`
+detaches the operation rather than cancelling it.
+
+Internally the I/O pool reuses the blocking runtime's scheduler and worker
+loop as a separate instance, so admission, `WouldBlock` rejection by the
+adapters, cancelling one job through its own `Job` handle, `Job` joins, the
+`WouldDeadlock` and `Deadlock` checks, resource-domain Tasks/CPU/Control
+accounting and worker CPU parking behave as they do for a user pool, per
+pool. Its workers are named `allocatbelt-io-<index>`. Size it for the
+adapters alone: a worker blocked in a stream call, such as a stdin read,
+holds that worker until the call returns, and the I/O pool's
+`max_outstanding` and `capacity` bound adapter operations separately from
+the user pool's bounds. A closed I/O pool rejects new adapter operations
+with `BrokenPipe`, which is terminal; capacity rejection stays `WouldBlock`.
+
+### Migrating from adapters on the user blocking pool
+
+- `DriverBuildError::FilesystemNeedsBlocking` is renamed
+  `FilesystemNeedsIoPool`; `.filesystem()` needs `.io_pool(config)`, also
+  when a blocking pool is selected. `DriverBuildError::IoPool` and
+  `DriverShutdownError::IoPool` report I/O pool failures.
+- `FsHandle::new`, `NetHandle::new`, `blocking_io::reader`, `writer`,
+  `stdin_reader`, `stdout_writer` and `stderr_writer` take an
+  `IoPoolHandle` (from `IoPool::handle` or a driver's `io_pool()`) instead
+  of a user `Handle`.
+- A user pool's `CancelPending` shutdown does not shorten adapter work:
+  queued copies, walks and other operations on the I/O pool all run, and the
+  tokens of running walks are not signalled by any pool shutdown.
+- Selecting both pools starts both sets of worker threads, charges a second
+  pool payload to `Control` and reserves a second waiter share.
+- A blocking closure that joins a filesystem or network job waits for it
+  instead of getting `WouldDeadlock`, because the job runs on another pool;
+  join cycles between the two pools are not detected.
+- Caller-supplied `Read` and `Write` implementations given to the stream
+  adapters run on I/O pool workers.
+
 ## Blocking streams and standard I/O
 
 `runtime::blocking_io::reader` and `writer` adapt owned `Read + Send + 'static`
 and `Write + Send + 'static` streams to initialized-buffer asynchronous I/O.
 Streams may be `!Sync` or `!Unpin`: each adapter boxes its stream and owns a
 nonempty, uniquely owned caller-supplied `ManagedBuf`. Constructor rejection
-returns both original inputs. The adapter uses a supplied blocking `Handle`
-and explicit per-operation `Resources`; it creates no worker or private queue.
+returns both original inputs. The adapter uses a supplied `IoPoolHandle` and
+explicit per-operation `Resources`; it creates no worker or per-endpoint queue,
+and its jobs never share a queue with user blocking closures.
 There is at most one retained job per endpoint. Each job performs at most five
 underlying read, write or flush calls: the first attempt and four bounded
 Interrupted retries. Other I/O errors retain their kind.
@@ -200,21 +275,25 @@ Shutdown flushes and permanently stops new writes on this adapter.
 
 Admission or resource-capacity rejection returns `WouldBlock`, restores the
 adapter's owned inputs, and accepts no write bytes. There is no asynchronous
-blocking-pool capacity notification; applications must explicitly retry or
-abandon the operation. Dropping a borrowing future retains its job and progress.
+I/O pool capacity notification; applications must explicitly retry or
+abandon the operation. A closed I/O pool returns `BrokenPipe` with the
+`Submission(Closed)` cause instead; it does not reopen, so do not retry. Dropping a borrowing future retains its job and progress.
 Dropping an endpoint detaches the job: stream and charged staging storage remain
-owned until actual completion and result cleanup. Queued `CancelPending`
-cancellation drops the captured stream and storage and makes that endpoint
-terminal. Started blocking calls cannot be preempted, so a read can delay pool
-Drain indefinitely. Operation panics and recursive destructor-panic payloads
-follow the existing contained blocking-job cleanup path.
+owned until actual completion and result cleanup. Neither pool's shutdown
+discards a queued adapter job, so an endpoint does not lose its stream to a
+shutdown. Started blocking calls cannot be preempted, so a read can delay the
+I/O pool's draining shutdown indefinitely. Operation panics and recursive
+destructor-panic payloads follow the existing contained blocking-job cleanup
+path.
 
 `stdin_reader`, `stdout_writer` and `stderr_writer` use the standard library's
 process-global handles and locking/buffering. Those global buffers, boxes and
 fixed job metadata are ordinary allocations outside managed-memory accounting.
 Staging storage stays charged to its actual owners. Logical writer shutdown
-never closes a global descriptor. A pool with every worker blocked on stdin
-cannot service its queued jobs until a read returns. These endpoints participate
+never closes a global descriptor. An I/O pool with every worker blocked on
+stdin cannot service its queued adapter jobs, filesystem operations included,
+until a read returns; size the I/O pool with that in mind. User blocking
+pools are not held by these reads. These endpoints participate
 in automatic per-poll cooperation; native tests cover ownership, cancellation,
 rejection, partial/error progress, bounded retries and zero-budget preservation.
 They do not establish a shutdown latency bound or performance benefit.
@@ -256,7 +335,7 @@ cancellation, cooperative gating and the inherited signal policy.
 ## Named Unix FIFOs
 
 `FsHandle::create_fifo`, `open_fifo_receiver` and `open_fifo_sender` use the
-existing bounded blocking pool and disk-operation ledger. Creation validates
+handle's bounded I/O pool and disk-operation ledger. Creation validates
 permission bits before admission and returns the original path and mode on
 rejection. Opens use `NONBLOCK | CLOEXEC | NOCTTY`, validate the resulting
 descriptor as a FIFO, and register it with the supplied reactor before
@@ -293,8 +372,8 @@ is still live; the peak must fit the budget before replacement proceeds.
 This is cooperative accounting of explicit managed storage and operation slots.
 It excludes allocator metadata, the shared buffer header, physical rounding,
 RSS and arbitrary allocations. It supplies neither CPU quotas nor byte-rate
-limits. The existing blocking pool's declared `Resources` reservations remain
-separate from this ledger.
+limits. The declared `Resources` reservations of the user blocking pool and
+of the I/O pool remain separate from this ledger.
 
 `AsyncRuntime::scope_with_resources(&ledger)` and
 `scope_with_config_and_resources(config, &ledger)` explicitly bind a managed
@@ -322,7 +401,7 @@ charges no storage and imposes no accounting on ordinary allocations.
 
 ## Owned filesystem operations
 
-`runtime::fs::FsHandle` submits work to an explicit blocking handle. Each
+`runtime::fs::FsHandle` submits work to an explicit `IoPoolHandle`. Each
 accepted operation holds a disk permit while queued or running; rejection
 returns its original inputs, queued cancellation drops captures before permit
 release, and detaching a running job retains its resources until completion.
@@ -338,7 +417,7 @@ regardless of its supplied offset. `flush` is not a durability operation;
 
 `OwnedFile::from_std` and `into_std` transfer ownership without I/O or a
 disk-operation reservation. Existing descriptor aliases remain the caller's
-responsibility; direct standard-file operations bypass the pool and ledger.
+responsibility; direct standard-file operations bypass the I/O pool and ledger.
 Open-file metadata, length and permission jobs return the same file on I/O
 error. Metadata remains available after unlink; truncation preserves the
 sequential cursor even beyond the new EOF. Once a one-call mutation starts,
@@ -393,7 +472,7 @@ Write-after-read and relative seeks compensate for unread read-ahead to
 preserve the logical cursor. Successful seeks discard old staging; failed
 seeks retain it for retry. Partial write errors preserve only the unsent
 suffix, so subsequent flush/shutdown does not replay committed bytes.
-Pre-admission pool or disk-budget rejection restores the file/buffer and
+Pre-admission I/O pool or disk-budget rejection restores the file/buffer and
 returns `WouldBlock` with the typed submission cause; retry after capacity
 becomes available.
 
@@ -402,13 +481,14 @@ drains accepted bytes and performs the underlying flush before closing;
 admission or write errors retain retryable state. Once closed, later polls
 return `BrokenPipe`. Dropping the adapter does not flush unsubmitted staging.
 An already admitted operation retains its owned file, buffer and permit until
-actual completion or queued cancellation cleanup. Runtime-wide
-`CancelPending` can discard those queued inputs; the adapter then reports a
-terminal service error and cannot recover them. Managed charges follow the
+actual completion. No pool shutdown discards those queued inputs: the I/O
+pool's shutdown drains them, and a user pool never holds them. If an
+admitted job still ends without returning its inputs, the adapter reports a
+terminal service error. Managed charges follow the
 final buffer owner, including detached jobs. Job metadata and error values
-are outside byte accounting. Eleven native tests cover cursor ordering,
-partial/error retry, future cancellation, queued service cancellation,
-shutdown and panicking waker destruction.
+are outside byte accounting. Native tests cover cursor ordering,
+partial/error retry, future cancellation, draining I/O pool shutdown with
+queued operations, shutdown and panicking waker destruction.
 
 ## Bounded epoll readiness
 
@@ -465,7 +545,7 @@ transferred. Binding and standard-stream socket options use standard-library
 calls directly; `TcpSocket` also exposes safe, synchronous Rustix-backed options.
 Filesystem-path Unix datagram APIs do not support abstract addresses.
 
-`NetHandle::connect` keeps its blocking-pool behavior. The additive
+`NetHandle::connect` keeps its blocking-call behavior on the I/O pool. The additive
 `connect_nonblocking` and `connect_socket` methods instead use one explicitly
 created or supplied nonblocking TCP socket, register it with the reactor, then
 issue one connect syscall and wait for writable readiness. `TcpSocket` supports
@@ -515,8 +595,8 @@ linger requests an abortive close that discards unsent data. Ordinary write-side
 Rustix adapter's contract. These socket options reserve no runtime capacity or
 managed memory.
 
-The blocking `connect` and DNS resolver use the explicit bounded blocking
-handle. A blocking network permit remains held while work is queued or running;
+The blocking `connect` and DNS resolver use the explicit bounded I/O pool
+handle (`IoPoolHandle`), never a user blocking pool. A network permit remains held while work is queued or running;
 detaching a future retains worker captures until actual cleanup. DNS rejection
 returns the original hostname and port. Registration rejection from blocking
 connect returns the connected socket for recovery.
@@ -1422,9 +1502,10 @@ these behaviors; clock control is outside the two helper Loom models.
 An owning `CurrentThreadBuilder` can select `ClockMode::PausedAuto`. It advances
 to the next registered deadline only after the local executor observes
 quiescence and commits an unchanged idle epoch. Task wakes, imports, timer
-changes and associated blocking admissions invalidate that epoch before their
-transition. Blocking work inhibits advancement through closure and capture
-cleanup; an unrelated standalone blocking pool has no such association.
+changes and associated blocking or I/O pool admissions invalidate that epoch
+before their transition. Work on the facade's blocking pool or I/O pool
+inhibits advancement through closure and capture cleanup; an unrelated
+standalone blocking pool or I/O pool has no such association.
 Explicit inhibit guards cover other work the application needs to hold open.
 `MultiThreadBuilder` rejects automatic paused time. This clock affects timer
 semantics; byte refill and shutdown deadlines continue using real time.
@@ -2067,19 +2148,39 @@ meters until the final owner is dropped.
 
 `runtime::driver::CurrentThreadBuilder` and `MultiThreadBuilder` construct typed
 local and worker-pool owners for explicitly selected timer, readiness, blocking,
-filesystem, process and signal services. Existing low-level constructors remain
-available. The facade binds the executor's existing implicit root, borrowed
-root polls, owned children and local cross-thread imports to the same managed
-resource ledger; a second scope is not needed when `max_scopes = 1`. Filesystem
-handles use the selected blocking pool and that ledger. Signal installation is
-last during startup because its process-global bridge remains permanent.
+I/O pool, filesystem, process and signal services. Existing low-level
+constructors remain available. The facade binds the executor's existing
+implicit root, borrowed root polls, owned children and local cross-thread
+imports to the same managed resource ledger; a second scope is not needed when
+`max_scopes = 1`. `.blocking(config)` selects the pool for caller closures and
+`.io_pool(config)` selects the separate I/O adapter pool. The filesystem
+handle uses the selected I/O pool and that ledger, so `.filesystem()` needs
+`.io_pool(...)`; without it the build fails with
+`DriverBuildError::FilesystemNeedsIoPool`, also when only a blocking pool is
+selected. The driver's `io_pool()` returns an `IoPoolHandle` for building
+blocking stream adapters. Signal installation is last during startup because
+its process-global bridge remains permanent.
 
 `request_shutdown` closes executor admission. `try_shutdown` reports
-`ShutdownProgress::Pending` while task cleanup, blocking work, child reaping,
-callbacks or service threads remain owned. Async/local work finishes first,
-followed by blocking work and child reaping; timer and readiness services close
-last so admitted drains retain their dependencies. Thread owners use bounded
-join monitors to observe actual completion through thread-local cleanup;
+`ShutdownProgress::Pending` while task cleanup, blocking work, adapter work,
+child reaping, callbacks or service threads remain owned. Async/local work
+finishes first, followed by the blocking pool, then the I/O pool in its own
+step, then child reaping; timer and readiness services close last so admitted
+drains retain their dependencies. The I/O pool step starts only after the
+blocking pool's step has completed, so blocking closures still running under
+`Drain` can use the filesystem handle, stream adapters and connector. The
+I/O pool step always drains; `CurrentShutdown` and `MultiShutdown` have no
+I/O pool mode, and the blocking pool's `CancelPending` (the default) drops
+only that pool's queued closures. Because the step drains, a driver whose
+adapter is blocked in a read with no input, such as stdin, stays `Pending`
+until that read returns. Make such a stream return before or during
+shutdown (for example by closing its peer), or drop the driver owner, which
+detaches the I/O pool's workers instead of waiting. A detached pool keeps
+operations queued behind a blocked worker, with their permits, buffers,
+tenant charges and waiter share, until that worker returns, and its workers
+end with the process, so a queued write such as a stdout flush can be lost
+if `main` returns first; shut the driver down and wait when it must
+complete. Thread owners use bounded join monitors to observe actual completion through thread-local cleanup;
 polling does not join an unfinished worker on the caller. A failed monitor
 launch retains the original handle and returns a retryable typed error.
 `DriverShutdownError::is_retryable` distinguishes these failures from sticky
@@ -2089,14 +2190,19 @@ destructors on the caller. Explicit cleanup and owner destruction contain
 payload destructor panics, but a blocking destructor can still delay them.
 
 Local future and queued-blocking capture cleanup is explicit through
-`drive_shutdown_step`; it can invoke arbitrary caller code and has no finite
+`drive_shutdown_step`. Each call drops at most one queued job of the user
+blocking pool and separately advances the I/O pool's drain once that pool's
+step has been requested; it never discards an I/O pool operation. It can invoke arbitrary caller code and has no finite
 wall-time guarantee. Keep an unfinished facade owner alive until cleanup
 completes. Process-wide signal bridge lifetime is not included in
 `ShutdownProgress::Complete`. Its permanent tables and dispatcher metadata
 are outside tenant `Control`; subscriptions reuse fixed global slots. A bound
 facade includes its inline `SignalDriver` value in its own metadata charge.
 When a tenant resource domain is bound, root
-polls, owned tasks and blocking execution share its CPU and task admission.
+polls, owned tasks, blocking execution and I/O pool execution share its CPU
+and task admission. Each pool reserves its own waiter share and its own
+scheduler, queue and owner metadata under `Control`, so selecting both pools
+charges two pool payloads.
 Declared scheduler payloads, owning facades, controlled scopes, queues, metrics,
 flags, waiter owners, byte buckets and feedback state retain Control charges
 through their final handles. A native worker task reserves its one task

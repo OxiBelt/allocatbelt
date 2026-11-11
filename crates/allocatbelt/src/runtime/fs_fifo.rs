@@ -110,7 +110,7 @@ impl FsHandle {
     })
   }
 
-  /// Opens a FIFO reader on the existing blocking pool and registers it with
+  /// Opens a FIFO reader on the existing I/O pool and registers it with
   /// `reactor` before publishing the job result.
   ///
   /// The open uses `O_NONBLOCK | O_CLOEXEC | O_NOCTTY`; a default read-only
@@ -141,7 +141,7 @@ impl FsHandle {
     })
   }
 
-  /// Opens a FIFO writer on the existing blocking pool and registers it with
+  /// Opens a FIFO writer on the existing I/O pool and registers it with
   /// `reactor` before publishing the job result.
   ///
   /// Without `read_write(true)`, opening with no reader returns the operating

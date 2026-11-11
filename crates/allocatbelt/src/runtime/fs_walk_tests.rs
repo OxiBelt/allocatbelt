@@ -1,7 +1,7 @@
 use super::{WalkEntryKind, WalkLimits, WalkStep};
 use crate::runtime::fs::{FsHandle, FsSubmissionErrorKind};
 use crate::runtime::managed::{ResourceLimits, ResourceScope};
-use crate::runtime::{Config, JoinError, Resources, Runtime, ShutdownMode};
+use crate::runtime::{Config, IoPool, JoinError, Resources};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,8 +32,8 @@ impl Drop for Scratch {
   }
 }
 
-fn runtime(workers: usize, max_outstanding: usize) -> Runtime {
-  Runtime::new(Config {
+fn runtime(workers: usize, max_outstanding: usize) -> IoPool {
+  IoPool::new(Config {
     workers,
     max_outstanding,
     capacity: Resources::ZERO,
@@ -49,7 +49,7 @@ fn scope(memory: usize, disk: usize) -> ResourceScope {
   })
 }
 
-fn gated_job(runtime: &Runtime) -> (crate::runtime::Job<()>, Receiver<()>, Sender<()>) {
+fn gated_job(runtime: &IoPool) -> (crate::runtime::Job<()>, Receiver<()>, Sender<()>) {
   let (started_tx, started_rx) = mpsc::channel();
   let (release_tx, release_rx) = mpsc::channel();
   let job = runtime
@@ -149,7 +149,7 @@ fn recursive_walk_streams_one_charged_non_utf8_path_per_job() {
   }));
   assert_eq!(scope.snapshot().managed_memory, 0);
   assert_eq!(scope.snapshot().disk_ops, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[cfg(unix)]
@@ -216,7 +216,7 @@ fn recursive_walk_depth_and_entry_limits_are_explicit_and_do_not_descend_late() 
   assert!(matches!(third.step, WalkStep::EntryLimitReached));
   drop(third.path);
   assert_eq!(scope.snapshot().disk_ops, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[cfg(unix)]
@@ -294,7 +294,7 @@ fn zero_entry_limit_skips_filesystem_and_terminal_path_errors_cannot_resume() {
   drop(terminal.path);
   assert_eq!(scope.snapshot().disk_ops, 0);
   assert_eq!(scope.snapshot().managed_memory, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[cfg(unix)]
@@ -411,7 +411,7 @@ fn recursive_walk_rejects_root_symlinks_and_short_or_shared_output_before_admiss
   assert_eq!(scope.snapshot().disk_ops, 0);
   drop((walk, shared, clone));
   assert_eq!(scope.snapshot().managed_memory, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[cfg(unix)]
@@ -457,7 +457,7 @@ fn completed_walk_cursor_is_terminal_on_repoll() {
   assert!(matches!(terminal.step, WalkStep::Terminated));
   drop(terminal.path);
   assert_eq!(scope.snapshot().managed_memory, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[cfg(unix)]
@@ -497,7 +497,7 @@ fn queued_walk_cancellation_retains_then_releases_cursor_buffer_and_disk_slot() 
   assert!(matches!(job.join(), Err(JoinError::Cancelled)));
   assert_eq!(scope.snapshot().disk_ops, 0);
   assert_eq!(scope.snapshot().managed_memory, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[cfg(unix)]
@@ -542,5 +542,5 @@ fn recursive_walk_yields_after_bounded_empty_frame_work() {
   assert!(saw_yield);
   drop(path);
   assert_eq!(scope.snapshot().managed_memory, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }

@@ -156,6 +156,14 @@ impl NativeAcceptorFixture {
     .expect("create acceptor test domain");
     let limits = application_domain.local_limits();
     let rates = application_domain.rate_configs();
+    let pool = BlockingConfig {
+      workers,
+      max_outstanding: 32,
+      capacity: Resources {
+        disk: 8,
+        ..Resources::ZERO
+      },
+    };
     let driver = MultiThreadBuilder::new(AsyncConfig {
       workers,
       max_outstanding: 32,
@@ -167,14 +175,7 @@ impl NativeAcceptorFixture {
     .without_feedback()
     .timer(2)
     .rate_timer_registrations(64)
-    .blocking(BlockingConfig {
-      workers,
-      max_outstanding: 32,
-      capacity: Resources {
-        disk: 8,
-        ..Resources::ZERO
-      },
-    })
+    .io_pool(pool)
     .filesystem()
     .reactor(ReactorConfig {
       max_registrations: 24,
@@ -192,12 +193,12 @@ impl NativeAcceptorFixture {
     let io = bindings.io();
     let scope = driver.scope().expect("create acceptor test scope");
     let handle = scope.handle();
-    let blocking = driver.blocking().expect("blocking pool");
+    let io_pool = driver.io_pool().expect("I/O pool");
     let reactor = driver.reactor().expect("reactor");
     let timer = driver.timer().expect("timer");
     let fs_handle = driver.filesystem().expect("filesystem");
     let net =
-      allocatbelt::runtime::net::NetHandle::new(blocking, resources.clone(), reactor.clone(), 1)
+      allocatbelt::runtime::net::NetHandle::new(io_pool, resources.clone(), reactor.clone(), 1)
         .expect("create network handle");
     let (listener, address) = super::native_listener(&reactor).expect("bind test listener");
     Self {

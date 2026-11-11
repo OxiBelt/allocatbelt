@@ -220,7 +220,7 @@ impl FsHandle {
   /// `path` must be uniquely owned and at least `max_path_bytes` long; these
   /// conditions are checked before disk admission and rejection returns both
   /// original inputs. Bytes beyond `path_bytes` in an entry result are left
-  /// unchanged. Iterator and metadata work is performed on the blocking pool
+  /// unchanged. Iterator and metadata work is performed on the I/O pool
   /// under one disk permit. Cancellation is checked between filesystem calls;
   /// an in-flight call cannot be preempted.
   pub fn walk_next(

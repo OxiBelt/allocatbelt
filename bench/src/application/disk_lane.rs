@@ -6,62 +6,91 @@
 //! filesystem-operation ledger around each equivalent transaction stage.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Waker};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
-use allocatbelt::runtime::Handle as BlockingHandle;
+use allocatbelt::runtime::IoPoolHandle;
+use allocatbelt::runtime::blocking_io;
 use allocatbelt::runtime::cpu_gate::CpuGate;
 use allocatbelt::runtime::fs::BlockingByteIo;
 use allocatbelt::runtime::fs::FsHandle;
-use allocatbelt::runtime::managed::{OperationRequest, ResourceScope};
+use allocatbelt::runtime::io::AsyncReadExt;
+use allocatbelt::runtime::managed::{OperationRequest, ResourceLimits, ResourceScope};
 use allocatbelt_app_ports::disk::{self, DiskConfig, DiskReport};
 use allocatbelt_app_ports::memory;
 
 use super::{ApplicationTaskAdmission, Options};
 
+/// Starts one blocking read on each I/O pool worker at the same time, then
+/// releases them. Adapter jobs cannot be submitted as closures, so a pipe
+/// read stands in for the gate: `workers` reads running together prove that
+/// every I/O pool worker has started and run a job.
 pub(crate) fn warm_native_workers(
-  runtime: &BlockingHandle,
+  io_pool: &IoPoolHandle,
   async_handle: &allocatbelt::runtime::asynchronous::AsyncHandle,
   workers: usize,
 ) -> Result<(), String> {
-  let gate = super::WarmGate::new(workers, Duration::from_secs(30));
-  let mut jobs = Vec::new();
-  jobs
+  let warm_scope = ResourceScope::new(ResourceLimits {
+    managed_memory: workers,
+    disk_concurrent_ops: 0,
+    network_concurrent_ops: 0,
+  });
+  let mut endpoints = Vec::new();
+  endpoints
     .try_reserve_exact(workers)
     .map_err(|_| "could not reserve native disk worker warm-up handles".to_owned())?;
+  let mut context = Context::from_waker(Waker::noop());
   for _ in 0..workers {
-    let gate = Arc::clone(&gate);
-    jobs.push(
-      runtime
-        .try_spawn(allocatbelt::runtime::Resources::ZERO, move |_token| {
-          let thread_id = thread::current().id();
-          let released = gate.arrive_and_wait();
-          (thread_id, released)
-        })
-        .map_err(|error| format!("native disk worker warm-up admission failed: {error:?}"))?,
-    );
+    let (pipe_reader, pipe_writer) =
+      io::pipe().map_err(|error| format!("native disk warm-up pipe failed: {error}"))?;
+    let buffer = warm_scope
+      .try_alloc_zeroed(1)
+      .map_err(|error| format!("native disk warm-up buffer failed: {error}"))?;
+    let mut reader = blocking_io::reader(
+      io_pool.clone(),
+      allocatbelt::runtime::Resources::ZERO,
+      pipe_reader,
+      buffer,
+    )
+    .map_err(|error| format!("native disk warm-up reader failed: {}", error.kind))?;
+    let mut byte = [0_u8; 1];
+    // The first poll admits the blocking read; the adapter keeps the job.
+    if std::pin::pin!(reader.read(&mut byte))
+      .poll(&mut context)
+      .is_ready()
+    {
+      return Err("native disk warm-up read finished before its write".into());
+    }
+    endpoints.push((reader, pipe_writer));
   }
-  gate.release_after_all(workers)?;
-  let mut seen = HashSet::<ThreadId>::new();
-  for job in jobs {
-    let (thread_id, released) = async_handle
-      .block_on(job)
+  let deadline = std::time::Instant::now() + Duration::from_secs(30);
+  while io_pool.snapshot().running < workers {
+    if std::time::Instant::now() >= deadline {
+      return Err(format!(
+        "expected {workers} native filesystem workers, saw {}",
+        io_pool.snapshot().running
+      ));
+    }
+    thread::yield_now();
+  }
+  for (mut reader, mut pipe_writer) in endpoints {
+    pipe_writer
+      .write_all(&[1])
+      .map_err(|error| format!("native disk warm-up release failed: {error}"))?;
+    let mut byte = [0_u8; 1];
+    let read = async_handle
+      .block_on(async move { reader.read(&mut byte).await })
       .map_err(|error| format!("native disk warm-up root failed: {error}"))?
       .map_err(|error| format!("native disk warm-up job failed: {error}"))?;
-    if !released {
-      return Err("native disk worker warm-up gate timed out".into());
+    if read != 1 {
+      return Err("native disk worker warm-up read no byte".into());
     }
-    seen.insert(thread_id);
-  }
-  if seen.len() != workers {
-    return Err(format!(
-      "expected {workers} native filesystem workers, saw {}",
-      seen.len()
-    ));
   }
   Ok(())
 }

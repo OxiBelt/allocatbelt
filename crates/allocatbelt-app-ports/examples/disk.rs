@@ -1,7 +1,7 @@
 use allocatbelt::runtime::asynchronous::{AsyncConfig, AsyncRuntime, AsyncShutdown};
 use allocatbelt::runtime::fs::FsHandle;
 use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
-use allocatbelt::runtime::{Config, Resources, Runtime, ShutdownMode};
+use allocatbelt::runtime::{Config, IoPool, Resources};
 use allocatbelt_app_ports::PortResult;
 use allocatbelt_app_ports::disk::{self, DiskConfig, MAX_DISK_BYTES, MAX_DISK_OFFSET};
 
@@ -20,7 +20,7 @@ fn main() -> PortResult<()> {
     return Err(std::io::Error::other("disk arguments exceed their functional bounds").into());
   }
 
-  let mut blocking = Runtime::new(Config {
+  let mut io_pool = IoPool::new(Config {
     workers: 1,
     max_outstanding: 4,
     capacity: Resources::ZERO,
@@ -35,17 +35,17 @@ fn main() -> PortResult<()> {
     disk_concurrent_ops: 1,
     network_concurrent_ops: 0,
   });
-  let fs = FsHandle::new(blocking.handle(), resources.clone());
+  let fs = FsHandle::new(io_pool.handle(), resources.clone());
   let scope = async_runtime.scope_with_resources(&resources)?;
   let transaction = async_runtime.block_on(disk::run(&scope, fs, resources.clone(), config));
 
   let close = async_runtime.block_on(scope.close());
   let async_shutdown = async_runtime.shutdown(AsyncShutdown::Drain);
-  let blocking_shutdown = blocking.shutdown(ShutdownMode::Drain);
+  let io_pool_shutdown = io_pool.shutdown();
   let report = transaction??;
   close?;
   async_shutdown?;
-  blocking_shutdown?;
+  io_pool_shutdown?;
   if !report.temp_directory_removed {
     return Err(std::io::Error::other("disk temporary directory was not removed").into());
   }

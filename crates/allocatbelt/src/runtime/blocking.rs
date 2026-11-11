@@ -66,6 +66,7 @@ pub struct Runtime {
   shutdown_requested: bool,
   shutdown_complete: bool,
   shutdown_panicked: bool,
+  drop_policy: DropPolicy,
   _control: ControlCharge,
   launch_control: Option<Arc<ControlCharge>>,
 }
@@ -79,6 +80,20 @@ pub struct Handle {
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// What dropping a runtime that was not shut down does with admitted jobs.
+/// Fixed when the runtime starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DropPolicy {
+  /// Drop queued jobs unstarted and signal running ones' tokens.
+  CancelQueued,
+  /// Close admission only: workers run every admitted job and then exit on
+  /// their own; no token is signalled.
+  Detach,
+}
+
+/// The thread-name prefix of user blocking pool workers.
+const RUNTIME_THREAD_PREFIX: &str = "allocatbelt-runtime-";
 
 fn control_build_error(error: DomainError, bound: bool) -> io::Error {
   if !bound && matches!(error, DomainError::Invalid) {
@@ -152,6 +167,27 @@ impl Runtime {
   fn with_spawner_and_resources(
     config: Config,
     resources: Option<ResourceScope>,
+    spawn: impl FnMut(thread::Builder, Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>>,
+    setup: impl FnOnce(&mut Shared),
+  ) -> io::Result<Self> {
+    Self::start(
+      config,
+      resources,
+      RUNTIME_THREAD_PREFIX,
+      DropPolicy::CancelQueued,
+      spawn,
+      setup,
+    )
+  }
+
+  /// Starts a pool whose worker threads are named `thread_prefix` followed by
+  /// their index and whose drop follows `drop_policy`. Each call creates a
+  /// distinct scheduler and queue.
+  pub(crate) fn start(
+    config: Config,
+    resources: Option<ResourceScope>,
+    thread_prefix: &'static str,
+    drop_policy: DropPolicy,
     mut spawn: impl FnMut(thread::Builder, Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>>,
     setup: impl FnOnce(&mut Shared),
   ) -> io::Result<Self> {
@@ -167,7 +203,7 @@ impl Runtime {
       .and_then(ResourceScope::tenant_domain)
       .cloned();
     let bound = tenant.is_some();
-    let name_bound = "allocatbelt-runtime-"
+    let name_bound = thread_prefix
       .len()
       .checked_add(std::mem::size_of::<usize>() * 3)
       .ok_or_else(|| control_build_error(DomainError::Invalid, bound))?;
@@ -249,7 +285,7 @@ impl Runtime {
       let completion_owner = prepared_join.thread_owner();
       let worker_shared = Arc::clone(&shared);
       let thread_launch_control = launch_control.clone();
-      let name = format!("allocatbelt-runtime-{index}");
+      let name = format!("{thread_prefix}{index}");
       let name_capacity = name.capacity();
       if name_capacity > name_bound {
         let actual = actual_persistent_bytes
@@ -294,6 +330,7 @@ impl Runtime {
       shutdown_requested: false,
       shutdown_complete: false,
       shutdown_panicked: false,
+      drop_policy,
       _control: runtime_control,
       launch_control,
     })
@@ -558,7 +595,8 @@ impl Handle {
 impl Drop for Runtime {
   fn drop(&mut self) {
     if !self.workers.is_empty() {
-      abandon_closed_queue(&self.shared, self.shared.close(true));
+      let cancel = self.drop_policy == DropPolicy::CancelQueued;
+      abandon_closed_queue(&self.shared, self.shared.close(cancel));
       // Dropping the handles detaches the threads.
       self.workers.clear();
     }
@@ -697,6 +735,70 @@ mod tests {
     cleanup_rx
       .recv_timeout(Duration::from_secs(2))
       .unwrap_or_else(|error| panic!("remaining payload cleanup did not run: {error}"));
+  }
+
+  fn gated_runtime(policy: DropPolicy) -> (Runtime, mpsc::SyncSender<()>, Job<bool>) {
+    let runtime = Runtime::start(
+      Config {
+        workers: 1,
+        max_outstanding: 2,
+        capacity: Resources::ZERO,
+      },
+      None,
+      "allocatbelt-drop-test-",
+      policy,
+      |builder, f| builder.spawn(f),
+      |_| {},
+    )
+    .unwrap_or_else(|error| panic!("runtime setup failed: {error}"));
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let gate = runtime
+      .try_spawn(Resources::ZERO, move |token| {
+        let _ = entered_tx.send(());
+        let _ = release_rx.recv_timeout(Duration::from_secs(4));
+        token.is_cancelled()
+      })
+      .unwrap_or_else(|error| panic!("gate admission failed: {}", error.kind));
+    entered_rx
+      .recv_timeout(Duration::from_secs(4))
+      .unwrap_or_else(|error| panic!("gate did not start: {error}"));
+    (runtime, release_tx, gate)
+  }
+
+  #[test]
+  fn detach_drop_policy_runs_queued_jobs_without_signalling_tokens() {
+    let (runtime, release, gate) = gated_runtime(DropPolicy::Detach);
+    let queued = runtime
+      .try_spawn(Resources::ZERO, |token: CancellationToken| {
+        token.is_cancelled()
+      })
+      .unwrap_or_else(|error| panic!("queued admission failed: {}", error.kind));
+    let handle = runtime.handle();
+    drop(runtime);
+    assert!(handle.snapshot().closed);
+    assert_eq!(handle.snapshot().queued, 1);
+    release
+      .send(())
+      .unwrap_or_else(|error| panic!("gate release failed: {error}"));
+    assert_eq!(gate.join().ok(), Some(false));
+    assert_eq!(queued.join().ok(), Some(false));
+  }
+
+  #[test]
+  fn cancel_queued_drop_policy_drops_queued_jobs_and_signals_tokens() {
+    let (runtime, release, gate) = gated_runtime(DropPolicy::CancelQueued);
+    let queued = runtime
+      .try_spawn(Resources::ZERO, |token: CancellationToken| {
+        token.is_cancelled()
+      })
+      .unwrap_or_else(|error| panic!("queued admission failed: {}", error.kind));
+    drop(runtime);
+    release
+      .send(())
+      .unwrap_or_else(|error| panic!("gate release failed: {error}"));
+    assert_eq!(gate.join().ok(), Some(true));
+    assert!(matches!(queued.join(), Err(JoinError::Cancelled)));
   }
 
   #[test]

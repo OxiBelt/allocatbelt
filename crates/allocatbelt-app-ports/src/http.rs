@@ -6,7 +6,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener as StdTcpListener};
 use std::ops::{Deref, DerefMut};
 
-use allocatbelt::runtime::Handle as BlockingHandle;
+use allocatbelt::runtime::IoPoolHandle;
 use allocatbelt::runtime::asynchronous::{AbortHandle, AsyncJob, AsyncJoinError, OwnedTaskScope};
 use allocatbelt::runtime::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use allocatbelt::runtime::managed::{OperationPermit, OperationRequest, ResourceScope};
@@ -641,14 +641,14 @@ where
 /// request/connection is created here.
 pub async fn loopback_transaction(
   scope: &OwnedTaskScope,
-  blocking: BlockingHandle,
+  io_pool: IoPoolHandle,
   reactor: ReactorHandle,
   resources: ResourceScope,
   config: HttpConfig,
 ) -> PortResult<u64> {
   loopback_transaction_inner(
     scope,
-    blocking,
+    io_pool,
     reactor,
     resources,
     config,
@@ -660,21 +660,21 @@ pub async fn loopback_transaction(
 }
 
 /// Runs one loopback transaction using an explicitly bound readiness TCP
-/// listener and one nonblocking connect attempt. The supplied blocking handle
+/// listener and one nonblocking connect attempt. The supplied I/O pool handle
 /// is retained because [`NetHandle`] requires one, but this transport path
 /// does not submit work to its pool. Timeout policy remains caller-owned; wrap
 /// the whole returned future with a caller-selected timer deadline
 /// when a timeout is required.
 pub async fn loopback_transaction_nonblocking(
   scope: &OwnedTaskScope,
-  blocking: BlockingHandle,
+  io_pool: IoPoolHandle,
   reactor: ReactorHandle,
   resources: ResourceScope,
   config: HttpConfig,
 ) -> PortResult<u64> {
   loopback_transaction_inner(
     scope,
-    blocking,
+    io_pool,
     reactor,
     resources,
     config,
@@ -689,7 +689,7 @@ pub async fn loopback_transaction_nonblocking(
 /// independent client/server kernels used by executor comparison adapters.
 pub async fn loopback_transaction_with_id(
   scope: &OwnedTaskScope,
-  blocking: BlockingHandle,
+  io_pool: IoPoolHandle,
   reactor: ReactorHandle,
   resources: ResourceScope,
   config: HttpConfig,
@@ -697,7 +697,7 @@ pub async fn loopback_transaction_with_id(
 ) -> PortResult<(u64, u64)> {
   loopback_transaction_inner(
     scope,
-    blocking,
+    io_pool,
     reactor,
     resources,
     config,
@@ -708,13 +708,13 @@ pub async fn loopback_transaction_with_id(
 }
 
 /// Runs an ID-aware loopback exchange using the explicit readiness listener
-/// and nonblocking `NetHandle::connect_socket` path. The blocking handle is a
-/// required dependency of `NetHandle`; this operation never submits a
-/// blocking-pool job. Apply a caller-owned timer around this entire future if
+/// and nonblocking `NetHandle::connect_socket` path. The I/O pool handle is a
+/// required dependency of `NetHandle`; this operation never submits an
+/// I/O pool job. Apply a caller-owned timer around this entire future if
 /// a timeout is desired.
 pub async fn loopback_transaction_nonblocking_with_id(
   scope: &OwnedTaskScope,
-  blocking: BlockingHandle,
+  io_pool: IoPoolHandle,
   reactor: ReactorHandle,
   resources: ResourceScope,
   config: HttpConfig,
@@ -722,7 +722,7 @@ pub async fn loopback_transaction_nonblocking_with_id(
 ) -> PortResult<(u64, u64)> {
   loopback_transaction_inner(
     scope,
-    blocking,
+    io_pool,
     reactor,
     resources,
     config,
@@ -734,7 +734,7 @@ pub async fn loopback_transaction_nonblocking_with_id(
 
 async fn loopback_transaction_inner(
   scope: &OwnedTaskScope,
-  blocking: BlockingHandle,
+  io_pool: IoPoolHandle,
   reactor: ReactorHandle,
   resources: ResourceScope,
   config: HttpConfig,
@@ -766,7 +766,7 @@ async fn loopback_transaction_inner(
     .map_err(|error| join_message(error.kind))?;
   let mut server = AbortOnDrop::new(server);
   let client_result = transact_client(
-    blocking,
+    io_pool,
     reactor,
     resources.clone(),
     address,
@@ -824,7 +824,7 @@ async fn loopback_transaction_inner(
 }
 
 async fn transact_client(
-  blocking: BlockingHandle,
+  io_pool: IoPoolHandle,
   reactor: ReactorHandle,
   resources: ResourceScope,
   address: SocketAddr,
@@ -832,7 +832,7 @@ async fn transact_client(
   config: HttpConfig,
   connect_mode: ConnectMode,
 ) -> PortResult<u64> {
-  let net = NetHandle::new(blocking, resources.clone(), reactor, 1)?;
+  let net = NetHandle::new(io_pool, resources.clone(), reactor, 1)?;
   let stream = match connect_mode {
     ConnectMode::Blocking => {
       // Keep the original transport for callers that select the blocking API.

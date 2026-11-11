@@ -1,14 +1,14 @@
 # Application ports: nonblocking HTTP migration
 
 The app-ports crate keeps its existing `loopback_transaction` and
-`loopback_transaction_with_id` APIs, including their blocking-pool connection
-path. The additive `loopback_transaction_nonblocking` and
+`loopback_transaction_with_id` APIs, including their blocking connect path,
+which runs on the caller's I/O adapter pool (`IoPoolHandle`). The additive `loopback_transaction_nonblocking` and
 `loopback_transaction_nonblocking_with_id` APIs reuse the same bounded HTTP
 request/response kernels and server join/abort handling, while creating an
 explicit IPv4 loopback listener and connecting through the caller's readiness
 reactor with one `NetHandle::connect_socket` attempt. They preserve the same
 `HttpConfig`, ID, checksum and `PortResult` shape. The required
-`BlockingHandle` remains a `NetHandle` construction dependency; this path does
+`IoPoolHandle` remains a `NetHandle` construction dependency; this path does
 not submit a blocking connect job, resolve names or retry addresses.
 
 The new functions validate body size before socket, listener or task admission.
@@ -49,7 +49,7 @@ timer admission refusal, deadline completion and preservation of timer-close
 errors. The adapted
 `nonblocking_socket_http_progresses_with_a_full_blocking_pool` case exercises
 the actual reusable helper with zero and maximum-size bodies and an independent
-checksum while the blocking pool is held. Existing low-level socket tests
+checksum while the I/O pool is held. Existing low-level socket tests
 remain separate because the reusable transaction API intentionally does not
 expose its internal client socket.
 

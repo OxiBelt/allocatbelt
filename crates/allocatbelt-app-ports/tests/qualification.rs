@@ -1,3 +1,7 @@
+mod support {
+  pub mod io_gate;
+}
+
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Seek, SeekFrom};
@@ -17,13 +21,12 @@ use allocatbelt::runtime::managed::{
 };
 use allocatbelt::runtime::process::{ProcessDriver, ProcessShutdownMode, SpawnErrorKind};
 use allocatbelt::runtime::reactor::{Reactor, ReactorConfig};
-use allocatbelt::runtime::{
-  Config as BlockingConfig, Resources, Runtime as BlockingRuntime, ShutdownMode, SubmitErrorKind,
-};
+use allocatbelt::runtime::{Config as BlockingConfig, IoPool, Resources, SubmitErrorKind};
 use allocatbelt_app_ports::cpu::{self, CpuConfig};
 use allocatbelt_app_ports::disk;
 use allocatbelt_app_ports::http::{self, HttpConfig, MAX_REQUEST_BYTES};
 use allocatbelt_app_ports::memory::{self, MemoryConfig};
+use support::io_gate::IoGate;
 
 static NEXT_TREE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -153,12 +156,12 @@ fn returned_managed_output_stays_charged_until_its_final_clone_drops() {
 
 #[test]
 fn http_preoccupied_network_capacity_rejects_and_releases_all_resources() {
-  let mut blocking = BlockingRuntime::new(BlockingConfig {
+  let mut blocking = IoPool::new(BlockingConfig {
     workers: 1,
     max_outstanding: 4,
     capacity: Resources::ZERO,
   })
-  .expect("blocking runtime should start");
+  .expect("I/O pool should start");
   let reactor = Reactor::new(ReactorConfig {
     max_registrations: 3,
     max_waiters: 6,
@@ -197,9 +200,7 @@ fn http_preoccupied_network_capacity_rejects_and_releases_all_resources() {
   runtime
     .shutdown(AsyncShutdown::Drain)
     .expect("async runtime should stop");
-  blocking
-    .shutdown(ShutdownMode::Drain)
-    .expect("connect worker should drain");
+  blocking.shutdown().expect("connect worker should drain");
   reactor.shutdown().expect("reactor should stop");
   let snapshot = ledger.snapshot();
   assert_eq!(snapshot.managed_memory, 0);
@@ -210,12 +211,12 @@ fn http_preoccupied_network_capacity_rejects_and_releases_all_resources() {
 fn http_endpoints_competing_for_idle_capacity_one_fail_and_clean_up() {
   let (completed_tx, completed_rx) = mpsc::sync_channel(1);
   let worker = thread::spawn(move || {
-    let mut blocking = BlockingRuntime::new(BlockingConfig {
+    let mut blocking = IoPool::new(BlockingConfig {
       workers: 1,
       max_outstanding: 4,
       capacity: Resources::ZERO,
     })
-    .expect("blocking runtime should start");
+    .expect("I/O pool should start");
     let reactor = Reactor::new(ReactorConfig {
       max_registrations: 3,
       max_waiters: 6,
@@ -250,9 +251,7 @@ fn http_endpoints_competing_for_idle_capacity_one_fail_and_clean_up() {
     runtime
       .shutdown(AsyncShutdown::Drain)
       .expect("async runtime should stop");
-    blocking
-      .shutdown(ShutdownMode::Drain)
-      .expect("connect worker should drain");
+    blocking.shutdown().expect("connect worker should drain");
     reactor.shutdown().expect("reactor should stop");
     completed_tx
       .send(ledger.snapshot())
@@ -271,28 +270,14 @@ fn http_endpoints_competing_for_idle_capacity_one_fail_and_clean_up() {
 
 #[test]
 fn dropping_http_transaction_aborts_server_and_releases_scope_slot() {
-  let mut blocking = BlockingRuntime::new(BlockingConfig {
+  let mut blocking = IoPool::new(BlockingConfig {
     workers: 1,
     max_outstanding: 2,
     capacity: Resources::ZERO,
   })
-  .expect("blocking runtime should start");
+  .expect("I/O pool should start");
   let blocking_handle = blocking.handle();
-  let (started_tx, started_rx) = mpsc::channel();
-  let (release_tx, release_rx) = mpsc::channel();
-  let blocker = blocking_handle
-    .try_spawn(Resources::ZERO, move |_| {
-      started_tx
-        .send(())
-        .expect("test keeps the gate notification receiver");
-      release_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("test releases the worker gate");
-    })
-    .expect("gate job should be admitted");
-  started_rx
-    .recv_timeout(Duration::from_secs(5))
-    .expect("gate job should occupy the blocking worker");
+  let blocker = IoGate::occupy(&blocking_handle);
 
   let reactor = Reactor::new(ReactorConfig {
     max_registrations: 3,
@@ -352,19 +337,14 @@ fn dropping_http_transaction_aborts_server_and_releases_scope_slot() {
     0x51
   );
 
-  release_tx
-    .send(())
-    .expect("blocking worker gate should still be held");
-  blocker.join().expect("gate job should finish");
+  blocker.release();
   runtime
     .block_on(scope.close())
     .expect("HTTP task cleanup should finish");
   runtime
     .shutdown(AsyncShutdown::Drain)
     .expect("async runtime should stop");
-  blocking
-    .shutdown(ShutdownMode::Drain)
-    .expect("queued connect should drain");
+  blocking.shutdown().expect("queued connect should drain");
   reactor.shutdown().expect("reactor should stop");
   let snapshot = ledger.snapshot();
   assert_eq!(snapshot.managed_memory, 0);
@@ -406,12 +386,12 @@ impl Drop for TestTree {
 
 #[test]
 fn filesystem_open_rejection_recovers_path_and_options_for_retry() {
-  let mut blocking = BlockingRuntime::new(BlockingConfig {
+  let mut blocking = IoPool::new(BlockingConfig {
     workers: 1,
     max_outstanding: 1,
     capacity: Resources::ZERO,
   })
-  .expect("blocking runtime should start");
+  .expect("I/O pool should start");
   let handle = blocking.handle();
   let ledger = resources(0, 1, 0);
   let fs_handle = FsHandle::new(handle.clone(), ledger.clone());
@@ -440,23 +420,9 @@ fn filesystem_open_rejection_recovers_path_and_options_for_retry() {
   assert_eq!(path, tree.payload_path());
   drop(permit);
 
-  let (started_tx, started_rx) = mpsc::channel();
-  let (release_tx, release_rx) = mpsc::channel();
-  let blocker = handle
-    .try_spawn(Resources::ZERO, move |_| {
-      started_tx
-        .send(())
-        .expect("test keeps the gate notification receiver");
-      release_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("test releases the blocking worker");
-    })
-    .expect("gate job should occupy the only blocking slot");
-  started_rx
-    .recv_timeout(Duration::from_secs(5))
-    .expect("gate job should be running");
+  let gate = IoGate::occupy(&handle);
   let (path, options) = match disk::submit_prepared_open(&fs_handle, path, options) {
-    Ok(_) => panic!("blocking-pool capacity should reject the open"),
+    Ok(_) => panic!("I/O pool capacity should reject the open"),
     Err(error) => {
       assert!(matches!(
         error.kind,
@@ -467,10 +433,7 @@ fn filesystem_open_rejection_recovers_path_and_options_for_retry() {
   };
   assert_eq!(path, tree.payload_path());
   assert_eq!(ledger.snapshot().disk_ops, 0);
-  release_tx
-    .send(())
-    .expect("blocking worker gate should still be held");
-  blocker.join().expect("gate job should finish");
+  gate.release();
 
   let opened = disk::submit_prepared_open(&fs_handle, path, options)
     .expect("recovered path and options should be admitted")
@@ -478,20 +441,18 @@ fn filesystem_open_rejection_recovers_path_and_options_for_retry() {
     .expect("prepared open should finish")
     .expect("prepared file should open");
   drop(opened);
-  blocking
-    .shutdown(ShutdownMode::Drain)
-    .expect("blocking runtime should stop");
+  blocking.shutdown().expect("I/O pool should stop");
   assert_eq!(ledger.snapshot().disk_ops, 0);
 }
 
 #[test]
 fn filesystem_rejection_recovers_the_same_file_buffer_and_offset() {
-  let mut blocking = BlockingRuntime::new(BlockingConfig {
+  let mut blocking = IoPool::new(BlockingConfig {
     workers: 1,
     max_outstanding: 1,
     capacity: Resources::ZERO,
   })
-  .expect("blocking runtime should start");
+  .expect("I/O pool should start");
   let handle = blocking.handle();
   let ledger = resources(8192, 1, 0);
   let fs_handle = FsHandle::new(handle.clone(), ledger.clone());
@@ -533,25 +494,11 @@ fn filesystem_rejection_recovers_the_same_file_buffer_and_offset() {
     };
   drop(permit);
 
-  let (started_tx, started_rx) = mpsc::channel();
-  let (release_tx, release_rx) = mpsc::channel();
-  let blocker = handle
-    .try_spawn(Resources::ZERO, move |_| {
-      started_tx
-        .send(())
-        .expect("test keeps the gate notification receiver");
-      release_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("test releases the blocking worker");
-    })
-    .expect("gate job should occupy the only blocking slot");
-  started_rx
-    .recv_timeout(Duration::from_secs(5))
-    .expect("gate job should be running");
+  let gate = IoGate::occupy(&handle);
   let buffer_address_after_quota_rejection = buffer.as_slice().as_ptr();
   let (file, buffer, recovered_offset) =
     match disk::submit_positional_write(&fs_handle, file, buffer, recovered_offset) {
-      Ok(_) => panic!("blocking-pool capacity should reject the write"),
+      Ok(_) => panic!("I/O pool capacity should reject the write"),
       Err(error) => {
         assert!(matches!(
           error.kind,
@@ -569,10 +516,7 @@ fn filesystem_rejection_recovers_the_same_file_buffer_and_offset() {
   assert_eq!(ledger.snapshot().disk_ops, 0);
   assert_eq!(ledger.snapshot().managed_memory, 4096);
 
-  release_tx
-    .send(())
-    .expect("blocking worker gate should still be held");
-  blocker.join().expect("gate job should finish");
+  gate.release();
   let outcome: FileIoOutcome =
     disk::submit_positional_write(&fs_handle, file, buffer, recovered_offset)
       .expect("same owned inputs should be admitted after capacity returns")
@@ -585,21 +529,19 @@ fn filesystem_rejection_recovers_the_same_file_buffer_and_offset() {
     expected_checksum
   );
   drop(outcome);
-  blocking
-    .shutdown(ShutdownMode::Drain)
-    .expect("blocking runtime should stop");
+  blocking.shutdown().expect("I/O pool should stop");
   assert_eq!(ledger.snapshot().managed_memory, 0);
   assert_eq!(ledger.snapshot().disk_ops, 0);
 }
 
 #[test]
 fn detached_multichunk_write_keeps_buffer_and_disk_permit_until_worker_finishes() {
-  let mut blocking = BlockingRuntime::new(BlockingConfig {
+  let mut blocking = IoPool::new(BlockingConfig {
     workers: 1,
     max_outstanding: 2,
     capacity: Resources::ZERO,
   })
-  .expect("blocking runtime should start");
+  .expect("I/O pool should start");
   let handle = blocking.handle();
   let bytes = 3 * 64 * 1024 + 17;
   let ledger = resources(bytes, 1, 0);
@@ -620,21 +562,7 @@ fn detached_multichunk_write_keeps_buffer_and_disk_permit_until_worker_finishes(
   }
   let expected = allocatbelt_app_ports::memory::checksum(buffer.as_slice());
 
-  let (started_tx, started_rx) = mpsc::channel();
-  let (release_tx, release_rx) = mpsc::channel();
-  let blocker = handle
-    .try_spawn(Resources::ZERO, move |_| {
-      started_tx
-        .send(())
-        .expect("test keeps the gate notification receiver");
-      release_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("test releases the blocking worker");
-    })
-    .expect("gate job should be admitted");
-  started_rx
-    .recv_timeout(Duration::from_secs(5))
-    .expect("gate job should occupy the worker");
+  let gate = IoGate::occupy(&handle);
 
   let write = fs_handle
     .write_at(file, buffer, 211)
@@ -645,12 +573,9 @@ fn detached_multichunk_write_keeps_buffer_and_disk_permit_until_worker_finishes(
   assert_eq!(ledger.snapshot().disk_ops, 1);
   assert_eq!(ledger.snapshot().managed_memory, bytes);
 
-  release_tx
-    .send(())
-    .expect("blocking worker gate should still be held");
-  blocker.join().expect("gate job should finish");
+  gate.release();
   blocking
-    .shutdown(ShutdownMode::Drain)
+    .shutdown()
     .expect("queued positional write should finish before shutdown");
   assert_eq!(ledger.snapshot().disk_ops, 0);
   assert_eq!(ledger.snapshot().managed_memory, 0);

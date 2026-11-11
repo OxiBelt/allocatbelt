@@ -3,24 +3,26 @@
 //! [`AsyncFile`] owns one [`OwnedFile`] and two
 //! caller-sized [`ManagedBuf`] staging
 //! buffers. Reads use bounded read-ahead; writes are accepted into the write
-//! buffer and submitted to the blocking pool by flush, buffer pressure, seek,
-//! read-after-write or shutdown. The buffers remain charged to their resource
-//! scope for as long as this adapter or one of its admitted jobs owns them.
+//! buffer and submitted to the I/O adapter pool of its [`FsHandle`] by flush,
+//! buffer pressure, seek, read-after-write or shutdown. The buffers remain
+//! charged to their resource scope for as long as this adapter or one of its
+//! admitted jobs owns them.
 //!
 //! Dropping an I/O future does not cancel or discard an admitted job. The
-//! adapter retains it and its progress for the next poll. A blocking runtime
-//! that cancels an admitted job before it starts is different: the runtime
-//! drops the job's owned inputs, and the adapter becomes terminal because the
-//! file and the buffer in that job cannot be recovered through the current
-//! filesystem API. Polling then returns an explicit service error. Keep the
-//! blocking runtime in drain mode while adapters are in use if those inputs
-//! must remain available.
+//! adapter retains it and its progress for the next poll. The I/O pool never
+//! discards an admitted job: its shutdown drains every queued and running
+//! job, and dropping the pool detaches workers that still finish them, so
+//! the file and buffers in a job always come back to the adapter. Shutting
+//! down a user blocking [`Runtime`](crate::runtime::Runtime) does not cancel
+//! adapter jobs; they never share its queue. If an admitted job nevertheless
+//! ends without returning its inputs, the adapter becomes terminal and
+//! polling returns an explicit service error.
 //!
-//! Pool or disk-budget exhaustion rejects an operation before admission. The
-//! rejected file and buffer are restored to the adapter, and the poll returns
-//! `WouldBlock` with the typed submission reason as its error source. Retry
-//! after capacity becomes available. This adapter uses no private worker or
-//! unbounded queue.
+//! I/O pool or disk-budget exhaustion rejects an operation before admission.
+//! The rejected file and buffer are restored to the adapter, and the poll
+//! returns `WouldBlock` with the typed submission reason as its error source.
+//! Retry after capacity becomes available. This adapter uses no private
+//! worker or unbounded queue.
 //!
 //! A read can fill the read buffer beyond the bytes returned to its caller.
 //! Before writing or seeking relative to the current cursor, the adapter
@@ -46,10 +48,10 @@ use crate::runtime::managed::{ManagedBuf, ResourceError};
 #[cfg(all(test, not(loom)))]
 mod tests {
   use super::*;
-  use crate::runtime::blocking::{Config, Runtime, ShutdownMode};
   use crate::runtime::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
   use crate::runtime::managed::{ResourceLimits, ResourceScope};
   use crate::runtime::resources::Resources;
+  use crate::runtime::{Config, IoPool};
   use std::fs::{self, OpenOptions};
   use std::future::Future;
   use std::sync::Arc;
@@ -83,8 +85,8 @@ mod tests {
     }
   }
 
-  fn runtime(max_outstanding: usize) -> Runtime {
-    Runtime::new(Config {
+  fn runtime(max_outstanding: usize) -> IoPool {
+    IoPool::new(Config {
       workers: 1,
       max_outstanding,
       capacity: Resources::ZERO,
@@ -101,7 +103,7 @@ mod tests {
   }
 
   fn open_adapter(
-    runtime: &Runtime,
+    runtime: &IoPool,
     path: std::path::PathBuf,
     read_capacity: usize,
     write_capacity: usize,
@@ -162,7 +164,7 @@ mod tests {
     }
   }
 
-  fn block_worker(runtime: &Runtime) -> (crate::runtime::Job<()>, Receiver<()>, Sender<()>) {
+  fn block_worker(runtime: &IoPool) -> (crate::runtime::Job<()>, Receiver<()>, Sender<()>) {
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let job = runtime
@@ -241,7 +243,7 @@ mod tests {
       io::ErrorKind::BrokenPipe
     );
     assert_eq!(fs::read(path).unwrap(), b"aXYZef");
-    runtime.shutdown(ShutdownMode::Drain).unwrap();
+    runtime.shutdown().unwrap();
   }
 
   #[test]
@@ -268,7 +270,7 @@ mod tests {
     assert_eq!(&next, b"d");
     block_on(AsyncWriteExt::shutdown(&mut file)).unwrap();
     assert_eq!(fs::read(path).unwrap(), b"aXYdef");
-    runtime.shutdown(ShutdownMode::Drain).unwrap();
+    runtime.shutdown().unwrap();
   }
 
   #[test]
@@ -307,7 +309,7 @@ mod tests {
     assert_eq!(&next, b"d");
     block_on(AsyncWriteExt::shutdown(&mut file)).unwrap();
     assert_eq!(fs::read(path).unwrap(), b"aXYdef");
-    runtime.shutdown(ShutdownMode::Drain).unwrap();
+    runtime.shutdown().unwrap();
   }
 
   #[test]
@@ -337,18 +339,19 @@ mod tests {
     );
     assert_eq!(&next, b"b");
     block_on(AsyncWriteExt::shutdown(&mut file)).unwrap();
-    runtime.shutdown(ShutdownMode::Drain).unwrap();
+    runtime.shutdown().unwrap();
   }
 
-  fn cancel_queued_io(write: bool) {
+  fn drain_queued_io(write: bool) {
     let scratch = Scratch::new();
     let path = scratch.file();
     fs::write(&path, b"queued").unwrap();
-    let mut runtime = runtime(2);
-    let (scope, mut file) = open_adapter(&runtime, path, 4, 4);
+    let runtime = runtime(2);
+    let (scope, mut file) = open_adapter(&runtime, path.clone(), 4, 4);
     let (gate, started, release) = block_worker(&runtime);
     started.recv_timeout(Duration::from_secs(5)).unwrap();
 
+    let mut output = [0; 4];
     if write {
       assert_eq!(
         block_on(AsyncWriteExt::write(&mut file, b"sent")).unwrap(),
@@ -358,54 +361,52 @@ mod tests {
       let mut cx = Context::from_waker(Waker::noop());
       assert!(future.as_mut().poll(&mut cx).is_pending());
     } else {
-      let mut output = [0; 4];
       let mut future = Box::pin(AsyncReadExt::read(&mut file, &mut output));
       let mut cx = Context::from_waker(Waker::noop());
       assert!(future.as_mut().poll(&mut cx).is_pending());
     }
     assert_eq!(scope.snapshot().disk_ops, 1);
 
-    // The running gate and queued filesystem job fill the two-job bound.
-    // Wait until shutdown has closed admission before releasing the worker,
-    // so the filesystem closure is certainly canceled while still queued.
+    // Shutdown closes admission and waits; the queued filesystem job still
+    // runs after the gate, so the adapter keeps its file and progress.
     let handle = runtime.handle();
-    let release_after_close = release.clone();
-    let close_observer = thread::spawn(move || {
-      loop {
-        match handle.try_spawn(Resources::ZERO, |_| ()) {
-          Err(error) if error.kind() == crate::runtime::error::SubmitErrorKind::Closed => {
-            release_after_close.send(()).unwrap();
-            return;
-          }
-          Err(error) if error.kind() == crate::runtime::error::SubmitErrorKind::Full => {
-            thread::yield_now();
-          }
-          other => panic!("unexpected probe submission before shutdown: {other:?}"),
-        }
-      }
+    let shutdown = thread::spawn(move || {
+      let mut runtime = runtime;
+      runtime.shutdown()
     });
-    runtime.shutdown(ShutdownMode::CancelPending).unwrap();
-    close_observer.join().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !handle.snapshot().closed {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "shutdown did not start"
+      );
+      thread::yield_now();
+    }
+    assert_eq!(handle.snapshot().queued, 1);
+    release.send(()).unwrap();
+    shutdown.join().unwrap().unwrap();
     gate.join().unwrap();
+    assert_eq!(scope.snapshot().disk_ops, 0);
 
-    let error = if write {
-      block_on(AsyncWriteExt::flush(&mut file)).unwrap_err()
+    if write {
+      assert_eq!(fs::read(&path).unwrap(), b"sented");
     } else {
-      let mut output = [0; 4];
-      block_on(AsyncReadExt::read(&mut file, &mut output)).unwrap_err()
-    };
-    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
-    assert!(file.is_closed());
+      // The drained read filled the read-ahead; it is served without a job.
+      assert_eq!(
+        block_on(AsyncReadExt::read(&mut file, &mut output)).unwrap(),
+        4
+      );
+      assert_eq!(&output, b"queu");
+    }
+    assert!(!file.is_closed());
     drop(file);
-    let snapshot = scope.snapshot();
-    assert_eq!(snapshot.managed_memory, 0);
-    assert_eq!(snapshot.disk_ops, 0);
+    assert_eq!(scope.snapshot().managed_memory, 0);
   }
 
   #[test]
-  fn cancel_pending_queued_read_and_write_close_and_release_adapter() {
-    cancel_queued_io(false);
-    cancel_queued_io(true);
+  fn io_pool_shutdown_drains_queued_read_and_write_of_adapter() {
+    drain_queued_io(false);
+    drain_queued_io(true);
   }
 
   #[test]
@@ -439,7 +440,7 @@ mod tests {
         .kind(),
       io::ErrorKind::BrokenPipe
     );
-    runtime.shutdown(ShutdownMode::Drain).unwrap();
+    runtime.shutdown().unwrap();
   }
 
   #[test]
@@ -466,7 +467,7 @@ mod tests {
       4
     );
     assert_eq!(&resumed, b"reta");
-    runtime.shutdown(ShutdownMode::Drain).unwrap();
+    runtime.shutdown().unwrap();
   }
 
   #[test]
@@ -516,7 +517,7 @@ mod tests {
     let snapshot = scope.snapshot();
     assert_eq!(snapshot.managed_memory, 0);
     assert_eq!(snapshot.disk_ops, 0);
-    runtime.shutdown(ShutdownMode::Drain).unwrap();
+    runtime.shutdown().unwrap();
   }
 
   #[test]
@@ -543,7 +544,7 @@ mod tests {
     block_on(AsyncWriteExt::shutdown(&mut file)).unwrap();
 
     assert_eq!(fs::read(path).unwrap(), b"once");
-    runtime.shutdown(ShutdownMode::Drain).unwrap();
+    runtime.shutdown().unwrap();
   }
 
   #[test]
@@ -573,7 +574,7 @@ mod tests {
       2
     );
     assert_eq!(&output, b"re");
-    runtime.shutdown(ShutdownMode::Drain).unwrap();
+    runtime.shutdown().unwrap();
   }
 
   #[test]
@@ -618,7 +619,7 @@ mod tests {
     block_on(AsyncWriteExt::shutdown(&mut file)).unwrap();
     assert!(file.is_closed());
     assert_eq!(fs::read(path).unwrap(), b"abcd");
-    runtime.shutdown(ShutdownMode::Drain).unwrap();
+    runtime.shutdown().unwrap();
   }
 }
 

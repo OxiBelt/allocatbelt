@@ -1,6 +1,6 @@
 use super::{DirectoryEntryOutcome, FsHandle, FsSubmissionErrorKind, OwnedFile};
 use crate::runtime::managed::{ResourceLimits, ResourceScope};
-use crate::runtime::{Config, JoinError, Resources, Runtime, ShutdownMode, SubmitErrorKind};
+use crate::runtime::{Config, IoPool, JoinError, Resources, SubmitErrorKind};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
@@ -45,7 +45,7 @@ fn supplied_file_survives_unlink_mutations_and_recovery_without_cursor_reset() {
   assert_eq!(metadata.len(), 3);
   assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
   assert_eq!(scope.snapshot().disk_ops, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -74,7 +74,7 @@ fn rejected_and_queued_cancelled_file_mutations_have_no_side_effects() {
   assert_eq!(scope.snapshot().disk_ops, 0);
   release.send(()).unwrap();
   blocker.join().unwrap();
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 
   let mut runtime = self::runtime(1, 2);
   let (blocker, started, release) = gated_job(&runtime);
@@ -89,7 +89,7 @@ fn rejected_and_queued_cancelled_file_mutations_have_no_side_effects() {
   assert_eq!(fs::read(&path).unwrap(), b"unchanged");
   assert_eq!(scope.snapshot().disk_ops, 0);
   blocker.join().unwrap();
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -114,7 +114,7 @@ fn failed_truncation_returns_the_original_read_only_descriptor() {
   returned.read_to_string(&mut contents).unwrap();
   assert_eq!(contents, "retain");
   assert_eq!(scope.snapshot().disk_ops, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -187,7 +187,7 @@ fn path_ports_preserve_relative_links_dangling_links_and_nonempty_directories() 
     .unwrap()
     .unwrap();
   assert_eq!(scope.snapshot().disk_ops, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -243,7 +243,7 @@ fn bounded_path_copy_overwrites_contents_and_copies_source_permissions() {
 
   assert_eq!(scope.snapshot().disk_ops, 0);
 
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -269,7 +269,7 @@ fn path_copy_returns_rejected_paths_and_queued_cancel_has_no_side_effect() {
   assert_eq!(scope.snapshot().disk_ops, 0);
   assert!(!destination.exists());
   release.send(()).unwrap();
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 
   let mut runtime = self::runtime(1, 2);
   let (blocker, started, release) = gated_job(&runtime);
@@ -283,7 +283,7 @@ fn path_copy_returns_rejected_paths_and_queued_cancel_has_no_side_effect() {
   assert!(!destination.exists());
   assert_eq!(scope.snapshot().disk_ops, 0);
   blocker.join().unwrap();
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 
   let zero_disk_scope = self::scope(0, 0);
   let mut runtime = self::runtime(1, 1);
@@ -297,7 +297,7 @@ fn path_copy_returns_rejected_paths_and_queued_cancel_has_no_side_effect() {
   ));
   assert_eq!(error.into_input(), (source, destination));
   assert_eq!(zero_disk_scope.snapshot().disk_ops, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -317,7 +317,7 @@ fn path_copy_reports_io_errors_without_creating_a_destination() {
   assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
   assert!(!destination.exists());
   assert_eq!(scope.snapshot().disk_ops, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 struct Scratch(PathBuf);
@@ -341,8 +341,8 @@ impl Drop for Scratch {
   }
 }
 
-fn runtime(workers: usize, max_outstanding: usize) -> Runtime {
-  Runtime::new(Config {
+fn runtime(workers: usize, max_outstanding: usize) -> IoPool {
+  IoPool::new(Config {
     workers,
     max_outstanding,
     capacity: Resources::ZERO,
@@ -369,7 +369,7 @@ fn wait_until(mut ready: impl FnMut() -> bool) {
   }
 }
 
-fn gated_job(runtime: &Runtime) -> (crate::runtime::Job<()>, Receiver<()>, Sender<()>) {
+fn gated_job(runtime: &IoPool) -> (crate::runtime::Job<()>, Receiver<()>, Sender<()>) {
   let (started_tx, started_rx) = mpsc::channel();
   let (release_tx, release_rx) = mpsc::channel();
   let job = runtime
@@ -421,7 +421,7 @@ fn joined_result_keeps_managed_charge_until_its_buffer_is_dropped() {
   assert_eq!(scope.snapshot().disk_ops, 0);
   drop(outcome);
   assert_eq!(scope.snapshot().managed_memory, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -441,7 +441,7 @@ fn full_scheduler_rejection_returns_exact_path_and_releases_disk_permit() {
   assert_eq!(error.into_input(), path);
   assert_eq!(scope.snapshot().disk_ops, 0);
   release.send(()).unwrap();
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -466,7 +466,7 @@ fn running_detached_operation_keeps_its_permit_and_buffer_until_completion() {
   assert_eq!(scope.snapshot().managed_memory, charged);
   release_tx.send(()).unwrap();
   wait_until(|| scope.snapshot().disk_ops == 0 && scope.snapshot().managed_memory == 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 struct DropGate {
@@ -528,7 +528,7 @@ fn queued_cancel_holds_permit_until_capture_cleanup_finishes() {
   assert_eq!(scope.snapshot().disk_ops, 0);
   assert_eq!(scope.snapshot().managed_memory, 0);
   blocker.join().unwrap();
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -620,7 +620,7 @@ fn file_cursor_moves_with_owned_file_and_positional_io_leaves_it_unchanged() {
   assert_eq!(&bytes, b"AbcXYZgh");
   drop(positioned);
   assert_eq!(scope.snapshot().managed_memory, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -654,7 +654,7 @@ fn directory_iteration_returns_one_entry_per_job() {
     }
   }
   assert_eq!(count, 3);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -688,7 +688,7 @@ fn write_error_returns_file_and_charged_buffer_without_progress() {
   assert_eq!(positioned.position.unwrap(), 0);
   drop(outcome.buffer);
   assert_eq!(scope.snapshot().managed_memory, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -724,7 +724,7 @@ fn positioned_write_preserves_linux_append_behavior() {
   result.unwrap();
   let (_file, result) = handle.sync_all(file).unwrap().join().unwrap();
   result.unwrap();
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -752,7 +752,7 @@ fn shared_read_buffer_is_rejected_unchanged_before_disk_admission() {
   drop(other);
   drop(returned);
   assert_eq!(scope.snapshot().managed_memory, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 fn controlled_scope() -> (
@@ -806,7 +806,7 @@ fn metadata_refusal_recovers_input_before_disk_or_job_admission() {
   assert!(!called.load(Ordering::SeqCst));
   assert_eq!(scope.snapshot().disk_ops, 0);
   assert_eq!(domain.snapshot(), before);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
@@ -835,7 +835,7 @@ fn detached_active_request_keeps_declared_metadata_until_closure_finishes() {
   assert_eq!(domain.snapshot().used.get(DomainResource::Control), charged);
   assert_eq!(scope.snapshot().disk_ops, 1);
   release_tx.send(()).unwrap();
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
   assert_eq!(scope.snapshot().disk_ops, 0);
   assert_eq!(
     domain.snapshot().used.get(DomainResource::Control),
@@ -862,7 +862,7 @@ fn cancelled_queued_request_releases_metadata_and_operation_together() {
   release.send(()).unwrap();
   assert!(matches!(job.join(), Err(JoinError::Cancelled)));
   blocker.join().unwrap();
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
   assert!(!called.load(Ordering::SeqCst));
   assert_eq!(scope.snapshot().disk_ops, 0);
   assert_eq!(

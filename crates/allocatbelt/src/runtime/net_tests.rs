@@ -18,11 +18,11 @@ use super::{
   classify_connect_probe, classify_connect_start, finish_connect_probe, initiate_tcp_connect,
   wait_for_tcp_connect,
 };
-use crate::runtime::blocking::{Config, Runtime, ShutdownMode};
 use crate::runtime::io::{AsyncRead, AsyncWrite, copy_with_buffer};
 use crate::runtime::managed::{OperationRequest, ResourceLimits, ResourceScope};
 use crate::runtime::reactor::{Reactor, ReactorConfig};
 use crate::runtime::resources::Resources;
+use crate::runtime::{Config, IoPool};
 
 fn reactor(registrations: usize) -> Reactor {
   Reactor::new(ReactorConfig {
@@ -1120,8 +1120,8 @@ fn rejected_registration_returns_the_socket() {
 }
 
 #[test]
-fn connect_runs_on_the_blocking_pool_and_releases_its_network_permit() {
-  let mut runtime = Runtime::new(Config {
+fn connect_runs_on_the_io_pool_and_releases_its_network_permit() {
+  let mut runtime = IoPool::new(Config {
     workers: 1,
     max_outstanding: 2,
     capacity: Resources::ZERO,
@@ -1166,7 +1166,7 @@ fn connect_runs_on_the_blocking_pool_and_releases_its_network_permit() {
   assert_eq!(peer.read(&mut response).unwrap(), 0);
   assert_eq!(scope.snapshot().network_ops, 0);
   assert_eq!(stream.get_ref().peer_addr().unwrap(), address);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -1198,7 +1198,7 @@ fn tcp_stream_quickack_round_trips_kernel_value() {
 
 #[test]
 fn nonblocking_tcp_connect_preserves_bound_port_and_transfers_data() {
-  let mut blocking = Runtime::new(Config {
+  let mut blocking = IoPool::new(Config {
     workers: 1,
     max_outstanding: 2,
     capacity: Resources::ZERO,
@@ -1248,7 +1248,7 @@ fn nonblocking_tcp_connect_preserves_bound_port_and_transfers_data() {
   assert_eq!(&received, b"pong");
   drop(stream);
   assert_eq!(reactor.handle().registrations(), 0);
-  blocking.shutdown(ShutdownMode::Drain).unwrap();
+  blocking.shutdown().unwrap();
 }
 
 #[test]
@@ -1270,7 +1270,7 @@ fn nonblocking_ipv6_tcp_connect_works_when_loopback_is_available() {
   };
   let address = listener.local_addr().unwrap();
   let reactor = reactor(2);
-  let mut blocking = Runtime::new(Config {
+  let mut blocking = IoPool::new(Config {
     workers: 1,
     max_outstanding: 1,
     capacity: Resources::ZERO,
@@ -1287,7 +1287,7 @@ fn nonblocking_ipv6_tcp_connect_works_when_loopback_is_available() {
   assert_eq!(stream.get_ref().peer_addr().unwrap(), address);
   drop(peer);
   drop(stream);
-  blocking.shutdown(ShutdownMode::Drain).unwrap();
+  blocking.shutdown().unwrap();
 }
 
 #[test]
@@ -1393,7 +1393,7 @@ fn socket_buffer_size_conversion_rejects_kernel_values_above_u32() {
 
 #[test]
 fn tcp_connect_rejections_before_connect_return_the_supplied_socket() {
-  let mut blocking = Runtime::new(Config {
+  let mut blocking = IoPool::new(Config {
     workers: 1,
     max_outstanding: 1,
     capacity: Resources::ZERO,
@@ -1419,9 +1419,9 @@ fn tcp_connect_rejections_before_connect_return_the_supplied_socket() {
   }
   assert_eq!(reactor.handle().registrations(), 0);
   assert_eq!(reactor.handle().waiters(), 0);
-  blocking.shutdown(ShutdownMode::Drain).unwrap();
+  blocking.shutdown().unwrap();
 
-  let mut blocking = Runtime::new(Config {
+  let mut blocking = IoPool::new(Config {
     workers: 1,
     max_outstanding: 1,
     capacity: Resources::ZERO,
@@ -1456,12 +1456,12 @@ fn tcp_connect_rejections_before_connect_return_the_supplied_socket() {
   assert_eq!(handle.waiters(), 0);
   drop(_registered);
   assert_eq!(handle.registrations(), 0);
-  blocking.shutdown(ShutdownMode::Drain).unwrap();
+  blocking.shutdown().unwrap();
 }
 
 #[test]
 fn refused_nonblocking_connect_releases_its_permit_and_registration() {
-  let mut blocking = Runtime::new(Config {
+  let mut blocking = IoPool::new(Config {
     workers: 1,
     max_outstanding: 1,
     capacity: Resources::ZERO,
@@ -1492,9 +1492,9 @@ fn refused_nonblocking_connect_releases_its_permit_and_registration() {
   assert_eq!(reactor.handle().registrations(), 0);
   assert_eq!(reactor.handle().waiters(), 0);
   drop(reservation);
-  blocking.shutdown(ShutdownMode::Drain).unwrap();
+  blocking.shutdown().unwrap();
 
-  let mut blocking = Runtime::new(Config {
+  let mut blocking = IoPool::new(Config {
     workers: 1,
     max_outstanding: 1,
     capacity: Resources::ZERO,
@@ -1519,7 +1519,7 @@ fn refused_nonblocking_connect_releases_its_permit_and_registration() {
     TcpConnectError::Operation(error) => panic!("unexpected operation error: {error}"),
   }
   assert_eq!(reactor.handle().registrations(), 0);
-  blocking.shutdown(ShutdownMode::Drain).unwrap();
+  blocking.shutdown().unwrap();
 }
 
 #[test]
@@ -1696,7 +1696,7 @@ fn cancellation_drops_stale_connect_waiter_before_socket_and_permit() {
 
 #[test]
 fn resolver_output_never_exceeds_its_bound_plus_one_overflow_item() {
-  let mut runtime = Runtime::new(Config {
+  let mut runtime = IoPool::new(Config {
     workers: 1,
     max_outstanding: 2,
     capacity: Resources::ZERO,
@@ -1727,12 +1727,12 @@ fn resolver_output_never_exceeds_its_bound_plus_one_overflow_item() {
   assert_eq!(scope.snapshot().managed_memory, charged);
   drop(clone);
   assert_eq!(scope.snapshot().managed_memory, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
 fn dns_memory_rejection_returns_the_owned_hostname() {
-  let mut runtime = Runtime::new(Config {
+  let mut runtime = IoPool::new(Config {
     workers: 1,
     max_outstanding: 2,
     capacity: Resources::ZERO,
@@ -1755,12 +1755,12 @@ fn dns_memory_rejection_returns_the_owned_hostname() {
   assert!(matches!(error.kind, ResolveSubmissionKind::Resource(_)));
   assert_eq!(scope.snapshot().managed_memory, 0);
   assert_eq!(scope.snapshot().network_ops, 0);
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]
 fn dns_runtime_rejection_returns_the_owned_hostname() {
-  let mut runtime = Runtime::new(Config {
+  let mut runtime = IoPool::new(Config {
     workers: 1,
     max_outstanding: 1,
     capacity: Resources::ZERO,
@@ -1773,7 +1773,7 @@ fn dns_runtime_rejection_returns_the_owned_hostname() {
     network_concurrent_ops: 1,
   });
   let handle = runtime.handle();
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
   let net = NetHandle::new(handle, scope.clone(), reactor.handle(), 1).unwrap();
 
   let error = block_on(net.resolve("retry.this.host".to_owned(), 53)).unwrap_err();
@@ -1789,7 +1789,7 @@ fn dns_runtime_rejection_returns_the_owned_hostname() {
 
 #[test]
 fn dropping_dns_future_keeps_charges_until_blocking_worker_cleanup() {
-  let mut runtime = Runtime::new(Config {
+  let mut runtime = IoPool::new(Config {
     workers: 1,
     max_outstanding: 2,
     capacity: Resources::ZERO,
@@ -1837,7 +1837,7 @@ fn dropping_dns_future_keeps_charges_until_blocking_worker_cleanup() {
     );
     thread::yield_now();
   }
-  runtime.shutdown(ShutdownMode::Drain).unwrap();
+  runtime.shutdown().unwrap();
 }
 
 #[test]

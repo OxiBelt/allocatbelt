@@ -2,7 +2,7 @@ use allocatbelt::runtime::asynchronous::{AsyncConfig, AsyncRuntime, AsyncShutdow
 use allocatbelt::runtime::managed::{ResourceLimits, ResourceScope};
 use allocatbelt::runtime::reactor::{Reactor, ReactorConfig};
 use allocatbelt::runtime::time::TimerDriver;
-use allocatbelt::runtime::{Config, Resources, Runtime, ShutdownMode};
+use allocatbelt::runtime::{Config, IoPool, Resources};
 use allocatbelt_app_ports::PortResult;
 use allocatbelt_app_ports::http::{self, HttpConfig, MAX_BODY_BYTES, MAX_REQUEST_BYTES};
 use std::time::Duration;
@@ -16,7 +16,7 @@ fn main() -> PortResult<()> {
     return Err(std::io::Error::other("usage: tcp_http [body-bytes<=8192]").into());
   }
 
-  let mut blocking = Runtime::new(Config {
+  let mut io_pool = IoPool::new(Config {
     workers: 1,
     max_outstanding: 4,
     capacity: Resources::ZERO,
@@ -41,7 +41,7 @@ fn main() -> PortResult<()> {
     Duration::from_secs(30),
     http::loopback_transaction_nonblocking(
       &scope,
-      blocking.handle(),
+      io_pool.handle(),
       reactor.handle(),
       resources.clone(),
       config,
@@ -51,13 +51,13 @@ fn main() -> PortResult<()> {
 
   let close = async_runtime.block_on(scope.close());
   let async_shutdown = async_runtime.shutdown(AsyncShutdown::Drain);
-  let blocking_shutdown = blocking.shutdown(ShutdownMode::Drain);
+  let io_pool_shutdown = io_pool.shutdown();
   let reactor_shutdown = reactor.shutdown();
   let timer_shutdown = timer.shutdown();
   let checksum = transaction???;
   close?;
   async_shutdown?;
-  blocking_shutdown?;
+  io_pool_shutdown?;
   reactor_shutdown?;
   timer_shutdown?;
   let snapshot = resources.snapshot();

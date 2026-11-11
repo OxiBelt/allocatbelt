@@ -2722,7 +2722,7 @@ fn run_native_session(
   };
   let limits = application_domain.local_limits();
   let rate_configs = application_domain.rate_configs();
-  let blocking = BlockingConfig {
+  let io_pool = BlockingConfig {
     workers,
     max_outstanding: 64,
     capacity: Resources {
@@ -2739,7 +2739,7 @@ fn run_native_session(
   .resource_domain(application_domain.tenant())
   .timer(2)
   .rate_timer_registrations(256)
-  .blocking(blocking)
+  .io_pool(io_pool)
   .filesystem()
   .reactor(ReactorConfig {
     max_registrations: 2 * WINDOW + 4,
@@ -2783,10 +2783,10 @@ fn run_native_session(
     let handle = child_scope.handle();
     scope = Some(child_scope);
     crate::application::warm_bounded_for(&handle, workers)?;
-    let blocking_handle = driver
-      .blocking()
-      .ok_or_else(|| "owning soak runtime omitted its blocking pool".to_owned())?;
-    crate::application::disk_lane::warm_native_workers(&blocking_handle, &handle, workers)?;
+    let io_pool_handle = driver
+      .io_pool()
+      .ok_or_else(|| "owning soak runtime omitted its I/O pool".to_owned())?;
+    crate::application::disk_lane::warm_native_workers(&io_pool_handle, &handle, workers)?;
     let fs_handle = driver
       .filesystem()
       .ok_or_else(|| "owning soak runtime omitted its filesystem".to_owned())?;
@@ -2796,8 +2796,13 @@ fn run_native_session(
     let timer = driver
       .timer()
       .ok_or_else(|| "owning soak runtime omitted its sampling timer".to_owned())?;
-    let net = NetHandle::new(blocking_handle, resources.clone(), reactor.clone(), 1)
-      .map_err(|error| format!("soak network handle startup failed: {error}"))?;
+    let net = NetHandle::new(
+      io_pool_handle.clone(),
+      resources.clone(),
+      reactor.clone(),
+      1,
+    )
+    .map_err(|error| format!("soak network handle startup failed: {error}"))?;
     let (listener, address) = native_listener(&reactor)?;
     #[cfg(feature = "resource-feedback")]
     let startup_observation = if args.comparison_mode.feedback_enabled() {
