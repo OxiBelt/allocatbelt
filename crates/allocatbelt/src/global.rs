@@ -128,6 +128,15 @@ impl Os for LinuxOs {
     }
   }
 
+  fn protect(&self, offset: usize, len: usize) -> bool {
+    // SAFETY: as for `decommit`, the range holds no live allocation, and
+    // the heap hands nothing out of it until it has committed it again.
+    #[expect(unsafe_code, reason = "revoking access to unused memory")]
+    unsafe {
+      self.arena().user.protect(offset, len)
+    }
+  }
+
   fn purge(&self, offset: usize, len: usize) -> bool {
     // SAFETY: as for `decommit`, the range holds no live allocation.
     #[expect(unsafe_code, reason = "returning unused memory to the kernel")]

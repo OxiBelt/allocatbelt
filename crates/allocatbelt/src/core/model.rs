@@ -22,8 +22,8 @@ use std::sync::{Mutex, OnceLock};
 use std::vec::Vec;
 
 use crate::core::{
-  ARENA_SIZE, AgeKernel, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, PURGE_BATCH, Purger,
-  ReclaimTargets, Retention, SEGMENT_SIZE, ThreadCache, aged_pages,
+  ARENA_SIZE, AgeKernel, Block, Heap, MAX_SEGMENTS, META_WORDS, Os, PAGE_SIZE, PAGES_PER_SEGMENT,
+  PURGE_BATCH, Purger, ReclaimTargets, Retention, SEGMENT_SIZE, ThreadCache, aged_pages,
 };
 
 /// An [`Os`] that records what the heap does and checks it.
@@ -41,6 +41,11 @@ pub struct MockOs {
   /// Makes `purge` and `decommit` report failure, as `madvise` does on
   /// `mlock`ed memory.
   pub(crate) purge_fails: AtomicBool,
+  /// Segments made inaccessible by [`Os::protect`] with their contents
+  /// kept, until they are committed or decommitted again.
+  pub(crate) protected: Mutex<BTreeSet<usize>>,
+  /// Makes [`Os::protect`] report failure, as for an `Os` without it.
+  pub(crate) protect_fails: AtomicBool,
   /// The clock `now_ms` reports; advanced by hand.
   clock: AtomicU64,
   /// `futex_wake` calls (lock hand-offs and maintenance wake-ups).
@@ -70,6 +75,8 @@ impl MockOs {
       guarded: Mutex::new(BTreeSet::new()),
       purged: AtomicUsize::new(0),
       purge_fails: AtomicBool::new(false),
+      protected: Mutex::new(BTreeSet::new()),
+      protect_fails: AtomicBool::new(false),
       clock: AtomicU64::new(0),
       wakes: AtomicUsize::new(0),
       last_wait_ms: AtomicU64::new(0),
@@ -132,18 +139,42 @@ impl Os for MockOs {
   fn commit(&self, offset: usize, len: usize) -> bool {
     assert_eq!(offset % SEGMENT_SIZE, 0);
     self.assert_unguarded(offset, len, "commit");
+    let mut p = self.protected.lock().unwrap();
     for s in offset / SEGMENT_SIZE..(offset + len) / SEGMENT_SIZE {
       self.committed[s].store(true, Ordering::Relaxed);
+      // Accessible again, with whatever the segment held.
+      p.remove(&s);
     }
     true
   }
   fn decommit(&self, offset: usize, len: usize) -> bool {
     self.assert_no_live(offset, len, "decommit");
+    let mut p = self.protected.lock().unwrap();
     for s in offset / SEGMENT_SIZE..(offset + len) / SEGMENT_SIZE {
       self.committed[s].store(false, Ordering::Relaxed);
+      p.remove(&s);
     }
+    drop(p);
     self.purged.fetch_add(len, Ordering::Relaxed);
     self.zero(offset, len)
+  }
+  fn protect(&self, offset: usize, len: usize) -> bool {
+    assert_eq!(offset % SEGMENT_SIZE, 0);
+    assert_eq!(len % SEGMENT_SIZE, 0);
+    self.assert_no_live(offset, len, "protect");
+    self.assert_unguarded(offset, len, "protect");
+    if self.protect_fails.load(Ordering::Relaxed) {
+      return false;
+    }
+    let mut p = self.protected.lock().unwrap();
+    for s in offset / SEGMENT_SIZE..(offset + len) / SEGMENT_SIZE {
+      assert!(
+        self.committed[s].swap(false, Ordering::Relaxed),
+        "protect of segment {s}, which is not committed"
+      );
+      p.insert(s);
+    }
+    true
   }
   fn purge(&self, offset: usize, len: usize) -> bool {
     self.assert_no_live(offset, len, "purge");
@@ -591,7 +622,11 @@ pub fn check_observations(h: &Heap<MockOs>, caches: &[ThreadCache]) {
   assert!(s.new_pages <= s.refills, "{s:?}");
   assert!(s.new_segments <= s.run_searches + s.new_pages, "{s:?}");
   let u = h.usage();
-  assert_eq!(u.dirty_pages, h.dirty_pages(), "{u:?}");
+  assert_eq!(
+    u.dirty_pages + u.retained_segments * PAGES_PER_SEGMENT,
+    h.dirty_pages(),
+    "{u:?}"
+  );
   assert_eq!(
     u.owned_segments + u.huge_segments,
     h.segments_in_use(),

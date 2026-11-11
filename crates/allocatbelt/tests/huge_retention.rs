@@ -1,0 +1,137 @@
+//! Freed huge blocks stay resident but inaccessible until a pass decommits
+//! them: seen from a real process. A separate test binary, so that no other
+//! test allocates meanwhile.
+
+#![allow(
+  unsafe_code,
+  reason = "the tests fork, read a freed block on purpose and query the kernel"
+)]
+
+use std::time::{Duration, Instant};
+
+use allocatbelt::Allocatbelt;
+
+#[global_allocator]
+static GLOBAL: Allocatbelt = Allocatbelt;
+
+/// Two segments: well above the longest page run, below the dirty budget.
+const SIZE: usize = 8 << 20;
+
+/// Minor page faults of this process so far.
+fn minor_faults() -> i64 {
+  // SAFETY: `rusage` is plain data for which all-zero bytes are valid.
+  let mut r: libc::rusage = unsafe { std::mem::zeroed() };
+  // SAFETY: `getrusage` writes the usage of this process to `r`, a valid
+  // out pointer.
+  assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut r) }, 0);
+  r.ru_minflt
+}
+
+/// Writes one byte per 4 KiB page of `v`'s whole capacity.
+fn touch(v: &mut Vec<u8>) {
+  v.resize(v.capacity(), 1);
+  for i in (0..v.len()).step_by(4096) {
+    v[i] = i as u8;
+  }
+  std::hint::black_box(&v);
+}
+
+/// Waits up to 10 s for `done`.
+fn wait_for(done: impl Fn() -> bool) -> bool {
+  let deadline = Instant::now() + Duration::from_secs(10);
+  while !done() {
+    if Instant::now() > deadline {
+      return false;
+    }
+    std::thread::sleep(Duration::from_millis(5));
+  }
+  true
+}
+
+#[test]
+fn freed_huge_blocks_are_reused_without_faults_then_decayed() {
+  // No decay pass gets in the way until the end of the test.
+  GLOBAL.set_purge_delay(Duration::from_secs(3600));
+  let mut v = Vec::<u8>::with_capacity(SIZE);
+  touch(&mut v);
+  let first = v.as_ptr();
+  drop(v);
+  let u = GLOBAL.heap_usage();
+  assert_eq!((u.huge_segments, u.retained_segments), (0, 2), "{u:?}");
+
+  // First fit by address takes the same segments, still resident: filling
+  // the block again faults far less than once per page (2048 pages).
+  let before = minor_faults();
+  let mut v = Vec::<u8>::with_capacity(SIZE);
+  assert_eq!(v.as_ptr(), first);
+  touch(&mut v);
+  let faults = minor_faults() - before;
+  assert!(faults < 256, "{faults} faults refilling a retained block");
+  assert_eq!(GLOBAL.heap_usage().retained_segments, 0);
+  drop(v);
+  assert_eq!(GLOBAL.heap_usage().retained_segments, 2);
+
+  // Once the purge delay has passed, the maintenance thread's decay pass
+  // decommits them.
+  GLOBAL.set_purge_delay(Duration::from_millis(20));
+  assert!(GLOBAL.start_maintenance_thread().unwrap());
+  assert!(
+    wait_for(|| GLOBAL.heap_usage().retained_segments == 0),
+    "{:?}",
+    GLOBAL.heap_usage()
+  );
+  assert!(GLOBAL.maintenance_stats().retained_segments_purged >= 2);
+  // Decommitted, a new block of the size faults again on every page.
+  let before = minor_faults();
+  let mut v = Vec::<u8>::with_capacity(SIZE);
+  touch(&mut v);
+  let faults = minor_faults() - before;
+  assert!(
+    faults >= 1024,
+    "only {faults} faults filling a decommitted block"
+  );
+  drop(v);
+}
+
+/// What the child does: read a freed huge block, which must fault.
+fn read_after_free() -> ! {
+  // SAFETY: `alarm` only arms a timer; its default action kills the child
+  // if it hangs instead of faulting.
+  unsafe { libc::alarm(10) };
+  GLOBAL.set_purge_delay(Duration::from_secs(3600));
+  let mut v = Vec::<u8>::with_capacity(SIZE);
+  touch(&mut v);
+  let p = v.as_ptr().wrapping_add(SIZE / 2);
+  drop(v);
+  // Retained, not decommitted: the memory is still there, but the
+  // segments are inaccessible. (At least these two: the other test runs
+  // in the parent concurrently, and its state is forked too.)
+  assert!(GLOBAL.heap_usage().retained_segments >= 2);
+  // SAFETY: none; this is the use after free under test, in a child
+  // process that must die of `SIGSEGV` here.
+  let _ = unsafe { p.read_volatile() };
+  // SAFETY: `_exit` ends the child without running the parent's atexit
+  // handlers or flushing its stdio buffers twice.
+  unsafe { libc::_exit(0) }
+}
+
+#[test]
+fn reading_a_retained_huge_block_faults() {
+  // SAFETY: the child only calls async-signal-safe functions and the
+  // allocator (which supports use after `fork`) before it faults or exits.
+  let pid = unsafe { libc::fork() };
+  assert!(pid >= 0, "fork failed");
+  if pid == 0 {
+    read_after_free();
+  }
+  let mut status = 0;
+  // SAFETY: waits for the child just created; `status` is a valid out
+  // pointer.
+  let r = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+  assert_eq!(r, pid);
+  assert!(
+    libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSEGV,
+    "child ended with status {status:#x}, not SIGSEGV (a SIGALRM kill means it hung, \
+     an abort that an assertion failed)"
+  );
+}

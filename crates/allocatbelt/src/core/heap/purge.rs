@@ -206,7 +206,7 @@ impl<O: Os> Heap<O> {
   /// must equal [`Heap::dirty_pages`] whenever no pass or free is running.
   #[cfg(any(all(test, allocatbelt_core_check), allocatbelt_model))]
   pub fn dirty_pages_recounted(&self) -> usize {
-    let mut n = 0;
+    let mut n = self.retained_segments_recounted() * PAGES_PER_SEGMENT;
     for (wi, word) in self.seg_used.iter().enumerate() {
       let mut used_segs = word.load(Relaxed);
       while used_segs != 0 {
@@ -220,6 +220,23 @@ impl<O: Os> Heap<O> {
       }
     }
     n
+  }
+
+  /// The free segments marked retained, recounted from their headers,
+  /// which must equal the retained count whenever no free, allocation or
+  /// pass is running.
+  #[cfg(any(all(test, allocatbelt_core_check), allocatbelt_model))]
+  pub fn retained_segments_recounted(&self) -> usize {
+    // No segment at or above the top was ever retained.
+    (0..self.retained_top())
+      .filter(|&seg| {
+        self.seg_used[seg / 64].load(Relaxed) & 1 << (seg % 64) == 0
+          && self
+            .os
+            .meta(seg)
+            .is_some_and(|m| m[SEG_HDR].load(Acquire) == SEG_RETAINED)
+      })
+      .count()
   }
 
   /// Claims the free pages of a segment that have been dirty since epoch

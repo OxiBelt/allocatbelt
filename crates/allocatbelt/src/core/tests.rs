@@ -15,7 +15,8 @@ use crate::core::model::{
   MockOs, MockPurger, alloc, alloc_block, alloc_c, cache, free, free_c, resize,
 };
 use crate::core::{
-  Block, DIRTY_HARD_LIMIT_PAGES, Heap, PAGE_SIZE, PURGE_BATCH, SEGMENT_SIZE, Task, ThreadCache,
+  Block, DIRTY_HARD_LIMIT_PAGES, Heap, PAGE_SIZE, PAGES_PER_SEGMENT, PURGE_BATCH, SEGMENT_SIZE,
+  Task, ThreadCache,
 };
 
 // Keep intentional mock heaps reachable so Miri can still report other leaks.
@@ -417,8 +418,14 @@ fn zeroed_blocks_are_reported() {
   free(h, again.offset);
   h.purge();
   assert!(alloc_block(h, 0, 5 * PAGE_SIZE, 8).zeroed);
-  // Huge segments are decommitted on free, so they come back zeroed.
+  // Huge segments are retained on free with their contents, so they come
+  // back dirty; once a purge has decommitted them, zeroed.
   free(h, big.offset);
+  let again = alloc_block(h, 0, 10 << 20, 8);
+  assert_eq!(again.offset, big.offset);
+  assert!(!again.zeroed);
+  free(h, again.offset);
+  h.purge();
   assert!(alloc_block(h, 0, 10 << 20, 8).zeroed);
 }
 
@@ -438,14 +445,17 @@ fn failed_purges_are_not_zeroed() {
   let again = alloc_block(h, 0, 5 * PAGE_SIZE, 8);
   assert_eq!(again.offset, run);
   assert!(!again.zeroed);
-  // A segment whose decommit failed starts fully dirty when a shard takes
-  // it (first fit picks the lowest segment, freed here).
+  // A segment that may hold old bytes (retained after a huge free, as
+  // here, or one whose decommit failed) starts fully dirty when a shard
+  // takes it (first fit picks the lowest segment, freed here).
   assert_eq!(huge.offset, 0);
   free(h, huge.offset);
   let owned = alloc_block(h, 1, 5 * PAGE_SIZE, 8);
   assert!(owned.offset < SEGMENT_SIZE && !owned.zeroed);
-  // (All pages but the guard page start dirty.)
-  assert_eq!(h.dirty_pages(), MAX_RUN_PAGES - 5);
+  // (All pages but the guard page start dirty; the huge block's other two
+  // segments are still retained.)
+  assert_eq!(h.usage().retained_segments, 2);
+  assert_eq!(h.dirty_pages(), MAX_RUN_PAGES - 5 + 2 * PAGES_PER_SEGMENT);
   // Once purging works again, the pages are clean and reported zeroed.
   h.os().purge_fails.store(false, Ordering::Relaxed);
   h.purge();
@@ -2723,14 +2733,27 @@ fn usage_tells_memory_apart() {
       u.huge_segments,
       u.pages_in_use,
       u.dirty_pages,
-      u.clean_pages
+      u.clean_pages,
+      u.retained_segments
     ),
-    (0, 1, 8, 54)
+    (0, 1, 8, 54, 5)
   );
-  assert_eq!(u.dirty_pages, h.dirty_pages());
+  // The dirty budget counts the retained segments' pages too.
+  assert_eq!(
+    u.dirty_pages + u.retained_segments * PAGES_PER_SEGMENT,
+    h.dirty_pages()
+  );
   h.purge();
   let u = h.usage();
-  assert_eq!((u.pages_in_use, u.dirty_pages, u.clean_pages), (1, 0, 62));
+  assert_eq!(
+    (
+      u.pages_in_use,
+      u.dirty_pages,
+      u.clean_pages,
+      u.retained_segments
+    ),
+    (1, 0, 62, 0)
+  );
   free(h, small);
   h.purge();
   // The small page, the newest of its class, stays, with nothing out.
@@ -4343,4 +4366,201 @@ fn concurrent_frees_and_trims_lose_no_candidate() {
   assert_eq!(reconciled, 0);
   assert_eq!(h.usage().small_pages, h.newest_pages());
   assert!(h.os().live.lock().unwrap().is_empty());
+}
+
+// ---- retained huge segments ---------------------------------------------------
+
+/// Whether every segment of `off..off + len` is committed (accessible).
+fn committed(h: &Heap<MockOs>, off: usize, len: usize) -> bool {
+  (off / SEGMENT_SIZE..(off + len).div_ceil(SEGMENT_SIZE))
+    .all(|s| h.os().committed[s].load(Ordering::Relaxed))
+}
+
+#[test]
+fn a_freed_huge_block_stays_resident_but_inaccessible() {
+  let h = heap();
+  let size = 8 << 20;
+  let a = alloc(h, 0, size, 8);
+  assert!(committed(h, a, size));
+  free(h, a);
+  // Nothing was handed back to the OS, but every segment of the block
+  // faults on access: a use after free still traps.
+  assert_eq!(h.os().purged.load(Ordering::Relaxed), 0);
+  assert!(!committed(h, a, size));
+  assert_eq!(h.os().protected.lock().unwrap().len(), 2);
+  // The segments are free in the arena, counted as dirty pages.
+  assert_eq!(h.segments_in_use(), 0);
+  assert_eq!(h.usage().retained_segments, 2);
+  assert_eq!(h.dirty_pages(), 2 * PAGES_PER_SEGMENT);
+  assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
+  h.check_indexes();
+}
+
+#[test]
+fn a_retained_huge_block_is_reused_with_its_memory() {
+  let h = heap();
+  let size = 8 << 20;
+  let a = alloc(h, 0, size, 8);
+  free(h, a);
+  // First fit by address finds the same segments; they are committed again
+  // without being zeroed, so the block is not reported as zero.
+  let b = alloc_block(h, 0, size, 8);
+  assert_eq!(b.offset, a);
+  assert!(!b.zeroed);
+  assert!(committed(h, b.offset, size));
+  assert!(h.os().protected.lock().unwrap().is_empty());
+  assert_eq!(h.os().purged.load(Ordering::Relaxed), 0);
+  assert_eq!(h.usage().retained_segments, 0);
+  assert_eq!(h.dirty_pages(), 0);
+  h.check_indexes();
+  // A smaller huge block takes part of them; the rest stays retained.
+  free(h, b.offset);
+  let c = alloc_block(h, 0, 5 << 20, 8);
+  assert_eq!(c.offset, a);
+  assert!(!c.zeroed);
+  let d = alloc_block(h, 0, 5 << 20, 8);
+  assert_eq!(d.offset, a + 2 * SEGMENT_SIZE);
+  assert!(d.zeroed);
+  assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
+  h.check_indexes();
+}
+
+#[test]
+fn decay_decommits_a_retained_huge_block_after_the_purge_delay() {
+  let h = heap();
+  let size = 8 << 20;
+  let a = alloc(h, 0, size, 8);
+  free(h, a);
+  let purged = || h.os().purged.load(Ordering::Relaxed);
+  // Retained for the delay, as freed page runs are: freed in epoch 0, it
+  // is decommitted by the pass that starts epoch `DECAY_AGE`.
+  for _ in 1..DECAY_AGE {
+    h.decay();
+    assert_eq!(purged(), 0);
+    assert_eq!(h.usage().retained_segments, 2);
+  }
+  h.decay();
+  assert_eq!(purged(), size);
+  assert_eq!(h.usage().retained_segments, 0);
+  assert_eq!(h.dirty_pages(), 0);
+  assert!(!committed(h, a, size));
+  assert!(h.os().protected.lock().unwrap().is_empty());
+  let m = h.maintenance_stats();
+  assert_eq!(m.retained_segments_purged, 2);
+  assert!(m.purged_pages >= 2 * PAGES_PER_SEGMENT as u64);
+  // Decommitted, the segments come back zeroed.
+  assert!(alloc_block(h, 0, size, 8).zeroed);
+  h.check_indexes();
+}
+
+#[test]
+fn a_force_purge_decommits_retained_segments_at_once() {
+  let h = heap();
+  let a = alloc(h, 0, 8 << 20, 8);
+  free(h, a);
+  h.purge();
+  assert_eq!(h.os().purged.load(Ordering::Relaxed), 8 << 20);
+  assert_eq!(h.usage().retained_segments, 0);
+  assert_eq!(h.dirty_pages(), 0);
+  h.check_indexes();
+}
+
+#[test]
+fn the_dirty_budget_bounds_retained_segments() {
+  let h = heap();
+  // Ten segments: more than the 512-page trigger. Without a maintenance
+  // thread, the freeing thread runs the budget cycle, which decommits them.
+  let size = 10 * SEGMENT_SIZE;
+  let a = alloc(h, 0, size, 8);
+  free(h, a);
+  assert_eq!(h.usage().retained_segments, 0);
+  assert_eq!(h.os().purged.load(Ordering::Relaxed), size);
+  assert!(h.dirty_pages() <= DIRTY_BUDGET_PAGES as usize);
+  assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
+  h.check_indexes();
+}
+
+#[test]
+fn a_huge_free_decommits_when_the_os_cannot_protect() {
+  let h = heap();
+  h.os().protect_fails.store(true, Ordering::Relaxed);
+  let size = 8 << 20;
+  let a = alloc(h, 0, size, 8);
+  free(h, a);
+  assert_eq!(h.os().purged.load(Ordering::Relaxed), size);
+  assert_eq!(h.usage().retained_segments, 0);
+  assert_eq!(h.dirty_pages(), 0);
+  assert!(alloc_block(h, 0, size, 8).zeroed);
+  h.check_indexes();
+}
+
+#[test]
+fn a_shard_takes_a_retained_segment_as_dirty() {
+  let h = heap();
+  let a = alloc(h, 0, 5 << 20, 8);
+  free(h, a);
+  // A shard's new segment comes from the lowest free group: a retained
+  // segment, which arrives with all its pages dirty.
+  let run = alloc_block(h, 3, 5 * PAGE_SIZE, 8);
+  assert!(run.offset < 2 * SEGMENT_SIZE);
+  assert!(!run.zeroed);
+  assert_eq!(h.usage().retained_segments, 1);
+  assert_eq!(h.dirty_pages(), MAX_RUN_PAGES - 5 + PAGES_PER_SEGMENT);
+  assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
+  h.check_indexes();
+}
+
+#[test]
+fn in_place_growth_takes_retained_segments() {
+  let h = heap();
+  let a = alloc(h, 0, 5 << 20, 8);
+  let b = alloc(h, 0, 5 << 20, 8);
+  assert_eq!(b, a + 2 * SEGMENT_SIZE);
+  free(h, b);
+  assert_eq!(h.usage().retained_segments, 2);
+  assert!(resize(h, a, 14 << 20));
+  assert_eq!(h.usage().retained_segments, 0);
+  assert_eq!(h.dirty_pages(), 0);
+  assert!(committed(h, a, 14 << 20));
+  assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
+  h.check_indexes();
+}
+
+#[test]
+#[should_panic(expected = "invalid or double free")]
+fn double_free_of_a_retained_huge_block() {
+  let h = heap();
+  let a = h.alloc(0, 8 << 20, 8).unwrap();
+  h.dealloc(a);
+  h.dealloc(a);
+}
+
+#[test]
+fn segment_choice_ignores_retention() {
+  let h = heap();
+  let size = 5 << 20;
+  let a = alloc(h, 0, size, 8);
+  let b = alloc(h, 0, size, 8);
+  let c = alloc(h, 0, size, 8);
+  assert_eq!((b, c), (a + 2 * SEGMENT_SIZE, a + 4 * SEGMENT_SIZE));
+  // `a`'s segments are decommitted (clean), `c`'s retained (dirty).
+  h.os().protect_fails.store(true, Ordering::Relaxed);
+  free(h, a);
+  h.os().protect_fails.store(false, Ordering::Relaxed);
+  free(h, c);
+  assert_eq!(h.usage().retained_segments, 2);
+  // First fit by address: the lower, clean segments first, although the
+  // retained ones would save the faults.
+  let d = alloc_block(h, 0, size, 8);
+  assert_eq!(d.offset, a);
+  assert!(d.zeroed);
+  assert_eq!(h.usage().retained_segments, 2);
+  // Then the retained ones, the lowest free now, although they hold old
+  // bytes and a fresh range above would read as zero.
+  let e = alloc_block(h, 0, size, 8);
+  assert_eq!(e.offset, c);
+  assert!(!e.zeroed);
+  assert_eq!(h.usage().retained_segments, 0);
+  assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
+  h.check_indexes();
 }

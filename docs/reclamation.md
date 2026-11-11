@@ -2,6 +2,18 @@
 
 Freed page runs stay resident as *dirty* pages, so that a program that frees and allocates again reuses them without a system call. This page describes when they are purged (`MADV_DONTNEED`, or the opt-in io_uring backend) and how much work that may cost the thread that does it. None of the numbers below was tuned by measurement: **performance not measured; benchmark gate intentionally disabled** (see [research/theory-driven-implementation-status.md](research/theory-driven-implementation-status.md)).
 
+## Freed huge blocks
+
+A block too large for a page run (more than 63 pages of 64 KiB, about 3.9 MiB) takes whole 4 MiB segments. Its free used to decommit them at once (`madvise(MADV_DONTNEED)` and `mprotect(PROT_NONE)`), so a program that allocated and filled such a buffer again and again paid a page fault per 4 KiB page each time: about 1 ms per 8 MiB block, where page runs and glibc reuse resident memory.
+
+The segments of a freed huge block are now **retained**:
+
+- The free makes them inaccessible with `mprotect(PROT_NONE)` alone (`Os::protect`), so a use after free still faults, and returns them to the arena with a *retained* mark and the decay epoch. Their pages count as dirty pages (64 per segment) toward the thresholds above.
+- An allocation finds them by the same first fit by address as any free segment; nothing prefers or avoids them. Taking one clears its mark and its share of the dirty count; it is committed again (`mprotect(RW)`) with its old bytes, so the block is not reported as zeroed and `alloc_zeroed` clears it.
+- A decay sweep decommits a retained segment once it has been retained for the purge delay, as it purges page runs; budget and force sweeps decommit them regardless of age. The purge phase visits free segments only while any is retained, claims each under the segment lock like an allocation, and decommits it outside the lock (synchronously, not through the io_uring purger). `MaintenanceStats::retained_segments_purged` counts them and `HeapUsage::retained_segments` reports how many are retained.
+- A free of more than the trigger (32 MiB by default) starts a budget cycle at once, so the largest blocks are still decommitted right after their free; without a maintenance thread, the freeing thread runs it.
+- If the range cannot be protected, the free decommits it as before. Shrinking a huge block in place and returning an empty owned segment still decommit at once.
+
 ## Thresholds
 
 `ReclaimTargets` holds three thresholds on the dirty pages the allocator tracks, in 64 KiB allocator pages, with `low < trigger <= emergency`:

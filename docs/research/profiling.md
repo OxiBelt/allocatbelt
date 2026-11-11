@@ -14,7 +14,7 @@ scripts/profile.sh --help
 
 Output goes to `target/profile/<UTC time>/` (or `--out DIR`), one directory per profiled binary, plus `environment.txt` (commit, kernel, CPU, rustc, options). The script builds with `cargo --profile bench`, which is `release` with debug info, so the tools can name functions and lines.
 
-`--quick` runs a twentieth of each workload and a shorter idle wait. It is for smoke runs and for callgrind, which is slow; its timings mean nothing. `--only KEYS` runs only the named workloads (`single`, `local`, `small`, `pairs`, `idle`, `oversubscribed`, `aligned`, `region`); the benchmark binaries accept the same `--quick` and `--only` arguments when run directly.
+`--quick` runs a twentieth of each workload and a shorter idle wait. It is for smoke runs and for callgrind, which is slow; its timings mean nothing. `--only KEYS` runs only the named workloads (`single`, `local`, `small`, `pairs`, `idle`, `oversubscribed`, `aligned`, `region`, `huge`); the benchmark binaries accept the same `--quick` and `--only` arguments when run directly.
 
 `aligned` churns boxes aligned to 64 and 256 bytes. `region` exercises explicit
 64-byte region allocations, chunk reuse after reset, and release. The explicit

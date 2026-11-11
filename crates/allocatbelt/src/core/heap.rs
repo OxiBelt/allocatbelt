@@ -12,7 +12,8 @@
 //!                the segment is not owned, non-zero if its memory may hold
 //!                non-zero bytes
 //! [4] SEG_IDLE   decay epoch (+ 1) in which trimming first found the
-//!                owned segment empty, or 0
+//!                owned segment empty; for a retained segment, the epoch
+//!                (+ 1) in which its huge block was freed; or 0
 //! [5] SEG_EMPTY  small pages that may have become completely free
 //!                (empty-page candidates, set by frees, taken by trimming)
 //! [6..8]         reserved
@@ -71,6 +72,17 @@
 //! whose pages have all been free for the purge delay to the arena, keeping
 //! one empty segment per shard; both damp the decommit/recommit churn of a
 //! workload that empties and refills segments.
+//!
+//! Freed huge blocks are retained the same way: their segments go back to
+//! the arena at once, but inaccessible with their memory still resident
+//! ([`Os::protect`], so a use after free still faults), counted as dirty
+//! pages. An allocation that takes such a segment by the usual first fit
+//! commits it again without a fault per page; otherwise a decay pass
+//! decommits it once it has been retained for the purge delay, and budget
+//! and force passes regardless of age. Without it, every free of a block
+//! above [`MAX_RUN_PAGES`] pages decommitted it, and a program that
+//! repeatedly allocated and filled such a block paid a fault per 4 KiB
+//! page every time.
 //!
 //! Zero tracking: memory that was never handed out, or that was purged or
 //! decommitted successfully, reads as zero. Free pages that are not dirty are
@@ -146,6 +158,17 @@ pub trait Os: Sync {
   /// Returns the physical memory of the range to the OS but keeps it
   /// accessible. Returns `true` if the range now reads as zero.
   fn purge(&self, offset: usize, len: usize) -> bool;
+  /// Makes the range inaccessible but keeps its memory and contents, for
+  /// the segments of a freed huge block that the heap retains until a
+  /// later pass decommits them: access faults meanwhile, and a later
+  /// [`Os::commit`] makes the range accessible again with its contents
+  /// unchanged. Returns `true` if the range is inaccessible now. The
+  /// default returns `false`, and the heap then decommits at once, as it
+  /// does when this fails.
+  fn protect(&self, offset: usize, len: usize) -> bool {
+    let _ = (offset, len);
+    false
+  }
   /// Commits (once) and returns the [`crate::core::META_WORDS`] metadata words of
   /// `segment`. Words are zero the first time they are returned.
   fn commit_meta(&self, segment: usize) -> Option<&[AtomicU64]>;
@@ -239,6 +262,10 @@ const SEG_FREE: u64 = 0;
 const SEG_OWNED: u64 = 1;
 const SEG_HUGE: u64 = 2;
 const SEG_HUGE_TAIL: u64 = 3;
+/// A free segment of the arena (clear in `seg_used`) whose memory is still
+/// resident but inaccessible: it held a huge block that was freed and has
+/// not been decommitted yet. Set and cleared under `seg_lock`.
+const SEG_RETAINED: u64 = 4;
 
 const P_INFO: usize = 0;
 const P_FREE: usize = 1;
@@ -472,8 +499,16 @@ pub struct Heap<O> {
   os: O,
   seg_lock: Lock,
   seg_used: [AtomicU64; MAX_SEGMENTS / 64],
-  /// Pages marked dirty and not yet purged or reused (may transiently lag).
+  /// Pages marked dirty and not yet purged or reused (may transiently lag),
+  /// retained segments included ([`PAGES_PER_SEGMENT`] each).
   dirty_pages: AtomicIsize,
+  /// Free segments marked [`SEG_RETAINED`]: changed under `seg_lock` with a
+  /// load and a store, read by purge passes as a hint.
+  retained_segs: AtomicU64,
+  /// One past the highest segment ever retained: no retained segment lies
+  /// at or above it. Raised under `seg_lock` with a load and a store, never
+  /// lowered; bounds the free segments a purge pass visits.
+  retained_top: AtomicU64,
   purge_lock: Lock,
   purge_delay_ms: AtomicU64,
   /// Clock reading of the last decay pass.
@@ -512,6 +547,8 @@ impl<O: Os> Heap<O> {
       seg_lock: Lock::new(),
       seg_used: [const { AtomicU64::new(0) }; MAX_SEGMENTS / 64],
       dirty_pages: AtomicIsize::new(0),
+      retained_segs: AtomicU64::new(0),
+      retained_top: AtomicU64::new(0),
       purge_lock: Lock::new(),
       purge_delay_ms: AtomicU64::new(DEFAULT_PURGE_DELAY_MS),
       last_decay_ms: AtomicU64::new(0),
@@ -1251,7 +1288,8 @@ impl<O: Os> Heap<O> {
 
   /// Frees the huge block at `seg`, whose header read `hdr`: checks and
   /// clears the header under `seg_lock`, so of two frees of the block the
-  /// second finds it cleared, then returns the segments to the arena.
+  /// second finds it cleared, then returns the segments to the arena,
+  /// retained (see [`Heap::retain_segments`]).
   fn free_huge(&self, seg: usize, m: &[AtomicU64], hdr: u64) {
     let k = (hdr >> 16) as usize;
     {
@@ -1264,7 +1302,80 @@ impl<O: Os> Heap<O> {
         self.seg_meta(seg + i)[SEG_HDR].store(SEG_FREE, Relaxed);
       }
     }
-    self.free_segments(seg, k);
+    self.retain_segments(seg, k);
+  }
+
+  /// Returns the `k` segments at `first`, which hold no live block, to the
+  /// arena without discarding their memory: they become inaccessible
+  /// ([`Os::protect`]), are marked [`SEG_RETAINED`] and stamped with the
+  /// decay epoch, and their pages count as dirty until an allocation takes
+  /// them again (see [`Heap::mark_segments`]) or a purge pass decommits
+  /// them ([`Heap::purge_retained`]). Nothing ranks them: allocations find
+  /// them by the same first fit as any free segment. If the range cannot
+  /// be protected, decommits it at once instead.
+  fn retain_segments(&self, first: usize, k: usize) {
+    if !self.os.protect(first << SEGMENT_SHIFT, k << SEGMENT_SHIFT) {
+      self.free_segments(first, k);
+      return;
+    }
+    let stamp = self.epoch.load(Relaxed).wrapping_add(1);
+    for s in first..first + k {
+      let m = self.seg_meta(s);
+      // All pages "used": a stale purge pass cannot claim any of them.
+      m[SEG_PAGES].store(u64::MAX, Relaxed);
+      // The memory still holds the block's bytes.
+      m[SEG_DIRTY].store(u64::MAX, Relaxed);
+      m[SEG_IDLE].store(stamp, Relaxed);
+    }
+    // Counted before the segments can be taken again, so the count never
+    // drops below what is retained.
+    let pages = (k * PAGES_PER_SEGMENT) as isize;
+    let dirty = self.dirty_pages.fetch_add(pages, Relaxed) + pages;
+    {
+      let _g = self.seg_lock.lock(&self.os);
+      for s in first..first + k {
+        proto::retain_segment(
+          &self.seg_meta(s)[SEG_HDR],
+          &self.seg_used[s / 64],
+          1 << (s % 64),
+          &self.retained_segs,
+          SEG_RETAINED,
+        );
+      }
+      let top = self.retained_top.load(Relaxed).max((first + k) as u64);
+      self.retained_top.store(top, Relaxed);
+    }
+    self.after_release(dirty);
+  }
+
+  /// Decommits retained segment `seg` (metadata `m`) and returns it to the
+  /// arena as an ordinary free segment, if it is still retained and was
+  /// retained in epoch `cutoff` or earlier (any epoch if `cutoff` is
+  /// `u64::MAX`). Claims it under `seg_lock` first, like an allocation, so
+  /// nothing commits it while it is being decommitted. Returns whether it
+  /// did. Caller holds `purge_lock`.
+  pub(super) fn purge_retained(&self, seg: usize, m: &[AtomicU64], cutoff: u64) -> bool {
+    {
+      let _g = self.seg_lock.lock(&self.os);
+      // Taken like an allocation would take it.
+      if !proto::claim_retained(
+        &m[SEG_HDR],
+        &self.seg_used[seg / 64],
+        1 << (seg % 64),
+        &self.retained_segs,
+        (SEG_RETAINED, SEG_FREE),
+        &m[SEG_IDLE],
+        cutoff,
+      ) {
+        return false;
+      }
+      m[SEG_IDLE].store(0, Relaxed);
+    }
+    self
+      .dirty_pages
+      .fetch_sub(PAGES_PER_SEGMENT as isize, Relaxed);
+    self.free_segments(seg, 1);
+    true
   }
 
   /// Extends the huge block of `k` segments at `seg` to `k2` segments if
@@ -1395,13 +1506,49 @@ impl<O: Os> Heap<O> {
 
   /// Marks `k` segments used or free in the arena. Caller holds
   /// `seg_lock`, which every change to `seg_used` takes: a plain load and
-  /// store under it, other threads only read the words.
+  /// store under it, other threads only read the words. A retained segment
+  /// marked used is taken as it is: its mark is cleared and its pages leave
+  /// the dirty count, and its `SEG_DIRTY` word, non-zero, tells the new
+  /// owner that its memory holds old bytes.
   fn mark_segments(&self, first: usize, k: usize, used: bool) {
+    let mut taken = 0;
     for s in first..first + k {
       let bit = 1u64 << (s % 64);
       let word = &self.seg_used[s / 64];
-      let w = word.load(Relaxed);
-      word.store(if used { w | bit } else { w & !bit }, Relaxed);
+      if !used {
+        word.store(word.load(Relaxed) & !bit, Relaxed);
+        continue;
+      }
+      let m = self.os.meta(s);
+      let hdr = m.map(|m| &m[SEG_HDR]);
+      if proto::take_segment(
+        hdr,
+        word,
+        bit,
+        &self.retained_segs,
+        (SEG_RETAINED, SEG_FREE),
+      ) && let Some(m) = m
+      {
+        m[SEG_IDLE].store(0, Relaxed);
+        taken += 1;
+      }
     }
+    if taken != 0 {
+      self
+        .dirty_pages
+        .fetch_sub((taken * PAGES_PER_SEGMENT) as isize, Relaxed);
+    }
+  }
+
+  /// Free segments retained after a huge free, for a purge pass to visit
+  /// (a hint without `seg_lock`).
+  pub(super) fn retained_segments(&self) -> usize {
+    self.retained_segs.load(Relaxed) as usize
+  }
+
+  /// One past the highest segment ever retained (a hint without
+  /// `seg_lock`).
+  pub(super) fn retained_top(&self) -> usize {
+    self.retained_top.load(Relaxed) as usize
   }
 }
