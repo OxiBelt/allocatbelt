@@ -157,8 +157,8 @@ pub struct HeapUsage {
   pub clean_pages: usize,
   /// Free segments of the arena that held a freed huge block and are still
   /// resident, though inaccessible, until an allocation takes them or a
-  /// pass decommits them. Each counts [`crate::core::PAGES_PER_SEGMENT`]
-  /// pages in the dirty budget ([`Heap::dirty_pages`]), not in
+  /// pass decommits them. Each counts as 64 pages (a whole 4 MiB segment)
+  /// in the dirty pages that the reclamation thresholds compare, not in
   /// [`HeapUsage::dirty_pages`].
   pub retained_segments: usize,
 }
