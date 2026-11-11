@@ -2,14 +2,19 @@
 //! them: seen from a real process, in every feature combination. No test
 //! here starts the maintenance thread, so decay passes run inline on
 //! allocation slow paths; `huge_retention_maintenance.rs` covers the thread.
-//! A separate test binary, so that no other test allocates meanwhile.
+//!
+//! One test runs the cases in order. A thread's first allocations take a
+//! segment for its shard, and a shard's new segment may be any free one, a
+//! retained one included (randomized placement does not look at
+//! retention); a second test thread starting while a case holds retained
+//! segments could take one and upset the counts. A separate test binary,
+//! so that no other test allocates meanwhile.
 
 #![allow(
   unsafe_code,
   reason = "the tests fork, read a freed block on purpose and query the kernel"
 )]
 
-use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use allocatbelt::Allocatbelt;
@@ -19,15 +24,6 @@ static GLOBAL: Allocatbelt = Allocatbelt;
 
 /// Two segments: well above the longest page run, below the dirty budget.
 const SIZE: usize = 8 << 20;
-
-/// The tests change the process-wide purge delay: one at a time.
-static SERIAL: Mutex<()> = Mutex::new(());
-
-fn serial() -> MutexGuard<'static, ()> {
-  SERIAL
-    .lock()
-    .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 /// Minor page faults of this process so far.
 fn minor_faults() -> i64 {
@@ -57,9 +53,9 @@ fn filled() -> (Vec<u8>, i64) {
   (v, minor_faults() - before)
 }
 
-#[test]
-fn freed_huge_blocks_are_reused_without_faults_until_purged() {
-  let _s = serial();
+/// Retained segments are reused without a fault per page until an
+/// explicit purge decommits them.
+fn reused_without_faults_until_purged() {
   // No decay pass gets in the way.
   GLOBAL.set_purge_delay(Duration::from_secs(3600));
   let (v, _) = filled();
@@ -95,17 +91,20 @@ fn freed_huge_blocks_are_reused_without_faults_until_purged() {
   GLOBAL.purge();
 }
 
-#[test]
-fn inline_decay_decommits_retained_huge_blocks() {
-  let _s = serial();
+/// Without a maintenance thread, the decay passes that allocation slow
+/// paths run decommit retained segments once the delay has passed.
+fn inline_decay_decommits_them() {
   GLOBAL.set_purge_delay(Duration::from_millis(20));
+  let purged = || GLOBAL.maintenance_stats().retained_segments_purged;
+  let before = purged();
   let (v, _) = filled();
   drop(v);
   assert_eq!(GLOBAL.heap_usage().retained_segments, 2);
   // Without a maintenance thread, allocation slow paths run the decay
   // passes once they are due (sampled every 16th slow path): allocate and
   // free page runs, which take the slow path, until a pass has decommitted
-  // the retained segments.
+  // the retained segments. The passes run on this thread and add their
+  // work to the counters before the allocation that ran them returns.
   let deadline = Instant::now() + Duration::from_secs(10);
   while GLOBAL.heap_usage().retained_segments != 0 {
     assert!(Instant::now() < deadline, "{:?}", GLOBAL.heap_usage());
@@ -114,7 +113,7 @@ fn inline_decay_decommits_retained_huge_blocks() {
     }
     std::thread::sleep(Duration::from_millis(2));
   }
-  assert!(GLOBAL.maintenance_stats().retained_segments_purged >= 2);
+  assert_eq!(purged() - before, 2);
   GLOBAL.set_purge_delay(Duration::from_secs(3600));
 }
 
@@ -139,9 +138,8 @@ fn read_after_free() -> ! {
   unsafe { libc::_exit(0) }
 }
 
-#[test]
-fn reading_a_retained_huge_block_faults() {
-  let _s = serial();
+/// A read of a freed huge block faults (in a forked child).
+fn reading_a_retained_block_faults() {
   // SAFETY: the child only calls async-signal-safe functions and the
   // allocator (which supports use after `fork`) before it faults or exits.
   let pid = unsafe { libc::fork() };
@@ -159,4 +157,13 @@ fn reading_a_retained_huge_block_faults() {
     "child ended with status {status:#x}, not SIGSEGV (a SIGALRM kill means it hung, \
      an abort that an assertion failed)"
   );
+}
+
+#[test]
+fn freed_huge_blocks_are_retained_inaccessible_and_decommitted_later() {
+  // This thread's shard takes its segment now, before any is retained.
+  std::hint::black_box(Vec::<u8>::with_capacity(256 << 10));
+  reused_without_faults_until_purged();
+  inline_decay_decommits_them();
+  reading_a_retained_block_faults();
 }

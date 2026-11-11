@@ -53,6 +53,14 @@ fn wait_for(done: impl Fn() -> bool) -> bool {
 #[test]
 fn the_maintenance_thread_decays_retained_huge_blocks() {
   GLOBAL.set_purge_delay(Duration::from_secs(3600));
+  // A thread's first allocations take a segment for its shard, and a
+  // shard's new segment may be any free one, a retained one included
+  // (randomized placement does not look at retention). So the maintenance
+  // thread starts, and has made its first allocations (it has when this
+  // returns), and this thread's shard has a segment, before any segment is
+  // retained: from then on only this test's huge blocks take segments.
+  assert!(GLOBAL.start_maintenance_thread().unwrap());
+  std::hint::black_box(Vec::<u8>::with_capacity(256 << 10));
   fill_and_free();
   assert_eq!(GLOBAL.heap_usage().retained_segments, 2);
   // Retained: reused without a fault per page.
@@ -61,15 +69,19 @@ fn the_maintenance_thread_decays_retained_huge_blocks() {
   assert_eq!(GLOBAL.heap_usage().retained_segments, 2);
 
   // Once the purge delay has passed, the thread's decay pass decommits
-  // them, with no allocation from this thread.
+  // them, with no allocation from this thread. The retained count drops
+  // while the pass runs, and the pass adds its work to the counters only
+  // when its slice ends: wait for both.
+  let purged = || GLOBAL.maintenance_stats().retained_segments_purged;
+  let before = purged();
   GLOBAL.set_purge_delay(Duration::from_millis(20));
-  assert!(GLOBAL.start_maintenance_thread().unwrap());
   assert!(
-    wait_for(|| GLOBAL.heap_usage().retained_segments == 0),
-    "{:?}",
-    GLOBAL.heap_usage()
+    wait_for(|| GLOBAL.heap_usage().retained_segments == 0 && purged() - before >= 2),
+    "{:?} {:?}",
+    GLOBAL.heap_usage(),
+    GLOBAL.maintenance_stats()
   );
-  assert!(GLOBAL.maintenance_stats().retained_segments_purged >= 2);
+  assert_eq!(purged() - before, 2);
   // Decommitted, a new block of the size faults again on every page.
   GLOBAL.set_purge_delay(Duration::from_secs(3600));
   let faults = fill_and_free();
