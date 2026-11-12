@@ -1,7 +1,8 @@
 //! RISC-V vector permission is local to a thread, not a cached CPU feature.
-//! Public dispatch fails closed when a sandbox refuses the control query.
-//! Where Linux supports the interface, a fresh OFF process enables just one
-//! thread and checks selection and policy validation on both threads.
+//! A riscv64 build has V everywhere (the platform baseline), so a process
+//! started with V off must stop at its first allocation with the
+//! allocator's message, while a sandbox that refuses the control query does
+//! not stop it and dispatch still fails closed to the baseline kernels.
 
 #![cfg(all(target_arch = "riscv64", feature = "experimental-riscv-rvv"))]
 #![expect(
@@ -12,7 +13,6 @@
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
-use std::sync::mpsc;
 
 use allocatbelt::{Allocatbelt, Availability, CpuFeatures, FeaturePolicy, KernelSet, Policy};
 
@@ -118,7 +118,9 @@ fn refuse_query() -> io::Result<()> {
   }
 }
 
-fn child(mode: &'static str) {
+/// Runs this test in a fresh process prepared by `mode` before exec, and
+/// returns whether it succeeded and what it wrote to standard error.
+fn child(mode: &'static str) -> (bool, String) {
   let mut command = Command::new(std::env::current_exe().unwrap());
   command
     .args(["--exact", TEST, "--nocapture"])
@@ -132,10 +134,11 @@ fn child(mode: &'static str) {
       _ => unreachable!(),
     });
   }
-  assert!(
-    command.status().unwrap().success(),
-    "vector-control child failed: {mode}"
-  );
+  let output = command.output().unwrap();
+  (
+    output.status.success(),
+    String::from_utf8_lossy(&output.stderr).into_owned(),
+  )
 }
 
 fn unavailable_here() {
@@ -154,61 +157,6 @@ fn unavailable_here() {
   );
 }
 
-fn mixed_threads() {
-  assert_eq!(get_control().unwrap() & CURRENT_MASK, OFF as libc::c_int);
-  // Hardware V remains visible even when this thread cannot execute it.
-  assert!(GLOBAL.cpu_features().contains(CpuFeatures::RVV));
-  unavailable_here();
-  let (commands, receive) = mpsc::channel::<FeaturePolicy>();
-  let (done, completed) = mpsc::channel();
-  std::thread::scope(|scope| {
-    let enabled = scope.spawn(move || {
-      set_control(ON).unwrap();
-      assert_eq!(get_control().unwrap() & CURRENT_MASK, ON as libc::c_int);
-      assert!(GLOBAL.cpu_features().contains(CpuFeatures::RVV));
-      GLOBAL.configure(with(FeaturePolicy::Require)).unwrap();
-      assert_eq!(GLOBAL.kernel_set(), KernelSet::Rvv);
-      assert_eq!(
-        GLOBAL.report().detected.experimental_isa,
-        Availability::Available
-      );
-      done.send(()).unwrap();
-      for policy in receive {
-        assert_eq!(GLOBAL.policy().experimental_isa, policy);
-        assert_eq!(
-          GLOBAL.kernel_set(),
-          match policy {
-            FeaturePolicy::Disable => KernelSet::Baseline,
-            FeaturePolicy::Prefer => KernelSet::Rvv,
-            _ => panic!("unexpected test policy"),
-          }
-        );
-        done.send(()).unwrap();
-      }
-    });
-    completed.recv().unwrap();
-    let before = GLOBAL.policy();
-    assert_eq!(before.experimental_isa, FeaturePolicy::Require);
-    assert!(GLOBAL.configure(with(FeaturePolicy::Require)).is_err());
-    assert_eq!(GLOBAL.policy(), before);
-    assert_eq!(GLOBAL.kernel_set(), KernelSet::Baseline);
-    assert!(matches!(
-      GLOBAL.report().detected.experimental_isa,
-      Availability::Unavailable { .. }
-    ));
-    for policy in [FeaturePolicy::Disable, FeaturePolicy::Prefer] {
-      GLOBAL.configure(with(policy)).unwrap();
-      commands.send(policy).unwrap();
-      completed.recv().unwrap();
-      assert_eq!(GLOBAL.kernel_set(), KernelSet::Baseline);
-    }
-    drop(commands);
-    enabled.join().unwrap();
-  });
-  assert_eq!(get_control().unwrap() & CURRENT_MASK, OFF as libc::c_int);
-  GLOBAL.configure(Policy::DEFAULT).unwrap();
-}
-
 #[test]
 fn vector_permissions_are_thread_local_and_fail_closed() {
   match std::env::var(CHILD).ok().as_deref() {
@@ -217,10 +165,7 @@ fn vector_permissions_are_thread_local_and_fail_closed() {
       unavailable_here();
       eprintln!("riscv vector control: refused query selects baseline");
     }
-    Some("off") => {
-      mixed_threads();
-      eprintln!("riscv vector control: OFF and ON threads select independently");
-    }
+    Some("off") => panic!("a process started with V off ran its tests"),
     None => {
       if !GLOBAL.cpu_features().contains(CpuFeatures::RVV) || get_control().is_err() {
         assert!(
@@ -228,11 +173,22 @@ fn vector_permissions_are_thread_local_and_fail_closed() {
           "this check requires hardware V and a working vector-control interface"
         );
         unavailable_here();
-        eprintln!("riscv vector control: mixed-thread check unavailable on this host");
+        eprintln!("riscv vector control: process checks unavailable on this host");
         return;
       }
-      child("denied");
-      child("off");
+      assert_eq!(get_control().unwrap() & CURRENT_MASK, ON as libc::c_int);
+      let (ran, stderr) = child("denied");
+      assert!(
+        ran,
+        "a refused permission query stopped the process: {stderr}"
+      );
+      let (ran, stderr) = child("off");
+      assert!(!ran, "a process started with V off ran");
+      assert!(
+        stderr.contains("vector instructions are off for this thread"),
+        "a process started with V off did not stop with the allocator's message: {stderr}"
+      );
+      eprintln!("riscv vector control: V-off process refused, denied query runs");
     }
     Some(_) => panic!("unknown vector-control child mode"),
   }
