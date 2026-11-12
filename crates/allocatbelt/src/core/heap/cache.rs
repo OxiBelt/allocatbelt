@@ -54,10 +54,26 @@ struct CachedBlocks {
 
 impl CachedBlocks {
   /// Whether block `i` of the word is in the list.
+  ///
+  /// Compares all 64 entries with `i` and keeps the matches among the first
+  /// `len`; the entries past `len` are stale and do not count. Without an
+  /// early exit and with byte-wide lanes, this lowers to two 32-byte
+  /// compares on x86-64-v3 and four 16-byte compares on AArch64, where a
+  /// search of the live entries took up to 64 compare-and-branch steps on
+  /// every free into the claimed word. Every target runs this code; a base
+  /// RV64GC core, without vector instructions, runs it as a loop of 64
+  /// scalar steps.
+  #[inline]
   fn holds(&self, i: u32) -> bool {
-    self.blocks[..usize::from(self.len.get())]
-      .iter()
-      .any(|b| u32::from(b.get()) == i)
+    // A block number is below 64, so it fits the entries' byte.
+    debug_assert!(i < 64);
+    let i = i as u8;
+    let len = self.len.get();
+    let mut hit = 0u8;
+    for (b, k) in self.blocks.iter().zip(&POSITIONS) {
+      hit |= u8::from(b.get() == i) & u8::from(*k < len);
+    }
+    hit != 0
   }
 
   /// The listed blocks as a mask of the word, emptying the list.
@@ -66,6 +82,18 @@ impl CachedBlocks {
     self.blocks[..n].iter().fold(0, |m, b| m | 1 << b.get())
   }
 }
+
+/// `POSITIONS[k] == k`: the positions of a list's entries, as bytes, so a
+/// compare with its length stays byte-wide (see [`CachedBlocks::holds`]).
+const POSITIONS: [u8; 64] = {
+  let mut t = [0; 64];
+  let mut k = 0;
+  while k < 64 {
+    t[k] = k as u8;
+    k += 1;
+  }
+  t
+};
 
 /// Freed blocks of one bitmap word, not yet returned to the bitmap.
 #[derive(Debug)]
@@ -99,6 +127,30 @@ const fn set_index(page: usize, w: usize) -> usize {
 // Slot indices fit the per-class `pending` masks, and the per-set victim
 // bits fit a `u32`.
 const _: () = assert!(FREE_SLOTS == 64 && FREE_WAYS == 2 && FREE_SETS == 32);
+
+/// The size class of a request for `size` bytes aligned to `align`, when
+/// `align` is a power of two and a small class holds `size` in blocks
+/// aligned to it: the class of `size` rounded up to a multiple of `align`
+/// (at least `align`). It is the class [`class::class_for`] finds by
+/// search, without the search. Up to 128 bytes every multiple of 16 is a
+/// class size. Above, the classes between powers of two `b` and `2b` step
+/// by `b / 4`: an alignment up to `b / 4` divides all of them, and the
+/// multiples of a larger one in that range, `3b / 2` and `2b`, are class
+/// sizes too. So no smaller class holds the request aligned.
+#[inline]
+const fn aligned_class(size: usize, align: usize) -> Option<usize> {
+  if !align.is_power_of_two() || align > SMALL_MAX || size > SMALL_MAX {
+    return None;
+  }
+  // Both are at most `SMALL_MAX`, so this cannot overflow.
+  let rounded = (size + align - 1) & !(align - 1);
+  let rounded = if rounded < align { align } else { rounded };
+  if rounded > SMALL_MAX {
+    None
+  } else {
+    Some(class::class_of(rounded))
+  }
+}
 
 /// A thread's private allocation state: one claimed bitmap word per size
 /// class, and a small buffer of frees not yet returned to the bitmaps.
@@ -214,6 +266,16 @@ impl<O: Os> Heap<O> {
         return Some(Block::new(o, false));
       }
       return self.refill(tc, c).map(|o| Block::new(o, false));
+    }
+    // An alignment above the default that a small class satisfies takes
+    // the same cached path, without the general size and alignment check.
+    if align > MIN_ALIGN
+      && let Some(c) = aligned_class(size, align)
+      && tc.is_attached()
+    {
+      return Self::pop(tc, c)
+        .or_else(|| self.refill(tc, c))
+        .map(|o| Block::new(o, false));
     }
     self.alloc_cached_slow(tc, size, align)
   }
@@ -639,3 +701,6 @@ impl<O: Os> Heap<O> {
 fn bump(counter: &Cell<u64>, n: u64) {
   counter.set(counter.get().wrapping_add(n));
 }
+
+#[cfg(all(test, allocatbelt_core_check))]
+mod tests;
