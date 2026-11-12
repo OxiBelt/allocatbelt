@@ -191,7 +191,9 @@ impl<T> Packet<T> {
 /// The handle of a submitted job.
 ///
 /// Dropping a `Job` detaches it: the job still runs (or stays cancelled)
-/// and its result is dropped on the worker; dropping is not cancellation.
+/// and its result is dropped on the worker, or by the handle if the job had
+/// already finished; a panic from that drop is contained either way.
+/// Dropping is not cancellation.
 /// The handle can also be awaited without blocking an executor thread.
 pub struct Job<T> {
   control: Arc<Control>,
@@ -297,9 +299,11 @@ impl<T> Future for Job<T> {
 
 impl<T> Drop for Job<T> {
   fn drop(&mut self) {
-    // A result already published is dropped here, outside the lock.
+    // A result already published is dropped here, outside the lock, and
+    // contained as the worker contains an outcome nobody claimed: detaching
+    // never unwinds into the caller, whichever side finished first.
     let taken = std::mem::replace(&mut *self.packet.lock(), Slot::Taken);
-    drop(taken);
+    crate::runtime::task::drop_contained(taken);
   }
 }
 
