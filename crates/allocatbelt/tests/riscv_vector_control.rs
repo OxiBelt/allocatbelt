@@ -12,7 +12,7 @@
 
 use std::io;
 use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use allocatbelt::{Allocatbelt, Availability, CpuFeatures, FeaturePolicy, KernelSet, Policy};
 
@@ -119,12 +119,15 @@ fn refuse_query() -> io::Result<()> {
 }
 
 /// Runs this test in a fresh process prepared by `mode` before exec, and
-/// returns whether it succeeded and what it wrote to standard error.
+/// returns whether it succeeded and what it wrote to standard error. Its
+/// standard output, with the test summary of a child that runs, goes to
+/// this process's, where the RISC-V guest counts it.
 fn child(mode: &'static str) -> (bool, String) {
   let mut command = Command::new(std::env::current_exe().unwrap());
   command
     .args(["--exact", TEST, "--nocapture"])
-    .env(CHILD, mode);
+    .env(CHILD, mode)
+    .stdout(Stdio::inherit());
   // SAFETY: this pre-exec hook performs only allocation-free prctl syscalls,
   // with stack-local data; it does not access allocator, std or user locks.
   unsafe {
