@@ -35,7 +35,6 @@ run() {
   cat /tmp/test-output
   # Required child processes also emit summaries before the parent does.
   summaries=1
-  if [ "$label" = rvv-kernel ]; then summaries=2; fi
   if [ "$label" = thread-policy ]; then summaries=2; fi
   count=$(grep -Ec '^[[:space:]]*test result:' /tmp/test-output || :)
   test "$count" -eq "$summaries" || fail

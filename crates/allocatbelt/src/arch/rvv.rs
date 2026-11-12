@@ -1,9 +1,10 @@
 //! Experimental RISC-V V kernel (feature `experimental-riscv-rvv`).
 //!
-//! The leaf kernel is stable Rust naked assembly: only its local assembler
-//! option enables V, so the rest of the binary remains RV64GC. It scans the
-//! fixed segment snapshot in length-agnostic chunks; no assumptions are made
-//! about VLEN. This is not measured and is never selected by default.
+//! The leaf kernel is stable Rust naked assembly with its own local
+//! assembler option for V; the rest of the binary is built with V too, the
+//! riscv64 baseline (docs/platform.md). It scans the fixed segment snapshot
+//! in length-agnostic chunks; no assumptions are made about VLEN. This is
+//! not measured and is never selected by default.
 
 use crate::arch::KernelSet;
 use crate::core::{AgeKernel, PAGES_PER_SEGMENT, aged_pages};
@@ -82,21 +83,12 @@ unsafe extern "C" fn aged_pages_rvv_body(since: *const u64, cutoff: u64) -> u64 
 
 #[cfg(test)]
 mod tests {
-  use std::io;
-  use std::os::unix::process::CommandExt;
-  use std::process::Command;
-  use std::sync::mpsc;
-
   use crate::arch::riscv64::vector_permission;
   use crate::arch::{FeaturePolicy, KernelSet};
   use crate::core::{AgeKernel, PAGES_PER_SEGMENT, aged_pages};
   use crate::policy::Policy;
 
-  const CROSS_THREAD_CHILD: &str = "ALLOCATBELT_RVV_CROSS_THREAD_CHILD";
   const REQUIRE_VECTOR_CONTROL: &str = "ALLOCATBELT_REQUIRE_VECTOR_CONTROL";
-  const PR_RISCV_V_SET_CONTROL: libc::c_int = 69;
-  const PR_RISCV_V_VSTATE_CTRL_ON: libc::c_ulong = 2;
-  const PR_RISCV_V_VSTATE_CTRL_OFF_NEXT: libc::c_ulong = 1 << 2;
 
   static TEST_ALLOCATOR: crate::global::Allocatbelt = crate::global::Allocatbelt;
 
@@ -181,12 +173,14 @@ mod tests {
     assert_eq!(direct_leaf(snapshot, u64::MAX), u64::MAX);
   }
 
+  /// A saved kernel pointer follows the dispatch policy on every call, on
+  /// the thread that saved it and on another one. A thread whose vector
+  /// state is off cannot run this V build at all (the start-up check refuses
+  /// it, docs/platform.md), so only threads with V on are exercised; a
+  /// refused permission query (qemu-user) selects the baseline, which
+  /// `scripts/check-experimental-rvv.sh` checks.
   #[test]
-  fn a_saved_age_kernel_rechecks_the_calling_threads_permission() {
-    if std::env::var_os(CROSS_THREAD_CHILD).is_some() {
-      saved_kernel_in_off_parent_and_on_worker();
-      return;
-    }
+  fn a_saved_age_kernel_follows_the_dispatch_policy() {
     if vector_permission().is_err() {
       assert!(
         std::env::var_os(REQUIRE_VECTOR_CONTROL).is_none(),
@@ -195,117 +189,46 @@ mod tests {
       eprintln!("thread-local RVV permission unavailable: saved-kernel test skipped");
       return;
     }
-
-    let mut command = Command::new(std::env::current_exe().unwrap());
-    command
-      .args([
-        "--exact",
-        "arch::rvv::tests::a_saved_age_kernel_rechecks_the_calling_threads_permission",
-        "--nocapture",
-      ])
-      .env(CROSS_THREAD_CHILD, "1");
-    // SAFETY: this pre-exec hook makes one allocation-free prctl call to set
-    // the next exec's vector state OFF; it neither accesses allocator state
-    // nor touches parent-thread state.
-    unsafe {
-      command.pre_exec(set_off_for_next_exec);
-    }
-    assert!(
-      command.status().unwrap().success(),
-      "OFF-thread child failed"
-    );
-  }
-
-  fn set_off_for_next_exec() -> io::Result<()> {
-    // SAFETY: SET_CONTROL takes a scalar control word and no pointer.
-    let result = unsafe {
-      libc::prctl(
-        PR_RISCV_V_SET_CONTROL,
-        PR_RISCV_V_VSTATE_CTRL_OFF_NEXT,
-        0 as libc::c_ulong,
-        0 as libc::c_ulong,
-        0 as libc::c_ulong,
-      )
-    };
-    if result < 0 {
-      Err(io::Error::last_os_error())
-    } else {
-      Ok(())
-    }
-  }
-
-  fn saved_kernel_in_off_parent_and_on_worker() {
-    assert!(vector_permission().is_err(), "child must start with V OFF");
     let mut since = [u64::MAX; PAGES_PER_SEGMENT];
     since[0] = 0;
     since[17] = 0;
     since[63] = 0;
     let expected = aged_pages(&since, 0);
 
-    let (kernel_tx, kernel_rx) = mpsc::sync_channel::<AgeKernel>(0);
-    let (policy_tx, policy_rx) = mpsc::sync_channel::<FeaturePolicy>(0);
-    let (result_tx, result_rx) = mpsc::sync_channel::<(KernelSet, bool)>(0);
-    std::thread::scope(|scope| {
-      let worker = scope.spawn(|| {
-        set_vector_control(PR_RISCV_V_VSTATE_CTRL_ON);
-        crate::arch::initialize_dispatch();
-        set_isa_policy(FeaturePolicy::Prefer);
-        let kernel = crate::arch::age_kernel().expect("ON worker must select RVV");
-        assert_eq!(kernel(&since, 0), expected, "ON worker must execute RVV");
-        kernel_tx.send(kernel).unwrap();
-        for policy in policy_rx {
-          set_isa_policy(policy);
-          let selected = crate::arch::kernel_set();
-          result_tx
-            .send((selected, kernel(&since, 0) == expected))
-            .unwrap();
-        }
-      });
-
-      let kernel = kernel_rx.recv().unwrap();
-      assert_eq!(crate::arch::kernel_set(), KernelSet::Baseline);
-      assert_eq!(kernel(&since, 0), expected, "OFF parent must take fallback");
-
-      policy_tx.send(FeaturePolicy::Disable).unwrap();
-      let (selected, correct) = result_rx.recv().unwrap();
-      assert_eq!(selected, KernelSet::Baseline);
-      assert!(correct);
-      assert_eq!(kernel(&since, 0), expected);
-
-      policy_tx.send(FeaturePolicy::Prefer).unwrap();
-      let (selected, correct) = result_rx.recv().unwrap();
-      assert_eq!(selected, KernelSet::Rvv);
-      assert!(correct, "ON worker must still call the saved RVV kernel");
-      assert_eq!(crate::arch::kernel_set(), KernelSet::Baseline);
-      assert_eq!(
-        kernel(&since, 0),
-        expected,
-        "saved pointer must recheck OFF parent"
-      );
-
-      drop(policy_tx);
-      worker.join().unwrap();
-    });
-  }
-
-  fn set_vector_control(control: libc::c_ulong) {
-    // SAFETY: SET_CONTROL changes only this worker thread's vector state;
-    // this scalar control word contains no pointer.
-    let result = unsafe {
-      libc::prctl(
-        PR_RISCV_V_SET_CONTROL,
-        control,
-        0 as libc::c_ulong,
-        0 as libc::c_ulong,
-        0 as libc::c_ulong,
-      )
-    };
+    crate::arch::initialize_dispatch();
+    set_isa_policy(FeaturePolicy::Prefer);
+    let kernel: AgeKernel = crate::arch::age_kernel().expect("a thread with V on must select RVV");
+    assert_eq!(crate::arch::kernel_set(), KernelSet::Rvv);
     assert_eq!(
-      result,
-      0,
-      "SET_CONTROL failed: {:?}",
-      io::Error::last_os_error()
+      kernel(&since, 0),
+      expected,
+      "RVV must match the portable loop"
     );
+    std::thread::scope(|scope| {
+      scope
+        .spawn(|| {
+          assert_eq!(crate::arch::kernel_set(), KernelSet::Rvv);
+          assert_eq!(
+            kernel(&since, 0),
+            expected,
+            "another thread runs the saved kernel"
+          );
+        })
+        .join()
+        .unwrap();
+    });
+
+    set_isa_policy(FeaturePolicy::Disable);
+    assert_eq!(crate::arch::kernel_set(), KernelSet::Baseline);
+    assert_eq!(
+      kernel(&since, 0),
+      expected,
+      "the saved kernel must follow the policy to the baseline"
+    );
+    set_isa_policy(FeaturePolicy::Prefer);
+    assert_eq!(crate::arch::kernel_set(), KernelSet::Rvv);
+    assert_eq!(kernel(&since, 0), expected);
+    TEST_ALLOCATOR.configure(Policy::DEFAULT).unwrap();
   }
 
   struct Mapped {

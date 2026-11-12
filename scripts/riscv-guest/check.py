@@ -293,10 +293,10 @@ def validate_log(log, scenario, identity):
       if summaries or refusals[label] not in segment:
         raise ValueError(f"{scenario}: {label} did not refuse with the allocator's message")
       continue
-    # RVV runs a saved-kernel child, and thread-policy runs one child that
-    # must run (a denied permission query) besides the refused V-off one.
-    # Every subprocess that runs and its parent emit a successful summary.
-    count = {"rvv-kernel": 2, "thread-policy": 2}.get(label, 1)
+    # thread-policy runs one child that must run (a denied permission
+    # query) besides the refused V-off one. Every subprocess that runs and
+    # its parent emit a successful summary.
+    count = {"thread-policy": 2}.get(label, 1)
     if len(summaries) != count:
       raise ValueError(f"{scenario}: {label} did not execute its required coverage")
     for line in summaries:

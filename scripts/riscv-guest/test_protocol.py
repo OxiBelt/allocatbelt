@@ -30,7 +30,7 @@ class Protocol(unittest.TestCase):
       else:
         rows.extend(["test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
                      "0 filtered out; finished in 0.00s"] *
-                    {"rvv-kernel": 2, "thread-policy": 2}.get(label, 1))
+                    {"thread-policy": 2}.get(label, 1))
       rows.append(f"ALLOCATBELT_GUEST PASS {scenario} {identity} {label}")
     rows.append(f"ALLOCATBELT_GUEST COMPLETE {scenario} {identity}")
     return "\n".join(rows)
@@ -87,7 +87,7 @@ class Protocol(unittest.TestCase):
 
   def test_nested_suites_require_children_and_parent(self):
     log = self.log("v-on")
-    for label in ("rvv-kernel", "thread-policy"):
+    for label in ("thread-policy",):
       begin = f"ALLOCATBELT_GUEST BEGIN v-on abc {label}\n"
       head, segment = log.split(begin)
       lines = segment.splitlines()
