@@ -7,9 +7,11 @@
 #
 # 1. Lints `allocatbelt` for riscv64 with the feature.
 # 2. Builds its lib, `experimental_isa` and `platform` tests for riscv64
-#    with the feature and checks that V instructions appear only in the
-#    kernel (`arch::rvv::aged_pages_rvv_body`): V is not enabled for the
-#    rest of the binary, which must run on the RV64GC baseline.
+#    with the feature and checks that each contains the kernel
+#    (`arch::rvv::aged_pages_rvv_body`). The rest of the binary is built
+#    with V too (the riscv64 baseline, docs/platform.md), so V instructions
+#    are expected elsewhere; the kernel's own `vsetvli` must still be there,
+#    since it strip-mines at the hardware's VLEN whatever the compiler did.
 # 3. Runs them under qemu-user with V at VLEN 128, 256 (the `max` default)
 #    and 1024: a test-only override exercises the direct kernel ABI, while
 #    dispatch requires the current-thread permission query to succeed. Then
@@ -42,20 +44,16 @@ mapfile -t bins < <(
 )
 [[ ${#bins[@]} -eq 3 ]] || { echo "FAIL: found ${#bins[@]} test binaries" >&2; exit 1; }
 
-echo "== V instructions only in the kernel"
+echo "== the kernel is compiled in"
 for b in "${bins[@]}"; do
   mapfile -t fns < <(
     llvm-objdump -d --no-show-raw-insn --mattr=+v "$b" |
       awk '/^[0-9a-f]+ <.*>:$/ { fn = $2 }
-        /\t(vsetvli|vsetivli|vsetvl|vl[0-9a-z]*\.v|vs[0-9a-z]*\.v|vmv|vmerge|vredor|vmsleu)[ \t]/ { print fn }' |
+        /\t(vsetvli|vsetivli|vsetvl)[ \t]/ && fn ~ /aged_pages_rvv_body/ { print fn }' |
       sort -u
   )
-  for fn in "${fns[@]}"; do
-    [[ "${fn}" == *aged_pages_rvv_body* ]] ||
-      { echo "FAIL: V instructions in ${fn} ($(basename "$b"))" >&2; exit 1; }
-  done
   [[ ${#fns[@]} -eq 1 ]] || { echo "FAIL: kernel not found in $(basename "$b")" >&2; exit 1; }
-  echo "ok: $(basename "$b"): only ${fns[0]}"
+  echo "ok: $(basename "$b"): ${fns[0]} sets its own vector length"
 done
 
 pick() {

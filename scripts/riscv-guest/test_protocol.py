@@ -126,10 +126,12 @@ class Protocol(unittest.TestCase):
           with self.assertRaises(ValueError):
             guest.validate_payload(key)
 
-  def test_payload_attributes_do_not_require_vectors(self):
-    guest.validate_elf_attributes('Tag_RISCV_arch: "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0"', "test")
-    for attributes in ('Tag_RISCV_arch: "rv64i2p1_v1p0"',
-                       'Tag_RISCV_arch: "rv64i2p1_zve64d1p0"', ""):
+  def test_payload_attributes_require_vectors(self):
+    guest.validate_elf_attributes(
+      'Tag_RISCV_arch: "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_v1p0_zve64d1p0"', "test")
+    for attributes in ('Tag_RISCV_arch: "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0"',
+                       'Tag_RISCV_arch: "rv64i2p1_zve64d1p0"', "",
+                       'Tag_RISCV_arch: "rv32i2p1_v1p0"'):
       with self.assertRaises(ValueError):
         guest.validate_elf_attributes(attributes, "test")
 

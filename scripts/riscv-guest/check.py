@@ -172,9 +172,10 @@ def validate_elf_attributes(attributes, name):
   architectures = re.findall(r'Tag_RISCV_arch:\s*"([^"]+)"', attributes)
   if len(architectures) != 1 or not architectures[0].startswith("rv64"):
     raise ValueError(f"{name} lacks an unambiguous RV64 ISA attribute")
+  # V is the riscv64 baseline: every binary is built with it.
   extensions = architectures[0].split("_")[1:]
-  if any(extension.startswith(("v", "zv")) for extension in extensions):
-    raise ValueError(f"{name} requires V in its baseline ELF architecture")
+  if not any(extension.startswith("v") for extension in extensions):
+    raise ValueError(f"{name} lacks V in its baseline ELF architecture")
 
 
 def source_fingerprint(key):
@@ -212,7 +213,9 @@ def payload():
   env = os.environ.copy()
   env.pop("CARGO_ENCODED_RUSTFLAGS", None)
   env.pop("CARGO_BUILD_RUSTFLAGS", None)
-  env["RUSTFLAGS"] = "-C target-feature=+crt-static"
+  # RUSTFLAGS replaces `.cargo/config.toml`, so it names V (required on
+  # riscv64, docs/platform.md) as well as the static C runtime.
+  env["RUSTFLAGS"] = "-C target-feature=+crt-static,+v"
   env["CARGO_TARGET_DIR"] = str(WORK / "rust")
   env["CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER"] = str(
     OUTPUT / "host/bin/riscv64-buildroot-linux-musl-gcc")
