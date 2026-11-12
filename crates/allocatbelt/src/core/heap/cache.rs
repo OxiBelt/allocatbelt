@@ -344,6 +344,16 @@ impl<O: Os> Heap<O> {
           self.with_shard(hint, |s, sh| self.claim_class(s, sh, c, true, false))??
         }
       };
+    // A block of the claimed word that this thread still holds as freed in
+    // its buffer cannot be free in the shared bitmap as well.
+    let key = slot_key(page, w as usize, c);
+    let first = set_index(page, w as usize) * FREE_WAYS;
+    if tc.frees[first..first + FREE_WAYS]
+      .iter()
+      .any(|slot| slot.key.get() == key && slot.mask.get() & bits != 0)
+    {
+      self.os.fatal(DOUBLE_FREE);
+    }
     let cw = &tc.words[c];
     cw.base
       .set((page << PAGE_SHIFT) + w as usize * 64 * class::size(c));

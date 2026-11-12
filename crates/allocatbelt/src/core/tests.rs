@@ -1127,6 +1127,51 @@ fn misaligned_free_of_an_aligned_cached_block() {
 }
 
 #[test]
+#[should_panic(expected = "double free")]
+fn a_refill_reports_a_block_the_thread_holds_as_freed() {
+  let h = heap();
+  let tc = cache(h);
+  let x = alloc_c(h, &tc, 48, 8);
+  let _y = alloc_c(h, &tc, 48, 8);
+  free_c(h, &tc, x);
+  // The flush returns x and the rest of the claimed word.
+  h.flush(&tc);
+  h.dealloc_cached(&tc, x);
+  // The refill claims x's word again while the buffer holds x as freed.
+  let _ = h.alloc_cached(&tc, 48, 8);
+}
+
+#[test]
+fn a_refill_accepts_a_word_whose_buffered_blocks_it_does_not_claim() {
+  let h = heap();
+  let (a, b) = (cache(h), cache(h));
+  // One whole 16-byte word for `a`, and the start of the next.
+  let word: Vec<_> = (0..64).map(|_| alloc_c(h, &a, 16, 8)).collect();
+  let next = alloc_c(h, &a, 16, 8);
+  assert_eq!(word[63] + 16, next);
+  // `b` returns one block of the word to the shared bitmap; `a` holds
+  // another one as freed in its buffer.
+  let (v, z) = (word[10], word[20]);
+  free_c(h, &b, v);
+  h.flush(&b);
+  free_c(h, &a, z);
+  // `a` uses up its claimed word, then refills: the claim takes the word
+  // again with v free and z still buffered, which is legitimate.
+  let rest: Vec<_> = (0..63).map(|_| alloc_c(h, &a, 16, 8)).collect();
+  let got = alloc_c(h, &a, 16, 8);
+  assert!(!rest.contains(&z) && got != z);
+  assert!(rest.contains(&v) || got == v);
+  let s = h.cache_stats(&a);
+  assert_eq!(s.buffered_blocks, 1);
+  for o in rest.into_iter().chain([got, next]) {
+    free_c(h, &a, o);
+  }
+  free_rest(h, &a, &word, &[v, z]);
+  h.retire(&b);
+  assert_eq!(h.usage().small_bytes_out, 0);
+}
+
+#[test]
 fn a_seeded_cache_hands_out_each_claimed_block_once() {
   let h = heap();
   h.set_seed(0x9E37_79B9_7F4A_7C15);
