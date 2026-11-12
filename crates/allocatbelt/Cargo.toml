@@ -9,7 +9,7 @@ repository = "https://github.com/OxiBelt/allocatbelt"
 readme = "../../README.md"
 keywords = ["allocator", "global-allocator", "malloc", "linux"]
 categories = ["memory-management", "os::linux-apis"]
-include = ["/src/**/*.rs", "/tests/**/*.rs", "/examples/**/*.rs", "/LICENSE"]
+include = ["/build.rs", "/build/**/*.rs", "/src/**/*.rs", "/tests/**/*.rs", "/examples/**/*.rs", "/LICENSE"]
 # The only package of this workspace that is published; every other one is a
 # development tool (`publish = false` from `[workspace.package]`).
 

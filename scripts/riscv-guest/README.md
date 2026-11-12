@@ -29,9 +29,12 @@ drivers remain disabled. The kernel enables `NETDEVICES` for the socket's
 fixtures that require Bash syntax; PID 1 itself continues to run under
 BusyBox `/bin/sh`.
 
-The no-V boot checks platform, region, runtime and baseline ISA dispatch.
-The V-enabled boot checks allowed dispatch, fresh-exec disabled dispatch,
-and real Linux thread-local vector control. A system-wide default changes
+The payload is built with V, the riscv64 baseline. The no-V boot checks that
+the allocator refuses to start with its message. The V-enabled boot runs the
+platform, region and runtime tests, allowed dispatch and real Linux
+thread-local vector control (a process started with V off is refused, a
+denied permission query is not), then checks that a fresh process started
+with V off by `abi.riscv_v_default_allow = 0` is refused too. A system-wide default changes
 the policy of new execs only; the library never enables V on behalf of a
 caller. QEMU-user still provides the wider kernel/VLEN equivalence matrix.
 

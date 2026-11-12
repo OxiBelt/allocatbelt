@@ -38,6 +38,14 @@ pub(crate) fn arena() -> Option<&'static Arena> {
     .get_or_init(|| {
       // A missing mandatory facility is a platform the allocator does not
       // support, not an out-of-memory condition: say so and stop.
+      // riscv64 builds contain V instructions anywhere (the platform gate
+      // requires `+v`), the probe below included: stop with a message, not
+      // a SIGILL, on a machine or thread without V. First, before any call
+      // whose result the compiler may copy with vector instructions.
+      #[cfg(target_arch = "riscv64")]
+      if let Err(msg) = crate::arch::vector_ready() {
+        LinuxOs.fatal(msg);
+      }
       let platform = crate::sys::probe().unwrap_or_else(|e| LinuxOs.fatal(e.message()));
       // Allocation-free (cpuid, getauxval or riscv_hwprobe). Allocations
       // before this point, and on the way here, use the baseline kernels.
@@ -245,6 +253,12 @@ fn attach(tc: &ThreadCache) {
   // glibc, but nothing guarantees that); until `attach` returns, such
   // allocations take the uncached paths.
   tc.begin_attach();
+  // Vector state is per thread: check each thread before it caches (see
+  // `arena`). A thread that turns V off later is not seen.
+  #[cfg(target_arch = "riscv64")]
+  if let Err(msg) = crate::arch::vector_ready() {
+    LinuxOs.fatal(msg);
+  }
   if RETIRE.try_with(|_| ()).is_ok() {
     HEAP.attach(tc);
   }

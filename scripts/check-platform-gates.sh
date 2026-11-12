@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Checks the compile-time platform contract (docs/platform.md): supported
-# targets build, and every other target, and x86_64 below x86-64-v3, fails
-# with the gate's own message. `cargo check` needs only the targets' std
+# targets build, and every other target, x86_64 below x86-64-v3 and riscv64
+# without the V extension, fails with the gate's own message. `cargo check` needs only the targets' std
 # (`rustup target add ...`), no linker or C cross compiler.
 #
 #   scripts/check-platform-gates.sh            # all cases
@@ -40,18 +40,32 @@ check() {
 
 v3='must be built for x86-64-v3 or newer'
 
-# Supported: .cargo/config.toml supplies x86-64-v3 for x86_64.
+v='must be built with the V extension'
+
+# Supported: .cargo/config.toml supplies x86-64-v3 for x86_64 and V for
+# riscv64.
 check x86_64-unknown-linux-gnu ok
 check x86_64-unknown-linux-musl ok
 check x86_64-unknown-linux-gnu ok '-C target-cpu=x86-64-v4'
 check aarch64-unknown-linux-gnu ok
 check riscv64gc-unknown-linux-gnu ok
+check riscv64gc-unknown-linux-gnu ok '-C target-feature=+v'
+check riscv64gc-unknown-linux-gnu ok '-C target-feature=+zbb,+v'
+check riscv64gc-unknown-linux-gnu ok '-Ctarget-feature=-v -Ctarget-feature=+v'
 
 # x86_64 below v3: a RUSTFLAGS without the CPU flag replaces the config.
 check x86_64-unknown-linux-gnu "${v3}" ''
 check x86_64-unknown-linux-gnu "${v3}" '-C target-cpu=x86-64'
 check x86_64-unknown-linux-gnu "${v3}" '-C target-cpu=x86-64-v2'
 check x86_64-unknown-linux-musl "${v3}" '-C target-cpu=x86-64-v2'
+
+# riscv64 without V: a RUSTFLAGS without `+v` replaces the config, a later
+# `-v` turns it off, and a CPU that has V is not enough on its own (stable
+# rustc does not report the features a `target-cpu` implies).
+check riscv64gc-unknown-linux-gnu "${v}" ''
+check riscv64gc-unknown-linux-gnu "${v}" '-C target-feature=+zbb'
+check riscv64gc-unknown-linux-gnu "${v}" '-C target-feature=+v,-v'
+check riscv64gc-unknown-linux-gnu "${v}" '-C target-cpu=sifive-x280'
 
 # Unsupported architectures, ABIs, byte orders and operating systems.
 # 32-bit targets stop first at the core module's own 64-bit gate.

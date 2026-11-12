@@ -7,16 +7,17 @@
 #
 # 1. Lints `allocatbelt` for riscv64 with the feature.
 # 2. Builds its lib, `experimental_isa` and `platform` tests for riscv64
-#    with the feature and checks that V instructions appear only in the
-#    kernel (`arch::rvv::aged_pages_rvv_body`): V is not enabled for the
-#    rest of the binary, which must run on the RV64GC baseline.
+#    with the feature and checks that each contains the kernel
+#    (`arch::rvv::aged_pages_rvv_body`). The rest of the binary is built
+#    with V too (the riscv64 baseline, docs/platform.md), so V instructions
+#    are expected elsewhere; the kernel's own `vsetvli` must still be there,
+#    since it strip-mines at the hardware's VLEN whatever the compiler did.
 # 3. Runs them under qemu-user with V at VLEN 128, 256 (the `max` default)
 #    and 1024: a test-only override exercises the direct kernel ABI, while
 #    dispatch requires the current-thread permission query to succeed. Then
-#    without V, if the cross C library permits it, `Prefer` keeps the baseline.
-#    That run is skipped when the cross C library itself needs V (Ubuntu
-#    26.04 builds its riscv64 glibc for RVA23), which qemu reports as SIGILL
-#    before any test.
+#    without V, the allocator must refuse to start with its message. That run
+#    is skipped when the cross C library itself needs V (an RVA23 glibc),
+#    which qemu reports as SIGILL before any allocation.
 #
 # Needs qemu-user, riscv64-linux-gnu-gcc and its sysroot, llvm-objdump,
 # jq, and Rust 1.99.0 with the riscv64gc-unknown-linux-gnu target.
@@ -42,20 +43,16 @@ mapfile -t bins < <(
 )
 [[ ${#bins[@]} -eq 3 ]] || { echo "FAIL: found ${#bins[@]} test binaries" >&2; exit 1; }
 
-echo "== V instructions only in the kernel"
+echo "== the kernel is compiled in"
 for b in "${bins[@]}"; do
   mapfile -t fns < <(
     llvm-objdump -d --no-show-raw-insn --mattr=+v "$b" |
       awk '/^[0-9a-f]+ <.*>:$/ { fn = $2 }
-        /\t(vsetvli|vsetivli|vsetvl|vl[0-9a-z]*\.v|vs[0-9a-z]*\.v|vmv|vmerge|vredor|vmsleu)[ \t]/ { print fn }' |
+        /\t(vsetvli|vsetivli|vsetvl)[ \t]/ && fn ~ /aged_pages_rvv_body/ { print fn }' |
       sort -u
   )
-  for fn in "${fns[@]}"; do
-    [[ "${fn}" == *aged_pages_rvv_body* ]] ||
-      { echo "FAIL: V instructions in ${fn} ($(basename "$b"))" >&2; exit 1; }
-  done
   [[ ${#fns[@]} -eq 1 ]] || { echo "FAIL: kernel not found in $(basename "$b")" >&2; exit 1; }
-  echo "ok: $(basename "$b"): only ${fns[0]}"
+  echo "ok: $(basename "$b"): ${fns[0]} sets its own vector length"
 done
 
 pick() {
@@ -127,14 +124,20 @@ for vlen in 128 256 1024; do
   echo "-- ${cpu}: current-thread permission ${permission}"
   run "${expected}" "${cpu}" "${direct}" "${require}"
 done
+# Without V the build cannot run: the allocator must stop at its first
+# allocation with its message (docs/platform.md), unless the cross C library
+# itself needs V and faults first.
 status=0
-"${qemu[@]}" -cpu max,v=false "$(pick platform)" --list >/dev/null 2>&1 || status=$?
+refusal="${probe_dir}/refusal"
+"${qemu[@]}" -cpu max,v=false "$(pick platform)" >"${refusal}" 2>&1 || status=$?
 if [[ ${status} -eq 132 ]]; then
   echo "-- max,v=false: skipped, the cross C library needs V (SIGILL before any test)"
-elif [[ ${status} -ne 0 ]]; then
-  echo "FAIL: max,v=false: exit ${status}" >&2
-  exit 1
+elif [[ ${status} -ne 0 ]] && grep -qF "riscv_hwprobe reports no V" "${refusal}" &&
+  ! grep -qE '^test result' "${refusal}"; then
+  echo "-- max,v=false: refused at start-up (exit ${status})"
 else
-  run Baseline max,v=false no no
+  echo "FAIL: max,v=false: exit ${status} without the allocator's refusal" >&2
+  cat "${refusal}" >&2
+  exit 1
 fi
 echo "ok: experimental RVV kernel"

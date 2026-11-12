@@ -14,16 +14,23 @@ spec.loader.exec_module(guest)
 
 
 class Protocol(unittest.TestCase):
-  def log(self, scenario="v-off", identity="abc"):
-    labels = ["platform", "region", "runtime"] + (
-      ["dispatch-off"] if scenario == "v-off" else
-      ["rvv-kernel", "dispatch-on", "dispatch-disabled", "thread-policy"])
+  REFUSALS = {"refuse-no-v": "riscv_hwprobe reports no V",
+              "refuse-v-off": "vector instructions are off for this thread"}
+
+  def log(self, scenario="v-on", identity="abc"):
+    labels = (["refuse-no-v"] if scenario == "v-off" else
+              ["platform", "region", "runtime", "rvv-kernel", "dispatch-on",
+               "thread-policy", "refuse-v-off"])
     rows = []
     for label in labels:
       rows.append(f"ALLOCATBELT_GUEST BEGIN {scenario} {identity} {label}")
-      rows.extend(["test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
-                   "0 filtered out; finished in 0.00s"] *
-                  {"rvv-kernel": 2, "thread-policy": 3}.get(label, 1))
+      if label in self.REFUSALS:
+        rows.append(f"allocatbelt: this riscv64 build needs the V extension, and "
+                    f"{self.REFUSALS[label]}; see docs/platform.md")
+      else:
+        rows.extend(["test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
+                     "0 filtered out; finished in 0.00s"] *
+                    {"thread-policy": 2}.get(label, 1))
       rows.append(f"ALLOCATBELT_GUEST PASS {scenario} {identity} {label}")
     rows.append(f"ALLOCATBELT_GUEST COMPLETE {scenario} {identity}")
     return "\n".join(rows)
@@ -32,43 +39,55 @@ class Protocol(unittest.TestCase):
     for scenario in ("v-off", "v-on"):
       guest.validate_log(self.log(scenario), scenario, "abc")
 
+  def test_refusals_need_the_message_and_no_tests(self):
+    summary = ("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
+               "0 filtered out; finished in 0.00s")
+    for scenario, label in (("v-off", "refuse-no-v"), ("v-on", "refuse-v-off")):
+      log = self.log(scenario)
+      message = self.REFUSALS[label]
+      end = f"ALLOCATBELT_GUEST PASS {scenario} abc {label}"
+      for damaged in (log.replace(message, "something else"),
+                      log.replace(end, summary + "\n" + end)):
+        with self.assertRaises(ValueError):
+          guest.validate_log(damaged, scenario, "abc")
+
   def test_missing_or_duplicate_result_is_rejected(self):
     log = self.log()
     for damaged in (log.rsplit("\n", 1)[0], log + "\n" + log,
-                    log.replace("PASS v-off abc runtime", "FAIL v-off abc runtime")):
+                    log.replace("PASS v-on abc runtime", "FAIL v-on abc runtime")):
       with self.assertRaises(ValueError):
-        guest.validate_log(damaged, "v-off", "abc")
+        guest.validate_log(damaged, "v-on", "abc")
 
   def test_wrong_identity_or_scenario_is_rejected(self):
-    for scenario, identity in (("v-on", "abc"), ("v-off", "other")):
+    for scenario, identity in (("v-off", "abc"), ("v-on", "other")):
       with self.assertRaises(ValueError):
         guest.validate_log(self.log(), scenario, identity)
 
   def test_panic_or_skipped_coverage_is_rejected(self):
     for failure in ("Kernel panic", "Oops:", "test result: FAILED", "1 ignored;"):
       with self.assertRaises(ValueError):
-        guest.validate_log(self.log() + "\n" + failure, "v-off", "abc")
+        guest.validate_log(self.log() + "\n" + failure, "v-on", "abc")
 
   def test_zero_tests_or_missing_summaries_are_rejected(self):
     for damaged in (self.log().replace("1 passed", "0 passed"),
                     self.log().replace("test result: ok.", "unrecognized result:")):
       with self.assertRaises(ValueError):
-        guest.validate_log(damaged, "v-off", "abc")
+        guest.validate_log(damaged, "v-on", "abc")
 
   def test_extra_or_malformed_summaries_are_rejected(self):
     summary = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;"
     for extra in (summary, "test result: ok. malformed", " " + summary,
                   summary + " unexpected trailing text"):
-      damaged = self.log().replace("ALLOCATBELT_GUEST PASS v-off abc platform",
-                                  extra + "\nALLOCATBELT_GUEST PASS v-off abc platform")
+      damaged = self.log().replace("ALLOCATBELT_GUEST PASS v-on abc platform",
+                                  extra + "\nALLOCATBELT_GUEST PASS v-on abc platform")
       with self.assertRaises(ValueError):
-        guest.validate_log(damaged, "v-off", "abc")
+        guest.validate_log(damaged, "v-on", "abc")
       with self.assertRaises(ValueError):
-        guest.validate_log(self.log() + "\n" + extra, "v-off", "abc")
+        guest.validate_log(self.log() + "\n" + extra, "v-on", "abc")
 
   def test_nested_suites_require_children_and_parent(self):
     log = self.log("v-on")
-    for label in ("rvv-kernel", "thread-policy"):
+    for label in ("thread-policy",):
       begin = f"ALLOCATBELT_GUEST BEGIN v-on abc {label}\n"
       head, segment = log.split(begin)
       lines = segment.splitlines()
@@ -126,10 +145,12 @@ class Protocol(unittest.TestCase):
           with self.assertRaises(ValueError):
             guest.validate_payload(key)
 
-  def test_payload_attributes_do_not_require_vectors(self):
-    guest.validate_elf_attributes('Tag_RISCV_arch: "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0"', "test")
-    for attributes in ('Tag_RISCV_arch: "rv64i2p1_v1p0"',
-                       'Tag_RISCV_arch: "rv64i2p1_zve64d1p0"', ""):
+  def test_payload_attributes_require_vectors(self):
+    guest.validate_elf_attributes(
+      'Tag_RISCV_arch: "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0_v1p0_zve64d1p0"', "test")
+    for attributes in ('Tag_RISCV_arch: "rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0"',
+                       'Tag_RISCV_arch: "rv64i2p1_zve64d1p0"', "",
+                       'Tag_RISCV_arch: "rv32i2p1_v1p0"'):
       with self.assertRaises(ValueError):
         guest.validate_elf_attributes(attributes, "test")
 

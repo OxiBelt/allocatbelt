@@ -147,7 +147,7 @@ jobs:
   # and unsupported architectures, ABIs, byte orders and operating systems
   # fail at compile time with the gates' own messages.
   platform-gates:
-    name: Platform gates (x86-64-v3 floor, unsupported targets rejected)
+    name: Platform gates (x86-64-v3 floor, riscv64 V, unsupported targets rejected)
     runs-on: ubuntu-26.04
     timeout-minutes: 30
 
@@ -491,10 +491,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: rv64gc
-            rustflags: ""
-          - name: rv64gc + Zbb
-            rustflags: "-C target-feature=+zbb"
+          # V is required (docs/platform.md). RUSTFLAGS replaces the
+          # `.cargo/config.toml` flags, so each row names `+v` itself.
+          - name: rv64gcv
+            rustflags: "-C target-feature=+v"
+          - name: rv64gcv + Zbb
+            rustflags: "-C target-feature=+v,+zbb"
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
 
@@ -534,12 +536,17 @@ jobs:
           ALLOCATBELT_EXPECT_RSEQ: not registered
         run: cargo test --release --locked --target riscv64gc-unknown-linux-gnu -p allocatbelt -p allocatbelt-core-check -p allocatbelt-simd-bench --features allocatbelt/io-uring,allocatbelt/experimental-rseq
 
-      # The experimental RVV candidates: the auto-vectorized kernels built
-      # with V (an unstable target feature, hence rustc's warning).
-      - name: Cargo test (SIMD candidates with V)
+      # A riscv64 build without V must stop at allocatbelt's platform gate,
+      # whichever other features it enables.
+      - name: Build without V is rejected
         env:
-          RUSTFLAGS: ${{ matrix.rustflags }} -C target-feature=+v
-        run: cargo test --release --locked --target riscv64gc-unknown-linux-gnu -p allocatbelt-simd-bench
+          RUSTFLAGS: ${{ matrix.rustflags }} -C target-feature=-v
+        run: |
+          if cargo build --release --locked --target riscv64gc-unknown-linux-gnu -p allocatbelt --lib 2>build.log; then
+            echo "a riscv64 build without V was accepted" >&2
+            exit 1
+          fi
+          grep -F "allocatbelt on riscv64 must be built with the V extension" build.log
 
   loom-models:
     name: loom models of allocator and runtime protocols
