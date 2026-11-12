@@ -35,8 +35,7 @@ run() {
   cat /tmp/test-output
   # Required child processes also emit summaries before the parent does.
   summaries=1
-  if [ "$label" = rvv-kernel ]; then summaries=2; fi
-  if [ "$label" = thread-policy ]; then summaries=3; fi
+  if [ "$label" = thread-policy ]; then summaries=2; fi
   count=$(grep -Ec '^[[:space:]]*test result:' /tmp/test-output || :)
   test "$count" -eq "$summaries" || fail
   # Check every result line, including malformed, zero-test and ignored ones.
@@ -44,23 +43,39 @@ run() {
   test "$count" -eq "$summaries" || fail
   echo "ALLOCATBELT_GUEST PASS $scenario $identity $label"
 }
-export ALLOCATBELT_EXPECT_KERNEL=Baseline
-run platform /guest/platform --test-threads=2
-run region /guest/allocator-lib region:: --test-threads=2
-run runtime /guest/runtime-lib runtime:: --test-threads=2
+# The payload is built with V (the riscv64 baseline). Where V cannot run,
+# the allocator must stop at its first allocation with its own message and
+# a non-zero status, before any test runs.
+refuse() {
+  label=$1
+  expected=$2
+  shift 2
+  echo "ALLOCATBELT_GUEST BEGIN $scenario $identity $label"
+  if "$@" >/tmp/test-output 2>&1; then
+    cat /tmp/test-output
+    fail
+  fi
+  cat /tmp/test-output
+  grep -qF "$expected" /tmp/test-output || fail
+  if grep -Eq '^[[:space:]]*test result:' /tmp/test-output; then fail; fi
+  echo "ALLOCATBELT_GUEST PASS $scenario $identity $label"
+}
 if [ "$scenario" = v-off ]; then
-  run dispatch-off /guest/experimental_isa --test-threads=1
+  refuse refuse-no-v "riscv_hwprobe reports no V" /guest/platform --test-threads=2
 else
   test -f /proc/sys/abi/riscv_v_default_allow || fail
   echo 1 >/proc/sys/abi/riscv_v_default_allow
+  export ALLOCATBELT_EXPECT_KERNEL=Baseline
+  run platform /guest/platform --test-threads=2
+  run region /guest/allocator-lib region:: --test-threads=2
+  run runtime /guest/runtime-lib runtime:: --test-threads=2
   export ALLOCATBELT_EXPECT_KERNEL=Rvv
   export ALLOCATBELT_REQUIRE_VECTOR_CONTROL=1
   run rvv-kernel /guest/allocator-lib arch::rvv:: --test-threads=1
   run dispatch-on /guest/experimental_isa --test-threads=1
-  echo 0 >/proc/sys/abi/riscv_v_default_allow
-  export ALLOCATBELT_EXPECT_KERNEL=Baseline
-  run dispatch-disabled /guest/experimental_isa --test-threads=1
   run thread-policy /guest/riscv_vector_control --test-threads=1
+  echo 0 >/proc/sys/abi/riscv_v_default_allow
+  refuse refuse-v-off "vector instructions are off for this thread" /guest/platform --test-threads=2
 fi
 echo "ALLOCATBELT_GUEST COMPLETE $scenario $identity"
 trap - EXIT

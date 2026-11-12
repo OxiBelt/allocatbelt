@@ -262,9 +262,13 @@ def payload():
 
 def validate_log(log, scenario, identity):
   text = log.replace("\r", "")
-  expected = ["platform", "region", "runtime"] + (
-    ["dispatch-off"] if scenario == "v-off" else
-    ["rvv-kernel", "dispatch-on", "dispatch-disabled", "thread-policy"])
+  # Without V the allocator must refuse to start; with V the tests run,
+  # and a fresh process started with V off must be refused.
+  expected = (["refuse-no-v"] if scenario == "v-off" else
+              ["platform", "region", "runtime", "rvv-kernel", "dispatch-on",
+               "thread-policy", "refuse-v-off"])
+  refusals = {"refuse-no-v": "riscv_hwprobe reports no V",
+              "refuse-v-off": "vector instructions are off for this thread"}
   protocol = [line for line in text.splitlines() if line.startswith("ALLOCATBELT_GUEST ")]
   wanted = []
   for label in expected:
@@ -284,9 +288,15 @@ def validate_log(log, scenario, identity):
     segment = text.split(begin, 1)[1].split(end, 1)[0]
     summaries = [line for line in segment.splitlines()
                  if line.lstrip().startswith("test result:")]
-    # RVV runs a saved-kernel child, and thread-policy runs two children.
-    # Every subprocess and its parent must emit a successful summary.
-    count = {"rvv-kernel": 2, "thread-policy": 3}.get(label, 1)
+    if label in refusals:
+      # A refusal runs no test: it prints the allocator's message instead.
+      if summaries or refusals[label] not in segment:
+        raise ValueError(f"{scenario}: {label} did not refuse with the allocator's message")
+      continue
+    # thread-policy runs one child that must run (a denied permission
+    # query) besides the refused V-off one. Every subprocess that runs and
+    # its parent emit a successful summary.
+    count = {"thread-policy": 2}.get(label, 1)
     if len(summaries) != count:
       raise ValueError(f"{scenario}: {label} did not execute its required coverage")
     for line in summaries:

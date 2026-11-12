@@ -15,10 +15,9 @@
 # 3. Runs them under qemu-user with V at VLEN 128, 256 (the `max` default)
 #    and 1024: a test-only override exercises the direct kernel ABI, while
 #    dispatch requires the current-thread permission query to succeed. Then
-#    without V, if the cross C library permits it, `Prefer` keeps the baseline.
-#    That run is skipped when the cross C library itself needs V (Ubuntu
-#    26.04 builds its riscv64 glibc for RVA23), which qemu reports as SIGILL
-#    before any test.
+#    without V, the allocator must refuse to start with its message. That run
+#    is skipped when the cross C library itself needs V (an RVA23 glibc),
+#    which qemu reports as SIGILL before any allocation.
 #
 # Needs qemu-user, riscv64-linux-gnu-gcc and its sysroot, llvm-objdump,
 # jq, and Rust 1.99.0 with the riscv64gc-unknown-linux-gnu target.
@@ -125,14 +124,20 @@ for vlen in 128 256 1024; do
   echo "-- ${cpu}: current-thread permission ${permission}"
   run "${expected}" "${cpu}" "${direct}" "${require}"
 done
+# Without V the build cannot run: the allocator must stop at its first
+# allocation with its message (docs/platform.md), unless the cross C library
+# itself needs V and faults first.
 status=0
-"${qemu[@]}" -cpu max,v=false "$(pick platform)" --list >/dev/null 2>&1 || status=$?
+refusal="${probe_dir}/refusal"
+"${qemu[@]}" -cpu max,v=false "$(pick platform)" >"${refusal}" 2>&1 || status=$?
 if [[ ${status} -eq 132 ]]; then
   echo "-- max,v=false: skipped, the cross C library needs V (SIGILL before any test)"
-elif [[ ${status} -ne 0 ]]; then
-  echo "FAIL: max,v=false: exit ${status}" >&2
-  exit 1
+elif [[ ${status} -ne 0 ]] && grep -qF "riscv_hwprobe reports no V" "${refusal}" &&
+  ! grep -qE '^test result' "${refusal}"; then
+  echo "-- max,v=false: refused at start-up (exit ${status})"
 else
-  run Baseline max,v=false no no
+  echo "FAIL: max,v=false: exit ${status} without the allocator's refusal" >&2
+  cat "${refusal}" >&2
+  exit 1
 fi
 echo "ok: experimental RVV kernel"
