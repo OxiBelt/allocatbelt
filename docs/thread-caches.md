@@ -7,7 +7,7 @@ Each thread that allocates has a cache of its own: the free blocks of one claime
 A small free sets a bit in the buffer. The buffer has 128 slots, in 64 sets of 2 ways (`FREE_SLOTS`, `FREE_WAYS`; fixed constants, not settings); each slot holds the freed blocks of one bitmap word (up to 64). When a slot is written back, one update under the lock of the shard that owns the page returns all of its blocks, so the cost of the lock and the shared update is spread over the blocks the slot collected.
 
 - A free goes to the set its word hashes to: into the way that already holds the word, else an empty way, else it evicts the older of the two ways (round robin per set). The evicted word goes back in one update (`CacheStats::evictions`).
-- A word is in at most one slot. A second free of a block still buffered, in either way, or of a block the thread claimed but has not handed out, aborts with "double free". Frees of the same block from two threads are caught when the second reaches the shared bitmap. A refill that claims a block this thread still holds as freed in its buffer aborts with "double free" too.
+- A word is in at most one slot. A second free of a block still buffered, in either way, or of a block the thread claimed but has not handed out, aborts with "double free". So does a free of a block whose bit the shared bitmap already shows as free, because a free of it was written back: the free reads that bit, without the lock, before it is buffered. A refill that claims a block this thread still holds as freed in its buffer aborts with "double free" too. The write-back of a buffered free is checked again under the lock.
 - Before a size class would take a new page, the thread writes back its buffered frees of that class and tries again (`refill_flushes`), so buffering never grows the heap.
 - With a direct-mapped buffer, two words hashing to the same slot evicted each other on every alternating free. Two ways keep both words; a third word in the same set is needed to evict.
 
@@ -76,5 +76,6 @@ The child has only the thread that forked. Its cache works as before; the caches
 ## Costs
 
 - **Free fast path.** One more comparison: the word is looked up in both ways of its set. The key encoding, the per-class masks of occupied slots and the flush path are unchanged.
+- **Free fast path, bitmap check.** One relaxed load of the block's shared bitmap word and a test before the buffer lookup. The word is in the page's metadata, after the page information the fast path already reads, but can be on another cache line. On x86-64-v3 a free that finds its slot runs 12 more instructions.
 - **State.** Three `Cell`s more per cache (a 32-bit mask of which way each set evicts next, the last generation drained for, and the drain counter). One `AtomicU32` in the heap.
 - **Sampled checks.** One relaxed load and a comparison at each sampled point, none on the allocation and free fast paths.

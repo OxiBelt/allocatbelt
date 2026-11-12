@@ -482,12 +482,13 @@ impl<O: Os> Heap<O> {
       && m[SEG_HDR].load(Acquire) & 0xFF == SEG_OWNED
     {
       let page = offset >> PAGE_SHIFT;
-      let info =
-        m[SEGMENT_HEADER_WORDS + page % PAGES_PER_SEGMENT * PAGE_META_WORDS + P_INFO].load(Acquire);
+      let pm = &m[SEGMENT_HEADER_WORDS + page % PAGES_PER_SEGMENT * PAGE_META_WORDS..];
+      let info = pm[P_INFO].load(Acquire);
       if info & 0xFF == PAGE_SMALL {
         let c = ((info >> 8) & 0xFF) as usize;
         if let Some(idx) = class::block_index(c, offset % PAGE_SIZE) {
-          self.buffer_free(tc, page, c, idx / 64, 1 << (idx % 64));
+          let w = idx / 64;
+          self.buffer_free(tc, page, c, w, 1 << (idx % 64), &pm[P_BITMAP + w]);
           return;
         }
       }
@@ -501,7 +502,9 @@ impl<O: Os> Heap<O> {
       Target::Small { in_page, page, c } => {
         let (w, bit) = self.block_bit(in_page, c);
         if tc.is_attached() {
-          self.buffer_free(tc, page, c, w, bit);
+          let m = self.seg_meta(page / PAGES_PER_SEGMENT);
+          let word = PageMeta::new(m, page % PAGES_PER_SEGMENT).bitmap(w);
+          self.buffer_free(tc, page, c, w, bit, word);
         } else {
           self.free_bits(page, c, w, bit);
         }
@@ -519,9 +522,31 @@ impl<O: Os> Heap<O> {
     }
   }
 
-  /// Records a small free in the thread's buffer.
+  /// Records a small free in the thread's buffer. `word` is the block's
+  /// word of the page's shared bitmap.
   #[inline(always)]
-  fn buffer_free(&self, tc: &ThreadCache, page: usize, c: usize, w: usize, bit: u64) {
+  fn buffer_free(
+    &self,
+    tc: &ThreadCache,
+    page: usize,
+    c: usize,
+    w: usize,
+    bit: u64,
+    word: &AtomicU64,
+  ) {
+    // A block that the shared bitmap shows as free is not allocated, so
+    // this is a second free of it. One plain load without the lock, never a
+    // read-modify-write; aborting is its only effect, and the value is not
+    // kept. A clear bit decides nothing: the free is buffered, and its
+    // write-back is checked under the lock. A free is ordered after the
+    // allocation of its block (one that is not is a data race on the block),
+    // so the claim that handed the block out, which cleared its bit under
+    // the owner's lock, happened before this load; only a write-back of a
+    // free of the block sets the bit again, so the check never reports a
+    // legitimate free.
+    if word.load(Relaxed) & bit != 0 {
+      self.os.fatal(DOUBLE_FREE);
+    }
     let cw = &tc.words[c];
     // A block the thread claimed but has not handed out cannot be freed.
     if cw.base.get() == (page << PAGE_SHIFT) + w * 64 * class::size(c)
