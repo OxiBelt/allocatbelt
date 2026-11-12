@@ -6,6 +6,7 @@ use std::boxed::Box;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::vec;
 use std::vec::Vec;
 
 use crate::core::heap::DIRTY_BUDGET_PAGES;
@@ -999,6 +1000,130 @@ fn blocks_handed_out_from_the_claimed_word_free_cleanly() {
       h.check_indexes();
     }
   }
+}
+
+/// Alignments above the default 16 bytes, from those every small class
+/// above 128 bytes satisfies to those that only a page run does.
+const ALIGNS: [usize; 11] = [
+  32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16_384, 65_536,
+];
+
+/// Request sizes at and around every small class boundary.
+fn class_boundary_sizes() -> Vec<usize> {
+  let mut sizes = vec![0, 1, 15, 16, 17, crate::core::class::SMALL_MAX + 1];
+  for c in 0..crate::core::class::NUM_CLASSES {
+    let s = crate::core::class::size(c);
+    sizes.extend([s - 1, s, s + 1]);
+  }
+  sizes
+}
+
+#[test]
+fn aligned_cached_requests_get_the_block_of_an_uncached_one() {
+  let h = heap();
+  let tc = cache(h);
+  let aligns: &[usize] = if cfg!(miri) {
+    &[32, 256, 4096, 16_384]
+  } else {
+    &ALIGNS
+  };
+  let mut offs = Vec::new();
+  for &align in aligns {
+    for size in class_boundary_sizes() {
+      // `alloc_c` and `alloc` check the alignment and record the block.
+      let cached = alloc_c(h, &tc, size, align);
+      let uncached = alloc(h, 0, size, align);
+      assert_eq!(
+        h.usable_size(cached),
+        h.usable_size(uncached),
+        "size {size} align {align}"
+      );
+      offs.extend([cached, uncached]);
+    }
+  }
+  for o in offs {
+    free_c(h, &tc, o);
+  }
+  h.retire(&tc);
+  assert!(h.os().live.lock().unwrap().is_empty());
+  assert_eq!(h.usage().small_bytes_out, 0);
+  h.check_indexes();
+}
+
+#[test]
+fn an_aligned_small_request_comes_from_the_claimed_word() {
+  let h = heap();
+  let tc = cache(h);
+  // 48 bytes aligned to 64 and 64 bytes aligned to 16 share the 64-byte
+  // class, and both come from the word its refill claimed.
+  let a = alloc_c(h, &tc, 48, 64);
+  assert_eq!(h.usable_size(a), 64);
+  let claimed = h.cache_stats(&tc).claimed_blocks;
+  assert_eq!(claimed, 63);
+  let b = alloc_c(h, &tc, 64, 8);
+  let c = alloc_c(h, &tc, 1, 64);
+  assert_eq!(h.cache_stats(&tc).claimed_blocks, claimed - 2);
+  assert_eq!((b - a, c - b), (64, 64));
+  for o in [a, b, c] {
+    free_c(h, &tc, o);
+  }
+  h.retire(&tc);
+}
+
+#[test]
+fn aligned_requests_through_a_detached_cache_are_uncached() {
+  let h = heap();
+  let tc = ThreadCache::new();
+  let a = alloc_c(h, &tc, 48, 64);
+  assert_eq!(h.cache_stats(&tc).claimed_blocks, 0);
+  free_c(h, &tc, a);
+  // Through a cache being attached too.
+  tc.begin_attach();
+  let a = alloc_c(h, &tc, 48, 64);
+  assert_eq!(h.cache_stats(&tc).claimed_blocks, 0);
+  free_c(h, &tc, a);
+}
+
+#[test]
+fn alignments_that_are_not_powers_of_two_fail_through_a_cache() {
+  let h = heap();
+  let tc = cache(h);
+  // Above the default alignment; up to it, the request takes the default
+  // class path, as it always did.
+  for align in [24, 48, 96, 3 << 10, usize::MAX] {
+    assert!(h.alloc_cached(&tc, 64, align).is_none(), "align {align}");
+  }
+  assert_eq!(h.cache_stats(&tc).claimed_blocks, 0);
+}
+
+#[test]
+#[should_panic(expected = "double free")]
+fn double_free_of_an_aligned_cached_block() {
+  let h = heap();
+  let tc = cache(h);
+  let a = h.alloc_cached(&tc, 64, 64).unwrap().offset;
+  let _b = h.alloc_cached(&tc, 64, 64).unwrap();
+  h.dealloc_cached(&tc, a);
+  h.dealloc_cached(&tc, a);
+}
+
+#[test]
+#[should_panic(expected = "double free")]
+fn free_of_a_claimed_aligned_block() {
+  let h = heap();
+  let tc = cache(h);
+  let a = h.alloc_cached(&tc, 200, 256).unwrap().offset;
+  // The next 256-byte block of the word is claimed but not handed out.
+  h.dealloc_cached(&tc, a + 256);
+}
+
+#[test]
+#[should_panic(expected = "misaligned")]
+fn misaligned_free_of_an_aligned_cached_block() {
+  let h = heap();
+  let tc = cache(h);
+  let a = h.alloc_cached(&tc, 64, 64).unwrap().offset;
+  h.dealloc_cached(&tc, a + 16);
 }
 
 #[test]

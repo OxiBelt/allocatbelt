@@ -86,3 +86,49 @@ fn holds_at_the_ends_of_the_list() {
   let most = list(&ascending, 63);
   assert!(most.holds(62) && !most.holds(63));
 }
+
+/// Sizes at and around every class boundary, and the ends of the range.
+fn boundary_sizes() -> Vec<usize> {
+  let mut sizes = vec![0, 1, 15, 16, 17, SMALL_MAX, SMALL_MAX + 1];
+  for c in 0..NUM_CLASSES {
+    let s = class::size(c);
+    sizes.extend([s - 1, s, s + 1]);
+  }
+  sizes
+}
+
+#[test]
+fn aligned_class_is_the_class_that_class_for_finds() {
+  let sizes: Vec<usize> = if cfg!(miri) {
+    boundary_sizes()
+  } else {
+    (0..=SMALL_MAX + 1).collect()
+  };
+  for shift in 0..=17 {
+    let align = 1usize << shift;
+    for &size in &sizes {
+      assert_eq!(
+        aligned_class(size, align),
+        class::class_for(size, align),
+        "size {size} align {align}"
+      );
+    }
+  }
+  for size in [SMALL_MAX + 2, 1 << 20, usize::MAX] {
+    assert_eq!(aligned_class(size, 32), None, "size {size}");
+  }
+}
+
+#[test]
+fn aligned_class_refuses_alignments_that_are_not_powers_of_two() {
+  // `Heap::kind` refuses them too, so the request fails as before.
+  for align in [0, 3, 24, 48, 96, 3 << 10, usize::MAX] {
+    for size in [0, 1, 48, 4096] {
+      assert_eq!(
+        aligned_class(size, align),
+        None,
+        "size {size} align {align}"
+      );
+    }
+  }
+}

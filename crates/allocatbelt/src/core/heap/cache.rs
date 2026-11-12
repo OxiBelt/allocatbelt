@@ -128,6 +128,30 @@ const fn set_index(page: usize, w: usize) -> usize {
 // bits fit a `u32`.
 const _: () = assert!(FREE_SLOTS == 64 && FREE_WAYS == 2 && FREE_SETS == 32);
 
+/// The size class of a request for `size` bytes aligned to `align`, when
+/// `align` is a power of two and a small class holds `size` in blocks
+/// aligned to it: the class of `size` rounded up to a multiple of `align`
+/// (at least `align`). It is the class [`class::class_for`] finds by
+/// search, without the search. Up to 128 bytes every multiple of 16 is a
+/// class size. Above, the classes between powers of two `b` and `2b` step
+/// by `b / 4`: an alignment up to `b / 4` divides all of them, and the
+/// multiples of a larger one in that range, `3b / 2` and `2b`, are class
+/// sizes too. So no smaller class holds the request aligned.
+#[inline]
+const fn aligned_class(size: usize, align: usize) -> Option<usize> {
+  if !align.is_power_of_two() || align > SMALL_MAX || size > SMALL_MAX {
+    return None;
+  }
+  // Both are at most `SMALL_MAX`, so this cannot overflow.
+  let rounded = (size + align - 1) & !(align - 1);
+  let rounded = if rounded < align { align } else { rounded };
+  if rounded > SMALL_MAX {
+    None
+  } else {
+    Some(class::class_of(rounded))
+  }
+}
+
 /// A thread's private allocation state: one claimed bitmap word per size
 /// class, and a small buffer of frees not yet returned to the bitmaps.
 ///
@@ -242,6 +266,16 @@ impl<O: Os> Heap<O> {
         return Some(Block::new(o, false));
       }
       return self.refill(tc, c).map(|o| Block::new(o, false));
+    }
+    // An alignment above the default that a small class satisfies takes
+    // the same cached path, without the general size and alignment check.
+    if align > MIN_ALIGN
+      && let Some(c) = aligned_class(size, align)
+      && tc.is_attached()
+    {
+      return Self::pop(tc, c)
+        .or_else(|| self.refill(tc, c))
+        .map(|o| Block::new(o, false));
     }
     self.alloc_cached_slow(tc, size, align)
   }
