@@ -12,8 +12,8 @@
 //! - `--quick`: a twentieth of the operations and a shorter idle wait, for
 //!   smoke runs and slow tools such as callgrind. Not for timings.
 //! - `--only KEY[,KEY...]`: run only these workloads, of `single`, `local`,
-//!   `small`, `pairs`, `idle`, `oversubscribed`, `aligned`, `region` and
-//!   `huge`.
+//!   `small`, `pairs`, `idle`, `oversubscribed`, `aligned`, `region`,
+//!   `small1`, `aligned-mix` and `huge`.
 
 use std::hint::black_box;
 use std::sync::mpsc;
@@ -103,6 +103,70 @@ fn aligned_churn(ops: usize) {
     checksum = checksum.wrapping_add(usize::from(a.0[191]) + usize::from(b.0[767]));
   }
   black_box(checksum);
+}
+
+/// Element types of [`aligned_mix`]: as large as their alignment, and never
+/// read, since only their layout matters.
+macro_rules! aligned_types {
+  ($($name:ident $align:literal),*) => {
+    $(
+      #[allow(dead_code, reason = "only the size and alignment are used")]
+      #[repr(align($align))]
+      struct $name([u8; $align]);
+    )*
+  };
+}
+
+aligned_types!(Align32 32, Align64 64, Align128 128, Align512 512, Align4096 4096);
+
+/// A live buffer of [`aligned_mix`]: one to four elements of an aligned type.
+enum AlignedBuf {
+  A32(Vec<Align32>),
+  A64(Vec<Align64>),
+  A128(Vec<Align128>),
+  A512(Vec<Align512>),
+  A4096(Vec<Align4096>),
+}
+
+impl AlignedBuf {
+  fn bytes(&self) -> usize {
+    match self {
+      Self::A32(v) => v.capacity() * size_of::<Align32>(),
+      Self::A64(v) => v.capacity() * size_of::<Align64>(),
+      Self::A128(v) => v.capacity() * size_of::<Align128>(),
+      Self::A512(v) => v.capacity() * size_of::<Align512>(),
+      Self::A4096(v) => v.capacity() * size_of::<Align4096>(),
+    }
+  }
+}
+
+/// Small allocations aligned to 32 to 4096 bytes (32 B to 8 KiB, every one
+/// a small-class size), kept in a window of live buffers and freed in
+/// random order. Only the capacity is requested: the row measures the
+/// aligned allocation and its free, not the writes of a payload.
+fn aligned_mix(seed: u64, ops: usize, window: usize) -> usize {
+  let mut rng = Rng(seed | 1);
+  let mut live: Vec<AlignedBuf> = Vec::with_capacity(window);
+  let mut n = 0usize;
+  for _ in 0..ops {
+    let k = 1 + (rng.next() % 4) as usize;
+    let b = match rng.next() % 8 {
+      0 | 1 => AlignedBuf::A32(Vec::with_capacity(k)),
+      2 | 3 => AlignedBuf::A64(Vec::with_capacity(k)),
+      4 | 5 => AlignedBuf::A128(Vec::with_capacity(k)),
+      6 => AlignedBuf::A512(Vec::with_capacity(k)),
+      _ => AlignedBuf::A4096(Vec::with_capacity(k.min(2))),
+    };
+    n += b.bytes();
+    if live.len() < window {
+      live.push(b);
+    } else {
+      let i = (rng.next() as usize) % window;
+      live[i] = b;
+    }
+  }
+  black_box(&live);
+  n
 }
 
 /// Sizes of the huge-block churn: above the longest page run (63 pages of
@@ -360,6 +424,27 @@ pub fn run(name: &str) {
   }
   if peak_after_oversubscribed {
     peak(name);
+  }
+  // After the peak and idle figures, which they would change, and before
+  // the huge blocks: the small-object fast path on one thread, without
+  // and with alignments above the default 16 bytes.
+  if o.runs("small1") {
+    time(
+      &format!("single-thread small churn {}", count(n(4_000_000))),
+      name,
+      || {
+        black_box(small_churn(42, n(4_000_000), 1000));
+      },
+    );
+  }
+  if o.runs("aligned-mix") {
+    time(
+      &format!("aligned 32-4096-byte mix churn {}", count(n(4_000_000))),
+      name,
+      || {
+        black_box(aligned_mix(42, n(4_000_000), 1000));
+      },
+    );
   }
   // Last too: a few huge blocks would raise the peak above.
   if o.runs("huge") {
