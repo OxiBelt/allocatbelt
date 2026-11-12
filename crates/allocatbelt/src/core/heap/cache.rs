@@ -1,11 +1,11 @@
 //! Per-thread caches: claimed bitmap words for allocation, and a buffer of
 //! frees returned to the shared bitmaps one word at a time.
 //!
-//! **Free buffer.** 64 slots in 32 sets of 2 ways (theory-driven plan,
-//! Stage C). A free of a block goes to the set its bitmap word hashes to:
+//! **Free buffer.** [`FREE_SLOTS`] slots (128) in sets of [`FREE_WAYS`]
+//! ways (2). A free of a block goes to the set its bitmap word hashes to:
 //! into the way that already holds the word, else an empty way, else it
-//! evicts the older of the two (per-set round robin, one bit per set), whose
-//! frees go back to the shared bitmap in one update. A word lives in at
+//! evicts the oldest way (per-set round robin), whose frees go back to the
+//! shared bitmap in one update. A word lives in at
 //! most one slot, so a duplicate free is caught in either way. Two words
 //! whose frees interleave share a set without evicting each other, which a
 //! direct-mapped buffer could not do: the shared update per free is
@@ -17,9 +17,9 @@
 //! bumps a generation, and each attached cache drains itself completely
 //! when it next sees a new value at a sampled point of its own slow paths:
 //! a refill, a page-run or huge allocation or free, and a free that needs a
-//! new slot. A thread that only frees reaches the last within 4096 frees
+//! new slot. A thread that only frees reaches the last within 8192 frees
 //! (a slot takes at most 64 frees of its word before a free must start a
-//! new one, and there are 64 slots). A drain is bounded: 64 slots and one
+//! new one, and there are 128 slots). A drain is bounded: 128 slots and one
 //! claimed word per class, one shared update each. Only the owner mutates
 //! its cache; a thread that sleeps or blocks sees nothing and keeps what it
 //! holds, so the embedder flushes before parking.
@@ -29,10 +29,14 @@ use core::cell::Cell;
 use super::*;
 
 /// Slots of buffered frees per thread: [`FREE_SETS`] sets of [`FREE_WAYS`]
-/// ways. Slot `i` is way `i % FREE_WAYS` of set `i / FREE_WAYS`.
-const FREE_SLOTS: usize = 64;
+/// ways. Slot `i` is way `i % FREE_WAYS` of set `i / FREE_WAYS`. A fixed
+/// constant, not a setting (`docs/design-constraints.md`, cache capacity);
+/// `docs/thread-caches.md` gives the bounds it sets.
+const FREE_SLOTS: usize = 128;
 const FREE_WAYS: usize = 2;
 const FREE_SETS: usize = FREE_SLOTS / FREE_WAYS;
+/// `u64` words of a per-class mask of slots (`ThreadCache::pending`).
+const SLOT_WORDS: usize = FREE_SLOTS / 64;
 
 const DETACHED: u8 = 0;
 const ATTACHING: u8 = 1;
@@ -118,15 +122,24 @@ const fn unpack_key(key: u64) -> (usize, usize, usize) {
 
 const _: () = assert!(NUM_CLASSES <= 32);
 
-/// The set of the free buffer that frees of word `w` of `page` go to.
+/// The set of the free buffer that frees of word `w` of `page` go to: the
+/// top bits of a multiplicative hash, as many as the sets need.
 #[inline]
 const fn set_index(page: usize, w: usize) -> usize {
-  ((((page << 6) | w) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 59) as usize
+  ((((page << 6) | w) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    >> (64 - FREE_SETS.trailing_zeros())) as usize
 }
 
-// Slot indices fit the per-class `pending` masks, and the per-set victim
-// bits fit a `u32`.
-const _: () = assert!(FREE_SLOTS == 64 && FREE_WAYS == 2 && FREE_SETS == 32);
+// Sets are a power of two (the hash takes their bits), slots fill whole
+// `u64` words of the per-class `pending` masks, and a way number fits the
+// per-set `u8` victim.
+const _: () = assert!(
+  FREE_SETS.is_power_of_two()
+    && FREE_SETS >= 2
+    && FREE_WAYS >= 2
+    && FREE_WAYS <= u8::MAX as usize
+    && FREE_SLOTS.is_multiple_of(64)
+);
 
 /// The size class of a request for `size` bytes aligned to `align`, when
 /// `align` is a power of two and a small class holds `size` in blocks
@@ -170,10 +183,11 @@ const fn aligned_class(size: usize, align: usize) -> Option<usize> {
 pub struct ThreadCache {
   words: [CachedBlocks; NUM_CLASSES],
   frees: [FreeSlot; FREE_SLOTS],
-  /// Occupied free slots per class (bit `i` = `frees[i]`).
-  pending: [Cell<u64>; NUM_CLASSES],
-  /// Way to evict next, per set (bit `s` for set `s`).
-  victims: Cell<u32>,
+  /// Occupied free slots per class (bit `i % 64` of word `i / 64` =
+  /// `frees[i]`).
+  pending: [[Cell<u64>; SLOT_WORDS]; NUM_CLASSES],
+  /// Way to evict next, per set.
+  victims: [Cell<u8>; FREE_SETS],
   /// Last cache-return generation this cache drained for.
   pressure_seen: Cell<u32>,
   /// [`CacheStats::pressure_returns`].
@@ -213,8 +227,8 @@ impl ThreadCache {
           mask: Cell::new(0),
         }
       }; FREE_SLOTS],
-      pending: [const { Cell::new(0) }; NUM_CLASSES],
-      victims: Cell::new(0),
+      pending: [const { [const { Cell::new(0) }; SLOT_WORDS] }; NUM_CLASSES],
+      victims: [const { Cell::new(0) }; FREE_SETS],
       pressure_seen: Cell::new(0),
       pressure_returns: Cell::new(0),
       shard: Cell::new(0),
@@ -333,7 +347,7 @@ impl<O: Os> Heap<O> {
     // Frees the thread has buffered stay buffered (and keep batching)
     // while the class has free blocks elsewhere; before a new page is
     // taken for the class, they go back so the claim can reuse them.
-    let grow = tc.pending[c].get() == 0;
+    let grow = tc.pending[c].iter().all(|w| w.get() == 0);
     let hint = self.shard_of(tc);
     let (page, w, bits) =
       match self.with_shard(hint, |s, sh| self.claim_class(s, sh, c, grow, false))? {
@@ -517,13 +531,12 @@ impl<O: Os> Heap<O> {
     }
     let key = slot_key(page, w, c);
     let set = set_index(page, w);
-    let i = set * FREE_WAYS;
+    let first = set * FREE_WAYS;
     // The word lives in at most one way of its set.
-    let slot = if tc.frees[i].key.get() == key {
-      &tc.frees[i]
-    } else if tc.frees[i + 1].key.get() == key {
-      &tc.frees[i + 1]
-    } else {
+    let Some(slot) = tc.frees[first..first + FREE_WAYS]
+      .iter()
+      .find(|slot| slot.key.get() == key)
+    else {
       return self.insert_slot(tc, set, key, c, bit);
     };
     let m = slot.mask.get();
@@ -540,24 +553,26 @@ impl<O: Os> Heap<O> {
   fn insert_slot(&self, tc: &ThreadCache, set: usize, key: u64, c: usize, bit: u64) {
     self.observe_pressure(tc);
     let first = set * FREE_WAYS;
-    let way = if tc.frees[first].key.get() == 0 {
-      0
-    } else if tc.frees[first + 1].key.get() == 0 {
-      1
-    } else {
-      bump(&tc.evictions, 1);
-      let way = (tc.victims.get() >> set) as usize & 1;
-      self.flush_slot(tc, first + way);
-      way
+    let way = match tc.frees[first..first + FREE_WAYS]
+      .iter()
+      .position(|slot| slot.key.get() == 0)
+    {
+      Some(way) => way,
+      None => {
+        bump(&tc.evictions, 1);
+        let way = usize::from(tc.victims[set].get());
+        self.flush_slot(tc, first + way);
+        way
+      }
     };
-    // The other way is now the older one: the next to go.
-    let v = tc.victims.get();
-    tc.victims.set(v & !(1 << set) | ((way as u32 ^ 1) << set));
+    // The next way is now the oldest: the next to go.
+    tc.victims[set].set(((way + 1) % FREE_WAYS) as u8);
     let i = first + way;
     let slot = &tc.frees[i];
     slot.key.set(key);
     slot.mask.set(bit);
-    tc.pending[c].set(tc.pending[c].get() | 1 << i);
+    let pending = &tc.pending[c][i / 64];
+    pending.set(pending.get() | 1 << (i % 64));
   }
 
   /// Drains `tc` if a cache return was requested since it last looked (see
@@ -606,7 +621,8 @@ impl<O: Os> Heap<O> {
       return;
     }
     let (page, w, c) = unpack_key(key);
-    tc.pending[c].set(tc.pending[c].get() & !(1 << i));
+    let pending = &tc.pending[c][i / 64];
+    pending.set(pending.get() & !(1 << (i % 64)));
     let mask = slot.mask.get();
     let n = mask.count_ones();
     bump(&tc.flushed_blocks, u64::from(n));
@@ -620,10 +636,12 @@ impl<O: Os> Heap<O> {
 
   /// Returns the buffered frees of class `c`.
   fn flush_class(&self, tc: &ThreadCache, c: usize) {
-    let mut pending = tc.pending[c].get();
-    while pending != 0 {
-      self.flush_slot(tc, pending.trailing_zeros() as usize);
-      pending &= pending - 1;
+    for (n, word) in tc.pending[c].iter().enumerate() {
+      let mut pending = word.get();
+      while pending != 0 {
+        self.flush_slot(tc, n * 64 + pending.trailing_zeros() as usize);
+        pending &= pending - 1;
+      }
     }
   }
 
@@ -663,17 +681,41 @@ impl<O: Os> Heap<O> {
     set_index(page, idx / 64)
   }
 
-  /// The occupied slots of class `c`, for tests of the pending masks.
+  /// The occupied slots of class `c` (bit `i` = slot `i`), for tests of
+  /// the pending masks.
   #[cfg(all(test, allocatbelt_core_check))]
-  pub(crate) fn pending_slots(tc: &ThreadCache, c: usize) -> u64 {
-    tc.pending[c].get()
+  pub(crate) fn pending_slots(tc: &ThreadCache, c: usize) -> u128 {
+    const { assert!(FREE_SLOTS <= 128) };
+    tc.pending[c]
+      .iter()
+      .enumerate()
+      .fold(0, |m, (n, w)| m | u128::from(w.get()) << (n * 64))
   }
+
+  /// The words the free buffer holds, as `(page, word, class)`, and the
+  /// mask of each, for tests of its bounds.
+  #[cfg(all(test, allocatbelt_core_check))]
+  pub(crate) fn buffered_words(tc: &ThreadCache) -> std::vec::Vec<((usize, usize, usize), u64)> {
+    tc.frees
+      .iter()
+      .filter(|slot| slot.key.get() != 0)
+      .map(|slot| (unpack_key(slot.key.get()), slot.mask.get()))
+      .collect()
+  }
+
+  /// Slots of the free buffer, for tests of its bounds.
+  #[cfg(all(test, allocatbelt_core_check))]
+  pub(crate) const FREE_SLOTS: usize = FREE_SLOTS;
+
+  /// Ways of a set of the free buffer, for tests that fill one set.
+  #[cfg(all(test, allocatbelt_core_check))]
+  pub(crate) const FREE_WAYS: usize = FREE_WAYS;
 
   /// Checks that every class's pending mask names exactly the occupied
   /// slots of that class, and that no word is in two slots.
   #[cfg(all(any(all(test, allocatbelt_core_check), allocatbelt_model), not(loom)))]
   pub(crate) fn check_free_buffer(tc: &ThreadCache) {
-    let mut seen = [0u64; NUM_CLASSES];
+    let mut seen = [[0u64; SLOT_WORDS]; NUM_CLASSES];
     for (i, slot) in tc.frees.iter().enumerate() {
       let key = slot.key.get();
       if key == 0 {
@@ -686,7 +728,7 @@ impl<O: Os> Heap<O> {
         i / FREE_WAYS,
         "slot {i} in the wrong set"
       );
-      seen[c] |= 1 << i;
+      seen[c][i / 64] |= 1 << (i % 64);
       for (j, other) in tc.frees.iter().enumerate() {
         assert!(
           j == i || other.key.get() != key,
@@ -695,7 +737,14 @@ impl<O: Os> Heap<O> {
       }
     }
     for (c, p) in tc.pending.iter().enumerate() {
-      assert_eq!(p.get(), seen[c], "pending mask of class {c}");
+      assert_eq!(
+        core::array::from_fn::<u64, SLOT_WORDS, _>(|n| p[n].get()),
+        seen[c],
+        "pending mask of class {c}"
+      );
+    }
+    for (set, victim) in tc.victims.iter().enumerate() {
+      assert!(usize::from(victim.get()) < FREE_WAYS, "victim of set {set}");
     }
   }
 

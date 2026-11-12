@@ -4,14 +4,14 @@ Each thread that allocates has a cache of its own: the free blocks of one claime
 
 ## The free buffer
 
-A small free sets a bit in the buffer. The buffer has 64 slots, in 32 sets of 2 ways; each slot holds the freed blocks of one bitmap word (up to 64). When a slot is written back, one update under the lock of the shard that owns the page returns all of its blocks, so the cost of the lock and the shared update is spread over the blocks the slot collected.
+A small free sets a bit in the buffer. The buffer has 128 slots, in 64 sets of 2 ways (`FREE_SLOTS`, `FREE_WAYS`; fixed constants, not settings); each slot holds the freed blocks of one bitmap word (up to 64). When a slot is written back, one update under the lock of the shard that owns the page returns all of its blocks, so the cost of the lock and the shared update is spread over the blocks the slot collected.
 
 - A free goes to the set its word hashes to: into the way that already holds the word, else an empty way, else it evicts the older of the two ways (round robin per set). The evicted word goes back in one update (`CacheStats::evictions`).
 - A word is in at most one slot. A second free of a block still buffered, in either way, or of a block the thread claimed but has not handed out, aborts with "double free". Frees of the same block from two threads are caught when the second reaches the shared bitmap. A refill that claims a block this thread still holds as freed in its buffer aborts with "double free" too.
 - Before a size class would take a new page, the thread writes back its buffered frees of that class and tries again (`refill_flushes`), so buffering never grows the heap.
 - With a direct-mapped buffer, two words hashing to the same slot evicted each other on every alternating free. Two ways keep both words; a third word in the same set is needed to evict.
 
-The buffer holds at most 64 words, 4096 blocks, per thread. Frees from other threads are not queued to the block's owner: the shared bitmap is the transfer, and a thread's buffer holds whatever it freed, whoever allocated it.
+The buffer holds at most 128 words, 8192 blocks, per thread. Each word belongs to one page, so the blocks it holds, freed but not yet returned, are at most 128 pages' worth (8 MiB), and in practice the blocks a thread freed since its last write-back of each word. The slots cost 2 KiB of the thread cache, and the per-class masks of occupied slots 512 bytes. Frees from other threads are not queued to the block's owner: the shared bitmap is the transfer, and a thread's buffer holds whatever it freed, whoever allocated it.
 
 ## Returning a cache
 
@@ -24,7 +24,7 @@ What a cache holds (the rest of each claimed word, and the buffered frees) is un
 
 ### `flush_thread_cache`
 
-Returns every block the calling thread's cache holds, with one update per word under the lock of the shard that owns its page: at most 64 buffered words and one claimed word per size class. The cache stays attached and usable. It purges nothing, and it does not initialise the allocator, attach a cache that was never used, or allocate. It is not async-signal-safe: do not call it from a signal handler.
+Returns every block the calling thread's cache holds, with one update per word under the lock of the shard that owns its page: at most 128 buffered words and one claimed word per size class. The cache stays attached and usable. It purges nothing, and it does not initialise the allocator, attach a cache that was never used, or allocate. It is not async-signal-safe: do not call it from a signal handler.
 
 ### `request_cache_return`
 
@@ -34,7 +34,7 @@ Bumps a process-wide generation and returns at once (one atomic add). Each attac
 - a page-run or huge allocation, or a free of one;
 - a free that needs a new slot of the buffer.
 
-When it sees a new generation it drains itself completely (the same work as `flush_thread_cache`), records the generation and counts it (`CacheStats::pressure_returns`). A thread that only frees reaches a new slot within 4096 small frees: a slot takes at most 64 frees of its word, and there are 64 slots. A cache created after a request owes nothing for it; a cache being attached, or retired at thread exit, is never asked.
+When it sees a new generation it drains itself completely (the same work as `flush_thread_cache`), records the generation and counts it (`CacheStats::pressure_returns`). A thread that only frees reaches a new slot within 8192 small frees: a slot takes at most 64 frees of its word, and there are 128 slots. A cache created after a request owes nothing for it; a cache being attached, or retired at thread exit, is never asked.
 
 Only the owner thread ever touches its cache. So a thread that sleeps, blocks in a system call, or stops calling the allocator does not drain, and nothing can drain it from outside: there is **no time bound** on a cache return without the thread's cooperation. The generation is a `u32` compared for equality, so it wraps harmlessly; a cache that misses exactly 2^32 requests misses one drain.
 

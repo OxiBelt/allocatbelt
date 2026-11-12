@@ -109,7 +109,7 @@ pub struct CacheStats {
   /// 16-31, 32-63 and 64 (bucket `floor(log2(n))`).
   pub flush_sizes: [u64; 7],
   /// Flushes forced because a free of another word needed a slot and both
-  /// ways of the word's set were taken (the buffer is 32 sets of 2 ways).
+  /// ways of the word's set were taken (the buffer is 64 sets of 2 ways).
   pub evictions: u64,
   /// Flushes of a class's buffered frees before a refill of that class
   /// would have taken a new page.

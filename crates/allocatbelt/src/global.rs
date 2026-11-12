@@ -396,7 +396,7 @@ impl Allocatbelt {
   }
 
   /// Returns every block the calling thread's cache holds (the rest of a
-  /// claimed bitmap word per size class, and up to 64 words of buffered
+  /// claimed bitmap word per size class, and up to 128 words of buffered
   /// frees) to the shared heap, where other threads can use them. The
   /// cache stays usable. Call it before a worker thread parks or ends an
   /// idle phase: a thread that sleeps holds its cache until it runs again.
@@ -417,7 +417,7 @@ impl Allocatbelt {
   /// and returns at once. Each thread drains its own cache, completely, the
   /// next time it takes one of the allocator's slower paths (a cache refill,
   /// a large allocation or free, a free that starts a new buffered word;
-  /// a thread that only frees reaches the last within 4096 small frees). A
+  /// a thread that only frees reaches the last within 8192 small frees). A
   /// thread that sleeps, blocks or stops calling the allocator does not
   /// drain, so there is no time bound: pair it with
   /// [`Allocatbelt::flush_thread_cache`] in workers before they park. For
