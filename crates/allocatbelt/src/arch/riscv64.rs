@@ -49,10 +49,57 @@ pub(crate) fn detect() -> CpuFeatures {
     .with_if(CpuFeatures::RVV, pair.value & RISCV_HWPROBE_IMA_V != 0)
 }
 
-#[cfg(feature = "experimental-riscv-rvv")]
 pub(crate) use vector_control::vector_permission;
 
-#[cfg(feature = "experimental-riscv-rvv")]
+/// Whether this thread may run the V instructions a riscv64 build contains:
+/// the CPUs have V and the thread's vector state is not off. `Err` carries
+/// the message to stop with. Allocation-free: two syscalls at most (the
+/// hardware detection is cached by the caller).
+#[inline(never)]
+pub(crate) fn vector_ready(cpus_have_v: bool) -> Result<(), &'static str> {
+  if !cpus_have_v {
+    return verdict(false, Ok(()));
+  }
+  verdict(true, vector_permission())
+}
+
+/// The decision of [`vector_ready`] from its two inputs. A query the kernel
+/// or an emulator refuses (qemu-user answers `EINVAL`) is not taken as off,
+/// since Linux 7.0 always answers it; see docs/platform.md.
+fn verdict(cpus_have_v: bool, permission: Result<(), i32>) -> Result<(), &'static str> {
+  if !cpus_have_v {
+    return Err(NO_V);
+  }
+  match permission {
+    Err(0) => Err(V_OFF),
+    Ok(()) | Err(_) => Ok(()),
+  }
+}
+
+const NO_V: &str = "allocatbelt: this riscv64 build needs the V extension, and riscv_hwprobe reports no V on this machine's CPUs; see docs/platform.md";
+const V_OFF: &str = "allocatbelt: this riscv64 build needs the V extension, and vector instructions are off for this thread (prctl PR_RISCV_V_GET_CONTROL, sysctl abi.riscv_v_default_allow); see docs/platform.md";
+
+#[cfg(test)]
+mod verdict_tests {
+  use super::{NO_V, V_OFF, verdict};
+
+  #[test]
+  fn refuses_cpus_without_v_and_threads_with_v_off() {
+    for permission in [Ok(()), Err(0), Err(libc::EINVAL)] {
+      assert_eq!(verdict(false, permission), Err(NO_V));
+    }
+    assert_eq!(verdict(true, Err(0)), Err(V_OFF));
+  }
+
+  #[test]
+  fn runs_with_v_on_or_an_unanswered_query() {
+    assert_eq!(verdict(true, Ok(())), Ok(()));
+    for errno in [libc::EINVAL, libc::ENOSYS, libc::EPERM] {
+      assert_eq!(verdict(true, Err(errno)), Ok(()));
+    }
+  }
+}
+
 mod vector_control {
   /// Linux `include/uapi/linux/prctl.h` and
   /// `Documentation/arch/riscv/vector.rst`.

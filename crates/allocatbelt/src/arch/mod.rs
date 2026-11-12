@@ -111,6 +111,14 @@ pub fn detected_features() -> CpuFeatures {
   features
 }
 
+/// On riscv64, whether this thread may run the build's V instructions (see
+/// `riscv64::vector_ready`); `Err` is the message to stop with. Uses the
+/// cached CPU detection and one `prctl`; allocation-free.
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn vector_ready() -> Result<(), &'static str> {
+  riscv64::vector_ready(detected_features().contains(CpuFeatures::RVV))
+}
+
 /// Probes the CPU (once) and lets [`kernel_set`] select kernels from now
 /// on. Allocation-free and idempotent; call it before worker threads
 /// start. Allocations that happen earlier use the baseline.

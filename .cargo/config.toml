@@ -15,6 +15,17 @@ rustdocflags = ["-C", "target-cpu=x86-64-v3"]
 [target.x86_64-unknown-linux-musl]
 rustdocflags = ["-C", "target-cpu=x86-64-v3"]
 
+# The V extension is the minimum riscv64 CPU (docs/platform.md), and
+# allocatbelt's `build.rs` and `sys` module reject riscv64 builds without
+# `-C target-feature=+v`. As for x86_64 above, this covers every riscv64
+# Linux target built inside this repository, a `RUSTFLAGS` environment
+# variable replaces these flags (so it must carry `+v` itself), and crates
+# depending on allocatbelt from elsewhere must set the flag in their own
+# build. `v` is an unstable target feature: stable rustc accepts it with a
+# warning.
+[target.'cfg(target_arch = "riscv64")']
+rustflags = ["-C", "target-feature=+v"]
+
 # Cross-testing on riscv64 (see README). Only applies when building for that target.
 # `-cpu max` enables every extension qemu implements: Zbb for builds with
 # `-C target-feature=+zbb`, and the RVA23 set (V, Zicond, ...) that Ubuntu
@@ -22,3 +33,7 @@ rustdocflags = ["-C", "target-cpu=x86-64-v3"]
 [target.riscv64gc-unknown-linux-gnu]
 linker = "riscv64-linux-gnu-gcc"
 runner = "qemu-riscv64 -cpu max -L /usr/riscv64-linux-gnu"
+rustdocflags = ["-C", "target-feature=+v"]
+
+[target.riscv64gc-unknown-linux-musl]
+rustdocflags = ["-C", "target-feature=+v"]

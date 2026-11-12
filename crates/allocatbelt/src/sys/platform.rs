@@ -52,6 +52,15 @@ compile_error!(
   "allocatbelt on x86_64 must be built for x86-64-v3 or newer: build the final binary with `-C target-cpu=x86-64-v3` (or a newer CPU), in RUSTFLAGS or your workspace's `.cargo/config.toml`. Cargo does not apply allocatbelt's own `.cargo/config.toml` to crates that depend on it, and a `RUSTFLAGS` environment variable replaces the config's flags; see allocatbelt's README"
 );
 
+// riscv64 requires the V extension. `v` is an unstable target feature, so
+// `cfg(target_feature = "v")` is false on stable Rust even with
+// `-C target-feature=+v`; `build.rs` reads the flags Cargo passes instead and
+// sets this `cfg` when they do not enable V (see docs/platform.md).
+#[cfg(all(target_arch = "riscv64", allocatbelt_riscv64_without_v))]
+compile_error!(
+  "allocatbelt on riscv64 must be built with the V extension: build the final binary with `-C target-feature=+v`, in RUSTFLAGS or your workspace's `.cargo/config.toml` (a `-C target-cpu` alone is not enough, since stable Rust does not report the features it implies). Cargo does not apply allocatbelt's own `.cargo/config.toml` to crates that depend on it, and a `RUSTFLAGS` environment variable replaces the config's flags; see allocatbelt's README"
+);
+
 /// A Linux kernel release as `uname(2)` reports it, for diagnostics.
 ///
 /// The version is not what decides whether allocatbelt runs: the start-up probe
