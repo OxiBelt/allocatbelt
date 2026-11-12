@@ -3249,8 +3249,13 @@ fn burst_respects_spinner_cap_and_denied_dispatchers_park_immediately() {
     for release in releases {
       release.send(()).unwrap();
     }
-    wait(|| (0..4).all(|seat| lane_sleeping(&shared, seat)));
-    assert_eq!(d.spinners.current(), 0);
+    // `lane_sleeping` counts a worker as asleep from just before it waits
+    // until it has woken up, so a worker that was already told to wake can
+    // still count as asleep, then wake, find nothing and spin for a while.
+    // Wait until every lane sleeps and no spinner slot is taken at the same
+    // time: a slot that is never given back fails this wait, and the check
+    // after the workers have joined.
+    wait(|| (0..4).all(|seat| lane_sleeping(&shared, seat)) && d.spinners.current() == 0);
     let jobs: Vec<_> = (0..64)
       .map(|_| {
         shared
@@ -3265,8 +3270,8 @@ fn burst_respects_spinner_cap_and_denied_dispatchers_park_immediately() {
     for job in jobs {
       finish(job).unwrap();
     }
-    wait(|| (0..4).all(|seat| lane_sleeping(&shared, seat)));
-    assert_eq!(d.spinners.current(), 0);
+    // The jobs' wake-ups can still be on their way, as above.
+    wait(|| (0..4).all(|seat| lane_sleeping(&shared, seat)) && d.spinners.current() == 0);
     shared.close(false);
     for worker in workers {
       join_worker(worker);
