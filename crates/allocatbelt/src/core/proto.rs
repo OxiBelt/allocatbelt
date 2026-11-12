@@ -5,7 +5,7 @@
 //! the `loom` tests below) checks exactly the code the heap executes. Callers pass the words
 //! involved; nothing here knows the metadata layout.
 //!
-//! Four protocols live here:
+//! Five protocols live here:
 //!
 //! * **Block bitmaps.** A small page has one bitmap bit per block (1 =
 //!   free) and a counter of its free blocks. Like the page runs below, they
@@ -38,6 +38,19 @@
 //!   `madvise`, so no one can hand them out while their contents are being
 //!   discarded; it holds the lock only for the claim and for the end, not
 //!   while the purge is in flight.
+//! * **Retained segments.** The arena has a `used` bit per segment and,
+//!   per segment, a header word; a free segment whose header carries the
+//!   *retained* mark still holds the memory of a freed huge block
+//!   (inaccessible, not decommitted). All of it changes only under the
+//!   arena's segment lock, with plain loads and stores, as does the count
+//!   of retained segments. A huge free marks its segments retained and
+//!   clears their `used` bits ([`retain_segment`]); an allocation sets the
+//!   `used` bit of every segment it takes and clears the mark of a retained
+//!   one ([`take_segment`]); a purge pass claims a retained segment that is
+//!   old enough the same way ([`claim_retained`]) and returns it as an
+//!   ordinary free segment after the decommit. A retained segment is thus
+//!   taken by exactly one of them, and the count is exact whenever the
+//!   lock is free.
 //! * **Maintenance requests.** A word of work bits (1 = requested) that
 //!   any thread posts to and the maintenance thread takes from. A poster
 //!   first publishes the cause (e.g. adds to the dirty count) and wakes the
@@ -229,6 +242,69 @@ pub(crate) fn take_work(work: &AtomicU32, bit: u32) {
 pub(crate) fn idle_word(work: &AtomicU32, deferred: u32) -> Option<u32> {
   let w = work.load(Acquire);
   (w & !deferred == 0).then_some(w)
+}
+
+// ---- retained segments -------------------------------------------------
+
+/// Returns a segment that held a freed huge block to the arena as
+/// retained: its header gets `mark`, the count grows by one and its `used`
+/// bit `bit` is cleared. Caller holds the segment lock.
+pub(crate) fn retain_segment(
+  hdr: &AtomicU64,
+  used: &AtomicU64,
+  bit: u64,
+  count: &AtomicU64,
+  mark: u64,
+) {
+  hdr.store(mark, Release);
+  count.store(count.load(Relaxed) + 1, Relaxed);
+  used.store(used.load(Relaxed) & !bit, Relaxed);
+}
+
+/// Takes a free segment for an allocation: sets its `used` bit `bit`, and
+/// if its header `hdr` (if the segment has metadata) carries `mark`,
+/// replaces it with `free` and lowers the count. Returns whether the
+/// segment was retained. Caller holds the segment lock.
+pub(crate) fn take_segment(
+  hdr: Option<&AtomicU64>,
+  used: &AtomicU64,
+  bit: u64,
+  count: &AtomicU64,
+  (mark, free): (u64, u64),
+) -> bool {
+  used.store(used.load(Relaxed) | bit, Relaxed);
+  match hdr {
+    Some(h) if h.load(Relaxed) == mark => {
+      h.store(free, Release);
+      count.store(count.load(Relaxed) - 1, Relaxed);
+      true
+    }
+    _ => false,
+  }
+}
+
+/// Claims a retained segment for its decommit, as an allocation would take
+/// it ([`take_segment`]), if it is still free and retained and was
+/// retained in epoch `cutoff` or earlier (`since`, its epoch + 1, read from
+/// `retained_since`; any epoch if `cutoff` is `u64::MAX`). Returns whether
+/// it did. Caller holds the segment lock.
+pub(crate) fn claim_retained(
+  hdr: &AtomicU64,
+  used: &AtomicU64,
+  bit: u64,
+  count: &AtomicU64,
+  (mark, free): (u64, u64),
+  retained_since: &AtomicU64,
+  cutoff: u64,
+) -> bool {
+  if hdr.load(Relaxed) != mark || used.load(Relaxed) & bit != 0 {
+    return false;
+  }
+  let since = retained_since.load(Relaxed);
+  if cutoff != u64::MAX && (since == 0 || since - 1 > cutoff) {
+    return false;
+  }
+  take_segment(Some(hdr), used, bit, count, (mark, free))
 }
 
 #[cfg(all(test, loom))]
@@ -795,6 +871,102 @@ mod loom_tests {
       assert_ne!(work.load(Relaxed) & BUDGET, 0);
       for p in posters {
         p.join().unwrap();
+      }
+    });
+  }
+
+  /// One segment of the arena and the segment lock.
+  struct Arena {
+    lock: Lock,
+    futex: Futex,
+    hdr: AtomicU64,
+    used: AtomicU64,
+    count: AtomicU64,
+    since: AtomicU64,
+    /// Who holds the segment: 0 nobody, 1 the huge block, 2 an
+    /// allocation, 3 a purge. Checked and changed under the lock.
+    holder: AtomicU64,
+  }
+
+  const MARK: u64 = 4;
+  const FREE: u64 = 0;
+
+  /// A huge free racing an allocation and a purge pass: the retained
+  /// segment is taken by at most one of them at a time, never by both,
+  /// and the count matches the header at rest.
+  #[test]
+  fn a_retained_segment_is_taken_once() {
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = Some(3);
+    model.check(|| {
+      // Held by a live huge block.
+      let a = Arc::new(Arena {
+        lock: Lock::new(),
+        futex: Futex::default(),
+        hdr: AtomicU64::new(2),
+        used: AtomicU64::new(1),
+        count: AtomicU64::new(0),
+        since: AtomicU64::new(0),
+        holder: AtomicU64::new(1),
+      });
+      let f = a.clone();
+      let freer = thread::spawn(move || {
+        // `free_huge`: the header is cleared, the memory protected, then
+        // the segment is retained.
+        {
+          let _g = f.lock.lock(&f.futex);
+          f.hdr.store(FREE, Relaxed);
+        }
+        f.since.store(1, Relaxed);
+        let _g = f.lock.lock(&f.futex);
+        assert_eq!(f.holder.load(Relaxed), 1);
+        f.holder.store(0, Relaxed);
+        retain_segment(&f.hdr, &f.used, 1, &f.count, MARK);
+      });
+      let p = a.clone();
+      let purger = thread::spawn(move || {
+        let claimed = {
+          let _g = p.lock.lock(&p.futex);
+          let c = claim_retained(&p.hdr, &p.used, 1, &p.count, (MARK, FREE), &p.since, 0);
+          if c {
+            assert_eq!(p.holder.load(Relaxed), 0, "claimed a held segment");
+            p.holder.store(3, Relaxed);
+          }
+          c
+        };
+        if claimed {
+          // The decommit runs outside the lock; then the segment is free.
+          let _g = p.lock.lock(&p.futex);
+          assert_eq!(p.holder.load(Relaxed), 3);
+          p.holder.store(0, Relaxed);
+          p.used.store(p.used.load(Relaxed) & !1, Relaxed);
+        }
+      });
+      // An allocation by first fit: takes the segment if it is free.
+      let took = {
+        let _g = a.lock.lock(&a.futex);
+        let free = a.used.load(Relaxed) & 1 == 0;
+        if free {
+          assert_eq!(a.holder.load(Relaxed), 0, "took a held segment");
+          take_segment(Some(&a.hdr), &a.used, 1, &a.count, (MARK, FREE));
+          a.holder.store(2, Relaxed);
+        }
+        free
+      };
+      freer.join().unwrap();
+      purger.join().unwrap();
+      let hdr = a.hdr.load(Relaxed);
+      let used = a.used.load(Relaxed) & 1 != 0;
+      assert_eq!(
+        a.count.load(Relaxed),
+        u64::from(hdr == MARK && !used),
+        "the count disagrees with the header"
+      );
+      if took {
+        assert!(used && hdr != MARK && a.holder.load(Relaxed) == 2);
+      } else {
+        // Retained, or decommitted and free.
+        assert!(!used && a.holder.load(Relaxed) == 0);
       }
     });
   }

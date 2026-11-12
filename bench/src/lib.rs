@@ -12,7 +12,8 @@
 //! - `--quick`: a twentieth of the operations and a shorter idle wait, for
 //!   smoke runs and slow tools such as callgrind. Not for timings.
 //! - `--only KEY[,KEY...]`: run only these workloads, of `single`, `local`,
-//!   `small`, `pairs`, `idle`, `oversubscribed`, `aligned` and `region`.
+//!   `small`, `pairs`, `idle`, `oversubscribed`, `aligned`, `region` and
+//!   `huge`.
 
 use std::hint::black_box;
 use std::sync::mpsc;
@@ -102,6 +103,28 @@ fn aligned_churn(ops: usize) {
     checksum = checksum.wrapping_add(usize::from(a.0[191]) + usize::from(b.0[767]));
   }
   black_box(checksum);
+}
+
+/// Sizes of the huge-block churn: above the longest page run (63 pages of
+/// 64 KiB), so each takes whole segments, and below the dirty budget.
+const HUGE_SIZES: [usize; 3] = [9 << 19, 8 << 20, 16 << 20];
+
+/// Huge blocks allocated, written one byte per 4 KiB page, and freed, one
+/// at a time: a buffer that a program grows to megabytes again and again.
+/// The bytes are written into the spare capacity, without zero-filling the
+/// block first, so the row measures the allocator and its page faults
+/// rather than a memset. Every allocator has to fault the pages in once;
+/// the row shows what a free costs the next allocation.
+fn huge_churn(ops: usize) {
+  for i in 0..ops {
+    let size = HUGE_SIZES[i % HUGE_SIZES.len()];
+    let mut v = Vec::<u8>::with_capacity(size);
+    let spare = v.spare_capacity_mut();
+    for p in (0..size).step_by(4096) {
+      spare[p].write(i as u8);
+    }
+    black_box(&mut v);
+  }
 }
 
 /// Bump hits, standard chunk changes, and reuse after reset. This explicit
@@ -337,6 +360,14 @@ pub fn run(name: &str) {
   }
   if peak_after_oversubscribed {
     peak(name);
+  }
+  // Last too: a few huge blocks would raise the peak above.
+  if o.runs("huge") {
+    time(
+      &format!("huge 4.5-16 MiB churn {}", count(n(3_000))),
+      name,
+      || huge_churn(n(3_000)),
+    );
   }
 }
 

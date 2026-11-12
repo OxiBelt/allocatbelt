@@ -955,13 +955,42 @@ impl<O: Os> Heap<O> {
       } else {
         ((1u64 << span) - 1) << (pos % 64)
       };
-      let mut used = self.seg_used[pos / 64].load(Relaxed) & mask;
+      let word = self.seg_used[pos / 64].load(Relaxed);
+      // Free segments too while any is retained after a huge free, below
+      // the highest one ever retained (hints: each is checked under
+      // `seg_lock`).
+      let top = self.retained_top();
+      let free = if self.retained_segments() != 0 && pos < top {
+        let below = top - pos / 64 * 64;
+        !word
+          & mask
+          & if below >= 64 {
+            u64::MAX
+          } else {
+            (1 << below) - 1
+          }
+      } else {
+        0
+      };
+      let mut segs = (word & mask) | free;
       *work += 1;
       let mut covered = span as u64;
-      while used != 0 {
-        let seg = (pos / 64) * 64 + used.trailing_zeros() as usize;
-        used &= used - 1;
-        if let Some(m) = self.os.meta(seg)
+      while segs != 0 {
+        let seg = (pos / 64) * 64 + segs.trailing_zeros() as usize;
+        segs &= segs - 1;
+        let m = self.os.meta(seg);
+        if free & 1 << (seg % 64) != 0 {
+          if let Some(m) = m
+            && m[SEG_HDR].load(Acquire) == SEG_RETAINED
+          {
+            batch.work.segments_inspected += 1;
+            *work += 1;
+            if self.purge_retained(seg, m, st.cutoff) {
+              batch.work.purged_pages += PAGES_PER_SEGMENT as u64;
+              batch.work.retained_segments_purged += 1;
+            }
+          }
+        } else if let Some(m) = m
           && m[SEG_HDR].load(Acquire) & 0xFF == SEG_OWNED
         {
           batch.work.segments_inspected += 1;

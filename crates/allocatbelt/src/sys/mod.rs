@@ -175,6 +175,28 @@ impl Region {
     r.is_ok()
   }
 
+  /// Makes the range inaccessible but keeps its physical pages and
+  /// contents: a later [`Region::commit`] makes the same bytes accessible
+  /// again without a fault per page, and a later [`Region::decommit`]
+  /// discards them. Returns `true` if the range is inaccessible now.
+  ///
+  /// # Safety
+  ///
+  /// No reference to, and no access of, any byte of `offset..offset + len`
+  /// may exist until it is committed again: access faults meanwhile.
+  #[expect(unsafe_code, reason = "contract: caller owns the range")]
+  pub unsafe fn protect(&self, offset: usize, len: usize) -> bool {
+    let Some(p) = self.range(offset, len) else {
+      return false;
+    };
+    // SAFETY: the span is inside our mapping (checked by `range`) and, per
+    // the caller contract, unused, so revoking access cannot fault a live
+    // user; the contents stay, so nothing is discarded.
+    #[expect(unsafe_code, reason = "mprotect syscall")]
+    let r = unsafe { mm::mprotect(p, len, MprotectFlags::empty()) };
+    r.is_ok()
+  }
+
   /// Returns the physical pages of the range and makes it inaccessible.
   /// Returns `true` if the range will read as zeroes once committed again.
   ///

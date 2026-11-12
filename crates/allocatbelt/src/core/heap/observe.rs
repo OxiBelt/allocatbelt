@@ -155,6 +155,12 @@ pub struct HeapUsage {
   /// Free pages of owned segments that read as zero (never used, or
   /// purged).
   pub clean_pages: usize,
+  /// Free segments of the arena that held a freed huge block and are still
+  /// resident, though inaccessible, until an allocation takes them or a
+  /// pass decommits them. Each counts as 64 pages (a whole 4 MiB segment)
+  /// in the dirty pages that the reclamation thresholds compare, not in
+  /// [`HeapUsage::dirty_pages`].
+  pub retained_segments: usize,
 }
 
 impl<O: Os> Heap<O> {
@@ -185,7 +191,10 @@ impl<O: Os> Heap<O> {
   /// one read per segment header word and one per small page, so it is
   /// linear in the segments in use: for diagnostics, not for a hot path.
   pub fn usage(&self) -> HeapUsage {
-    let mut u = HeapUsage::default();
+    let mut u = HeapUsage {
+      retained_segments: self.retained_segments(),
+      ..HeapUsage::default()
+    };
     for (wi, word) in self.seg_used.iter().enumerate() {
       let mut used_segs = word.load(Relaxed);
       while used_segs != 0 {
@@ -329,6 +338,11 @@ impl<O: Os> Heap<O> {
         }
       }
     }
+    assert_eq!(
+      self.retained_segments(),
+      self.retained_segments_recounted(),
+      "the retained count disagrees with the retained segments' headers"
+    );
   }
 
   /// The pages that are the newest of their shard and class, which
