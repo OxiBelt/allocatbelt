@@ -54,10 +54,26 @@ struct CachedBlocks {
 
 impl CachedBlocks {
   /// Whether block `i` of the word is in the list.
+  ///
+  /// Compares all 64 entries with `i` and keeps the matches among the first
+  /// `len`; the entries past `len` are stale and do not count. Without an
+  /// early exit and with byte-wide lanes, this lowers to two 32-byte
+  /// compares on x86-64-v3 and four 16-byte compares on AArch64, where a
+  /// search of the live entries took up to 64 compare-and-branch steps on
+  /// every free into the claimed word. Every target runs this code; a base
+  /// RV64GC core, without vector instructions, runs it as a loop of 64
+  /// scalar steps.
+  #[inline]
   fn holds(&self, i: u32) -> bool {
-    self.blocks[..usize::from(self.len.get())]
-      .iter()
-      .any(|b| u32::from(b.get()) == i)
+    // A block number is below 64, so it fits the entries' byte.
+    debug_assert!(i < 64);
+    let i = i as u8;
+    let len = self.len.get();
+    let mut hit = 0u8;
+    for (b, k) in self.blocks.iter().zip(&POSITIONS) {
+      hit |= u8::from(b.get() == i) & u8::from(*k < len);
+    }
+    hit != 0
   }
 
   /// The listed blocks as a mask of the word, emptying the list.
@@ -66,6 +82,18 @@ impl CachedBlocks {
     self.blocks[..n].iter().fold(0, |m, b| m | 1 << b.get())
   }
 }
+
+/// `POSITIONS[k] == k`: the positions of a list's entries, as bytes, so a
+/// compare with its length stays byte-wide (see [`CachedBlocks::holds`]).
+const POSITIONS: [u8; 64] = {
+  let mut t = [0; 64];
+  let mut k = 0;
+  while k < 64 {
+    t[k] = k as u8;
+    k += 1;
+  }
+  t
+};
 
 /// Freed blocks of one bitmap word, not yet returned to the bitmap.
 #[derive(Debug)]
@@ -639,3 +667,6 @@ impl<O: Os> Heap<O> {
 fn bump(counter: &Cell<u64>, n: u64) {
   counter.set(counter.get().wrapping_add(n));
 }
+
+#[cfg(all(test, allocatbelt_core_check))]
+mod tests;

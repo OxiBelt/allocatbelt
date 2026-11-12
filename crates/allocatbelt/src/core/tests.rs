@@ -939,6 +939,69 @@ fn free_of_a_claimed_block() {
 }
 
 #[test]
+#[should_panic(expected = "double free")]
+fn free_of_the_first_listed_claimed_block() {
+  let h = heap();
+  let tc = cache(h);
+  // A fresh word of 64 16-byte blocks: block 0 is handed out, and the
+  // list starts with the highest block, 63.
+  let a = h.alloc_cached(&tc, 16, 8).unwrap().offset;
+  assert_eq!(h.cache_stats(&tc).claimed_blocks, 63);
+  h.dealloc_cached(&tc, a + 63 * 16);
+}
+
+#[test]
+#[should_panic(expected = "double free")]
+fn free_of_the_last_claimed_block_left() {
+  let h = heap();
+  let tc = cache(h);
+  let a = h.alloc_cached(&tc, 16, 8).unwrap().offset;
+  for _ in 0..62 {
+    h.alloc_cached(&tc, 16, 8).unwrap();
+  }
+  // One block, 63, is left in a list whose other entries are stale.
+  assert_eq!(h.cache_stats(&tc).claimed_blocks, 1);
+  h.dealloc_cached(&tc, a + 63 * 16);
+}
+
+#[test]
+#[should_panic(expected = "double free")]
+fn free_of_a_claimed_block_in_a_seeded_cache() {
+  let h = heap();
+  h.set_seed(0x9E37_79B9_7F4A_7C15);
+  let tc = cache(h);
+  let first = h.alloc_cached(&tc, 16, 8).unwrap().offset;
+  let base = first / (64 * 16) * (64 * 16);
+  // Every other block of the word is still listed, in a shuffled order.
+  h.dealloc_cached(&tc, if first == base { base + 16 } else { base });
+}
+
+#[test]
+fn blocks_handed_out_from_the_claimed_word_free_cleanly() {
+  // The list keeps the numbers of the blocks it handed out past its end;
+  // freeing those blocks is not a double free, with or without a seed, and
+  // whether the list still holds blocks or is empty.
+  for seed in [0, 0x9E37_79B9_7F4A_7C15] {
+    for handed in [1, 10, 63, 64] {
+      let h = heap();
+      h.set_seed(seed);
+      let tc = cache(h);
+      let got: Vec<_> = (0..handed).map(|_| alloc_c(h, &tc, 16, 8)).collect();
+      let base = got[0] / (64 * 16) * (64 * 16);
+      assert!(got.iter().all(|&o| (base..base + 64 * 16).contains(&o)));
+      assert_eq!(h.cache_stats(&tc).claimed_blocks, 64 - handed as u64);
+      for o in got {
+        free_c(h, &tc, o);
+      }
+      Heap::<MockOs>::check_free_buffer(&tc);
+      h.retire(&tc);
+      assert_eq!(h.usage().small_bytes_out, 0);
+      h.check_indexes();
+    }
+  }
+}
+
+#[test]
 fn a_seeded_cache_hands_out_each_claimed_block_once() {
   let h = heap();
   h.set_seed(0x9E37_79B9_7F4A_7C15);
