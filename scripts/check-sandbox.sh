@@ -101,9 +101,20 @@ if ! jq -r 'select(.reason == "compiler-artifact" and .executable != null and .p
   echo "FAIL: could not parse static test artifacts" >&2
   exit 1
 fi
-mapfile -t bins <"${build_work}/binaries"
-[[ ${#bins[@]} -ge 9 ]] || { echo "FAIL: found only ${#bins[@]} test binaries" >&2; exit 1; }
-dir="$(dirname "${bins[0]}")"
+mapfile -t built <"${build_work}/binaries"
+[[ ${#built[@]} -ge 9 ]] || { echo "FAIL: found only ${#built[@]} test binaries" >&2; exit 1; }
+# Cargo's build layout is not a stable interface (since Rust 1.100 each test
+# binary has its own directory), so stage the binaries Cargo reported in one
+# read-only mount.
+dir="${build_work}/tests"
+install -d -m 0755 "${dir}"
+bins=()
+for b in "${built[@]}"; do
+  [[ ! -e "${dir}/$(basename "$b")" ]] ||
+    { echo "FAIL: duplicate test binary name $(basename "$b")" >&2; exit 1; }
+  install -m 0555 "$b" "${dir}/$(basename "$b")"
+  bins+=("${dir}/$(basename "$b")")
+done
 sandbox=""
 for b in "${bins[@]}"; do
   [[ "$(basename "$b")" == sandbox-* ]] && sandbox="$(basename "$b")"
