@@ -1150,21 +1150,49 @@ impl<O: Os> Heap<O> {
   /// Claims `n` contiguous pages starting at a multiple of `step` pages from
   /// a segment owned by shard `s`: first fit by address, from the shard's
   /// lowest free page up, else from a new segment. Also returns whether the
-  /// pages read as zero.
+  /// pages read as zero. Raises the shard's bound on its lowest free page
+  /// past the segments the search found with every page taken.
   fn alloc_pages(&self, s: usize, sh: &Shard, n: usize, step: usize) -> Option<(usize, bool)> {
     sh.bump(SearchStat::RunSearch, 1);
     let mut segs = 0;
-    let mut cur = self.first_segment_from(s, sh, sh.free_low.load(Relaxed));
+    let free_low = sh.free_low.load(Relaxed);
+    // Nothing below `low` is free: the bound, raised past each segment the
+    // search finds with every page taken (its pages after any claim) to the
+    // first page of the shard's next segment, where the next search finds
+    // its start directly, up to the lowest free page of the first segment
+    // that has one. Past the last segment, none is free.
+    let (mut low, mut raising) = (free_low, true);
+    let mut cur = self.first_segment_from(s, sh, free_low);
     while cur != 0 {
       let seg = cur as usize - 1;
       segs += 1;
       let m = self.seg_meta(seg);
-      if let Some((start, reused)) = self.claim_run(m, n, step) {
+      let claimed = self.claim_run(m, n, step);
+      let next = m[SEG_NEXT].load(Relaxed) as u32;
+      if raising {
+        let free = !m[SEG_PAGES].load(Relaxed);
+        raising = free == 0;
+        low = if !raising {
+          (seg * PAGES_PER_SEGMENT) as u64 + u64::from(free.trailing_zeros())
+        } else if next != 0 {
+          ((next as usize - 1) * PAGES_PER_SEGMENT) as u64
+        } else {
+          NO_PAGE
+        };
+      }
+      if let Some((start, reused)) = claimed {
+        if low > free_low {
+          sh.free_low.store(low, Relaxed);
+        }
         sh.bump(SearchStat::RunSearchSegment, segs);
         sh.bump(SearchStat::DirtyReuse, reused);
         return Some((seg * PAGES_PER_SEGMENT + start, reused == 0));
       }
-      cur = m[SEG_NEXT].load(Relaxed) as u32;
+      cur = next;
+    }
+    // The new segment below lowers the bound again.
+    if low > free_low {
+      sh.free_low.store(low, Relaxed);
     }
     sh.bump(SearchStat::RunSearchSegment, segs);
     let seg = self.add_segment(s, sh)?;
