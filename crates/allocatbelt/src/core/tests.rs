@@ -747,10 +747,10 @@ fn caches_free_each_others_blocks() {
 
     // Keep one request from every size class in the native request range,
     // including its endpoints in the first and last classes. Then extend the
-    // smallest class across three bitmap words and add 70 full pages of the
-    // largest small class. Those pages provide more than 64 distinct free
-    // keys and exercise free-buffer evictions without repeating all 3,000
-    // native requests. The class-31 helper is additional topology, not part
+    // smallest class across three bitmap words and add full pages of the
+    // largest small class, six more than the free buffer has slots. Those
+    // pages provide more distinct free keys than slots and exercise
+    // free-buffer evictions without repeating all 3,000 native requests. The class-31 helper is additional topology, not part
     // of the native request distribution.
     let mut requests = Vec::new();
     for (c, bound) in bounds.iter().enumerate() {
@@ -776,11 +776,11 @@ fn caches_free_each_others_blocks() {
 
     let helper_class = crate::core::class::NUM_CLASSES - 1;
     let helper_size = crate::core::class::size(helper_class);
-    let helper_pages = 70;
+    let helper_pages = Heap::<MockOs>::FREE_SLOTS + 6;
     let helper_blocks = helper_pages * crate::core::class::capacity(helper_class);
     assert_eq!(crate::core::class::class_of(helper_size), helper_class);
     requests.extend(core::iter::repeat_n(helper_size, helper_blocks));
-    assert_eq!(requests.len(), 714);
+    assert_eq!(requests.len(), 154 + helper_blocks);
 
     let from_a: Vec<_> = requests
       .iter()
@@ -796,10 +796,12 @@ fn caches_free_each_others_blocks() {
 
     let pages: BTreeSet<_> = from_a.iter().map(|offset| offset / PAGE_SIZE).collect();
     assert_eq!(pages.len(), represented.len() + helper_pages);
-    assert_eq!(h.segments_in_use(), 2);
+    // The pages fill whole segments in address order.
+    assert_eq!(h.segments_in_use(), pages.len().div_ceil(PAGES_PER_SEGMENT));
 
     let mut keys = BTreeSet::new();
-    let mut keys_by_set: Vec<BTreeSet<_>> = (0..32).map(|_| BTreeSet::new()).collect();
+    let sets = Heap::<MockOs>::FREE_SLOTS / Heap::<MockOs>::FREE_WAYS;
+    let mut keys_by_set: Vec<BTreeSet<_>> = (0..sets).map(|_| BTreeSet::new()).collect();
     for (&offset, &size) in from_a.iter().zip(&requests) {
       let c = crate::core::class::class_of(size);
       let page = offset / PAGE_SIZE;
@@ -815,7 +817,11 @@ fn caches_free_each_others_blocks() {
       keys.iter().map(|key| key.2).collect::<BTreeSet<_>>(),
       expected_classes
     );
-    assert!(keys.len() > 64, "{} keys: {keys:?}", keys.len());
+    assert!(
+      keys.len() > Heap::<MockOs>::FREE_SLOTS,
+      "{} keys: {keys:?}",
+      keys.len()
+    );
     assert!(
       keys.len() >= represented.len() + helper_pages + 2,
       "{keys:?}"
@@ -1124,6 +1130,51 @@ fn misaligned_free_of_an_aligned_cached_block() {
   let tc = cache(h);
   let a = h.alloc_cached(&tc, 64, 64).unwrap().offset;
   h.dealloc_cached(&tc, a + 16);
+}
+
+#[test]
+#[should_panic(expected = "double free")]
+fn a_refill_reports_a_block_the_thread_holds_as_freed() {
+  let h = heap();
+  let tc = cache(h);
+  let x = alloc_c(h, &tc, 48, 8);
+  let _y = alloc_c(h, &tc, 48, 8);
+  free_c(h, &tc, x);
+  // The flush returns x and the rest of the claimed word.
+  h.flush(&tc);
+  h.dealloc_cached(&tc, x);
+  // The refill claims x's word again while the buffer holds x as freed.
+  let _ = h.alloc_cached(&tc, 48, 8);
+}
+
+#[test]
+fn a_refill_accepts_a_word_whose_buffered_blocks_it_does_not_claim() {
+  let h = heap();
+  let (a, b) = (cache(h), cache(h));
+  // One whole 16-byte word for `a`, and the start of the next.
+  let word: Vec<_> = (0..64).map(|_| alloc_c(h, &a, 16, 8)).collect();
+  let next = alloc_c(h, &a, 16, 8);
+  assert_eq!(word[63] + 16, next);
+  // `b` returns one block of the word to the shared bitmap; `a` holds
+  // another one as freed in its buffer.
+  let (v, z) = (word[10], word[20]);
+  free_c(h, &b, v);
+  h.flush(&b);
+  free_c(h, &a, z);
+  // `a` uses up its claimed word, then refills: the claim takes the word
+  // again with v free and z still buffered, which is legitimate.
+  let rest: Vec<_> = (0..63).map(|_| alloc_c(h, &a, 16, 8)).collect();
+  let got = alloc_c(h, &a, 16, 8);
+  assert!(!rest.contains(&z) && got != z);
+  assert!(rest.contains(&v) || got == v);
+  let s = h.cache_stats(&a);
+  assert_eq!(s.buffered_blocks, 1);
+  for o in rest.into_iter().chain([got, next]) {
+    free_c(h, &a, o);
+  }
+  free_rest(h, &a, &word, &[v, z]);
+  h.retire(&b);
+  assert_eq!(h.usage().small_bytes_out, 0);
 }
 
 #[test]
@@ -2782,14 +2833,16 @@ fn words_in_one_set(h: &Heap<MockOs>, tc: &ThreadCache, k: usize) -> (Vec<usize>
   };
   let size = crate::core::class::size(c);
   let blocks_per_word = crate::core::class::capacity(c).min(64);
-  // Seventy words in 32 sets: some set gets at least three.
-  let offs: Vec<_> = (0..blocks_per_word * 70)
+  // More than two words per set of the buffer: some set gets at least three.
+  let sets = Heap::<MockOs>::FREE_SLOTS / Heap::<MockOs>::FREE_WAYS;
+  let n_words = 2 * sets + 6;
+  let offs: Vec<_> = (0..blocks_per_word * n_words)
     .map(|_| alloc_c(h, tc, size, 8))
     .collect();
   let pages: BTreeSet<_> = offs.iter().map(|offset| offset / PAGE_SIZE).collect();
   if cfg!(miri) {
     assert_eq!(size, 8192);
-    assert_eq!(pages.len(), 70);
+    assert_eq!(pages.len(), n_words);
     assert_eq!(blocks_per_word, crate::core::class::capacity(c));
   }
   let mut by_set: std::collections::BTreeMap<usize, Vec<Vec<usize>>> = Default::default();
@@ -2808,11 +2861,11 @@ fn words_in_one_set(h: &Heap<MockOs>, tc: &ThreadCache, k: usize) -> (Vec<usize>
       .or_default()
       .push(w.to_vec());
   }
-  assert_eq!(distinct_words.len(), 70);
+  assert_eq!(distinct_words.len(), n_words);
   let words = by_set
     .into_values()
     .find(|v| v.len() >= k)
-    .expect("70 distinct words in 32 sets of two")
+    .expect("more than two distinct words per set")
     .into_iter()
     .take(k)
     .collect();
@@ -3576,14 +3629,19 @@ fn pending_masks_follow_evictions_across_classes() {
   // across classes; the masks must name exactly each class's slots.
   //
   // Native stress keeps 2,560 blocks of each of three tiny classes and frees
-  // all 7,680 in one seeded shuffle. Miri uses 24 full one-word pages of each
-  // of three large small classes (816 blocks, all live together). Page runs
+  // all 7,680 in one seeded shuffle. Miri uses full one-word pages of three
+  // large small classes, together more words than the buffer has slots
+  // (24 pages each for 64 slots), all live together. Page runs
   // above `SMALL_MAX` never reach the free buffer. A fixed prefix frees one
   // block of every page, interleaving the classes, and must evict a word of
   // another class; the rest follow the same seeded shuffle. The separate
   // bitmap-word boundary tests keep multiword and 64-block flush coverage.
+  let per_class = (Heap::<MockOs>::FREE_SLOTS + 8) / 3;
   let (sizes, counts) = if cfg!(miri) {
-    ([4096, 6144, 8192], [24 * 16, 24 * 10, 24 * 8])
+    (
+      [4096, 6144, 8192],
+      [per_class * 16, per_class * 10, per_class * 8],
+    )
   } else {
     ([16, 48, 256], [64 * 40; 3])
   };
@@ -3612,7 +3670,7 @@ fn pending_masks_follow_evictions_across_classes() {
   let mut cross_class_evictions = 0;
   let mut freed = std::vec![false; offs.len()];
   if cfg!(miri) {
-    assert_eq!(offs.len(), 816);
+    assert_eq!(offs.len(), per_class * 34);
     assert_eq!(offs.iter().collect::<BTreeSet<_>>().len(), offs.len());
     // Every claimed word was exhausted: nothing is left in the cache.
     assert_eq!(h.cache_stats(&tc).claimed_blocks, 0);
@@ -3624,10 +3682,14 @@ fn pending_masks_follow_evictions_across_classes() {
       keys.insert((page, word, classes[k]));
       pages[k].entry(page).or_default().push(i);
     }
-    assert_eq!(keys.len(), 72);
+    assert_eq!(keys.len(), 3 * per_class);
+    assert!(keys.len() > Heap::<MockOs>::FREE_SLOTS);
     for (k, by_page) in pages.iter().enumerate() {
-      assert_eq!(keys.iter().filter(|key| key.2 == classes[k]).count(), 24);
-      assert_eq!(by_page.len(), 24);
+      assert_eq!(
+        keys.iter().filter(|key| key.2 == classes[k]).count(),
+        per_class
+      );
+      assert_eq!(by_page.len(), per_class);
       let capacity = crate::core::class::capacity(classes[k]);
       assert!(by_page.values().all(|blocks| blocks.len() == capacity));
     }
@@ -3638,10 +3700,10 @@ fn pending_masks_follow_evictions_across_classes() {
         .map(|blocks| blocks[0])
         .collect::<Vec<_>>()
     });
-    for ordinal in 0..24 {
+    for ordinal in 0..per_class {
       prefix.extend(firsts.iter().map(|class_firsts| class_firsts[ordinal]));
     }
-    assert_eq!(prefix.iter().collect::<BTreeSet<_>>().len(), 72);
+    assert_eq!(prefix.iter().collect::<BTreeSet<_>>().len(), 3 * per_class);
     let pending = || classes.map(|c| Heap::<MockOs>::pending_slots(&tc, c));
     for &i in &prefix {
       let k = kinds[i];
@@ -3831,6 +3893,139 @@ fn free_only_threads_see_cache_return_requests() {
   assert_eq!(h.cache_stats(&c).pressure_returns, 1);
   free_rest(h, &c, &w, &[w[0], w[1], w[2], w[64]]);
   h.retire(&p);
+}
+
+#[test]
+fn a_free_only_thread_sees_a_request_within_the_buffer_bound() {
+  let h = heap();
+  let (p, c) = (cache(h), cache(h));
+  let slots = Heap::<MockOs>::FREE_SLOTS;
+  // Whole words from the producer, more than the buffer holds. Miri uses
+  // the largest class, eight blocks a word, instead of 64-block words.
+  let size = if cfg!(miri) { 8192 } else { 16 };
+  let class = crate::core::class::class_of(size);
+  let per_word = crate::core::class::capacity(class).min(64);
+  let words = 2 * slots;
+  let offs: Vec<_> = (0..per_word * words)
+    .map(|_| alloc_c(h, &p, size, 8))
+    .collect();
+  // The consumer frees the first block of every word: the buffer fills,
+  // with one block in each word it keeps.
+  for w in offs.chunks(per_word) {
+    free_c(h, &c, w[0]);
+  }
+  let kept = Heap::<MockOs>::buffered_words(&c);
+  assert!(kept.len() <= slots);
+  assert!(kept.iter().all(|&(_, mask)| mask == 1));
+  h.request_cache_return();
+  // Frees into the words it keeps are the fast path and see nothing: the
+  // most a free-only thread can do before it needs a slot is fill every
+  // buffered word, at most 63 more frees for each.
+  let mut freed: Vec<usize> = offs.chunks(per_word).map(|w| w[0]).collect();
+  let mut fast = 0;
+  for &((page, word, c_), _) in &kept {
+    assert_eq!(c_, class);
+    let base = page * PAGE_SIZE + word * 64 * size;
+    for i in 1..per_word {
+      free_c(h, &c, base + i * size);
+      freed.push(base + i * size);
+      fast += 1;
+    }
+  }
+  assert_eq!(h.cache_stats(&c).pressure_returns, 0);
+  assert!(fast <= slots * 63);
+  // The next free needs a slot and sees the request.
+  let next = offs.iter().copied().find(|o| !freed.contains(o)).unwrap();
+  free_c(h, &c, next);
+  freed.push(next);
+  assert_eq!(h.cache_stats(&c).pressure_returns, 1);
+  free_rest(h, &c, &offs, &freed);
+  h.retire(&p);
+  assert_eq!(h.usage().small_bytes_out, 0);
+}
+
+#[test]
+fn buffered_frees_are_not_handed_out_before_they_are_returned() {
+  let h = heap();
+  let (p, c) = (cache(h), cache(h));
+  let n = if cfg!(miri) { 64 * 2 } else { 64 * 8 };
+  let offs: Vec<_> = (0..n).map(|_| alloc_c(h, &p, 16, 8)).collect();
+  // The consumer buffers every other block.
+  let buffered: BTreeSet<usize> = offs.iter().copied().step_by(2).collect();
+  for &o in &buffered {
+    free_c(h, &c, o);
+  }
+  let s = h.cache_stats(&c);
+  assert_eq!(s.buffered_blocks + s.flushed_blocks, buffered.len() as u64);
+  let still: BTreeSet<usize> = Heap::<MockOs>::buffered_words(&c)
+    .into_iter()
+    .flat_map(|((page, word, _), mask)| {
+      (0..64)
+        .filter(move |i| mask >> i & 1 == 1)
+        .map(move |i| page * PAGE_SIZE + (word * 64 + i) * 16)
+    })
+    .collect();
+  assert!(!still.is_empty());
+  // Neither thread gets a block that is still buffered, however much the
+  // class allocates.
+  let mut again = Vec::new();
+  for tc in [&p, &c] {
+    for _ in 0..if cfg!(miri) { 64 * 3 } else { 64 * 16 } {
+      let o = alloc_c(h, tc, 16, 8);
+      assert!(!still.contains(&o), "a buffered block was handed out");
+      again.push(o);
+    }
+  }
+  for o in again {
+    free_c(h, &p, o);
+  }
+  free_rest(h, &p, &offs, &buffered.iter().copied().collect::<Vec<_>>());
+  h.retire(&c);
+  assert_eq!(h.usage().small_bytes_out, 0);
+}
+
+#[test]
+#[should_panic(expected = "double free")]
+fn a_double_free_across_threads_is_caught_by_the_eviction() {
+  let h = heap();
+  let (a, b) = (cache(h), cache(h));
+  // Words of one set: the first holds the doubly freed block.
+  let (_, w) = words_in_one_set(h, &a, Heap::<MockOs>::FREE_WAYS + 1);
+  let x = w[0][0];
+  free_c(h, &a, x);
+  h.flush(&a);
+  // The second free is buffered; the frees of the other words of its set
+  // evict it, and returning it finds x already free.
+  h.dealloc_cached(&b, x);
+  for word in &w[1..] {
+    h.dealloc_cached(&b, word[0]);
+  }
+}
+
+#[test]
+#[should_panic(expected = "double free")]
+fn a_double_free_across_threads_is_caught_by_a_flush() {
+  let h = heap();
+  let (a, b) = (cache(h), cache(h));
+  let x = alloc_c(h, &a, 48, 8);
+  let _y = alloc_c(h, &a, 48, 8);
+  free_c(h, &a, x);
+  h.flush(&a);
+  h.dealloc_cached(&b, x);
+  h.flush(&b);
+}
+
+#[test]
+#[should_panic(expected = "double free")]
+fn a_double_free_across_threads_is_caught_at_thread_exit() {
+  let h = heap();
+  let (a, b) = (cache(h), cache(h));
+  let x = alloc_c(h, &a, 48, 8);
+  let _y = alloc_c(h, &a, 48, 8);
+  free_c(h, &a, x);
+  h.flush(&a);
+  h.dealloc_cached(&b, x);
+  h.retire(&b);
 }
 
 #[test]
