@@ -10,6 +10,7 @@ Date: 2026-09-27. Detailed reports (with sources and verification tags):
 - [simd-benchmarks.md](simd-benchmarks.md): SIMD candidate kernels measured against scalar code, and why none was promoted (plan Phases 4 and 5)
 - [single-package-baseline.md](single-package-baseline.md): the state the single-package directive starts from (`33dfc7b`): correctness suite, unsafe inventory counts, public API (directive Phase A), and what the package consolidation changed (Phase B)
 - [rust199-modernization.md](rust199-modernization.md): stable ABI boundaries, Rust 1.99 API selection and native qualification method
+- [rust1100-toolchain.md](rust1100-toolchain.md): the Rust 1.100.0 minimum, which assembly features each release stabilized, and the 1.100 changes reviewed for the workspace
 - [resource-runtime-plan.md](resource-runtime-plan.md): runtime capability stages and allocator, executor and application qualification gates
 - [application-comparator.md](application-comparator.md): shared application kernels, matched executor policies, response latency and qualification evidence
 

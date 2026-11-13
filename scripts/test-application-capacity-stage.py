@@ -609,8 +609,8 @@ class CapacityStageCliTests(unittest.TestCase):
             raise unittest.SkipTest("capacity stage witness requires a native C compiler for the direct fake child")
         rustc_verbose = subprocess.check_output(["rustc", "-Vv"], text=True).splitlines()
         rustc_release = next((line.split(" ", 2)[1] for line in rustc_verbose if line.startswith("rustc ")), "")
-        if rustc_release != "1.99.0":
-            raise unittest.SkipTest("capacity stage witness requires the frozen Rust 1.99.0 source build")
+        if rustc_release != "1.100.0":
+            raise unittest.SkipTest("capacity stage witness requires the frozen Rust 1.100.0 source build")
         cls.root_temp = Path(tempfile.mkdtemp(prefix="application-capacity-stage-"))
         os.chmod(cls.root_temp, 0o700)
         cls.input_root = cls.root_temp / "inputs"
@@ -670,7 +670,7 @@ class CapacityStageCliTests(unittest.TestCase):
         cargo_version = subprocess.check_output(["cargo", "-V"], cwd=SOURCE_ROOT, text=True).strip()
         for source in sources.values():
             source["source"]["git_commit"] = git_commit
-            source["build"]["rustc_release"] = "1.99.0"
+            source["build"]["rustc_release"] = "1.100.0"
             source["build"]["rustc_verbose"] = rustc_verbose
             source["build"]["cargo_version"] = cargo_version
             source["build"]["target_triple"] = "x86_64-unknown-linux-gnu"

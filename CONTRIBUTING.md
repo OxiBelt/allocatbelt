@@ -8,7 +8,7 @@ wins for this repository.
 ## Local Checks
 
 Run the checks CI runs from the repository root. The toolchain is pinned by
-`rust-version` in `Cargo.toml` (currently 1.99.0).
+`rust-version` in `Cargo.toml` (currently 1.100.0).
 
 ```sh
 cargo fmt --all --check

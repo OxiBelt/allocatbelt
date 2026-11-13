@@ -94,8 +94,8 @@ def source_manifest(host_id: str) -> dict[str, Any]:
             "files": records,
         },
         "build": {
-            "host_id": host_id, "rustc_release": "1.99.0",
-            "rustc_verbose": ["rustc 1.99.0"], "cargo_version": "cargo 1.99.0",
+            "host_id": host_id, "rustc_release": "1.100.0",
+            "rustc_verbose": ["rustc 1.100.0"], "cargo_version": "cargo 1.100.0",
             "target_triple": "x86_64-unknown-linux-gnu",
             "target_cpu": "x86-64-v3", "profile": "release",
             "features_sha256": "c" * 64, "build_inputs_sha256": "d" * 64,

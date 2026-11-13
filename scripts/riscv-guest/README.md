@@ -2,7 +2,7 @@
 
 `python3 -B scripts/riscv-guest/check.py build`, `payload`, and `boot` build
 and run two offline QEMU TCG guests. Rust test binaries are host-built with
-Rust 1.99.0 and the generated RV64GC/LP64D musl linker. The guests never run
+Rust 1.100.0 and the generated RV64GC/LP64D musl linker. The guests never run
 Cargo. Each boot has four vCPUs, 2 GiB RAM and a 300-second deadline; these
 are correctness checks, never performance evidence.
 When validating a source archive without `.git`, set

@@ -126,9 +126,9 @@ class SourceV4Fixture:
         self.cargo_lock_sha256 = self._hash(self.root / "Cargo.lock")
 
         self.build_base = {
-            "rustc_release": "1.99.0",
-            "rustc_verbose": ["rustc 1.99.0 fixture", "host: x86_64-unknown-linux-gnu"],
-            "cargo_version": "cargo 1.99.0 fixture",
+            "rustc_release": "1.100.0",
+            "rustc_verbose": ["rustc 1.100.0 fixture", "host: x86_64-unknown-linux-gnu"],
+            "cargo_version": "cargo 1.100.0 fixture",
             "target_triple": "x86_64-unknown-linux-gnu",
             "target_cpu": "x86-64-v3",
             "profile": "release",

@@ -150,7 +150,7 @@ def build():
 
 
 def cargo_artifacts(args, env):
-  result = subprocess.run(["cargo", "+1.99.0", "test", "--release", "--locked",
+  result = subprocess.run(["cargo", "+1.100.0", "test", "--release", "--locked",
                     "--target", ASSETS["target"], "--no-run", "--message-format=json"] + args,
                    cwd=ROOT, env=env, capture_output=True, text=True)
   # Cargo diagnostics on stderr remain visible even when artifact JSON is parsed.

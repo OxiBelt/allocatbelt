@@ -158,7 +158,7 @@ pins its test-only pair-runner bytes in the regular file inventory and in
 `spec.runner_sha256`; it retains the PlanV3 job matrix and run IDs, then
 rebuilds source-bound template nonces and runtime recipes against the synthetic
 source pins. That fixture is never eligible for qualification. On the native
-x86_64/Rust 1.99.0 host the test suite exercises the actual chronology CLI
+x86_64/Rust 1.100.0 host the test suite exercises the actual chronology CLI
 through the full 15-context capacity stage and replay, registration,
 source-pinned synthetic-runner Popen, Popen-fsync ordering, private-lock
 contention, prior-directory and missing-registration rejection,
