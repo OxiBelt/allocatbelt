@@ -47,12 +47,17 @@ policy and permission recheck, which `extern "custom"` would not allow.
   comparison follows the method in
   [rust199-modernization.md](rust199-modernization.md#qualification-method),
   and hosted CI or emulated timings are not performance evidence.
-- Cargo uses a new layout for intermediate build artifacts. Tools that look
-  inside the build directory must not rely on its paths.
+- Cargo uses a new layout for intermediate build artifacts: `--emit asm`
+  output is no longer in `deps/`. `scripts/check-scalar-isa.sh` now searches
+  the profile directory for the one probe assembly file instead of relying on
+  a path inside it.
+- Clippy 1.100 reports `needless_range_loop` on the checking model's segment
+  loops and `needless_bool` on a feature-gated bench helper. Both are rewritten
+  without changing behavior.
 - Rust 1.99.1, also included, fixed a miscompilation of FFI `bool` return
   values on x86_64.
 - The never type is stable, `Infallible` is an alias of `!`, and never-type
-  fallback is `!` on every edition. Lints and tests pass unchanged on 1.100.0.
+  fallback is `!` on every edition. No source change was needed for it.
 
 ## Campaign evidence
 

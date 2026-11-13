@@ -140,8 +140,9 @@ impl Os for MockOs {
     assert_eq!(offset % SEGMENT_SIZE, 0);
     self.assert_unguarded(offset, len, "commit");
     let mut p = self.protected.lock().unwrap();
-    for s in offset / SEGMENT_SIZE..(offset + len) / SEGMENT_SIZE {
-      self.committed[s].store(true, Ordering::Relaxed);
+    let segments = offset / SEGMENT_SIZE..(offset + len) / SEGMENT_SIZE;
+    for (s, committed) in segments.clone().zip(&self.committed[segments]) {
+      committed.store(true, Ordering::Relaxed);
       // Accessible again, with whatever the segment held.
       p.remove(&s);
     }
@@ -150,8 +151,9 @@ impl Os for MockOs {
   fn decommit(&self, offset: usize, len: usize) -> bool {
     self.assert_no_live(offset, len, "decommit");
     let mut p = self.protected.lock().unwrap();
-    for s in offset / SEGMENT_SIZE..(offset + len) / SEGMENT_SIZE {
-      self.committed[s].store(false, Ordering::Relaxed);
+    let segments = offset / SEGMENT_SIZE..(offset + len) / SEGMENT_SIZE;
+    for (s, committed) in segments.clone().zip(&self.committed[segments]) {
+      committed.store(false, Ordering::Relaxed);
       p.remove(&s);
     }
     drop(p);
@@ -167,9 +169,10 @@ impl Os for MockOs {
       return false;
     }
     let mut p = self.protected.lock().unwrap();
-    for s in offset / SEGMENT_SIZE..(offset + len) / SEGMENT_SIZE {
+    let segments = offset / SEGMENT_SIZE..(offset + len) / SEGMENT_SIZE;
+    for (s, committed) in segments.clone().zip(&self.committed[segments]) {
       assert!(
-        self.committed[s].swap(false, Ordering::Relaxed),
+        committed.swap(false, Ordering::Relaxed),
         "protect of segment {s}, which is not committed"
       );
       p.insert(s);

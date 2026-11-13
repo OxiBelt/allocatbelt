@@ -76,11 +76,11 @@ enum CapacityCollection {
 
 impl CapacityCollection {
   fn is_traced(&self) -> bool {
-    #[cfg(feature = "resource-feedback")]
-    if matches!(self, Self::Traced(_)) {
-      return true;
+    match self {
+      Self::Fixed => false,
+      #[cfg(feature = "resource-feedback")]
+      Self::Traced(_) => true,
     }
-    false
   }
 
   fn production_horizon_end(
