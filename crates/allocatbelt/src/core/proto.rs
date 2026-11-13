@@ -313,7 +313,7 @@ mod loom_tests {
   //! `RUSTFLAGS="--cfg loom" cargo test -p allocatbelt-core-check --release --lib loom`.
 
   use loom::sync::Arc;
-  use loom::sync::atomic::Ordering::{Acquire, Relaxed};
+  use loom::sync::atomic::Ordering::{Acquire, Relaxed, Release};
   use loom::sync::atomic::{AtomicU32, AtomicU64};
   use loom::thread;
   use std::vec::Vec;
@@ -439,6 +439,41 @@ mod loom_tests {
       page.check_count();
       assert_eq!(got & page.bits()[0], 0);
       assert_eq!(got | page.bits()[0], 0b11);
+    });
+  }
+
+  /// A block handed to another thread never reads as free there, without
+  /// the lock, while the claiming thread frees and claims again the other
+  /// blocks of its word: a free can test the shared bit before it is
+  /// buffered.
+  #[test]
+  fn a_handed_over_block_never_reads_as_free() {
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = Some(3);
+    model.check(|| {
+      let page = Page::new([0b111, 0], 3);
+      let handed = Arc::new(AtomicU32::new(0));
+      let (p, h) = (page.clone(), handed.clone());
+      let freer = thread::spawn(move || {
+        while h.load(Acquire) == 0 {
+          thread::yield_now();
+        }
+        assert_eq!(
+          p.words[0].load(Relaxed) & 0b001,
+          0,
+          "a live block reads as free"
+        );
+        assert!(p.free(0, 0b001));
+      });
+      assert_eq!(page.claim(0, false), Some((0, 0b111)));
+      handed.store(1, Release);
+      assert!(page.free(0, 0b110));
+      if let Some((w, b)) = page.claim(0, false) {
+        assert!(page.free(w, b));
+      }
+      freer.join().unwrap();
+      page.check_count();
+      assert_eq!(page.bits(), [0b111, 0]);
     });
   }
 

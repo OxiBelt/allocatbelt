@@ -1136,15 +1136,16 @@ fn misaligned_free_of_an_aligned_cached_block() {
 #[should_panic(expected = "double free")]
 fn a_refill_reports_a_block_the_thread_holds_as_freed() {
   let h = heap();
-  let tc = cache(h);
-  let x = alloc_c(h, &tc, 48, 8);
-  let _y = alloc_c(h, &tc, 48, 8);
-  free_c(h, &tc, x);
+  let (a, b) = (cache(h), cache(h));
+  let x = alloc_c(h, &a, 48, 8);
+  let _y = alloc_c(h, &a, 48, 8);
+  // Both frees are buffered, so the bitmap still shows x as allocated.
+  free_c(h, &a, x);
+  h.dealloc_cached(&b, x);
   // The flush returns x and the rest of the claimed word.
-  h.flush(&tc);
-  h.dealloc_cached(&tc, x);
-  // The refill claims x's word again while the buffer holds x as freed.
-  let _ = h.alloc_cached(&tc, 48, 8);
+  h.flush(&a);
+  // The refill claims x's word again while b's buffer holds x as freed.
+  let _ = h.alloc_cached(&b, 48, 8);
 }
 
 #[test]
@@ -3992,11 +3993,12 @@ fn a_double_free_across_threads_is_caught_by_the_eviction() {
   // Words of one set: the first holds the doubly freed block.
   let (_, w) = words_in_one_set(h, &a, Heap::<MockOs>::FREE_WAYS + 1);
   let x = w[0][0];
+  // Both frees are buffered; the first is then returned.
   free_c(h, &a, x);
-  h.flush(&a);
-  // The second free is buffered; the frees of the other words of its set
-  // evict it, and returning it finds x already free.
   h.dealloc_cached(&b, x);
+  h.flush(&a);
+  // The frees of the other words of its set evict the second, and returning
+  // it finds x already free.
   for word in &w[1..] {
     h.dealloc_cached(&b, word[0]);
   }
@@ -4010,8 +4012,8 @@ fn a_double_free_across_threads_is_caught_by_a_flush() {
   let x = alloc_c(h, &a, 48, 8);
   let _y = alloc_c(h, &a, 48, 8);
   free_c(h, &a, x);
-  h.flush(&a);
   h.dealloc_cached(&b, x);
+  h.flush(&a);
   h.flush(&b);
 }
 
@@ -4023,9 +4025,100 @@ fn a_double_free_across_threads_is_caught_at_thread_exit() {
   let x = alloc_c(h, &a, 48, 8);
   let _y = alloc_c(h, &a, 48, 8);
   free_c(h, &a, x);
-  h.flush(&a);
   h.dealloc_cached(&b, x);
+  h.flush(&a);
   h.retire(&b);
+}
+
+/// Frees `x` through `tc` and returns the message of the panic it raises.
+fn free_c_panic(h: &Heap<MockOs>, tc: &ThreadCache, x: usize) -> std::string::String {
+  let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.dealloc_cached(tc, x)));
+  let e = r.expect_err("the free was not reported");
+  e.downcast_ref::<std::string::String>()
+    .cloned()
+    .or_else(|| {
+      e.downcast_ref::<&str>()
+        .map(|m| std::string::String::from(*m))
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_free_of_a_block_the_bitmap_shows_as_free_is_reported_at_the_free() {
+  // The first free reaches the bitmap through a flush, an eviction, thread
+  // exit or an uncached free; a second free through another thread's cache
+  // is then reported by the free call itself, before it is buffered.
+  for first in 0..4 {
+    let h = heap();
+    let (a, b) = (cache(h), cache(h));
+    let x = if first == 1 {
+      let (_, w) = words_in_one_set(h, &a, Heap::<MockOs>::FREE_WAYS + 1);
+      let x = w[0][0];
+      free_c(h, &a, x);
+      for word in &w[1..] {
+        free_c(h, &a, word[0]);
+      }
+      x
+    } else if first == 3 {
+      let x = alloc(h, 0, 48, 8);
+      let _y = alloc(h, 0, 48, 8);
+      free(h, x);
+      x
+    } else {
+      let x = alloc_c(h, &a, 48, 8);
+      let _y = alloc_c(h, &a, 48, 8);
+      free_c(h, &a, x);
+      if first == 0 {
+        h.flush(&a);
+      } else {
+        h.retire(&a);
+      }
+      x
+    };
+    let message = free_c_panic(h, &b, x);
+    assert!(message.contains("double free"), "{first}: {message}");
+  }
+}
+
+#[test]
+fn a_free_of_an_aligned_block_the_bitmap_shows_as_free_is_reported() {
+  let h = heap();
+  let (a, b) = (cache(h), cache(h));
+  let x = alloc_c(h, &a, 64, 64);
+  let _y = alloc_c(h, &a, 64, 64);
+  free_c(h, &a, x);
+  h.flush(&a);
+  assert!(free_c_panic(h, &b, x).contains("double free"));
+}
+
+#[test]
+fn frees_across_threads_next_to_returned_blocks_are_not_reported() {
+  // Blocks freed by another thread share bitmap words with blocks that were
+  // returned before them and with blocks reused after a return; none of
+  // those frees is a double free.
+  let h = heap();
+  let (a, b) = (cache(h), cache(h));
+  let rounds = if cfg!(miri) { 2 } else { 4 };
+  for size in [16, 48, 1000, 8192] {
+    for _ in 0..rounds {
+      let offs: Vec<_> = (0..130).map(|_| alloc_c(h, &a, size, 8)).collect();
+      for (i, &o) in offs.iter().enumerate() {
+        if i % 2 == 0 {
+          free_c(h, &b, o);
+        } else {
+          free_c(h, &a, o);
+        }
+        if i % 16 == 15 {
+          h.flush(if i % 32 == 15 { &a } else { &b });
+        }
+      }
+      h.flush(&b);
+    }
+  }
+  h.retire(&a);
+  h.retire(&b);
+  assert!(h.os().live.lock().unwrap().is_empty());
+  assert_eq!(h.usage().small_bytes_out, 0);
 }
 
 #[test]
