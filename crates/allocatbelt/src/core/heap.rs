@@ -1246,10 +1246,12 @@ impl<O: Os> Heap<O> {
     Some(seg)
   }
 
-  /// Atomically claims a run of `n` free pages starting at a multiple of
-  /// `step` in a segment and returns its first page and how many of its
-  /// pages were dirty (0: it reads as zero). Reusing dirty pages is free:
-  /// they simply stop being dirty (and are not zero).
+  /// Claims a run of `n` free pages starting at a multiple of `step` in a
+  /// segment and returns its first page and how many of its pages were
+  /// dirty (0: it reads as zero). Reusing dirty pages is free: they simply
+  /// stop being dirty (and are not zero). Caller holds the lock of the
+  /// shard that owns the segment; the claim is a load and a store of the
+  /// segment's page word under it ([`proto::claim_run`]).
   fn claim_run(&self, m: &[AtomicU64], n: usize, step: usize) -> Option<(usize, u64)> {
     let (start, was_dirty) = proto::claim_run(&m[SEG_PAGES], &m[SEG_DIRTY], n as u32, step as u32)?;
     if was_dirty != 0 {
