@@ -13,7 +13,7 @@
 //!   smoke runs and slow tools such as callgrind. Not for timings.
 //! - `--only KEY[,KEY...]`: run only these workloads, of `single`, `local`,
 //!   `small`, `pairs`, `idle`, `oversubscribed`, `aligned`, `region`,
-//!   `small1`, `aligned-mix` and `huge`.
+//!   `small1`, `aligned-mix`, `runs`, `runs4000` and `huge`.
 
 use std::hint::black_box;
 use std::sync::mpsc;
@@ -84,6 +84,27 @@ fn small_churn(seed: u64, ops: usize, window: usize) -> usize {
   }
   black_box(&live);
   n
+}
+
+/// Buffers of 8 KiB to 64 KiB only, each one page run in allocatbelt, with
+/// `window` of them live: frees leave single free pages among full ones.
+fn run_churn(seed: u64, ops: usize, window: usize) -> usize {
+  let mut rng = Rng(seed | 1);
+  let mut live: Vec<Vec<u8>> = Vec::with_capacity(window);
+  let mut touched = 0usize;
+  for _ in 0..ops {
+    let mut v = Vec::with_capacity(8193 + (rng.next() % 57_344) as usize);
+    v.push(1u8);
+    touched += v.capacity();
+    if live.len() < window {
+      live.push(v);
+    } else {
+      let i = (rng.next() as usize) % window;
+      live[i] = v;
+    }
+  }
+  black_box(&live);
+  touched
 }
 
 #[repr(align(64))]
@@ -445,6 +466,22 @@ pub fn run(name: &str) {
         black_box(aligned_mix(42, n(4_000_000), 1000));
       },
     );
+  }
+  // After the peak and idle figures too: page runs of 8 to 64 KiB, with
+  // as many live as fill about 16 and about 64 segments.
+  for (key, live) in [("runs", 1000), ("runs4000", 4000)] {
+    if o.runs(key) {
+      time(
+        &format!(
+          "page-run 8-64 KiB churn {}, {live} live",
+          count(n(1_000_000))
+        ),
+        name,
+        || {
+          black_box(run_churn(42, n(1_000_000), live));
+        },
+      );
+    }
   }
   // Last too: a few huge blocks would raise the peak above.
   if o.runs("huge") {

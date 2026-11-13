@@ -5040,3 +5040,190 @@ fn segment_choice_ignores_retention() {
   assert_eq!(h.dirty_pages(), h.dirty_pages_recounted());
   h.check_indexes();
 }
+
+#[test]
+fn run_searches_skip_segments_with_every_page_taken() {
+  let h = heap();
+  let size = 20_000;
+  // Six segments full of one-page runs. Each search starts from the lowest
+  // segment that may have a free page, so filling one segment does not
+  // look at the full ones below it again.
+  let before = h.search_stats();
+  let held: Vec<_> = (0..MAX_RUN_PAGES * 6)
+    .map(|_| alloc(h, 3, size, 8))
+    .collect();
+  let s = h.search_stats();
+  assert_eq!(s.run_searches - before.run_searches, held.len() as u64);
+  assert!(s.run_search_segments - before.run_search_segments <= held.len() as u64);
+  h.check_indexes();
+  // Repeated runs over the full segments look at one segment each.
+  for _ in 0..50 {
+    let x = alloc(h, 3, size, 8);
+    assert!(held.iter().all(|&o| o / SEGMENT_SIZE != x / SEGMENT_SIZE));
+    free(h, x);
+  }
+  let t = h.search_stats();
+  assert_eq!(t.run_searches - s.run_searches, 50);
+  assert!(t.run_search_segments - s.run_search_segments <= 50);
+  // Freeing a page of the lowest segment lowers the bound again: the next
+  // run takes that page, first by address.
+  free(h, held[5]);
+  let y = alloc(h, 3, size, 8);
+  assert_eq!(y, held[5]);
+  h.check_indexes();
+  for o in held {
+    free(h, o);
+  }
+}
+
+#[test]
+fn the_free_page_bound_stays_at_or_below_every_free_page() {
+  let h = heap();
+  h.set_purge_delay_ms(0);
+  // A segment of one-page runs with every fourth page freed: it has free
+  // pages but no four-page run, so runs of four go to a later segment and
+  // the search must not raise the bound past those free pages.
+  let ones: Vec<_> = (0..MAX_RUN_PAGES)
+    .map(|_| alloc(h, 3, PAGE_SIZE, 8))
+    .collect();
+  let mut holes = Vec::new();
+  for (i, &o) in ones.iter().enumerate() {
+    if i % 4 == 1 {
+      free(h, o);
+      holes.push(o);
+    }
+  }
+  h.check_indexes();
+  let fours: Vec<_> = (0..20).map(|_| alloc(h, 3, 4 * PAGE_SIZE, 8)).collect();
+  assert!(
+    fours
+      .iter()
+      .all(|&o| o / SEGMENT_SIZE != ones[0] / SEGMENT_SIZE)
+  );
+  h.check_indexes();
+  // First fit by address: a one-page run takes the lowest hole.
+  let back = alloc(h, 3, PAGE_SIZE, 8);
+  assert_eq!(back, holes[0]);
+  h.check_indexes();
+  // Shrinking a run frees its tail; growing it in place takes it again.
+  assert!(resize(h, fours[0], PAGE_SIZE));
+  h.check_indexes();
+  let tail = alloc(h, 3, 3 * PAGE_SIZE, 8);
+  assert_eq!(tail, fours[0] + PAGE_SIZE);
+  free(h, tail);
+  assert!(resize(h, fours[0], 4 * PAGE_SIZE));
+  h.check_indexes();
+  // Purged pages are given back, and empty segments returned, under the
+  // owner's lock; runs after that start from the lowest free page again.
+  for &o in &fours[1..] {
+    free(h, o);
+  }
+  h.purge();
+  h.check_indexes();
+  let again = alloc(h, 3, 4 * PAGE_SIZE, 8);
+  assert_eq!(again, fours[1]);
+  h.check_indexes();
+  for o in ones
+    .iter()
+    .filter(|o| !holes[1..].contains(o))
+    .copied()
+    .chain([fours[0], again])
+  {
+    free(h, o);
+  }
+  h.purge();
+  h.purge();
+  h.check_indexes();
+  let fresh = alloc(h, 3, 4 * PAGE_SIZE, 8);
+  h.check_indexes();
+  free(h, fresh);
+}
+
+#[test]
+fn a_purge_returning_pages_lowers_the_bound_a_search_raised_meanwhile() {
+  // A segment of one-page runs with every fourth page freed and dirty.
+  // While a purge holds those pages claimed, the segment reads as full, so
+  // run searches move the bound past it; giving the pages back must lower
+  // it again, whether each purge succeeded or failed.
+  for fail_every in [0, 1, 2, 3] {
+    let h = heap();
+    h.attach_maintenance();
+    let ones: Vec<_> = (0..MAX_RUN_PAGES)
+      .map(|_| alloc(h, 3, PAGE_SIZE, 8))
+      .collect();
+    let mut holes = Vec::new();
+    for (i, &o) in ones.iter().enumerate() {
+      if i % 4 == 1 {
+        free(h, o);
+        holes.push(o);
+      }
+    }
+    let got = Mutex::new(Vec::new());
+    let during = || {
+      let runs = [
+        alloc(h, 3, PAGE_SIZE, 8),
+        alloc(h, 3, 4 * PAGE_SIZE, 8),
+        alloc(h, 3, 100, 8),
+      ];
+      h.check_indexes();
+      got.lock().unwrap().extend(runs);
+    };
+    h.request_purge();
+    let mut p = MockPurger::new(h.os(), 4);
+    p.fail_every = fail_every;
+    p.during = Some(&during);
+    h.maintain_with(&mut p);
+    assert!(p.batches > 0);
+    h.check_indexes();
+    let got = got.into_inner().unwrap();
+    assert!(!got.is_empty());
+    assert!(
+      got
+        .iter()
+        .all(|&o| o / SEGMENT_SIZE != ones[0] / SEGMENT_SIZE),
+      "fail_every {fail_every}"
+    );
+    // First fit by address: the lowest hole is taken again.
+    assert_eq!(
+      alloc(h, 3, PAGE_SIZE, 8),
+      holes[0],
+      "fail_every {fail_every}"
+    );
+    h.check_indexes();
+  }
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(if cfg!(miri) { 2 } else { 64 }))]
+    /// Page runs of mixed sizes and alignments are claimed, shrunk, grown,
+    /// freed and purged; after each step no free page lies below the
+    /// shard's bound.
+    #[test]
+    fn random_run_sequences_keep_the_free_page_bound(
+        ops in proptest::collection::vec((1usize..20, 0u32..3, 0u8..5), 1..if cfg!(miri) { 40 } else { 300 })
+    ) {
+        let h = heap();
+        h.set_purge_delay_ms(0);
+        let mut live = Vec::new();
+        for (pages, align_shift, op) in ops {
+            match op {
+                1 if !live.is_empty() => {
+                    let o = live.swap_remove(pages % live.len());
+                    free(h, o);
+                }
+                2 if !live.is_empty() => {
+                    let o = live[pages % live.len()];
+                    resize(h, o, pages * PAGE_SIZE);
+                }
+                3 => h.purge(),
+                _ => live.push(alloc(h, 3, pages * PAGE_SIZE - 100, PAGE_SIZE << align_shift)),
+            }
+            h.check_indexes();
+        }
+        for o in live {
+            free(h, o);
+        }
+        h.purge();
+        h.check_indexes();
+    }
+}
