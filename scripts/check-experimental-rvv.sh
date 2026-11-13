@@ -20,11 +20,11 @@
 #    which qemu reports as SIGILL before any allocation.
 #
 # Needs qemu-user, riscv64-linux-gnu-gcc and its sysroot, llvm-objdump,
-# jq, and Rust 1.99.0 with the riscv64gc-unknown-linux-gnu target.
+# jq, and Rust 1.100.0 with the riscv64gc-unknown-linux-gnu target.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-toolchain="${RVV_TOOLCHAIN:-1.99.0}"
+toolchain="${RVV_TOOLCHAIN:-1.100.0}"
 target=riscv64gc-unknown-linux-gnu
 feature=experimental-riscv-rvv
 qemu=(qemu-riscv64 -L "${RISCV64_SYSROOT:-/usr/riscv64-linux-gnu}")

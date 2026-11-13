@@ -293,7 +293,7 @@ def _verify_source_manifest(
         "profile", "features_sha256", "build_inputs_sha256",
     }, "source build identity")
     require(build["host_id"] == host_id, "source build host differs from the selected host")
-    require(build["rustc_release"] == "1.99.0" and build["target_triple"] == "x86_64-unknown-linux-gnu" and build["target_cpu"] == "x86-64-v3" and build["profile"] == "release", "source build differs from the frozen Rust 1.99 amd64-v3 release contract")
+    require(build["rustc_release"] == "1.100.0" and build["target_triple"] == "x86_64-unknown-linux-gnu" and build["target_cpu"] == "x86-64-v3" and build["profile"] == "release", "source build differs from the frozen Rust 1.100 amd64-v3 release contract")
     require(type(build["rustc_verbose"]) is list and all(type(item) is str for item in build["rustc_verbose"]), "build rustc version record is malformed")
     require(type(build["cargo_version"]) is str and build["cargo_version"], "build Cargo version record is missing")
     require(is_sha256(build["features_sha256"]) and is_sha256(build["build_inputs_sha256"]), "build feature/input hash is malformed")

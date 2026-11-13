@@ -1510,7 +1510,7 @@ def _audit_manifest_and_binaries(
     build_sha = hashlib.sha256(canonical_bytes(build)).hexdigest()
     require(build_sha == identity["build_sha256"], "build identity differs from the parent recipe")
     require(build["host_id"] == identity["host_id"], "build manifest host differs from the soak host")
-    require(build["rustc_release"] == "1.99.0" and build["profile"] == "release", "soak binary build is not the frozen Rust 1.99 release build")
+    require(build["rustc_release"] == "1.100.0" and build["profile"] == "release", "soak binary build is not the frozen Rust 1.100 release build")
     require(build["target_triple"] == "x86_64-unknown-linux-gnu" and build["target_cpu"] == "x86-64-v3", "soak target differs from the frozen amd64-v3 build")
     digest(build["features_sha256"], "build features SHA-256")
     digest(build["build_inputs_sha256"], "build inputs SHA-256")

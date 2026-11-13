@@ -64,9 +64,9 @@ def source_for(host_id: str) -> dict:
     }
     build = {
         "host_id": host_id,
-        "rustc_release": "1.99.0",
-        "rustc_verbose": ["release: 1.99.0"],
-        "cargo_version": "cargo 1.99.0",
+        "rustc_release": "1.100.0",
+        "rustc_verbose": ["release: 1.100.0"],
+        "cargo_version": "cargo 1.100.0",
         "target_triple": "x86_64-unknown-linux-gnu",
         "target_cpu": "x86-64-v3",
         "profile": "release",

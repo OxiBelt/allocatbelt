@@ -540,8 +540,8 @@ class CampaignChronologyCliTests(unittest.TestCase):
         rustc_verbose = subprocess.check_output(["rustc", "-Vv"], text=True).splitlines()
         rustc_release = next((line.split(" ", 2)[1] for line in rustc_verbose
                               if line.startswith("rustc ")), "")
-        if rustc_release != "1.99.0":
-            raise unittest.SkipTest("campaign chronology witness requires the frozen Rust 1.99.0 source contract")
+        if rustc_release != "1.100.0":
+            raise unittest.SkipTest("campaign chronology witness requires the frozen Rust 1.100.0 source contract")
 
         fixture_class = capacity_fixtures.CapacityStageCliTests
         capacity_fixtures.sys = sys

@@ -170,7 +170,7 @@ def execution_join_case() -> dict[str, object]:
         path: sha(f"resident-module:{path}\n".encode("ascii"))
         for path in module_paths
     }
-    build = {"build_id": "research-build", "rustc": "1.99.0"}
+    build = {"build_id": "research-build", "rustc": "1.100.0"}
     build_sha = sha(canonical(build))
     for index, host in enumerate(hosts):
         files = [{"path": path, "kind": "file", "mode": "100644",

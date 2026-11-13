@@ -404,7 +404,7 @@ needed. Do not mark a partial phase complete or rerun a consumed ordinal.
 1. **Freeze fresh SourceV5 source and binaries on each host.** Use the reviewed
    signed source revision after all controller helpers are regular typed
    inventory entries, including `scripts/application-source5-soak.py`. Build
-   under Rust 1.99.0 with the target flags preserved:
+   under Rust 1.100.0 with the target flags preserved:
 
    ```sh
    cargo build --release --locked --target x86_64-unknown-linux-gnu -p allocatbelt-bench --features resource-feedback \

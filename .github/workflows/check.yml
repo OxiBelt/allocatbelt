@@ -28,7 +28,7 @@ jobs:
       fail-fast: false
       matrix:
         rust_version:
-          - 1.99.0
+          - 1.100.0
         runner:
           - ubuntu-26.04
           - ubuntu-26.04-arm
@@ -99,7 +99,7 @@ jobs:
       fail-fast: false
       matrix:
         rust_version:
-          - 1.99.0
+          - 1.100.0
         runner:
           - ubuntu-26.04
           - ubuntu-26.04-arm
@@ -139,7 +139,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Install pinned stable Rust
-        run: rustup toolchain install 1.99.0 --profile minimal
+        run: rustup toolchain install 1.100.0 --profile minimal
       - name: Check ARM64 bit scans and population counts
         run: scripts/check-scalar-isa.sh
 
@@ -160,8 +160,8 @@ jobs:
 
       - name: Install Rust toolchain and targets
         run: |
-          rustup toolchain install 1.99.0 --profile minimal
-          rustup default 1.99.0
+          rustup toolchain install 1.100.0 --profile minimal
+          rustup default 1.100.0
           rustup target add \
             x86_64-unknown-linux-musl \
             aarch64-unknown-linux-gnu \
@@ -206,8 +206,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.99.0 --profile minimal
-          rustup default 1.99.0
+          rustup toolchain install 1.100.0 --profile minimal
+          rustup default 1.100.0
 
       - name: Fetch locked Cargo dependency graph
         run: cargo fetch --locked
@@ -238,9 +238,9 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.99.0 --profile minimal
-          rustup default 1.99.0
-          rustup component add clippy --toolchain 1.99.0
+          rustup toolchain install 1.100.0 --profile minimal
+          rustup default 1.100.0
+          rustup component add clippy --toolchain 1.100.0
 
       - name: Fetch locked Cargo dependency graph
         run: cargo fetch --locked
@@ -274,8 +274,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.99.0 --profile minimal --target "$(uname -m)-unknown-linux-musl"
-          rustup default 1.99.0
+          rustup toolchain install 1.100.0 --profile minimal --target "$(uname -m)-unknown-linux-musl"
+          rustup default 1.100.0
 
       - name: Install qemu-user and static process fixtures
         run: |
@@ -314,8 +314,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.99.0 --profile minimal --target "$(uname -m)-unknown-linux-musl"
-          rustup default 1.99.0
+          rustup toolchain install 1.100.0 --profile minimal --target "$(uname -m)-unknown-linux-musl"
+          rustup default 1.100.0
 
       - name: Fetch locked Cargo dependency graph
         run: cargo fetch --locked
@@ -340,8 +340,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.99.0 --profile minimal --component clippy
-          rustup default 1.99.0
+          rustup toolchain install 1.100.0 --profile minimal --component clippy
+          rustup default 1.100.0
 
       - name: Install qemu-user
         run: |
@@ -376,7 +376,7 @@ jobs:
 
       - name: Install pinned stable Rust
         run: |
-          rustup toolchain install 1.99.0 --profile minimal --component clippy \
+          rustup toolchain install 1.100.0 --profile minimal --component clippy \
             --target riscv64gc-unknown-linux-gnu
 
       - name: Install qemu-user, the riscv64 cross toolchain and llvm-objdump
@@ -388,7 +388,7 @@ jobs:
           command -v llvm-objdump || sudo ln -s "$(ls /usr/bin/llvm-objdump-* | sort -V | tail -1)" /usr/local/bin/llvm-objdump
 
       - name: Fetch locked Cargo dependency graph
-        run: cargo +1.99.0 fetch --locked
+        run: cargo +1.100.0 fetch --locked
 
       - name: Lint, isolation and kernel checks under qemu
         run: scripts/check-experimental-rvv.sh
@@ -474,8 +474,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.99.0 --profile minimal --target riscv64gc-unknown-linux-gnu
-          rustup default 1.99.0
+          rustup toolchain install 1.100.0 --profile minimal --target riscv64gc-unknown-linux-gnu
+          rustup default 1.100.0
 
       - name: Fetch locked Cargo dependency graph
         run: cargo fetch --locked
@@ -509,8 +509,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.99.0 --profile minimal --target riscv64gc-unknown-linux-gnu
-          rustup default 1.99.0
+          rustup toolchain install 1.100.0 --profile minimal --target riscv64gc-unknown-linux-gnu
+          rustup default 1.100.0
 
       # qemu-user 8.2 intermittently crashes with "QEMU internal SIGSEGV" on
       # the multithreaded tests; 10.2.1 is the oldest release verified clean.
@@ -564,8 +564,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.99.0 --profile minimal
-          rustup default 1.99.0
+          rustup toolchain install 1.100.0 --profile minimal
+          rustup default 1.100.0
 
       - name: Fetch locked Cargo dependency graph
         run: cargo fetch --locked
@@ -613,8 +613,8 @@ jobs:
       - name: Install Rust toolchains and cargo-fuzz
         run: |
           rustup toolchain install nightly-2026-09-28 --profile minimal
-          rustup toolchain install 1.99.0 --profile minimal
-          cargo +1.99.0 install cargo-fuzz --version 0.13.2 --locked
+          rustup toolchain install 1.100.0 --profile minimal
+          cargo +1.100.0 install cargo-fuzz --version 0.13.2 --locked
 
       - name: Fuzz heap_ops
         working-directory: fuzz
@@ -643,8 +643,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.99.0 --profile minimal
-          rustup default 1.99.0
+          rustup toolchain install 1.100.0 --profile minimal
+          rustup default 1.100.0
 
       - name: Install pinned Rust dependency tools
         run: |
@@ -672,12 +672,12 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.99.0 --profile minimal
-          rustup default 1.99.0
+          rustup toolchain install 1.100.0 --profile minimal
+          rustup default 1.100.0
 
       - name: Install pinned mewt
         run: |
-          cargo +1.99.0 install mewt --version 4.0.0 --locked
+          cargo +1.100.0 install mewt --version 4.0.0 --locked
           test "$(mewt --version)" = "mewt 4.0.0"
 
       - name: Run mutation campaign

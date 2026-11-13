@@ -1,6 +1,8 @@
 # Rust 1.99 modernization
 
-The workspace, fuzz manifest and contributor toolchain require Rust 1.99.0.
+This step raised the workspace, fuzz manifest and contributor toolchain to
+Rust 1.99.0; [rust1100-toolchain.md](rust1100-toolchain.md) raises them to
+1.100.0.
 Stable features are selected for concrete ABI, ownership or generated-code
 benefits. The safe `no_std` core remains the same source used by the checker.
 

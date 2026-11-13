@@ -49,8 +49,13 @@ printf '%s\n' "$*" >>"${FAKE_CARGO_CALLS}"
 for index in {1..9}; do
   name="test-${index}"
   [[ "${index}" == 1 ]] && name=sandbox-fake
-  printf '{"reason":"compiler-artifact","executable":"%s/tests/%s","profile":{"test":true},"target":{"name":"%s"}}\n' \
-    "${FAKE_SANDBOX_ROOT}" "${name}" "${name}"
+  # Like Cargo 1.100, every test executable has a directory of its own.
+  executable="${FAKE_SANDBOX_ROOT}/build/${name}/out/${name}"
+  mkdir -p "$(dirname "${executable}")"
+  printf 'fake test %s\n' "${name}" >"${executable}"
+  chmod +x "${executable}"
+  printf '{"reason":"compiler-artifact","executable":"%s","profile":{"test":true},"target":{"name":"%s"}}\n' \
+    "${executable}" "${name}"
 done
 if [[ "${FAKE_SANDBOX_MODE:-}" == partial_build_failure ]]; then
   echo 'fake final test target failed to compile' >&2
@@ -91,6 +96,18 @@ if [[ "${*: -4}" == '/bin/busybox sha256sum /bin/bash /bin/busybox' ]]; then
   fi
   exit 0
 fi
+# A test binary must be executable in the one read-only `/t` mount.
+args=("$@")
+mount=""
+for ((i = 0; i + 1 < ${#args[@]}; i++)); do
+  [[ "${args[i]}" == -v ]] && mount="${args[i + 1]%:/t:ro}"
+done
+for arg in "$@"; do
+  if [[ "${arg}" == /t/* && ! -x "${mount}/${arg#/t/}" ]]; then
+    echo "exec: \"${arg}\": stat ${arg}: no such file or directory" >&2
+    exit 127
+  fi
+done
 echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'
 if [[ "${FAKE_SANDBOX_MODE:-}" == docker_failure ]]; then
   echo 'fake actionable container failure' >&2

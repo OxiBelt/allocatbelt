@@ -493,9 +493,9 @@ class Fixture:
         cargo_lock_sha = hash_file(self.root / "Cargo.lock")
         build = {
             "host_id": "host-fixture",
-            "rustc_release": "1.99.0",
-            "rustc_verbose": ["release: 1.99.0"],
-            "cargo_version": "cargo 1.99.0 fixture",
+            "rustc_release": "1.100.0",
+            "rustc_verbose": ["release: 1.100.0"],
+            "cargo_version": "cargo 1.100.0 fixture",
             "target_triple": "x86_64-unknown-linux-gnu",
             "target_cpu": "x86-64-v3",
             "profile": "release",

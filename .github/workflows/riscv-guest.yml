@@ -37,7 +37,7 @@ jobs:
             build-essential bc bison flex cpio file rsync unzip wget curl \
             python3 libncurses-dev libssl-dev libglib2.0-dev libpixman-1-dev \
             ninja-build meson patch perl tar xz-utils
-          rustup toolchain install 1.99.0 --profile minimal --target riscv64gc-unknown-linux-musl
+          rustup toolchain install 1.100.0 --profile minimal --target riscv64gc-unknown-linux-musl
       - name: Check the guest result validator
         run: python3 -B -m unittest discover -s scripts/riscv-guest -p 'test_*.py'
       - name: Identify guest configuration and host build tools

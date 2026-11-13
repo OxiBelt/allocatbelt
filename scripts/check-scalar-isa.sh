@@ -36,7 +36,17 @@ emit() {
   env "${env[@]}" cargo rustc --locked --quiet --release \
     -p allocatbelt-codegen-probes --lib --target "${target}" --target-dir "${dir}" \
     -- --emit asm -C codegen-units=1 >&2
-  ls "${dir}/${target}/release/deps/allocatbelt_codegen_probes-"*.s
+  # Cargo's intermediate build layout is not a stable interface (Rust 1.100
+  # moved it from `deps/` to per-package directories), so search the profile.
+  local -a found
+  mapfile -t found < <(find "${dir}/${target}/release" -type f \
+    -name 'allocatbelt_codegen_probes-*.s')
+  if [[ ${#found[@]} -ne 1 ]]; then
+    echo "expected one probe assembly file under ${dir}/${target}/release," \
+      "found ${#found[@]}" >&2
+    return 1
+  fi
+  echo "${found[0]}"
 }
 
 # body <asm> <probe>: the instructions of one probe function.

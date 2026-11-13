@@ -980,7 +980,7 @@ def functional_source_overlay(
         (line.removeprefix("release: ") for line in rustc_verbose if line.startswith("release: ")),
         "",
     )
-    require(rustc_release == "1.99.0", "functional E2E requires Rust 1.99.0")
+    require(rustc_release == "1.100.0", "functional E2E requires Rust 1.100.0")
     target_triple = "x86_64-unknown-linux-gnu"
     target_cpu = "x86-64-v3"
     require("x86-64-v3" in (source_root / ".cargo" / "config.toml").read_text(encoding="utf-8"), "signed Cargo config does not pin x86-64-v3")

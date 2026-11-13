@@ -654,7 +654,7 @@ def source_manifest(args: argparse.Namespace) -> dict[str, Any]:
     rustc = run_checked(["rustc", "-Vv"], root).decode().splitlines()
     cargo = run_checked(["cargo", "-V"], root).decode().strip()
     rustc_release = next((line.removeprefix("release: ") for line in rustc if line.startswith("release: ")), "")
-    require(rustc_release == "1.99.0", f"expected Rust 1.99.0, found {rustc_release or 'unknown'}")
+    require(rustc_release == "1.100.0", f"expected Rust 1.100.0, found {rustc_release or 'unknown'}")
     artifacts: dict[str, dict[str, Any]] = {}
     for assignment in args.allocator_binary:
         label, separator, path = assignment.partition("=")
@@ -809,7 +809,7 @@ def verify_source_manifest(
     source = exact_keys(manifest["source"], {"git_commit", "source_tree_sha256", "cargo_lock_sha256", "files"}, "source manifest source")
     build = exact_keys(manifest["build"], {"host_id", "rustc_release", "rustc_verbose", "cargo_version", "target_triple", "target_cpu", "profile", "features_sha256", "build_inputs_sha256"}, "source manifest build")
     require(source["git_commit"] and is_sha256(source["source_tree_sha256"]) and is_sha256(source["cargo_lock_sha256"]), "source identity is incomplete")
-    require(build["rustc_release"] == "1.99.0" and build["target_triple"] == "x86_64-unknown-linux-gnu" and build["target_cpu"] == "x86-64-v3" and build["profile"] == "release", "amd64-v3 build identity is unfrozen")
+    require(build["rustc_release"] == "1.100.0" and build["target_triple"] == "x86_64-unknown-linux-gnu" and build["target_cpu"] == "x86-64-v3" and build["profile"] == "release", "amd64-v3 build identity is unfrozen")
     require(is_sha256(build["features_sha256"]) and is_sha256(build["build_inputs_sha256"]), "build controls are not pinned")
     exact_keys(manifest["artifacts"], set(ALLOCATORS), "source manifest artifacts")
     verify_soak_artifact_bindings(manifest["soak_artifacts"])

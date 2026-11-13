@@ -81,8 +81,8 @@ def _source_v5_manifest(identity: dict[str, Any]) -> dict[str, Any]:
         "files": files,
     }
     build = {
-        "host_id": identity["host_id"], "rustc_release": "1.99.0", "rustc_verbose": [],
-        "cargo_version": "cargo 1.99.0", "target_triple": "x86_64-unknown-linux-gnu",
+        "host_id": identity["host_id"], "rustc_release": "1.100.0", "rustc_verbose": [],
+        "cargo_version": "cargo 1.100.0", "target_triple": "x86_64-unknown-linux-gnu",
         "target_cpu": "x86-64-v3", "profile": "release", "features_sha256": "e" * 64,
         "build_inputs_sha256": "f" * 64,
     }
@@ -341,8 +341,8 @@ class Fixture:
             "files": [],
         }
         build = {
-            "host_id": self.identity["host_id"], "rustc_release": "1.99.0", "rustc_verbose": [],
-            "cargo_version": "cargo 1.99.0", "target_triple": "x86_64-unknown-linux-gnu",
+            "host_id": self.identity["host_id"], "rustc_release": "1.100.0", "rustc_verbose": [],
+            "cargo_version": "cargo 1.100.0", "target_triple": "x86_64-unknown-linux-gnu",
             "target_cpu": "x86-64-v3", "profile": "release", "features_sha256": "e" * 64,
             "build_inputs_sha256": "f" * 64,
         }
