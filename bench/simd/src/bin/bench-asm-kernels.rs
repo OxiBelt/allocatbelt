@@ -14,7 +14,10 @@
 use std::cell::Cell;
 use std::hint::black_box;
 
-use allocatbelt_core_check::core::{list_holds, unpack_blocks};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use allocatbelt_core_check::core::bits::pick_bit;
+use allocatbelt_core_check::core::{list_holds, nonzero_words, pack_blocks, unpack_blocks};
 use allocatbelt_simd_bench::harness::{Config, Measurement, measure};
 use allocatbelt_simd_bench::perf::{Counters, EVENTS};
 
@@ -255,6 +258,129 @@ fn main() {
     print_row(
       csv,
       "unpack_blocks",
+      &case,
+      "asm",
+      &kernel,
+      portable.median_ns,
+    );
+  }
+  // `nonzero_words` + rank pick: a claim, under the shard's lock, picks one
+  // of the page's non-zero bitmap words by rank. `two-pass` is the loop the
+  // heap ran before the mask (count the non-zero words, then walk to the
+  // picked one); `portable` and `asm` build the mask and pick a bit of it.
+  // The lengths are the bitmap words of the 16-, 32-, 64-, 128-, 256- and
+  // 512-byte classes; about half of the words are zero.
+  for n in [64usize, 32, 16, 8, 4, 2] {
+    let pages: Vec<Vec<AtomicU64>> = (0..INPUTS)
+      .map(|_| {
+        (0..n)
+          .map(|_| {
+            AtomicU64::new(if rng.next() & 1 == 0 {
+              0
+            } else {
+              rng.next() | 1
+            })
+          })
+          .collect()
+      })
+      .collect();
+    let case = format!("{n} words");
+    let mut at = 0usize;
+    let mut sum = 0u64;
+    let two_pass = measure(cfg, c.as_deref_mut(), || {
+      let words = &pages[at & (INPUTS - 1)];
+      at += 1;
+      let r = (at as u32).wrapping_mul(0x9E37_79B9);
+      let k = words
+        .iter()
+        .filter(|w| w.load(Ordering::Relaxed) != 0)
+        .count() as u64;
+      if k != 0 {
+        let rank = (u64::from(r) * k) >> 32;
+        let picked = words
+          .iter()
+          .enumerate()
+          .filter(|(_, w)| w.load(Ordering::Relaxed) != 0)
+          .nth(rank as usize);
+        sum += picked.map_or(0, |(i, _)| i as u64);
+      }
+    });
+    black_box(sum);
+    let mut at = 0usize;
+    let mut sum_portable = 0u64;
+    let portable = measure(cfg, c.as_deref_mut(), || {
+      let words = &pages[at & (INPUTS - 1)];
+      at += 1;
+      let r = (at as u32).wrapping_mul(0x9E37_79B9);
+      let mask = nonzero_words(black_box(words));
+      if mask != 0 {
+        sum_portable += u64::from(pick_bit(mask, r));
+      }
+    });
+    black_box(sum_portable);
+    let mut at = 0usize;
+    let mut sum_asm = 0u64;
+    let kernel = measure(cfg, c.as_deref_mut(), || {
+      let words = &pages[at & (INPUTS - 1)];
+      at += 1;
+      let r = (at as u32).wrapping_mul(0x9E37_79B9);
+      let mask = asm::nonzero_words(black_box(words));
+      if mask != 0 {
+        sum_asm += u64::from(pick_bit(mask, r));
+      }
+    });
+    black_box(sum_asm);
+    print_row(
+      csv,
+      "pick word",
+      &case,
+      "two-pass",
+      &two_pass,
+      portable.median_ns,
+    );
+    print_row(
+      csv,
+      "pick word",
+      &case,
+      "portable",
+      &portable,
+      portable.median_ns,
+    );
+    print_row(csv, "pick word", &case, "asm", &kernel, portable.median_ns);
+  }
+
+  // `pack_blocks`: a cache that returns a claimed word packs the blocks
+  // it still lists into a mask.
+  for len in [1u8, 4, 16, 32, 64] {
+    let lists: Vec<[Cell<u8>; 64]> = (0..64).map(|_| shuffled_list(&mut rng)).collect();
+    let case = format!("{len} listed");
+    let mut at = 0usize;
+    let mut sum = 0u64;
+    let portable = measure(cfg, c.as_deref_mut(), || {
+      let list = &lists[at & 63];
+      at += 1;
+      sum ^= pack_blocks(black_box(list), black_box(len));
+    });
+    black_box(sum);
+    let mut at = 0usize;
+    let mut sum_asm = 0u64;
+    let kernel = measure(cfg, c.as_deref_mut(), || {
+      let list = &lists[at & 63];
+      at += 1;
+      sum_asm ^= asm::pack_blocks(black_box(list), black_box(len));
+    });
+    black_box(sum_asm);
+    print_row(
+      csv,
+      "pack_blocks",
+      &case,
+      "portable",
+      &portable,
+      portable.median_ns,
+    );
+    print_row(
+      csv,
+      "pack_blocks",
       &case,
       "asm",
       &kernel,

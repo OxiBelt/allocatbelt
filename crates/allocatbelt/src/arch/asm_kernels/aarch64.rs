@@ -285,3 +285,23 @@ pub(crate) fn unpack_blocks(bits: u64, blocks: &[Cell<u8>; 64]) -> u8 {
   }
   n as u8
 }
+
+/// PLACEHOLDER (portable loop), to be replaced by assembly: bit `i` is set
+/// iff `words[i]` is non-zero. `words.len()` is at most 64.
+#[inline(always)]
+pub(crate) fn nonzero_words(words: &[core::sync::atomic::AtomicU64]) -> u64 {
+  let mut mask = 0;
+  for (i, w) in words.iter().enumerate() {
+    mask |= u64::from(w.load(core::sync::atomic::Ordering::Relaxed) != 0) << i;
+  }
+  mask
+}
+
+/// PLACEHOLDER (portable loop), to be replaced by assembly: the mask of the
+/// block numbers (each below 64) in the first `len` (at most 64) entries.
+#[inline(always)]
+pub(crate) fn pack_blocks(blocks: &[Cell<u8>; 64], len: u8) -> u64 {
+  blocks[..usize::from(len)]
+    .iter()
+    .fold(0, |m, b| m | 1 << b.get())
+}

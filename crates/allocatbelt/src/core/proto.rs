@@ -58,7 +58,7 @@
 //!   reads the cause, so a post that races with a take is either seen by
 //!   the pass that follows or re-posts the bit (and wakes the thread).
 
-use crate::core::bits::find_run_aligned;
+use crate::core::bits::{find_run_aligned, pick_bit};
 use crate::core::sync::Ordering::{Acquire, Relaxed, Release, SeqCst};
 use crate::core::sync::{AtomicU32, AtomicU64, fence};
 
@@ -105,30 +105,45 @@ pub(crate) fn take_candidates(empty: &AtomicU64) -> u64 {
   taken
 }
 
-/// The non-zero word among `words` that `r` picks by rank: the non-zero
-/// words are counted, and `r`, read as a fraction of 2^32, picks the rank
-/// among them (`r = 0` takes the first). There is no summary of the words:
-/// they are read one by one.
-fn pick_word(words: &[AtomicU64], r: u32) -> Option<(usize, &AtomicU64)> {
-  let k = words.iter().filter(|w| w.load(Relaxed) != 0).count() as u64;
-  if k == 0 {
+/// Which of `words` (at most 64) are non-zero: bit `i` is set iff
+/// `words[i]` is. The value is computed from the words each time, under
+/// the lock that guards them, used to pick one word and dropped; nothing
+/// records it. The portable form of `Os::nonzero_words`.
+#[must_use]
+#[inline]
+pub fn nonzero_words(words: &[AtomicU64]) -> u64 {
+  debug_assert!(words.len() <= 64);
+  let mut mask = 0;
+  for (i, w) in words.iter().enumerate() {
+    mask |= u64::from(w.load(Relaxed) != 0) << i;
+  }
+  mask
+}
+
+/// The non-zero word among `words` that `r` picks by rank: `nonzero` marks
+/// the non-zero words (see [`nonzero_words`]), and `r`, read as a fraction
+/// of 2^32, picks the rank among them (`r = 0` takes the first). There is
+/// no stored summary of the words: the caller reads them for every pick.
+fn pick_word(words: &[AtomicU64], nonzero: u64, r: u32) -> Option<(usize, &AtomicU64)> {
+  if nonzero == 0 {
     return None;
   }
-  let rank = (u64::from(r) * k) >> 32;
-  words
-    .iter()
-    .enumerate()
-    .filter(|(_, w)| w.load(Relaxed) != 0)
-    .nth(rank as usize)
+  let w = pick_bit(nonzero, r) as usize;
+  Some((w, &words[w]))
 }
 
 /// Claims every free block of one bitmap word of a page, picked among its
-/// non-zero `words` by rank (see [`pick_word`]), and subtracts them from the
-/// page's free-block counter `count`. Returns the word index and the
-/// claimed bits, or `None` if every word is zero. Caller holds the lock of
-/// the shard that owns the page.
-pub(crate) fn claim_word(words: &[AtomicU64], count: &AtomicU64, r: u32) -> Option<(u32, u64)> {
-  let (w, word) = pick_word(words, r)?;
+/// non-zero `words` by rank (see [`pick_word`]; `nonzero` is their
+/// [`nonzero_words`]), and subtracts them from the page's free-block counter
+/// `count`. Returns the word index and the claimed bits, or `None` if every
+/// word is zero. Caller holds the lock of the shard that owns the page.
+pub(crate) fn claim_word(
+  words: &[AtomicU64],
+  nonzero: u64,
+  count: &AtomicU64,
+  r: u32,
+) -> Option<(u32, u64)> {
+  let (w, word) = pick_word(words, nonzero, r)?;
   let bits = word.load(Relaxed);
   word.store(0, Relaxed);
   count.store(count.load(Relaxed) - u64::from(bits.count_ones()), Relaxed);
@@ -139,8 +154,13 @@ pub(crate) fn claim_word(words: &[AtomicU64], count: &AtomicU64, r: u32) -> Opti
 /// word picked by rank (see [`pick_word`]). Returns the word index and the
 /// block's bit, or `None` if every word is zero. Caller holds the lock of
 /// the shard that owns the page.
-pub(crate) fn claim_block(words: &[AtomicU64], count: &AtomicU64, r: u32) -> Option<(u32, u64)> {
-  let (w, word) = pick_word(words, r)?;
+pub(crate) fn claim_block(
+  words: &[AtomicU64],
+  nonzero: u64,
+  count: &AtomicU64,
+  r: u32,
+) -> Option<(u32, u64)> {
+  let (w, word) = pick_word(words, nonzero, r)?;
   let bits = word.load(Relaxed);
   let bit = bits.isolate_lowest_one();
   word.store(bits & !bit, Relaxed);
@@ -361,9 +381,9 @@ mod loom_tests {
     fn claim(&self, r: u32, one: bool) -> Option<(u32, u64)> {
       let _g = self.lock.lock(&self.futex);
       if one {
-        claim_block(&self.words, &self.count, r)
+        claim_block(&self.words, nonzero_words(&self.words), &self.count, r)
       } else {
-        claim_word(&self.words, &self.count, r)
+        claim_word(&self.words, nonzero_words(&self.words), &self.count, r)
       }
     }
 

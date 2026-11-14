@@ -50,8 +50,10 @@ mod sync;
 pub use heap::{
   AgeKernel, Block, CacheStats, DIRTY_HARD_LIMIT_PAGES, Heap, HeapUsage, MAX_RETENTION,
   MaintenanceStats, Os, PURGE_BATCH, Purger, ReclaimStatus, ReclaimTargets, ReclaimTargetsError,
-  Retention, SearchStats, SyncPurger, Task, ThreadCache, aged_pages, list_holds, unpack_blocks,
+  Retention, SearchStats, SyncPurger, Task, ThreadCache, aged_pages, list_holds, pack_blocks,
+  unpack_blocks,
 };
+pub use proto::nonzero_words;
 
 /// log2 of [`PAGE_SIZE`].
 pub const PAGE_SHIFT: u32 = 16;

@@ -195,6 +195,18 @@ impl Os for LinuxOs {
     crate::arch::asm_kernels::unpack_blocks(bits, blocks)
   }
 
+  #[cfg(feature = "experimental-asm-kernels")]
+  #[inline(always)]
+  fn nonzero_words(&self, words: &[AtomicU64]) -> u64 {
+    crate::arch::asm_kernels::nonzero_words(words)
+  }
+
+  #[cfg(feature = "experimental-asm-kernels")]
+  #[inline(always)]
+  fn pack_blocks(&self, blocks: &[core::cell::Cell<u8>; 64], len: u8) -> u64 {
+    crate::arch::asm_kernels::pack_blocks(blocks, len)
+  }
+
   fn now_ms(&self) -> u64 {
     // `Instant::now` reads the vDSO clock and does not allocate.
     u64::try_from(self.arena().start.elapsed().as_millis()).unwrap_or(u64::MAX)

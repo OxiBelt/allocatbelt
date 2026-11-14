@@ -110,7 +110,7 @@ mod observe;
 mod purge;
 mod reclaim;
 
-pub use cache::{ThreadCache, list_holds, unpack_blocks};
+pub use cache::{ThreadCache, list_holds, pack_blocks, unpack_blocks};
 pub use maint::{DIRTY_HARD_LIMIT_PAGES, MaintenanceStats, Task};
 pub use observe::{CacheStats, HeapUsage, SearchStats};
 use observe::{SEARCH_STATS, SearchStat};
@@ -248,6 +248,25 @@ pub trait Os: Sync {
   #[inline]
   fn unpack_blocks(&self, bits: u64, blocks: &[Cell<u8>; 64]) -> u8 {
     unpack_blocks(bits, blocks)
+  }
+  /// Which of a small page's bitmap `words` (at most 64) are non-zero, as
+  /// a mask. Asked under the lock of the shard that owns the page, once
+  /// per claim, to pick the word to claim; the mask is not kept. An
+  /// implementation must return exactly what [`proto::nonzero_words`]
+  /// returns and reads only these words. The default is that portable
+  /// loop.
+  #[inline]
+  fn nonzero_words(&self, words: &[AtomicU64]) -> u64 {
+    proto::nonzero_words(words)
+  }
+  /// The mask of the block numbers (each below 64) in the first `len`
+  /// entries of a thread cache's block list. Asked when a cache returns a
+  /// claimed word. An implementation must return exactly what
+  /// [`pack_blocks`] returns and only reads the 64 entries. The default
+  /// is that portable loop.
+  #[inline]
+  fn pack_blocks(&self, blocks: &[Cell<u8>; 64], len: u8) -> u64 {
+    pack_blocks(blocks, len)
   }
   /// Reports heap corruption or misuse (invalid or double free). Must not
   /// return.
@@ -856,10 +875,11 @@ impl<O: Os> Heap<O> {
       pm.since().store(0, Relaxed);
     }
     let words = &pm.bitmaps()[..class::bitmap_words(c)];
+    let nonzero = self.os.nonzero_words(words);
     let claimed = if one {
-      proto::claim_block(words, pm.free(), sh.random())
+      proto::claim_block(words, nonzero, pm.free(), sh.random())
     } else {
-      proto::claim_word(words, pm.free(), sh.random())
+      proto::claim_word(words, nonzero, pm.free(), sh.random())
     };
     let Some((w, bits)) = claimed else {
       // Its counter said it had free blocks, or it was just set up.

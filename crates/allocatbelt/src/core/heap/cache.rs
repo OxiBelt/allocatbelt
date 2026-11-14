@@ -62,12 +62,17 @@ impl CachedBlocks {
   fn holds(&self, i: u32) -> bool {
     list_holds(&self.blocks, self.len.get(), i as u8)
   }
+}
 
-  /// The listed blocks as a mask of the word, emptying the list.
-  fn take_mask(&self) -> u64 {
-    let n = usize::from(self.len.replace(0));
-    self.blocks[..n].iter().fold(0, |m, b| m | 1 << b.get())
-  }
+/// The mask of the block numbers (each below 64) in the first `len` (at
+/// most 64) entries of `blocks`: the portable form of [`Os::pack_blocks`],
+/// which every kernel must match.
+#[must_use]
+#[inline]
+pub fn pack_blocks(blocks: &[Cell<u8>; 64], len: u8) -> u64 {
+  blocks[..usize::from(len)]
+    .iter()
+    .fold(0, |m, b| m | 1 << b.get())
 }
 
 /// Whether block number `i` (below 64) is among the first `len` entries of
@@ -470,7 +475,8 @@ impl<O: Os> Heap<O> {
       self.flush_slot(tc, i);
     }
     for (c, cw) in tc.words.iter().enumerate() {
-      let bits = cw.take_mask();
+      // The listed blocks as a mask of the word, emptying the list.
+      let bits = self.os.pack_blocks(&cw.blocks, cw.len.replace(0));
       if bits != 0 {
         let base = cw.base.get();
         let w = base % PAGE_SIZE / (64 * class::size(c));
