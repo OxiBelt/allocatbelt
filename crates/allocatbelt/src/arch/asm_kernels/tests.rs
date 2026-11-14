@@ -326,8 +326,8 @@ fn nonzero_words_and_pack_blocks_touch_only_their_input() {
   }
   for at in [0, GRANULE - 64, 4096 - 32] {
     let list = guarded.list(at);
-    for k in 0..64 {
-      list[k].set(63 - k as u8);
+    for (k, entry) in list.iter().enumerate() {
+      entry.set(63 - k as u8);
     }
     for len in 0..=64u8 {
       assert_eq!(pack_blocks(list, len), portable_pack(list, len));
