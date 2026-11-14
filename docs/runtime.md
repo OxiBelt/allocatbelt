@@ -1090,11 +1090,12 @@ state, so reuse among the first 64 slots touches no separate table. Each spawn
 scans up to `ceil(max_outstanding / 64)` bitmap words, so lookup cost grows
 with the configured outstanding-task bound.
 
-The executor appends newly ready, self-woken, requeued and quota-released
-tasks to a lane chosen by the inserting thread's rotating start index and the
-parked mask. Each thread keeps its own index, starts at a different value and
-advances it once per insertion, so producers and dispatchers do not share a
-counter. Dead seats are excluded; among live seats it skips parked
+The executor appends newly ready, idle-woken and quota-released tasks to a
+lane chosen by the inserting thread's rotating start index and the parked
+mask; a task notified during its own poll re-enters its polling dispatcher's
+lane instead (below). Each thread keeps its own index, starts at a different
+value and advances it once per insertion, so producers and dispatchers do
+not share a counter. Dead seats are excluded; among live seats it skips parked
 dispatchers unless all are parked. The choice loads each parked-mask word
 once and scans its bits from the start index, in the same cyclic order as a
 lane-by-lane scan; a runtime with a single lane uses it without a scan. A
@@ -1111,8 +1112,8 @@ multi-entry victim keeps at least one entry. Inserting ready work onto a
 lane whose dispatcher is awake wakes one parked dispatcher, if available,
 even for a lone entry. An insertion that claims a parked lane wakes only
 that lane's dispatcher. This applies to spawns, idle task wakes and quota
-transfers or releases. A task's own end-of-poll requeue wakes nobody; the
-finishing dispatcher continues searching. Work remaining after a pop or
+transfers or releases. An end-of-poll requeue wakes nobody; the finishing
+dispatcher continues with its lane. Work remaining after a pop or
 steal wakes one parked dispatcher, if available. Taking a lane's last entry
 wakes nobody. These wake decisions use the searching state described for
 `max_searching_dispatchers` below; a wake first checks whether any live
@@ -1121,11 +1122,60 @@ depth under its lane lock for the park rescan, the steal pre-check and the
 remaining-work check, which only test whether a lane is empty: a change
 between empty and non-empty is a SeqCst store, a change that stays
 non-empty is a Relaxed store that keeps the metric exact, and an unchanged
-depth is not stored. There is no per-task lane affinity or
-global scope rotation. A larger ready scope can receive proportionally more
-polls, and scope readiness order can change across lanes. Each task still
-polls exclusively, and ready tasks make progress if every poll returns;
-there is no time bound.
+depth is not stored.
+
+A task that was notified during its own poll re-enters the lane of the
+dispatcher that polled it, at the tail. This covers a task that woke itself
+(`yield_now`, an exhausted cooperative budget) and one that anything else
+woke while it was being polled: the notification is one bit of the task's
+state, and the executor neither records nor tests who set it. The rule
+applies only when the poll returned pending and its thread held its
+dispatcher seat through the whole poll. The rotating choice above still
+places the requeue of a poll during which `try_block_in_place` handed the
+seat off (even if the thread got the same seat back; a refused handoff keeps
+the seat), of a turn that polled nothing because the task waits for CPU
+admission, and of a dispatcher whose seat is being asked for by a restoring
+or resuming thread. Every other insertion is unchanged: spawns, wakes of
+idle tasks, quota transfers and releases, and completion wakes use the
+rotating choice whichever dispatcher's thread makes them.
+
+The requeued entry is an ordinary lane entry. It goes to the tail, behind
+everything already queued on that lane; it is not kept aside for its
+dispatcher, and another dispatcher can steal it under the usual bounds as
+soon as the insertion's lane lock is released. If an older entry was
+waiting on the lane, the dispatcher takes that front entry as its next turn
+under the same hold of the lane lock, with the kick acknowledgement, depth
+publication and remaining-work wake of an own-lane search; the requeued
+entry is never the one taken. On an empty lane it takes nothing, and its
+next search finds the requeued entry unless another dispatcher stole it
+first. Every turn starts with a fresh cooperative budget. The placement is
+fixed by a compile-time constant (`OWN_LANE_REQUEUE`); no load, queue
+length, time or poll count selects it. A task records no lane: after a
+steal, its next requeue goes to the lane of the dispatcher that polled it
+then.
+
+Consequences for ordering. Within a lane the order stays FIFO, so a task
+that keeps yielding is polled once per pass over its dispatcher's lane, and
+every entry on a lane is reached while that dispatcher's polls return.
+Across lanes, tasks that keep yielding stay with the dispatcher that polls
+them and move only when another dispatcher steals them, which a dispatcher
+does only when its own lane is empty. While every dispatcher's own lane
+holds work at each search:
+
+- entries queued behind a dispatcher that is inside a long poll wait until
+  that poll returns or some other lane runs empty. A dispatcher that leaves
+  entries behind wakes a parked dispatcher as before, so this needs every
+  other dispatcher to be busy with its own lane;
+- shared overflow is not searched, so cancellation cleanup of an idle task
+  (`AsyncJob::abort`, a scope close) waits until some dispatcher's lane
+  runs empty. With one worker this was already so.
+
+The rotating requeue made both waits short by emptying lanes at random.
+Tasks that yield a bounded number of times do not keep a lane occupied and
+are not affected. There is no global scope rotation. A larger ready scope
+can receive proportionally more polls, and scope readiness order can change
+across lanes. Each task still polls exclusively, and ready tasks make
+progress if every poll returns; there is no time bound.
 
 A binding scope keeps quota-blocked entries in FIFO order. Each release passes
 its permit directly to the oldest blocked entry, which reenters a lane without
@@ -1235,7 +1285,7 @@ finds the task idle it inserts the queue entry; if the task is running it
 leaves the notified bit for the poll's finish; a queued or complete task is
 unchanged. A pending poll's finish is also one word operation without the
 slot mutex: it goes idle, or, when notified during the poll, requeues the
-task through the usual lane choice. Completion and cancellation cleanup
+task by the placement rule above. Completion and cancellation cleanup
 take the slot mutex, where the generation, admission and abort state live;
 abort sets the slot's cleanup flag under that mutex and then marks the word
 like a wake, so a running task is requeued by its finish and the next
@@ -1285,7 +1335,7 @@ ends the loan with its one word operation; the final turn takes the slot's
 reference over for publication, so no dispatcher keeps a reference after its
 turn. The poll's `Context` carries a waker borrowed from that reference; only
 a clone that user code keeps holds its own reference count. Requeues still go
-through the usual lane choice, and queue entries remain slot indices.
+through the lane placement rule, and queue entries remain slot indices.
 The task allocation is a pinned `sys` cell (`Pin<Arc<TaskCell>>`) that
 stores the user future inline next to the runtime's bookkeeping; its atomic
 claim serializes polling and in-place destruction, and its pinned-only API is
@@ -1637,8 +1687,8 @@ saturation, cross-scope progress, FIFO quota transfer, cancellation, shutdown,
 slot reuse and cleanup; a same-source Loom model checks poll-slot acquire/release transitions.
 
 The same-source Loom models cover lane park/push, stealing versus owner pop
-and push, search admission versus a denied dispatcher's park, quota gating
-and transfer, abort and close versus spawn, lane depth publication
+and push, an own-lane requeue and its take versus a thief, search admission
+versus a denied dispatcher's park, quota gating and transfer, abort and close versus spawn, lane depth publication
 (pushes and pops, including Relaxed updates of a non-empty lane, versus a
 dispatcher's steal pre-check and park rescan), and the permit-free dispatch
 start: a turn begun on the task word racing an abort and an external wake,

@@ -177,7 +177,8 @@ where
     Placement::Disabled => Err(BlockInPlaceError::new(BlockInPlaceErrorKind::Disabled, f)),
     Placement::HandOff(shared, turn, context) => match shared.hand_off(turn) {
       Err(turn) => {
-        restore_phase(turn);
+        // The refused turn kept its permit and its seat.
+        restore_phase(turn, false);
         Err(BlockInPlaceError::new(BlockInPlaceErrorKind::Full, f))
       }
       Ok(loan) => {
@@ -210,7 +211,7 @@ impl Drop for Restore {
   fn drop(&mut self) {
     if let Some(loan) = self.loan.take() {
       let turn = self.shared.restore(loan, self.context);
-      restore_phase(turn);
+      restore_phase(turn, true);
       resume_busy();
     }
   }
@@ -233,6 +234,10 @@ struct DispatcherThread {
   shared: Arc<Shared>,
   context: AsyncThreadContext,
   phase: Phase,
+  /// Whether the entered turn released its permit to a handoff and took one
+  /// back. Set by the restoration, cleared when a turn is entered and read
+  /// only when the dispatch loop takes the turn back.
+  loaned: bool,
   #[cfg(not(loom))]
   busy_since: Option<Instant>,
   #[cfg(not(loom))]
@@ -293,10 +298,14 @@ fn take_turn() -> Placement {
     .unwrap_or(Placement::Inline)
 }
 
-fn restore_phase(turn: DispatchTurn) {
+/// Puts a turn back after a handoff attempt. `loaned` tells whether the
+/// permit was released in between: a restoration returns a new turn, which
+/// may hold another seat, while a refused loan returns the unchanged one.
+fn restore_phase(turn: DispatchTurn, loaned: bool) {
   let _ = DISPATCHER.try_with(|slot| {
     if let Some(thread) = slot.borrow_mut().as_mut() {
       thread.phase = Phase::Dispatching(turn);
+      thread.loaned |= loaned;
     }
   });
 }
@@ -339,6 +348,7 @@ pub(super) fn enter_turn(turn: DispatchTurn) {
   let _ = DISPATCHER.try_with(|slot| {
     if let Some(thread) = slot.borrow_mut().as_mut() {
       thread.phase = Phase::Dispatching(turn);
+      thread.loaned = false;
       #[cfg(not(loom))]
       if thread.busy_since.is_none() {
         thread.busy_since = Some(Instant::now());
@@ -349,8 +359,10 @@ pub(super) fn enter_turn(turn: DispatchTurn) {
 }
 
 /// Ends this thread's owned turn and returns its permit for release under
-/// the scheduler lock.
-pub(super) fn leave_turn() -> Option<DispatchTurn> {
+/// the scheduler lock, with whether the thread held that permit, and so its
+/// seat, without interruption since [`enter_turn`]: false once a handoff
+/// released it during the turn, even when the restoration took the same seat.
+pub(super) fn leave_turn() -> Option<(DispatchTurn, bool)> {
   DISPATCHER
     .try_with(|slot| {
       let mut slot = slot.borrow_mut();
@@ -364,7 +376,7 @@ pub(super) fn leave_turn() -> Option<DispatchTurn> {
               thread.publish_busy(true);
             }
           }
-          Some(turn)
+          Some((turn, !thread.loaned))
         }
         other => {
           debug_assert!(matches!(other, Phase::Idle));
@@ -390,6 +402,7 @@ impl DispatcherGuard {
           shared: Arc::clone(shared),
           context,
           phase: Phase::Idle,
+          loaned: false,
           #[cfg(not(loom))]
           busy_since: None,
           #[cfg(not(loom))]

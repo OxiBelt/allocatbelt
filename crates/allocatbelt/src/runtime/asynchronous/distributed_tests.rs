@@ -162,6 +162,9 @@ fn selected(shared: &Arc<Shared>, seat: usize) -> Option<Selected> {
     }
   }
 }
+#[path = "distributed_requeue_tests.rs"]
+mod requeue;
+
 fn run(shared: &Arc<Shared>, work: Selected) {
   let d = engine(shared);
   match work {
@@ -177,12 +180,15 @@ fn run(shared: &Arc<Shared>, work: Selected) {
         &mut None,
       );
       drop(permit);
-      d.finish_poll(
+      // The fixture's dispatcher holds no seat: the rotating placement.
+      let taken = d.finish_poll(
         shared,
         reference,
         lease,
         matches!(result, PollResult::Ready),
+        None,
       );
+      assert_eq!(taken, None);
     }
   }
 }
@@ -3767,7 +3773,7 @@ fn a_turn_borrows_the_slot_owner_without_a_reference_count() {
   assert_eq!(count(&owner), idle);
   waker.wake_by_ref();
   assert_eq!(owner.poll_word().flags(), (true, true));
-  d.finish_poll(&shared, reference, lease, false);
+  assert_eq!(d.finish_poll(&shared, reference, lease, false, None), None);
   // The pending finish requeued the woken task; the slot still owns it.
   assert!(owner.poll_word().is_queued());
   assert_eq!(count(&owner), idle);
