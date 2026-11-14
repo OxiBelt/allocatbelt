@@ -182,6 +182,9 @@ fn kernels_touch_only_the_64_entries() {
   let mut places = vec![0, GRANULE - 64];
   places.extend((1..64).map(|k| GRANULE - 64 - k));
   places.extend(1..64);
+  // Across a 4 KiB boundary inside the granule, where the system's pages
+  // are smaller than it: a kernel may treat such a list differently.
+  places.extend((1..64).map(|k| 4096 - k));
   for at in places {
     let list = guarded.list(at);
     for round in 0..64 {
