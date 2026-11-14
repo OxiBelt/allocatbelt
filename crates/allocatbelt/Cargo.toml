@@ -72,6 +72,11 @@ experimental-aarch64-sve2 = ["experimental-aarch64-sve"]
 # use it. Stable naked assembly enables V locally on riscv64. Nothing is
 # compiled on other architectures. Not measured, never default.
 experimental-riscv-rvv = []
+# Experimental: hand-written assembly for two leaf operations of the cached
+# allocation paths (the thread cache's block-list membership test and the
+# unpacking of a claimed bitmap word), one implementation per ISA level,
+# chosen at compile time. The portable loops stay the default.
+experimental-asm-kernels = []
 
 # The tests of an optional part run only when it is compiled in.
 [[test]]

@@ -57,27 +57,10 @@ struct CachedBlocks {
 }
 
 impl CachedBlocks {
-  /// Whether block `i` of the word is in the list.
-  ///
-  /// Compares all 64 entries with `i` and keeps the matches among the first
-  /// `len`; the entries past `len` are stale and do not count. Without an
-  /// early exit and with byte-wide lanes, this lowers to two 32-byte
-  /// compares on x86-64-v3 and four 16-byte compares on AArch64, where a
-  /// search of the live entries took up to 64 compare-and-branch steps on
-  /// every free into the claimed word. Every target runs this code; a base
-  /// RV64GC core, without vector instructions, runs it as a loop of 64
-  /// scalar steps.
-  #[inline]
+  /// Whether block `i` of the word is in the list (see [`list_holds`]).
+  #[cfg(test)]
   fn holds(&self, i: u32) -> bool {
-    // A block number is below 64, so it fits the entries' byte.
-    debug_assert!(i < 64);
-    let i = i as u8;
-    let len = self.len.get();
-    let mut hit = 0u8;
-    for (b, k) in self.blocks.iter().zip(&POSITIONS) {
-      hit |= u8::from(b.get() == i) & u8::from(*k < len);
-    }
-    hit != 0
+    list_holds(&self.blocks, self.len.get(), i as u8)
   }
 
   /// The listed blocks as a mask of the word, emptying the list.
@@ -87,8 +70,49 @@ impl CachedBlocks {
   }
 }
 
+/// Whether block number `i` (below 64) is among the first `len` entries of
+/// `blocks`: the portable form of [`Os::list_holds`], which every kernel
+/// must match.
+///
+/// Compares all 64 entries with `i` and keeps the matches among the first
+/// `len`; the entries past `len` are stale and do not count. Without an
+/// early exit and with byte-wide lanes, this lowers to two 32-byte
+/// compares on x86-64-v3 and four 16-byte compares on AArch64, where a
+/// search of the live entries took up to 64 compare-and-branch steps on
+/// every free into the claimed word. A base RV64GC core, without vector
+/// instructions, runs it as a loop of 64 scalar steps.
+#[must_use]
+#[inline]
+pub fn list_holds(blocks: &[Cell<u8>; 64], len: u8, i: u8) -> bool {
+  // A block number is below 64, so it fits the entries' byte.
+  debug_assert!(i < 64);
+  let mut hit = 0u8;
+  for (b, k) in blocks.iter().zip(&POSITIONS) {
+    hit |= u8::from(b.get() == i) & u8::from(*k < len);
+  }
+  hit != 0
+}
+
+/// Writes the numbers of the set bits of `bits` to `blocks`, highest
+/// first, and returns how many there are: the portable form of
+/// [`Os::unpack_blocks`]. A kernel must write the same first entries and
+/// return the same count; it may leave any value in the entries past the
+/// count, which no reader looks at.
+#[inline]
+pub fn unpack_blocks(bits: u64, blocks: &[Cell<u8>; 64]) -> u8 {
+  let mut rest = bits;
+  let mut n = 0;
+  while rest != 0 {
+    let i = 63 - rest.leading_zeros();
+    blocks[n].set(i as u8);
+    n += 1;
+    rest &= !(1 << i);
+  }
+  n as u8
+}
+
 /// `POSITIONS[k] == k`: the positions of a list's entries, as bytes, so a
-/// compare with its length stays byte-wide (see [`CachedBlocks::holds`]).
+/// compare with its length stays byte-wide (see [`list_holds`]).
 const POSITIONS: [u8; 64] = {
   let mut t = [0; 64];
   let mut k = 0;
@@ -373,15 +397,7 @@ impl<O: Os> Heap<O> {
       .set((page << PAGE_SHIFT) + w as usize * 64 * class::size(c));
     // Highest block first, so an unrandomized cache hands them out from
     // the lowest.
-    let mut rest = bits;
-    let mut n = 0;
-    while rest != 0 {
-      let i = 63 - rest.leading_zeros();
-      cw.blocks[n].set(i as u8);
-      n += 1;
-      rest &= !(1 << i);
-    }
-    cw.len.set(n as u8);
+    cw.len.set(self.os.unpack_blocks(bits, &cw.blocks));
     self.tick(tc);
     Self::pop(tc, c)
   }
@@ -550,7 +566,9 @@ impl<O: Os> Heap<O> {
     let cw = &tc.words[c];
     // A block the thread claimed but has not handed out cannot be freed.
     if cw.base.get() == (page << PAGE_SHIFT) + w * 64 * class::size(c)
-      && cw.holds(bit.trailing_zeros())
+      && self
+        .os
+        .list_holds(&cw.blocks, cw.len.get(), bit.trailing_zeros() as u8)
     {
       self.os.fatal(DOUBLE_FREE);
     }

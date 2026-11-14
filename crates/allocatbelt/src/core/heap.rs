@@ -89,6 +89,7 @@
 //! such memory, so a page run or segment run claimed without dirty pages is
 //! reported as zeroed ([`Block::zeroed`]) and `calloc` can skip the memset.
 
+use core::cell::Cell;
 use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::core::bits::{pick_bit, run_mask};
@@ -109,7 +110,7 @@ mod observe;
 mod purge;
 mod reclaim;
 
-pub use cache::ThreadCache;
+pub use cache::{ThreadCache, list_holds, unpack_blocks};
 pub use maint::{DIRTY_HARD_LIMIT_PAGES, MaintenanceStats, Task};
 pub use observe::{CacheStats, HeapUsage, SearchStats};
 use observe::{SEARCH_STATS, SearchStat};
@@ -228,6 +229,25 @@ pub trait Os: Sync {
   /// metadata. The default returns `None`.
   fn age_kernel(&self) -> Option<AgeKernel> {
     None
+  }
+  /// Whether block number `i` (below 64) is among the first `len` entries
+  /// of a thread cache's block list. Asked on every free into the word the
+  /// thread has claimed. An implementation must return exactly what
+  /// [`list_holds`] returns, and only reads the 64 entries, which belong
+  /// to the calling thread. The default is that portable loop.
+  #[inline]
+  fn list_holds(&self, blocks: &[Cell<u8>; 64], len: u8, i: u8) -> bool {
+    list_holds(blocks, len, i)
+  }
+  /// Unpacks the set bits of a claimed bitmap word into a thread cache's
+  /// block list, highest block first, and returns their count. Asked once
+  /// per refill. An implementation must write the same first entries and
+  /// return the same count as [`unpack_blocks`], writes only the 64
+  /// entries, and keeps nothing of `bits`. The default is that portable
+  /// loop.
+  #[inline]
+  fn unpack_blocks(&self, bits: u64, blocks: &[Cell<u8>; 64]) -> u8 {
+    unpack_blocks(bits, blocks)
   }
   /// Reports heap corruption or misuse (invalid or double free). Must not
   /// return.

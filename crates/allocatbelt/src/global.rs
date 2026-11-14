@@ -183,6 +183,18 @@ impl Os for LinuxOs {
     crate::sys::futex_wake(word);
   }
 
+  #[cfg(feature = "experimental-asm-kernels")]
+  #[inline(always)]
+  fn list_holds(&self, blocks: &[core::cell::Cell<u8>; 64], len: u8, i: u8) -> bool {
+    crate::arch::asm_kernels::list_holds(blocks, len, i)
+  }
+
+  #[cfg(feature = "experimental-asm-kernels")]
+  #[inline(always)]
+  fn unpack_blocks(&self, bits: u64, blocks: &[core::cell::Cell<u8>; 64]) -> u8 {
+    crate::arch::asm_kernels::unpack_blocks(bits, blocks)
+  }
+
   fn now_ms(&self) -> u64 {
     // `Instant::now` reads the vDSO clock and does not allocate.
     u64::try_from(self.arena().start.elapsed().as_millis()).unwrap_or(u64::MAX)

@@ -47,6 +47,16 @@ mod allocation_free;
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 #[cfg(all(
+  feature = "experimental-asm-kernels",
+  any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+  )
+))]
+#[expect(unsafe_code, reason = "inline assembly kernels")]
+pub(crate) mod asm_kernels;
+#[cfg(all(
   test,
   any(
     all(target_arch = "aarch64", feature = "experimental-aarch64-sve"),

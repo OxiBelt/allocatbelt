@@ -12,6 +12,9 @@ publish.workspace = true
 # resource feedback with `runtime` either way; fixed-policy runs turn the
 # default service off explicitly.
 resource-feedback = ["allocatbelt/resource-feedback"]
+# Builds allocatbelt with its experimental assembly kernels, for before and
+# after comparisons of the same benchmarks.
+asm-kernels = ["allocatbelt/experimental-asm-kernels"]
 
 [dependencies]
 allocatbelt = { workspace = true, features = ["io-uring", "runtime"] }

@@ -50,7 +50,7 @@ mod sync;
 pub use heap::{
   AgeKernel, Block, CacheStats, DIRTY_HARD_LIMIT_PAGES, Heap, HeapUsage, MAX_RETENTION,
   MaintenanceStats, Os, PURGE_BATCH, Purger, ReclaimStatus, ReclaimTargets, ReclaimTargetsError,
-  Retention, SearchStats, SyncPurger, Task, ThreadCache, aged_pages,
+  Retention, SearchStats, SyncPurger, Task, ThreadCache, aged_pages, list_holds, unpack_blocks,
 };
 
 /// log2 of [`PAGE_SIZE`].
