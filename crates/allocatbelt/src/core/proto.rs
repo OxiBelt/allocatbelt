@@ -120,26 +120,46 @@ pub fn nonzero_words(words: &[AtomicU64]) -> u64 {
   mask
 }
 
-/// The non-zero word among `words` that `r` picks by rank: `nonzero` marks
-/// the non-zero words (see [`nonzero_words`]), and `r`, read as a fraction
-/// of 2^32, picks the rank among them (`r = 0` takes the first). There is
-/// no stored summary of the words: the caller reads them for every pick.
-fn pick_word(words: &[AtomicU64], nonzero: u64, r: u32) -> Option<(usize, &AtomicU64)> {
-  if nonzero == 0 {
+/// The longest bitmap for which a pick counts and walks the words
+/// themselves; longer ones go through a mask of their non-zero words
+/// ([`nonzero_words`]). Measured: up to eight words the two short loops
+/// take less time than the rank selection in a mask does on its own.
+pub const WALK_WORDS: usize = 8;
+
+/// The non-zero word among `words` that `r` picks by rank: the non-zero
+/// words are counted, and `r`, read as a fraction of 2^32, picks the rank
+/// among them (`r = 0` takes the first). `nonzero`, when given, is the
+/// mask of the non-zero words ([`nonzero_words`]) the caller just read
+/// from them; without it the words are read one by one. Either way there
+/// is no stored summary of the words: they are read for every pick.
+fn pick_word(words: &[AtomicU64], nonzero: Option<u64>, r: u32) -> Option<(usize, &AtomicU64)> {
+  if let Some(nonzero) = nonzero {
+    if nonzero == 0 {
+      return None;
+    }
+    let w = pick_bit(nonzero, r) as usize;
+    return Some((w, &words[w]));
+  }
+  let k = words.iter().filter(|w| w.load(Relaxed) != 0).count() as u64;
+  if k == 0 {
     return None;
   }
-  let w = pick_bit(nonzero, r) as usize;
-  Some((w, &words[w]))
+  let rank = (u64::from(r) * k) >> 32;
+  words
+    .iter()
+    .enumerate()
+    .filter(|(_, w)| w.load(Relaxed) != 0)
+    .nth(rank as usize)
 }
 
 /// Claims every free block of one bitmap word of a page, picked among its
-/// non-zero `words` by rank (see [`pick_word`]; `nonzero` is their
-/// [`nonzero_words`]), and subtracts them from the page's free-block counter
-/// `count`. Returns the word index and the claimed bits, or `None` if every
-/// word is zero. Caller holds the lock of the shard that owns the page.
+/// non-zero `words` by rank (see [`pick_word`], also for `nonzero`), and
+/// subtracts them from the page's free-block counter `count`. Returns the
+/// word index and the claimed bits, or `None` if every word is zero.
+/// Caller holds the lock of the shard that owns the page.
 pub(crate) fn claim_word(
   words: &[AtomicU64],
-  nonzero: u64,
+  nonzero: Option<u64>,
   count: &AtomicU64,
   r: u32,
 ) -> Option<(u32, u64)> {
@@ -156,7 +176,7 @@ pub(crate) fn claim_word(
 /// the shard that owns the page.
 pub(crate) fn claim_block(
   words: &[AtomicU64],
-  nonzero: u64,
+  nonzero: Option<u64>,
   count: &AtomicU64,
   r: u32,
 ) -> Option<(u32, u64)> {
@@ -381,9 +401,14 @@ mod loom_tests {
     fn claim(&self, r: u32, one: bool) -> Option<(u32, u64)> {
       let _g = self.lock.lock(&self.futex);
       if one {
-        claim_block(&self.words, nonzero_words(&self.words), &self.count, r)
+        claim_block(
+          &self.words,
+          Some(nonzero_words(&self.words)),
+          &self.count,
+          r,
+        )
       } else {
-        claim_word(&self.words, nonzero_words(&self.words), &self.count, r)
+        claim_word(&self.words, None, &self.count, r)
       }
     }
 

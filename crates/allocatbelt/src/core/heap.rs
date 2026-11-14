@@ -875,7 +875,8 @@ impl<O: Os> Heap<O> {
       pm.since().store(0, Relaxed);
     }
     let words = &pm.bitmaps()[..class::bitmap_words(c)];
-    let nonzero = self.os.nonzero_words(words);
+    // Short bitmaps are walked; long ones are picked from a mask.
+    let nonzero = (words.len() > proto::WALK_WORDS).then(|| self.os.nonzero_words(words));
     let claimed = if one {
       proto::claim_block(words, nonzero, pm.free(), sh.random())
     } else {
