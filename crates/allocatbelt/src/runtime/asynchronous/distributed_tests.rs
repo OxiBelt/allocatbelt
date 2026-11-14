@@ -2764,6 +2764,46 @@ fn handoff_helper_parks_instead_of_reacquiring_a_resuming_workers_seat_case() {
   assert_eq!(shared.turn_counts(), (0, 0, 0, 0));
 }
 
+// A worker that yielded its seat holds no lane when a close kicks the
+// lanes. The dispatchers that hold them take the kicks and leave; the worker
+// then resumes onto a lane without a kick and must still see the close.
+#[test]
+fn a_worker_that_resumes_after_the_close_kick_leaves_instead_of_parking() {
+  each_spin_configuration(
+    a_worker_that_resumes_after_the_close_kick_leaves_instead_of_parking_case,
+  );
+}
+
+fn a_worker_that_resumes_after_the_close_kick_leaves_instead_of_parking_case() {
+  let (shared, _root) = shared_with_handoffs(config(2, 4), 2);
+  let d = engine(&shared);
+  let (other, helper, lease) = helper_restored_a_yielded_worker_seat(d);
+  shared.close(false);
+  // The helper and the other worker leave, as `serve` does on the kick.
+  {
+    let mut seats = d.seats();
+    seats.end_turn(helper);
+    seats.retire_helper(lease).unwrap();
+    seats.end_turn(other);
+    d.update_yield(&seats);
+  }
+  for seat in 0..2 {
+    let _ = d.lane(seat).take_recheck();
+  }
+  let worker = {
+    let shared = Arc::clone(&shared);
+    std::thread::spawn(move || {
+      run_dispatcher(&shared, worker_context(0), || {
+        let d = engine(&shared);
+        let turn = d.resume_worker(&shared, worker_context(0));
+        d.serve(&shared, worker_context(0), turn, false);
+      });
+    })
+  };
+  join_worker(worker);
+  assert_eq!(shared.turn_counts(), (0, 0, 0, 0));
+}
+
 #[test]
 fn handoff_serving_helper_yields_to_a_resuming_worker_without_other_yield_reasons() {
   each_spin_configuration(
