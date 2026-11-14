@@ -2,14 +2,17 @@
 //! BMI1, BMI2, LZCNT, POPCNT). Self-contained: no `crate::` paths, so the
 //! benchmark crate can include this file too.
 //!
-//! Both kernels stay at 256 bits (EVEX forms on ymm16 to ymm18, opmasks k1
+//! The kernels stay at 256 bits (EVEX forms on ymm16 to ymm20, opmasks k1
 //! and k2). No instruction touches a zmm register, so a build at this level
 //! takes no 512-bit frequency licence on the Intel cores that have one, and
 //! the registers above 15 are outside the SSE/AVX transition state, so the
 //! callers need no `vzeroupper` (which does not modify zmm16 to zmm31).
 //! Measured on Zen 5, the 512-bit forms save two instructions and under
-//! half a cycle in `list_holds`, and about four cycles of a refill in
-//! `unpack_blocks` (`vpcompressd` on four 16-entry chunks).
+//! half a cycle in `list_holds`, about four cycles of a refill in
+//! `unpack_blocks` (`vpcompressd` on four 16-entry chunks), one or two
+//! cycles of a claim from a page of 16 to 64 bitmap words in
+//! `nonzero_words` (none below) and about five cycles of a 64-entry
+//! `pack_blocks` (one and a half of a 32-entry one).
 
 use core::arch::asm;
 use core::cell::Cell;
@@ -30,8 +33,8 @@ compile_error!("the x86-64-v4 kernels need AVX-512 F, BW, DQ and VL, BMI2, LZCNT
   dead_code,
   reason = "read by the allocator's tests and by the benchmark that includes this file"
 )]
-pub(crate) const NAME: &str =
-  "x86_64_v4 (256-bit EVEX: vpcmpeqb+kunpckdq+bzhi; vpmovm2b+pext, lzcnt loop when sparse)";
+pub(crate) const NAME: &str = "x86_64_v4 (256-bit EVEX: vpcmpeqb+kunpckdq+bzhi; vpmovm2b+pext, lzcnt loop \
+   when sparse; vpcmpneqq+kmovb, cmp+adc below 8 words; vpmovzxbq+vprolvq)";
 
 /// Whether block number `i` is among the first `len` entries of `blocks`.
 ///
@@ -241,22 +244,218 @@ pub(crate) fn unpack_blocks(bits: u64, blocks: &[Cell<u8>; 64]) -> u8 {
   n as u8
 }
 
-/// PLACEHOLDER (portable loop), to be replaced by assembly: bit `i` is set
-/// iff `words[i]` is non-zero. `words.len()` is at most 64.
+/// Which of `words` (at most 64) are non-zero: bit `i` is set iff
+/// `words[i]` is. The caller holds the lock under which the words change,
+/// so they are read with plain loads.
+///
+/// Eight words or more are compared four at a time with a zero register
+/// (`vpcmpneqq` into an opmask, which has one bit per 64-bit word and
+/// zeros above the four of a ymm compare); `kmovb` moves the four bits to a
+/// general register and `shlx` shifts them to the index of the vector's
+/// first word. The two vectors that end at the end of the slice go first,
+/// then pairs of vectors from the start, as long as a pair starts more
+/// than eight words before the end. When the length is not a multiple of
+/// eight the last pair overlaps the two end vectors, which sets the same
+/// bits twice. No load is masked: every vector lies inside the slice. (A
+/// masked load is not needed for the tail, and one whose masked-off words
+/// lie on a page that is not present takes about 550 cycles on Zen 5 every
+/// time, since the suppressed fault never brings the page in.) A page's
+/// bitmap starts 32 bytes into a cache line or at the start of one (its
+/// segment's header is 320 bytes and a page's metadata 544, of which 32
+/// come first), so the pairs from the start never straddle a line there;
+/// 64-byte loads would on every other page.
+///
+/// Fewer than eight words take a scalar loop from the last word down:
+/// `cmp` of a zero register with the word borrows exactly when the word is
+/// non-zero, and `adc` shifts the carry into the mask. From the address to
+/// the mask this is about six cycles and one more per word on Zen 5,
+/// where a load, a compare into an opmask and `kmovb` take thirteen. In
+/// the benchmark's claim loop the scalar loop is four cycles ahead of a
+/// masked vector at two words and level with it at four, and one or two
+/// behind the vectors at eight.
 #[inline(always)]
 pub(crate) fn nonzero_words(words: &[core::sync::atomic::AtomicU64]) -> u64 {
-  let mut mask = 0;
-  for (i, w) in words.iter().enumerate() {
-    mask |= u64::from(w.load(core::sync::atomic::Ordering::Relaxed) != 0) << i;
+  let mask: u64;
+  // SAFETY: `words` borrows `n = words.len()` initialized 64-bit words
+  // (`AtomicU64` has the layout of `u64`), and every load is inside them,
+  // whatever `n` is (past 64 words only the mask is meaningless). With
+  // `n >= 8`, the two 32-byte loads at `8 * n - 64` and `8 * n - 32` bytes
+  // read words `n - 8..n`, and the loop runs while `i < n - 8`, so its
+  // loads at words `i` and `i + 4` read words `i..i + 8`, which end before
+  // `n`. With `n < 8`, the scalar loop reads the 8 bytes of each of words
+  // `n - 1` down to 0, and none when `n` is 0. Nothing is written (the
+  // loads race with no store: the caller holds the lock under which these
+  // words change) and the stack is not used. The block clobbers `n`,
+  // `mask`, `i`, `j`, `t`, `u`, ymm16, k1, k2 and the flags, all declared
+  // (flags by default). Every build that compiles this file has the
+  // instructions (checked above).
+  unsafe {
+    asm!(
+      "xor {r:e}, {r:e}",
+      "cmp {n}, 8",
+      "jb 5f",
+      "vpxord xmm16, xmm16, xmm16",
+      // Words n - 8..n: bits n - 8..n - 4 from k1 and n - 4..n from k2.
+      "vpcmpneqq k1, ymm16, ymmword ptr [{p} + 8*{n} - 64]",
+      "vpcmpneqq k2, ymm16, ymmword ptr [{p} + 8*{n} - 32]",
+      "lea {j}, [{n} - 4]",
+      "sub {n}, 8",
+      "kmovb {t:e}, k1",
+      "kmovb {u:e}, k2",
+      "shlx {r}, {t}, {n}",
+      "shlx {u}, {u}, {j}",
+      "or {r}, {u}",
+      "test {n}, {n}",
+      "jz 7f",
+      // Words i..i + 8 while i < n - 8 (`n` holds n - 8, `j` is i + 4).
+      "xor {i:e}, {i:e}",
+      "mov {j:e}, 4",
+      "2:",
+      "vpcmpneqq k1, ymm16, ymmword ptr [{p} + 8*{i}]",
+      "vpcmpneqq k2, ymm16, ymmword ptr [{p} + 8*{j}]",
+      "kmovb {t:e}, k1",
+      "kmovb {u:e}, k2",
+      "shlx {t}, {t}, {i}",
+      "shlx {u}, {u}, {j}",
+      "or {t}, {u}",
+      "or {r}, {t}",
+      "add {i:e}, 8",
+      "add {j:e}, 8",
+      "cmp {i}, {n}",
+      "jb 2b",
+      "jmp 7f",
+      // Fewer than eight words, from the last down: 0 - word borrows iff
+      // the word is non-zero, and `adc` shifts the carry in from below.
+      "5:",
+      "test {n}, {n}",
+      "jz 7f",
+      "xor {i:e}, {i:e}",
+      "6:",
+      "cmp {i}, qword ptr [{p} + 8*{n} - 8]",
+      "adc {r:e}, {r:e}",
+      "sub {n:e}, 1",
+      "jnz 6b",
+      "7:",
+      p = in(reg) words.as_ptr(),
+      n = inout(reg) words.len() => _,
+      r = out(reg) mask,
+      i = out(reg) _,
+      j = out(reg) _,
+      t = out(reg) _,
+      u = out(reg) _,
+      out("ymm16") _,
+      out("k1") _,
+      out("k2") _,
+      options(pure, readonly, nostack),
+    );
   }
   mask
 }
 
-/// PLACEHOLDER (portable loop), to be replaced by assembly: the mask of the
-/// block numbers (each below 64) in the first `len` (at most 64) entries.
+/// The mask of the block numbers (each below 64) in the first `len` (at
+/// most 64) entries of `blocks`.
+///
+/// Four entries at a time: `vpmovzxbq` widens four bytes to the four
+/// 64-bit lanes of a ymm register and `vprolvq` rotates a one in each lane
+/// left by its entry (the count is taken modulo 64), which is the entry's
+/// bit. The one is the absolute value of minus one (`vpabsq`), which
+/// needs no shift. One group runs up from the first entry and one down
+/// from the last four, each into its own accumulator, until the two meet;
+/// when they overlap, or `len` is four and they are the same group, the
+/// same bits are set twice. No group reaches past `len`, so the stale
+/// entries are never loaded and nothing is masked. The four lanes are then
+/// folded into one. Fewer than four entries take a scalar loop (`shlx` of
+/// a one, whose count is also taken modulo 64).
+///
+/// This is the shape the compiler gives the portable loop, which it also
+/// vectorizes four entries at a time: on Zen 5 the widening and the
+/// variable shift or rotate share two execution ports, which bounds both
+/// forms at two entries per cycle. The kernel is two cycles ahead at 64
+/// entries (15.6 against 17.5), level at 32 and not measurably different
+/// below, except at exactly four entries, where its two groups are the
+/// same one and it is a cycle behind. Its branches that depend on `len`
+/// are fewer: the length tests, one per eight entries, and the scalar
+/// loop's.
 #[inline(always)]
 pub(crate) fn pack_blocks(blocks: &[Cell<u8>; 64], len: u8) -> u64 {
-  blocks[..usize::from(len)]
-    .iter()
-    .fold(0, |m, b| m | 1 << b.get())
+  // The portable loop's slice of the first `len` entries panics here too.
+  assert!(len <= 64, "more entries than a list holds");
+  let bits: u64;
+  // SAFETY: `blocks` borrows 64 initialized bytes (`Cell<u8>` has the
+  // layout of `u8`), and every load is inside its first `len` (at most 64,
+  // checked above). With `len >= 4`, the first two loads are of the 4
+  // bytes at 0 and the 4 at `len - 4`. From `i = 0` and `j = len - 4`, a
+  // further pass loads the 4 bytes at `i + 4` and the 4 at `j - 4`, and it
+  // runs only when `i + 4` is below `j`: then `i + 4` is at most `len - 5`
+  // and `j - 4` at least 1, so both groups of four are inside the entries
+  // again. With `len < 4`, the scalar loop loads the bytes `len - 1` down
+  // to 0, and none when `len` is 0. Nothing is written and the stack is
+  // not used. The block clobbers `len`, `bits`, `i`, `t`, ymm16 to ymm20
+  // and the flags, all declared (flags by default). Every build that
+  // compiles this file has the instructions (checked above).
+  unsafe {
+    asm!(
+      "xor {r:e}, {r:e}",
+      "cmp {len:e}, 4",
+      "jb 5f",
+      // A one in each 64-bit lane: the absolute value of minus one.
+      "vpternlogd ymm18, ymm18, ymm18, 0xff",
+      "vpabsq ymm18, ymm18",
+      // Entries 0..4 and len - 4..len start the two accumulators.
+      "vpmovzxbq ymm16, dword ptr [{p}]",
+      "vpmovzxbq ymm17, dword ptr [{p} + {len} - 4]",
+      "vprolvq ymm16, ymm18, ymm16",
+      "vprolvq ymm17, ymm18, ymm17",
+      // Entries i..i + 4 and j..j + 4 while i is below the j before (`len`
+      // holds j); `lea` keeps the flags of that compare.
+      "mov {i:e}, 4",
+      "sub {len:e}, 4",
+      "cmp {i:e}, {len:e}",
+      "lea {len:e}, [{len} - 4]",
+      "jae 3f",
+      "2:",
+      "vpmovzxbq ymm19, dword ptr [{p} + {i}]",
+      "vpmovzxbq ymm20, dword ptr [{p} + {len}]",
+      "vprolvq ymm19, ymm18, ymm19",
+      "vprolvq ymm20, ymm18, ymm20",
+      "vporq ymm16, ymm16, ymm19",
+      "vporq ymm17, ymm17, ymm20",
+      "add {i:e}, 4",
+      "cmp {i:e}, {len:e}",
+      "lea {len:e}, [{len} - 4]",
+      "jb 2b",
+      "3:",
+      "vporq ymm16, ymm16, ymm17",
+      "vextracti64x2 xmm17, ymm16, 1",
+      "vporq xmm16, xmm16, xmm17",
+      "vpshufd xmm17, xmm16, 0xee",
+      "vporq xmm16, xmm16, xmm17",
+      "vmovq {r}, xmm16",
+      "jmp 7f",
+      // Fewer than four entries, from the last down.
+      "5:",
+      "test {len:e}, {len:e}",
+      "jz 7f",
+      "mov {i:e}, 1",
+      "6:",
+      "movzx {t:e}, byte ptr [{p} + {len} - 1]",
+      "shlx {t}, {i}, {t}",
+      "or {r}, {t}",
+      "sub {len:e}, 1",
+      "jnz 6b",
+      "7:",
+      p = in(reg) blocks.as_ptr(),
+      len = inout(reg) u64::from(len) => _,
+      r = out(reg) bits,
+      i = out(reg) _,
+      t = out(reg) _,
+      out("ymm16") _,
+      out("ymm17") _,
+      out("ymm18") _,
+      out("ymm19") _,
+      out("ymm20") _,
+      options(pure, readonly, nostack),
+    );
+  }
+  bits
 }
