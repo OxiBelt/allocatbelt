@@ -1779,6 +1779,24 @@ impl Distributed {
     self.serve(shared, context, turn, false);
   }
 
+  /// Ends the turn of a dispatcher that may leave for good: the executor is
+  /// closed with nothing admitted, and no handoff or restore is outstanding.
+  /// Returns whether it did.
+  fn leave_if_closed(&self, shared: &Shared, seat: &mut SeatGuard<'_>) -> bool {
+    let empty = {
+      let state = self.admission(shared);
+      state.closed && state.admitted == 0
+    };
+    let mut seats = self.seats();
+    if !seats.may_exit(empty) {
+      return false;
+    }
+    seats.end_turn(seat.take());
+    self.update_yield(&seats);
+    self.seat_cv.notify_all();
+    true
+  }
+
   fn serve(
     &self,
     shared: &Arc<Shared>,
@@ -1798,6 +1816,11 @@ impl Distributed {
       "injected dispatcher unwind"
     );
     let mut random = context.physical_index as u64 + 1;
+    // A close kicks the lanes once, and the dispatcher that holds a lane
+    // then takes the kick with it. One that takes its seat afterwards (a
+    // worker resuming after it yielded, a late start) finds no kick on its
+    // lane, so it looks at the close itself before it may park.
+    let mut seated = true;
     loop {
       let yield_pending = if helper {
         self.helper_yield.load(Ordering::Acquire)
@@ -1818,8 +1841,15 @@ impl Distributed {
           self.seat_cv.notify_all();
           drop(seats);
           seat.turn = Some(self.resume_worker(shared, context));
+          seated = true;
           continue;
         }
+      }
+      if std::mem::take(&mut seated)
+        && self.closing.load(Ordering::Acquire)
+        && self.leave_if_closed(shared, &mut seat)
+      {
+        return;
       }
       let index = match self.search_or_park(shared, seat.seat(), &mut random, context) {
         Search::Got(index) => index,
@@ -1829,15 +1859,7 @@ impl Distributed {
           if !self.closing.load(Ordering::Acquire) && !self.worker_yield.load(Ordering::Acquire) {
             continue;
           }
-          let empty = {
-            let state = self.admission(shared);
-            state.closed && state.admitted == 0
-          };
-          let mut seats = self.seats();
-          if seats.may_exit(empty) {
-            seats.end_turn(seat.take());
-            self.update_yield(&seats);
-            self.seat_cv.notify_all();
+          if self.leave_if_closed(shared, &mut seat) {
             return;
           }
           continue;
