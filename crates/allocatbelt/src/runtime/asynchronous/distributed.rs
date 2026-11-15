@@ -791,7 +791,9 @@ impl Distributed {
   /// look, nothing else. When a lane holds entries and its dispatcher
   /// completed no turn in between, it makes one ordinary steal attempt and
   /// returns what it took; the caller dispatches it before it looks at
-  /// overflow. The look sends no wake and changes no setting.
+  /// overflow. The look itself sends no wake; cleanup entries that its
+  /// steal moves to overflow make the usual cleanup wake attempt. It
+  /// changes no setting.
   #[cfg(not(loom))]
   #[cold]
   fn parked_look(&self, shared: &Shared, seat: usize, random: &mut u64) -> Option<usize> {

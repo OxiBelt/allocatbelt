@@ -1214,8 +1214,9 @@ ordinary bounded steal attempt, in the usual pseudo-random victim order
 among such lanes only, and dispatches what it took before it looks at
 overflow. A look that takes nothing goes straight back to the timed park:
 it searches neither its own lane nor other lanes nor overflow. The look
-sends no wake, changes no setting, and reads no clock, task or thread; the
-task being polled on that lane is not touched.
+itself sends no wake; cleanup entries that its steal moves to overflow make
+the usual cleanup wake attempt. It changes no setting and reads no clock,
+task or thread; the task being polled on that lane is not touched.
 After two consecutive looks that find every lane empty, no dispatcher waits
 with the period. The next lane insertion then notifies one parked
 dispatcher, which searches like any notified dispatcher and holds the look
