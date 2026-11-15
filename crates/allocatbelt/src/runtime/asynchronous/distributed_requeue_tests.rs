@@ -19,6 +19,7 @@ fn yields(mut rounds: usize) -> impl Future<Output = ()> + Send + 'static {
 /// Polls `work` once with the task's own waker and ends the pending poll
 /// the way `serve` does for a dispatcher that held seat `own` through it.
 fn poll_pending(shared: &Arc<Shared>, work: Selected, own: Option<usize>) -> Option<usize> {
+  let own = own.map(|seat| OwnLane { seat, take: true });
   let Selected::Poll(reference, lease, permit) = work else {
     panic!("expected a poll");
   };
@@ -88,7 +89,13 @@ fn drain(shared: &Arc<Shared>, seat: usize, first: Option<usize>) {
         };
         drop(permit);
         let ready = matches!(result, PollResult::Ready);
-        taken = d.finish_poll(shared, reference, lease, ready, Some(seat));
+        taken = d.finish_poll(
+          shared,
+          reference,
+          lease,
+          ready,
+          Some(OwnLane { seat, take: true }),
+        );
       }
       cancel => run(shared, cancel),
     }
@@ -244,10 +251,11 @@ fn requeue_of_a_task_aborted_during_its_poll_goes_to_overflow() {
   drop(permit);
   // The abort notifies the running task and marks its entry for cleanup.
   shared.abort(reference);
-  assert_eq!(
-    d.finish_poll(&shared, reference, lease, false, Some(1)),
-    None
-  );
+  let own = Some(OwnLane {
+    seat: 1,
+    take: true,
+  });
+  assert_eq!(d.finish_poll(&shared, reference, lease, false, own), None);
   assert!(lane_entries(&shared, 1).is_empty());
   assert_eq!(lock(&d.overflow, 4).check(&d.links()), [index]);
   assert_eq!(d.own_requeues.load(Ordering::Relaxed), 0);
@@ -461,4 +469,303 @@ fn a_dispatcher_whose_seat_is_asked_for_requeues_by_the_rotating_choice() {
     .unwrap();
   finish(job).unwrap();
   shutdown(runtime, AsyncShutdown::Drain);
+}
+
+/// A task that is polled once, reports it, and then stays idle. Dropping it
+/// runs `dropped`.
+struct Idle<F: FnMut()> {
+  polled: Option<mpsc::Sender<()>>,
+  dropped: F,
+}
+
+impl<F: FnMut() + Unpin> Future for Idle<F> {
+  type Output = ();
+  fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+    if let Some(polled) = self.polled.take() {
+      polled.send(()).unwrap();
+    }
+    Poll::Pending
+  }
+}
+
+impl<F: FnMut()> Drop for Idle<F> {
+  fn drop(&mut self) {
+    (self.dropped)();
+  }
+}
+
+/// Puts `count` cancellation entries into shared overflow: tasks polled once
+/// by seat `seat`'s fixture dispatcher, gone idle, then aborted.
+fn overflow_entries(
+  shared: &Arc<Shared>,
+  root: ScopeRef,
+  seat: usize,
+  count: usize,
+) -> (Vec<AsyncJob<()>>, Vec<usize>) {
+  let d = engine(shared);
+  let mut jobs = Vec::new();
+  let mut indices = Vec::new();
+  for _ in 0..count {
+    jobs.push(spawn_on(shared, root, seat, std::future::pending()));
+    let index = lane_entries(shared, seat)[0];
+    let work = selected(shared, seat).unwrap();
+    assert_eq!(poll_pending(shared, work, None), None);
+    let generation = d.slot(index).protocol.generation();
+    shared.abort(TaskRef { index, generation });
+    indices.push(index);
+  }
+  assert_eq!(lock(&d.overflow, 4).check(&d.links()), indices);
+  (jobs, indices)
+}
+
+#[test]
+fn requeue_before_an_overflow_turn_takes_nothing() {
+  let (shared, root) = shared(config(2, 2));
+  let d = engine(&shared);
+  let jobs: Vec<_> = (0..2)
+    .map(|_| spawn_on(&shared, root, 1, yields(1)))
+    .collect();
+  let queued = lane_entries(&shared, 1);
+  let Some(Selected::Poll(reference, lease, permit)) = selected(&shared, 1) else {
+    panic!("expected a poll");
+  };
+  let permit = {
+    let waker = lease.waker();
+    lease
+      .task()
+      .poll(
+        &lease.key(),
+        &mut Context::from_waker(&waker),
+        permit,
+        &mut None,
+      )
+      .1
+  };
+  drop(permit);
+  let own = Some(OwnLane {
+    seat: 1,
+    take: false,
+  });
+  // The entry still goes to the polling lane; the waiting one stays for
+  // the search that follows the look at overflow.
+  assert_eq!(d.finish_poll(&shared, reference, lease, false, own), None);
+  assert_eq!(lane_entries(&shared, 1), [queued[1], queued[0]]);
+  assert_eq!(d.own_requeues.load(Ordering::Relaxed), 1);
+  drain(&shared, 1, None);
+  for job in jobs {
+    finish(job).unwrap();
+  }
+  shared.close(false);
+  check_distributed(&shared);
+}
+
+#[test]
+fn overflow_turn_takes_one_entry_and_leaves_the_own_lane_queued() {
+  let (shared, root) = shared(config(2, 4));
+  let d = engine(&shared);
+  // With nothing in overflow the turn is an ordinary search: no entry and
+  // no lane lock.
+  let locks = d.lane_locks.load(Ordering::Relaxed);
+  assert_eq!(d.overflow_turn(&shared, 1), None);
+  assert_eq!(d.lane_locks.load(Ordering::Relaxed), locks);
+  let (cancelled, overflow) = overflow_entries(&shared, root, 1, 2);
+  let job = spawn_on(&shared, root, 1, yields(0));
+  let queued = lane_entries(&shared, 1);
+  // This dispatcher holds an unacknowledged search kick, and another one
+  // is parked.
+  d.searching.kicked();
+  d.lane(1).search_kick = true;
+  park(&shared, 0);
+  let wakes = d.wake_searches.load(Ordering::Relaxed);
+  // One entry, the oldest, handed to the caller; never placed on a lane.
+  assert_eq!(d.overflow_turn(&shared, 1), Some(overflow[0]));
+  assert_eq!(lock(&d.overflow, 4).check(&d.links()), overflow[1..]);
+  assert_eq!(lane_entries(&shared, 1), queued);
+  assert!(lane_entries(&shared, 0).is_empty());
+  assert_eq!(d.overflow_turns.load(Ordering::Relaxed), 1);
+  // The kick is settled, and the own-lane entry left behind for this turn
+  // wakes the parked dispatcher, as after an own-lane pop.
+  assert!(!d.lane(1).search_kick);
+  assert_eq!(d.wake_searches.load(Ordering::Relaxed), wakes + 1);
+  assert!(d.lane(0).search_kick);
+  unpark(&shared, 0);
+  assert!(d.lane(0).take_recheck());
+  let _ = d.acknowledge_search_kick(0);
+  assert_eq!(d.searching.pending(), 0);
+  run(&shared, d.dispatch_decision(&shared, overflow[0]).unwrap());
+  drain(&shared, 1, None);
+  finish(job).unwrap();
+  for job in cancelled {
+    assert!(matches!(finish(job), Err(AsyncJoinError::Cancelled)));
+  }
+  shared.close(false);
+  check_distributed(&shared);
+}
+
+#[test]
+fn abort_of_an_idle_task_completes_while_every_dispatcher_keeps_yielding() {
+  for (workers, yielders) in [(1, 1), (2, 2), (4, 8)] {
+    let runtime = runtime(workers, yielders + 1);
+    let handle = runtime.handle();
+    let (polled, idle_polled) = mpsc::channel();
+    let idle = handle
+      .spawn(Idle {
+        polled: Some(polled),
+        dropped: || {},
+      })
+      .unwrap();
+    idle_polled.recv_timeout(Duration::from_secs(30)).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let busy: Vec<_> = (0..yielders)
+      .map(|_| {
+        let (stop, polls) = (Arc::clone(&stop), Arc::clone(&polls));
+        handle
+          .spawn(std::future::poll_fn(move |cx| {
+            polls.fetch_add(1, Ordering::Relaxed);
+            if stop.load(Ordering::Acquire) {
+              return Poll::Ready(());
+            }
+            cx.waker().wake_by_ref();
+            Poll::Pending
+          }))
+          .unwrap()
+      })
+      .collect();
+    wait(|| polls.load(Ordering::Relaxed) > 10_000);
+    // No lane runs empty from here on; the cleanup entry is in overflow.
+    idle.abort();
+    assert!(matches!(finish(idle), Err(AsyncJoinError::Cancelled)));
+    assert!(!stop.load(Ordering::Acquire));
+    stop.store(true, Ordering::Release);
+    for job in busy {
+      finish(job).unwrap();
+    }
+    shutdown(runtime, AsyncShutdown::Drain);
+  }
+}
+
+#[test]
+fn a_dispatcher_looks_at_overflow_first_once_per_fixed_number_of_turns() {
+  let runtime = runtime(1, 3);
+  let handle = runtime.handle();
+  let polls = Arc::new(AtomicUsize::new(0));
+  let drops = Arc::new(Mutex::new(Vec::new()));
+  let (polled, idle_polled) = mpsc::channel();
+  let idle: Vec<_> = (0..2)
+    .map(|_| {
+      let (polls, drops) = (Arc::clone(&polls), Arc::clone(&drops));
+      handle
+        .spawn(Idle {
+          polled: Some(polled.clone()),
+          dropped: move || drops.lock().unwrap().push(polls.load(Ordering::Relaxed)),
+        })
+        .unwrap()
+    })
+    .collect();
+  for _ in 0..2 {
+    idle_polled.recv_timeout(Duration::from_secs(30)).unwrap();
+  }
+  let aborts: Vec<_> = idle.iter().map(AsyncJob::abort_handle).collect();
+  let (counter, seen) = (Arc::clone(&polls), Arc::clone(&drops));
+  let mut aborts = Some(aborts);
+  let busy = handle
+    .spawn(std::future::poll_fn(move |cx| {
+      counter.fetch_add(1, Ordering::Relaxed);
+      // Both cleanup entries enter overflow during one poll.
+      for abort in aborts.take().into_iter().flatten() {
+        abort.abort();
+      }
+      if seen.lock().unwrap().len() == 2 {
+        return Poll::Ready(());
+      }
+      cx.waker().wake_by_ref();
+      Poll::Pending
+    }))
+    .unwrap();
+  finish(busy).unwrap();
+  for job in idle {
+    assert!(matches!(finish(job), Err(AsyncJoinError::Cancelled)));
+  }
+  // The lone dispatcher took one cleanup entry per look, and its own
+  // lane's task every turn in between.
+  let drops = drops.lock().unwrap();
+  assert_eq!(drops[1] - drops[0], OVERFLOW_TURN_INTERVAL as usize - 1);
+  assert_eq!(
+    engine(&runtime.shared)
+      .overflow_turns
+      .load(Ordering::Relaxed),
+    2
+  );
+  drop(drops);
+  shutdown(runtime, AsyncShutdown::Drain);
+}
+
+#[test]
+fn overflow_turn_makes_one_wake_attempt_and_none_when_it_takes_nothing() {
+  let (shared, root) = shared(config(3, 4));
+  let d = engine(&shared);
+  let settle = |seat: usize| {
+    unpark(&shared, seat);
+    let _ = d.lane(seat).take_recheck();
+    let _ = d.acknowledge_search_kick(seat);
+  };
+  let job = spawn_on(&shared, root, 2, yields(0));
+  let queued = lane_entries(&shared, 2);
+  park(&shared, 0);
+  park(&shared, 1);
+  let wakes = d.wake_searches.load(Ordering::Relaxed);
+  let notifies = d.lane_notifies.load(Ordering::Relaxed);
+  // Nothing in overflow: the look takes nothing and wakes nobody, although
+  // the own lane holds an entry. The ordinary search that follows makes
+  // the turn's one attempt when it pops.
+  assert_eq!(d.overflow_turn(&shared, 2), None);
+  assert_eq!(d.wake_searches.load(Ordering::Relaxed), wakes);
+  assert_eq!(d.lane_notifies.load(Ordering::Relaxed), notifies);
+  assert!(d.parked.is_set(0) && d.parked.is_set(1));
+  settle(0);
+  settle(1);
+  // Seat one's fixture dispatcher polls and aborts the tasks to cancel.
+  let (cancelled, overflow) = overflow_entries(&shared, root, 1, 2);
+  assert_eq!(lane_entries(&shared, 2), queued);
+  park(&shared, 0);
+  park(&shared, 1);
+  assert_eq!(d.searching.pending(), 0);
+  let wakes = d.wake_searches.load(Ordering::Relaxed);
+  let notifies = d.lane_notifies.load(Ordering::Relaxed);
+  // An entry taken with the own lane non-empty: exactly one attempt, which
+  // wakes one of the two parked dispatchers. Overflow still holds an entry
+  // and that adds nothing.
+  assert_eq!(d.overflow_turn(&shared, 2), Some(overflow[0]));
+  assert_eq!(d.wake_searches.load(Ordering::Relaxed), wakes + 1);
+  assert_eq!(d.lane_notifies.load(Ordering::Relaxed), notifies + 1);
+  assert_eq!(d.searching.pending(), 1);
+  let kicked = (0..2).filter(|&seat| d.lane(seat).search_kick).count();
+  assert_eq!(kicked, 1);
+  assert_eq!(
+    usize::from(d.parked.is_set(0)) + usize::from(d.parked.is_set(1)),
+    1
+  );
+  settle(0);
+  settle(1);
+  assert_eq!(d.searching.pending(), 0);
+  run(&shared, d.dispatch_decision(&shared, overflow[0]).unwrap());
+  drain(&shared, 2, None);
+  finish(job).unwrap();
+  // With the own lane empty and no kick to settle, a taken entry wakes
+  // nobody, whatever overflow still holds.
+  let (more, late) = overflow_entries(&shared, root, 1, 2);
+  park(&shared, 0);
+  let wakes = d.wake_searches.load(Ordering::Relaxed);
+  assert_eq!(d.overflow_turn(&shared, 2), Some(late[0]));
+  assert_eq!(d.wake_searches.load(Ordering::Relaxed), wakes);
+  assert!(d.parked.is_set(0));
+  settle(0);
+  run(&shared, d.dispatch_decision(&shared, late[0]).unwrap());
+  drain(&shared, 2, None);
+  for job in cancelled.into_iter().chain(more) {
+    assert!(matches!(finish(job), Err(AsyncJoinError::Cancelled)));
+  }
+  shared.close(false);
+  check_distributed(&shared);
 }

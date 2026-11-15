@@ -207,6 +207,22 @@ struct Lane {
 /// nothing observed at run time selects between the two placements.
 const OWN_LANE_REQUEUE: bool = true;
 
+/// Every this many turns a dispatcher looks at shared overflow before its
+/// own lane and takes at most one entry from it (see
+/// `Distributed::overflow_turn`), so an own lane that never runs empty does
+/// not keep cancellation cleanup waiting. A compile-time constant; the turn
+/// comes round on the count alone.
+const OVERFLOW_TURN_INTERVAL: u32 = 64;
+
+/// The lane an end-of-poll requeue uses: the seat of the dispatcher that
+/// polled the task, and whether that dispatcher's next turn may be the entry
+/// waiting at the lane's front.
+#[derive(Clone, Copy)]
+struct OwnLane {
+  seat: usize,
+  take: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReadyInsertion {
   Publish,
@@ -283,6 +299,9 @@ pub(super) struct Distributed {
   /// Poll-end requeues inserted on the finishing dispatcher's own lane.
   #[cfg(all(test, not(loom)))]
   own_requeues: AtomicUsize,
+  /// Entries taken by a turn that looked at overflow first.
+  #[cfg(all(test, not(loom)))]
+  overflow_turns: AtomicUsize,
   #[cfg(all(test, not(loom)))]
   round_robin: AtomicBool,
   #[cfg(all(test, not(loom)))]
@@ -461,6 +480,8 @@ impl Distributed {
       #[cfg(all(test, not(loom)))]
       own_requeues: AtomicUsize::new(0),
       #[cfg(all(test, not(loom)))]
+      overflow_turns: AtomicUsize::new(0),
+      #[cfg(all(test, not(loom)))]
       round_robin: AtomicBool::new(false),
       #[cfg(all(test, not(loom)))]
       unwind_seat: AtomicUsize::new(usize::MAX),
@@ -602,8 +623,10 @@ impl Distributed {
   /// released. The insertion wakes nobody. The take is the own-lane pop of
   /// `search` moved under the same hold of the lane lock, with that pop's
   /// kick receipt, depth publication and wake: the requeued entry remains
-  /// queued behind it, so it attempts one search wake.
-  fn requeue_polled(&self, shared: &Shared, index: usize, seat: usize) -> Option<usize> {
+  /// queued behind it, so it attempts one search wake. Without `own.take`
+  /// (the dispatcher's next turn looks at overflow first) nothing is taken.
+  fn requeue_polled(&self, shared: &Shared, index: usize, own: OwnLane) -> Option<usize> {
+    let seat = own.seat;
     let (first, notify, woken) = {
       let mut queue = self.lane(seat);
       // As for every lane insertion: serialize with abort's lane scan.
@@ -613,7 +636,11 @@ impl Distributed {
         self.push_cleanup(shared, index);
         return None;
       }
-      let (first, notify) = queue.requeue_own(&self.links(), index);
+      let (first, notify) = if own.take {
+        queue.requeue_own(&self.links(), index)
+      } else {
+        (None, queue.push(&self.links(), index))
+      };
       self.publish_depth(shared, seat, &queue);
       let woken = first.is_some() && std::mem::take(&mut queue.search_kick);
       (first, notify, woken)
@@ -629,11 +656,23 @@ impl Distributed {
       self.lanes[seat].cv.notify_one();
     }
     let index = first?;
-    if woken {
-      self.searching.acknowledge(false);
-    }
-    self.search_wake();
+    // The requeued entry stays queued behind the one taken.
+    self.settle_own_lane(shared, woken, true);
     Some(index)
+  }
+
+  /// What a dispatcher owes after it took a turn while its own lane was
+  /// its to serve: the receipt of a search kick found on the lane (`woken`),
+  /// and one search wake attempt when entries remain on the lane, or when
+  /// the kick left queued work without a searcher. One attempt per turn,
+  /// under the usual suppression.
+  fn settle_own_lane(&self, shared: &Shared, woken: bool, remains: bool) {
+    // If acknowledgement finds no searcher, pass coverage to a sleeper
+    // before this turn's task can block inside its poll.
+    let uncovered = woken && self.searching.acknowledge(false);
+    if remains || (uncovered && self.any_work(shared)) {
+      self.search_wake();
+    }
   }
 
   /// Whether this dispatcher's seat is asked for at its next poll boundary:
@@ -1246,12 +1285,12 @@ impl Distributed {
     task_ref: TaskRef,
     lease: Lease<dyn ErasedTask>,
     ready: bool,
-    own: Option<usize>,
+    own: Option<OwnLane>,
   ) -> Option<usize> {
     if !ready {
       if lease.finish_pending() {
         match own {
-          Some(seat) => return self.requeue_polled(shared, task_ref.index, seat),
+          Some(own) => return self.requeue_polled(shared, task_ref.index, own),
           None => self.push_ready(shared, task_ref.index, ReadyInsertion::PollRequeue),
         }
       }
@@ -1448,12 +1487,7 @@ impl Distributed {
     if let Some(index) = first {
       // Own-lane work is the entry decision; it needs no search admission.
       // Taking own-lane work consumes the kick without entering searching.
-      // If acknowledgement finds no searcher, pass coverage to a sleeper
-      // before this task can block inside its poll.
-      let uncovered = woken && self.searching.acknowledge(false);
-      if remains || (uncovered && self.any_work(shared)) {
-        self.search_wake();
-      }
+      self.settle_own_lane(shared, woken, remains);
       self.found_work(shared, guard);
       return Search::Got(index);
     }
@@ -1476,23 +1510,49 @@ impl Distributed {
       self.found_work(shared, guard);
       return Search::Got(index);
     }
-    if shared.metrics.inner().overflow_depth.load(Ordering::SeqCst) != 0 {
-      let first = {
-        let mut queue = lock(&self.overflow, 4);
-        let first = queue.pop(&self.links());
-        shared
-          .metrics
-          .inner()
-          .overflow_depth
-          .store(queue.len(), Ordering::SeqCst);
-        first
-      };
-      if let Some(index) = first {
-        self.found_work(shared, guard);
-        return Search::Got(index);
-      }
+    if let Some(index) = self.pop_overflow(shared) {
+      self.found_work(shared, guard);
+      return Search::Got(index);
     }
     Search::Empty
+  }
+
+  /// Takes the oldest shared overflow entry, if the published depth shows
+  /// one.
+  fn pop_overflow(&self, shared: &Shared) -> Option<usize> {
+    if shared.metrics.inner().overflow_depth.load(Ordering::SeqCst) == 0 {
+      return None;
+    }
+    let mut queue = lock(&self.overflow, 4);
+    let first = queue.pop(&self.links());
+    shared
+      .metrics
+      .inner()
+      .overflow_depth
+      .store(queue.len(), Ordering::SeqCst);
+    first
+  }
+
+  /// The turn that looks at shared overflow first: takes at most one entry,
+  /// which the caller dispatches directly, like an overflow entry a search
+  /// reached last. It is never placed on a lane. With nothing there the
+  /// caller runs its ordinary search (own lane, other lanes, overflow).
+  ///
+  /// The dispatcher leaves its own lane untouched for this turn, so it
+  /// settles its lane exactly as after an own-lane pop: one wake attempt
+  /// for the entries that stay behind there. The state of overflow after
+  /// the pop is not looked at, and a turn that finds no overflow entry
+  /// makes no attempt here; its ordinary search makes its own.
+  fn overflow_turn(&self, shared: &Shared, seat: usize) -> Option<usize> {
+    let index = self.pop_overflow(shared)?;
+    #[cfg(all(test, not(loom)))]
+    self.overflow_turns.fetch_add(1, Ordering::Relaxed);
+    let (woken, remains) = {
+      let mut queue = self.lane(seat);
+      (std::mem::take(&mut queue.search_kick), queue.len() != 0)
+    };
+    self.settle_own_lane(shared, woken, remains);
+    Some(index)
   }
 
   fn retire_search_kick(&self, shared: &Shared, seat: usize, guard: &mut Option<SearchGuard<'_>>) {
@@ -1902,6 +1962,10 @@ impl Distributed {
     // The own-lane entry the previous poll's requeue took: this iteration's
     // turn, dispatched like a search's own-lane entry.
     let mut taken: Option<usize> = None;
+    // Turns since this dispatcher last looked at overflow first, and whether
+    // its next search owes that look. Loop-local: the count alone decides.
+    let mut turns = 0u32;
+    let mut overflow_first = false;
     loop {
       let index = match taken.take() {
         Some(index) => index,
@@ -1930,7 +1994,16 @@ impl Distributed {
           {
             return;
           }
-          match self.search_or_park(shared, seat.seat(), &mut random, context) {
+          let overflow_entry = if std::mem::take(&mut overflow_first) {
+            self.overflow_turn(shared, seat.seat())
+          } else {
+            None
+          };
+          let search = match overflow_entry {
+            Some(index) => Search::Got(index),
+            None => self.search_or_park(shared, seat.seat(), &mut random, context),
+          };
+          match search {
             Search::Got(index) => index,
             Search::Recheck => {
               // Close publishes before its kick; seat transitions publish the
@@ -2006,14 +2079,24 @@ impl Distributed {
         None => unreachable!("distributed dispatch keeps its seat"),
       };
       seat.turn = Some(turn);
+      turns += 1;
+      if turns == OVERFLOW_TURN_INTERVAL {
+        turns = 0;
+        overflow_first = true;
+      }
       if let Some((task_ref, lease, polled)) = pending {
         // No task code runs from here to the insertion. The own lane is the
         // lane of the seat this thread held through the whole poll: a poll
         // during which a handoff released the seat, a turn that polled
         // nothing, and a dispatcher whose seat is asked for (it may give the
         // seat up before its next search) all keep the rotating choice.
+        // A dispatcher whose next turn looks at overflow first takes no
+        // entry with its requeue.
         let own =
-          (OWN_LANE_REQUEUE && polled && held && !self.seat_requested(helper)).then(|| seat.seat());
+          (OWN_LANE_REQUEUE && polled && held && !self.seat_requested(helper)).then(|| OwnLane {
+            seat: seat.seat(),
+            take: !overflow_first,
+          });
         taken = self.finish_poll(shared, task_ref, lease, false, own);
       }
     }
