@@ -1101,7 +1101,14 @@ once and scans its bits from the start index, in the same cyclic order as a
 lane-by-lane scan; a runtime with a single lane uses it without a scan. A
 dispatcher takes its own front entry,
 then searches other lanes in a pseudo-random order, then takes one shared
-overflow entry.
+overflow entry. Once every 64 turns (`OVERFLOW_TURN_INTERVAL`, a
+compile-time constant) a dispatcher looks at shared overflow first: it
+takes at most one entry and dispatches it directly, and with nothing there
+it searches in the usual order. The turn comes round on the count of that
+dispatcher's turns alone; no abort, kick, queue depth or time brings it
+forward. The entry is never placed on a lane, the dispatcher's following
+search is an ordinary one, and a dispatcher that leaves entries on its own
+lane for that turn wakes a parked dispatcher as after an own-lane pop.
 Searching and spinning admit a fixed number of dispatchers at once (see
 `max_searching_dispatchers` below). An idle dispatcher can take a busy
 lane's oldest entries, including a single remaining one. A steal takes the
@@ -1148,7 +1155,8 @@ under the same hold of the lane lock, with the kick acknowledgement, depth
 publication and remaining-work wake of an own-lane search; the requeued
 entry is never the one taken. On an empty lane it takes nothing, and its
 next search finds the requeued entry unless another dispatcher stole it
-first. Every turn starts with a fresh cooperative budget. The placement is
+first. It also takes nothing when its next turn is the one that looks at
+overflow first. Every turn starts with a fresh cooperative budget. The placement is
 fixed by a compile-time constant (`OWN_LANE_REQUEUE`); no load, queue
 length, time or poll count selects it. A task records no lane: after a
 steal, its next requeue goes to the lane of the dispatcher that polled it
@@ -1165,12 +1173,14 @@ holds work at each search:
 - entries queued behind a dispatcher that is inside a long poll wait until
   that poll returns or some other lane runs empty. A dispatcher that leaves
   entries behind wakes a parked dispatcher as before, so this needs every
-  other dispatcher to be busy with its own lane;
-- shared overflow is not searched, so cancellation cleanup of an idle task
-  (`AsyncJob::abort`, a scope close) waits until some dispatcher's lane
-  runs empty. With one worker this was already so.
+  other dispatcher to be busy with its own lane. The rotating requeue made
+  this wait short by emptying lanes at random;
+- shared overflow is reached only by the turn that looks at it first, so
+  cancellation cleanup of an idle task (`AsyncJob::abort`, a scope close)
+  waits for such a turn: at most 64 turns of a dispatcher that keeps taking
+  turns, and one more interval for each cleanup entry queued ahead of it
+  that no other dispatcher takes.
 
-The rotating requeue made both waits short by emptying lanes at random.
 Tasks that yield a bounded number of times do not keep a lane occupied and
 are not affected. There is no global scope rotation. A larger ready scope
 can receive proportionally more polls, and scope readiness order can change
@@ -1670,7 +1680,8 @@ Cancellation cleanup bypasses the quota and consumes no poll slot. Entries
 made ready for cancellation cleanup go to the shared overflow queue and wake
 one parked dispatcher, if available, so a busy
 dispatcher's poll does not hold them on that dispatcher's lane. Overflow is
-still searched last, one entry at a time. Cancelling a task already polling
+still searched last, one entry at a time, except on the fixed-interval turn
+that looks at it first. Cancelling a task already polling
 still waits for that poll to return.
 The slot is released before future destruction or completion publication,
 including panic cleanup. Outstanding-task admission remains charged through
