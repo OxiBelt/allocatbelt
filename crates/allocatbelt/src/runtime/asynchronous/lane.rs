@@ -113,6 +113,25 @@ impl LaneQueue {
     Some(index)
   }
 
+  /// Requeues `index` for the lane's own dispatcher at the end of a poll:
+  /// takes the entry that waited at the front, if any, and appends `index`
+  /// at the tail, in one hold of the lane lock. The result is the one a
+  /// push followed by a pop gives whenever another entry waited. The
+  /// appended entry is never the one taken: it stays in the lane, where
+  /// another dispatcher can steal it as soon as the lock is released, and
+  /// with no entry waiting nothing is taken. Also returns whether the append
+  /// owes a lane notification, as [`Self::push`] does: the caller serves
+  /// this lane, so nobody sleeps on it and none is owed.
+  pub(super) fn requeue_own(
+    &mut self,
+    links: &(impl std::ops::Index<usize, Output = QueueLink> + ?Sized),
+    index: usize,
+  ) -> (Option<usize>, bool) {
+    let first = self.pop(links);
+    let notify = self.push(links, index);
+    (first, notify)
+  }
+
   /// Remove an entry without acquiring it for polling. Used only to relocate
   /// cancellation cleanup; ordinary dispatch still pops one FIFO entry.
   pub(super) fn remove(
@@ -761,6 +780,37 @@ mod tests {
   }
 
   #[test]
+  fn own_requeue_matches_push_then_pop_but_never_takes_the_requeued_entry() {
+    for len in 0..=4 {
+      let fused_links: Vec<_> = (0..=len).map(|_| QueueLink::new()).collect();
+      let plain_links: Vec<_> = (0..=len).map(|_| QueueLink::new()).collect();
+      let mut fused = LaneQueue::new();
+      let mut plain = LaneQueue::new();
+      for index in 0..len {
+        fused.push(&fused_links, index);
+        plain.push(&plain_links, index);
+      }
+      let (taken, notify) = fused.requeue_own(&fused_links, len);
+      assert!(!notify);
+      plain.push(&plain_links, len);
+      // With an entry waiting, a push followed by a pop gives the same
+      // turn and the same lane. Alone, the requeued entry stays queued.
+      let expected = (len != 0).then(|| plain.pop(&plain_links).unwrap());
+      assert_eq!(taken, expected);
+      assert_ne!(taken, Some(len));
+      assert_eq!(fused.check(&fused_links), plain.check(&plain_links));
+      assert_eq!(fused.check(&fused_links).last(), Some(&len));
+      assert_eq!(fused.len(), len.max(1));
+    }
+    // A lane that reports a sleeper passes the owed notification on.
+    let links = [QueueLink::new()];
+    let mut queue = LaneQueue::new();
+    assert!(queue.prepare_sleep());
+    assert_eq!(queue.requeue_own(&links, 0), (None, true));
+    queue.finish_sleep();
+  }
+
+  #[test]
   fn append_to_empty_and_park_recheck() {
     let links = [QueueLink::new(), QueueLink::new()];
     let mut victim = LaneQueue::new();
@@ -1207,6 +1257,67 @@ mod loom_tests {
         popped.sort_unstable();
         assert_eq!(popped, (0..=count).collect::<Vec<_>>());
         assert!(victim.lock().unwrap().check(&links[..]).is_empty());
+      });
+    }
+  }
+
+  /// A dispatcher that keeps requeueing the entry it polled onto its own
+  /// lane, against a thief: every entry stays in exactly one place, the
+  /// requeued entry is in the lane (never in the dispatcher's hand) when the
+  /// lock is released, and the entry taken is the oldest one waiting.
+  #[test]
+  fn loom_own_requeue_races_a_thief() {
+    for initial in [0, 1, 2] {
+      loom::model(move || {
+        let links = Arc::new((0..=initial).map(|_| QueueLink::new()).collect::<Vec<_>>());
+        let mut queue = LaneQueue::new();
+        for index in 0..initial {
+          queue.push(&links[..], index);
+        }
+        let lane = Arc::new(Mutex::new(queue));
+        let owner = {
+          let links = Arc::clone(&links);
+          let lane = Arc::clone(&lane);
+          thread::spawn(move || {
+            // The entry in hand was popped earlier and has just been polled.
+            let mut hand = Some(initial);
+            for _ in 0..2 {
+              let Some(polled) = hand.take() else {
+                break;
+              };
+              let mut queue = lane.lock().unwrap();
+              let before = queue.check(&links[..]);
+              let (taken, notify) = queue.requeue_own(&links[..], polled);
+              assert!(!notify);
+              assert_eq!(taken, before.first().copied());
+              assert_ne!(taken, Some(polled));
+              assert_eq!(queue.check(&links[..]).last(), Some(&polled));
+              drop(queue);
+              // Nothing taken: an ordinary pop, which a thief may beat.
+              hand = taken.or_else(|| lane.lock().unwrap().pop(&links[..]));
+            }
+            hand
+          })
+        };
+        let thief = {
+          let links = Arc::clone(&links);
+          let lane = Arc::clone(&lane);
+          thread::spawn(move || {
+            let mut queue = lane.lock().unwrap();
+            let before = queue.check(&links[..]);
+            let stolen = queue.steal_front(&links[..]).map(|chain| {
+              assert_eq!(chain.first, before[0]);
+              before[..chain.len].to_vec()
+            });
+            queue.check(&links[..]);
+            stolen.unwrap_or_default()
+          })
+        };
+        let mut seen: Vec<_> = owner.join().unwrap().into_iter().collect();
+        seen.extend(thief.join().unwrap());
+        seen.extend(lane.lock().unwrap().check(&links[..]));
+        seen.sort_unstable();
+        assert_eq!(seen, (0..=initial).collect::<Vec<_>>());
       });
     }
   }
