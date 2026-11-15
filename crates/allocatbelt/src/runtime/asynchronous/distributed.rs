@@ -10,6 +10,7 @@ use super::super::lane::{
   LaneQueue, ParkedMask, QueueLink, SearchGuard, Searching, VictimOrder, choose_lane,
 };
 use super::super::metrics::Padded;
+use super::super::park_spin::SearchWake;
 #[cfg(not(loom))]
 use super::super::park_spin::SpinnerSlots;
 use super::*;
@@ -214,6 +215,28 @@ const OWN_LANE_REQUEUE: bool = true;
 /// comes round on the count alone.
 const OVERFLOW_TURN_INTERVAL: u32 = 64;
 
+/// `SearchWake::AfterStreak`: a dispatcher wakes a parked one after work
+/// remained on its own lane at this many of its consecutive pops there.
+const SEARCH_WAKE_STREAK: u32 = 8;
+/// `SearchWake::AfterStreak`: the period of the parked dispatcher's look.
+#[cfg(not(loom))]
+const PARKED_LOOK_PERIOD: std::time::Duration = std::time::Duration::from_micros(500);
+/// Consecutive looks that find every lane empty after which the looks stop
+/// until the next insertion.
+#[cfg(not(loom))]
+const PARKED_LOOK_QUIET: u32 = 2;
+
+/// What the parked dispatcher's look remembers; only the dispatcher that
+/// holds the look touches it.
+struct ParkedLook {
+  /// Each seat's turn count at the previous look.
+  seen: Vec<u64>,
+  /// Scratch for one look: the lanes that hold entries while their
+  /// dispatcher completed no turn since the previous look.
+  behind: Vec<bool>,
+  quiet: u32,
+}
+
 /// The lane an end-of-poll requeue uses: the seat of the dispatcher that
 /// polled the task, and whether that dispatcher's next turn may be the entry
 /// waiting at the lane's front.
@@ -268,6 +291,17 @@ pub(super) struct Distributed {
   #[cfg(all(test, not(loom)))]
   spin_rounds: AtomicUsize,
   searching: Searching,
+  /// `SearchWake::AfterStreak`, fixed at construction.
+  wake_after_streak: bool,
+  /// Turns completed on each seat, written by the dispatcher on that seat
+  /// and read by the parked dispatcher's look.
+  seat_turns: Vec<Padded<AtomicU64>>,
+  look: Mutex<ParkedLook>,
+  /// Whether a parked dispatcher holds the look: at most one waits with
+  /// the period.
+  looker: Padded<AtomicBool>,
+  /// Whether the look runs; cleared after quiet looks, set by an insertion.
+  looking: Padded<AtomicBool>,
   #[cfg(all(test, not(loom)))]
   steal_denials: AtomicUsize,
   slots: Vec<SlotCell>,
@@ -302,6 +336,12 @@ pub(super) struct Distributed {
   /// Entries taken by a turn that looked at overflow first.
   #[cfg(all(test, not(loom)))]
   overflow_turns: AtomicUsize,
+  /// Steal attempts made by the parked dispatcher's look.
+  #[cfg(all(test, not(loom)))]
+  look_steals: AtomicUsize,
+  /// Looks made by a parked dispatcher.
+  #[cfg(all(test, not(loom)))]
+  looks: AtomicUsize,
   #[cfg(all(test, not(loom)))]
   round_robin: AtomicBool,
   #[cfg(all(test, not(loom)))]
@@ -434,6 +474,15 @@ impl Distributed {
       #[cfg(all(test, not(loom)))]
       spin_rounds: AtomicUsize::new(0),
       searching: Searching::new(max_searchers),
+      wake_after_streak: park_spin.search_wake == SearchWake::AfterStreak,
+      seat_turns: table(config.workers, || Padded(AtomicU64::new(0)))?,
+      look: Mutex::new(ParkedLook {
+        seen: table(config.workers, || 0)?,
+        behind: table(config.workers, || false)?,
+        quiet: 0,
+      }),
+      looker: Padded(AtomicBool::new(false)),
+      looking: Padded(AtomicBool::new(true)),
       #[cfg(all(test, not(loom)))]
       steal_denials: AtomicUsize::new(0),
       slots: table(config.max_outstanding, || SlotCell {
@@ -481,6 +530,10 @@ impl Distributed {
       own_requeues: AtomicUsize::new(0),
       #[cfg(all(test, not(loom)))]
       overflow_turns: AtomicUsize::new(0),
+      #[cfg(all(test, not(loom)))]
+      look_steals: AtomicUsize::new(0),
+      #[cfg(all(test, not(loom)))]
+      looks: AtomicUsize::new(0),
       #[cfg(all(test, not(loom)))]
       round_robin: AtomicBool::new(false),
       #[cfg(all(test, not(loom)))]
@@ -609,6 +662,7 @@ impl Distributed {
     if search {
       self.search_wake();
     }
+    self.restart_look();
   }
 
   /// Inserts the entry of a task that was notified during the poll that
@@ -627,7 +681,7 @@ impl Distributed {
   /// (the dispatcher's next turn looks at overflow first) nothing is taken.
   fn requeue_polled(&self, shared: &Shared, index: usize, own: OwnLane) -> Option<usize> {
     let seat = own.seat;
-    let (first, notify, woken) = {
+    let (first, notify, woken, due) = {
       let mut queue = self.lane(seat);
       // As for every lane insertion: serialize with abort's lane scan.
       if self.parked.is_dead(seat) || self.links()[index].cleanup.load(Ordering::SeqCst) {
@@ -643,10 +697,12 @@ impl Distributed {
       };
       self.publish_depth(shared, seat, &queue);
       let woken = first.is_some() && std::mem::take(&mut queue.search_kick);
-      (first, notify, woken)
+      let due = first.is_some() && self.streak_due(&mut queue);
+      (first, notify, woken, due)
     };
     #[cfg(all(test, not(loom)))]
     self.own_requeues.fetch_add(1, Ordering::Relaxed);
+    self.restart_look();
     // The caller serves this lane, so it has no sleeper to notify. Should
     // the lane ever report one, it is notified rather than left asleep.
     debug_assert!(!notify, "own-lane requeue found its lane asleep");
@@ -657,7 +713,7 @@ impl Distributed {
     }
     let index = first?;
     // The requeued entry stays queued behind the one taken.
-    self.settle_own_lane(shared, woken, true);
+    self.settle_own_lane(shared, woken, true, due);
     Some(index)
   }
 
@@ -666,13 +722,119 @@ impl Distributed {
   /// and one search wake attempt when entries remain on the lane, or when
   /// the kick left queued work without a searcher. One attempt per turn,
   /// under the usual suppression.
-  fn settle_own_lane(&self, shared: &Shared, woken: bool, remains: bool) {
+  ///
+  /// Under `SearchWake::AfterStreak` the attempt is made only when `due`:
+  /// the pop was the last of a run of `SEARCH_WAKE_STREAK` consecutive
+  /// own-lane pops that each left an entry behind.
+  fn settle_own_lane(&self, shared: &Shared, woken: bool, remains: bool, due: bool) {
     // If acknowledgement finds no searcher, pass coverage to a sleeper
     // before this turn's task can block inside its poll.
     let uncovered = woken && self.searching.acknowledge(false);
-    if remains || (uncovered && self.any_work(shared)) {
+    if self.wake_after_streak {
+      if due {
+        self.search_wake_now();
+      }
+    } else if remains || (uncovered && self.any_work(shared)) {
       self.search_wake();
     }
+  }
+
+  /// Counts an own-lane pop under the lane lock for `SearchWake::AfterStreak`;
+  /// see `LaneQueue::count_own_pop`.
+  #[inline]
+  fn streak_due(&self, queue: &mut LaneQueue) -> bool {
+    self.wake_after_streak && queue.count_own_pop(SEARCH_WAKE_STREAK)
+  }
+
+  /// `SearchWake::AfterStreak`: an insertion starts the parked dispatcher's
+  /// look again after it stopped, by letting one parked dispatcher take it.
+  #[inline]
+  fn restart_look(&self) {
+    if self.wake_after_streak
+      && !self.looking.0.load(Ordering::SeqCst)
+      && !self.looking.0.swap(true, Ordering::SeqCst)
+    {
+      self.pass_look();
+    }
+  }
+
+  /// `SearchWake::AfterStreak`: called by a dispatcher that found work to
+  /// run. While the look runs, a parked dispatcher is to hold it: the one
+  /// that was notified to take it may have found work instead, and the one
+  /// that held it may be the caller.
+  #[inline]
+  fn keep_look(&self) {
+    if self.wake_after_streak
+      && self.looking.0.load(Ordering::Relaxed)
+      && !self.looker.0.load(Ordering::Relaxed)
+    {
+      self.pass_look();
+    }
+  }
+
+  /// Lets one parked dispatcher take up the look.
+  #[cold]
+  fn pass_look(&self) {
+    // The first parked dispatcher in the parked mask's usual order from
+    // this thread's rotating index. It is only notified: its parked bit
+    // stays, and it takes the look itself when it parks again after its
+    // own recheck. Nothing is handed to it.
+    let _ = self.parked.claim_any_with(self.lane_start(false), |seat| {
+      self.kick(seat);
+      true
+    });
+  }
+
+  /// `SearchWake::AfterStreak`: the look of the one dispatcher that parked
+  /// with the period, after its timeout. It reads each lane's published
+  /// depth and each seat's turn count against the count at the previous
+  /// look, nothing else. When a lane holds entries and its dispatcher
+  /// completed no turn in between, it makes one ordinary steal attempt and
+  /// returns what it took; the caller dispatches it before it looks at
+  /// overflow. The look sends no wake and changes no setting.
+  #[cfg(not(loom))]
+  #[cold]
+  fn parked_look(&self, shared: &Shared, seat: usize, random: &mut u64) -> Option<usize> {
+    #[cfg(test)]
+    self.looks.fetch_add(1, Ordering::Relaxed);
+    let behind = {
+      let mut look = lock(&self.look, 4);
+      let look = &mut *look;
+      let metrics = shared.metrics.inner();
+      let mut any = false;
+      let mut queued = false;
+      for index in 0..self.lanes.len() {
+        let depth = metrics.lane_depth[index].0.load(Ordering::SeqCst);
+        let turns = self.seat_turns[index].0.load(Ordering::Relaxed);
+        queued |= depth != 0;
+        look.behind[index] = depth != 0 && turns == look.seen[index];
+        any |= look.behind[index];
+        look.seen[index] = turns;
+      }
+      look.quiet = if queued { 0 } else { look.quiet + 1 };
+      if look.quiet >= PARKED_LOOK_QUIET {
+        look.quiet = 0;
+        // An insertion publishes its depth before it reads this flag, and
+        // this reads the depths again after clearing it.
+        self.looking.0.store(false, Ordering::SeqCst);
+        if metrics
+          .lane_depth
+          .iter()
+          .any(|depth| depth.0.load(Ordering::SeqCst) != 0)
+        {
+          self.looking.0.store(true, Ordering::SeqCst);
+        }
+      }
+      // Lane locks stand alone: the steal runs without the look's lock.
+      any.then(|| std::mem::take(&mut look.behind))
+    };
+    let behind = behind?;
+    #[cfg(test)]
+    self.look_steals.fetch_add(1, Ordering::Relaxed);
+    // One ordinary steal, in the usual victim order, from those lanes only.
+    let taken = self.try_steal(shared, seat, random, Some(&behind));
+    lock(&self.look, 4).behind = behind;
+    taken
   }
 
   /// Whether this dispatcher's seat is asked for at its next poll boundary:
@@ -695,7 +857,9 @@ impl Distributed {
         .overflow_depth
         .store(queue.len(), Ordering::SeqCst);
     }
-    self.search_wake();
+    // Cleanup work has no lane and no lane's dispatcher behind it: its
+    // wake is made under every `SearchWake`.
+    self.search_wake_now();
   }
 
   fn kick(&self, seat: usize) {
@@ -711,8 +875,18 @@ impl Distributed {
       self.kick(seat);
     }
   }
+  /// The search wake of a dispatcher that leaves work queued or of an
+  /// insertion. `SearchWake::AfterStreak` makes none here: its wake comes
+  /// from `settle_own_lane` alone.
   #[inline]
   fn search_wake(&self) {
+    if !self.wake_after_streak {
+      self.search_wake_now();
+    }
+  }
+
+  #[inline]
+  fn search_wake_now(&self) {
     // With no parked lane there is no one to claim (the claim scan below
     // would find none); skip the gate's counter loads too.
     if self.parked.any_live_parked() {
@@ -1358,8 +1532,19 @@ impl Distributed {
     }
   }
 
-  fn try_steal(&self, shared: &Shared, seat: usize, random: &mut u64) -> Option<usize> {
+  /// One steal attempt in the pseudo-random victim order. `only`, from the
+  /// parked dispatcher's look, restricts the victims to the lanes it marks.
+  fn try_steal(
+    &self,
+    shared: &Shared,
+    seat: usize,
+    random: &mut u64,
+    only: Option<&[bool]>,
+  ) -> Option<usize> {
     for victim in VictimOrder::new(random, self.lanes.len()).victims(seat) {
+      if only.is_some_and(|only| !only[victim]) {
+        continue;
+      }
       if shared.metrics.inner().lane_depth[victim]
         .0
         .load(Ordering::SeqCst)
@@ -1476,18 +1661,19 @@ impl Distributed {
     random: &mut u64,
     guard: &mut Option<SearchGuard<'a>>,
   ) -> Search {
-    let (first, recheck, remains, woken) = {
+    let (first, recheck, remains, woken, due) = {
       let mut queue = self.lane(seat);
       let first = queue.pop(&self.links());
       let recheck = first.is_none() && queue.take_recheck();
       self.publish_depth(shared, seat, &queue);
       let woken = !recheck && std::mem::take(&mut queue.search_kick);
-      (first, recheck, queue.len() != 0, woken)
+      let due = first.is_some() && self.streak_due(&mut queue);
+      (first, recheck, queue.len() != 0, woken, due)
     };
     if let Some(index) = first {
       // Own-lane work is the entry decision; it needs no search admission.
       // Taking own-lane work consumes the kick without entering searching.
-      self.settle_own_lane(shared, woken, remains);
+      self.settle_own_lane(shared, woken, remains, due);
       self.found_work(shared, guard);
       return Search::Got(index);
     }
@@ -1505,7 +1691,7 @@ impl Distributed {
       return Search::Recheck;
     }
     if guard.is_some()
-      && let Some(index) = self.try_steal(shared, seat, random)
+      && let Some(index) = self.try_steal(shared, seat, random, None)
     {
       self.found_work(shared, guard);
       return Search::Got(index);
@@ -1551,7 +1737,9 @@ impl Distributed {
       let mut queue = self.lane(seat);
       (std::mem::take(&mut queue.search_kick), queue.len() != 0)
     };
-    self.settle_own_lane(shared, woken, remains);
+    // Not a pop of the own lane: it neither counts towards a run of
+    // own-lane pops nor ends one.
+    self.settle_own_lane(shared, woken, remains, false);
     Some(index)
   }
 
@@ -1662,20 +1850,62 @@ impl Distributed {
       if queue.prepare_sleep() {
         handoff::pause_busy();
         shared.thread_parked(context);
-        let guard = match queue.inner.take() {
-          Some(guard) => guard,
-          None => unreachable!(),
-        };
-        queue.inner = Some(
-          self.lanes[seat]
-            .cv
-            .wait(guard)
-            .unwrap_or_else(PoisonError::into_inner),
-        );
+        // `SearchWake::AfterStreak`: at most one parked dispatcher holds
+        // the look and waits with its period; every other wait is untimed.
+        // The entry a look took, to dispatch before anything else.
+        #[cfg_attr(loom, expect(unused_mut))]
+        let mut taken: Option<usize> = None;
+        loop {
+          let guard = match queue.inner.take() {
+            Some(guard) => guard,
+            None => unreachable!(),
+          };
+          #[cfg(not(loom))]
+          if self.wake_after_streak
+            && self.looking.0.load(Ordering::SeqCst)
+            && !self.looker.0.swap(true, Ordering::SeqCst)
+          {
+            let (guard, timeout) = self.lanes[seat]
+              .cv
+              .wait_timeout(guard, PARKED_LOOK_PERIOD)
+              .unwrap_or_else(PoisonError::into_inner);
+            queue.inner = Some(guard);
+            // Notified, or work or a recheck arrived as the period ended:
+            // leave the park like any notified dispatcher.
+            if !timeout.timed_out() || queue.len() != 0 || queue.recheck_pending() {
+              self.looker.0.store(false, Ordering::SeqCst);
+              break;
+            }
+            // The period passed. Look with the lane lock released; this
+            // dispatcher stays advertised as parked meanwhile.
+            queue.finish_sleep();
+            drop(queue);
+            taken = self.parked_look(shared, seat, random);
+            self.looker.0.store(false, Ordering::SeqCst);
+            queue = self.lane(seat);
+            // A look that took nothing goes straight back to the park:
+            // no search of this lane, of other lanes or of overflow.
+            if taken.is_none() && queue.prepare_sleep() {
+              continue;
+            }
+            break;
+          }
+          queue.inner = Some(
+            self.lanes[seat]
+              .cv
+              .wait(guard)
+              .unwrap_or_else(PoisonError::into_inner),
+          );
+          break;
+        }
         queue.finish_sleep();
         drop(queue);
         self.parked.claim(seat);
         shared.thread_unparked(context);
+        if let Some(index) = taken {
+          cache::set_shard(context.physical_index);
+          return Search::Got(index);
+        }
       } else {
         drop(queue);
         self.parked.claim(seat);
@@ -2004,7 +2234,10 @@ impl Distributed {
             None => self.search_or_park(shared, seat.seat(), &mut random, context),
           };
           match search {
-            Search::Got(index) => index,
+            Search::Got(index) => {
+              self.keep_look();
+              index
+            }
             Search::Recheck => {
               // Close publishes before its kick; seat transitions publish the
               // worker-yield hint. Helper retirement is handled above each
@@ -2025,6 +2258,7 @@ impl Distributed {
       let Some(selected) = self.dispatch_decision(shared, index) else {
         continue;
       };
+      let turn_seat = seat.seat();
       handoff::enter_turn(seat.take());
       // A pending poll ends after the turn is taken back below, when the
       // seat this thread holds is known again.
@@ -2079,6 +2313,11 @@ impl Distributed {
         None => unreachable!("distributed dispatch keeps its seat"),
       };
       seat.turn = Some(turn);
+      if self.wake_after_streak {
+        // One more turn completed on the seat this turn was entered on.
+        let completed = &self.seat_turns[turn_seat].0;
+        completed.store(completed.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+      }
       turns += 1;
       if turns == OVERFLOW_TURN_INTERVAL {
         turns = 0;

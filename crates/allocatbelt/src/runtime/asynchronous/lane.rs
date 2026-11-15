@@ -65,6 +65,8 @@ pub(super) struct LaneQueue {
   notified: bool,
   recheck: bool,
   pub(super) search_kick: bool,
+  /// Consecutive pops by the lane's dispatcher that left an entry behind.
+  streak: u32,
 }
 
 impl LaneQueue {
@@ -77,7 +79,25 @@ impl LaneQueue {
       notified: false,
       recheck: false,
       search_kick: false,
+      streak: 0,
     }
+  }
+
+  /// Counts a pop by the lane's own dispatcher, called after that pop
+  /// under the lane lock. A pop that leaves the lane empty ends the run;
+  /// the `limit`-th consecutive pop that leaves an entry behind returns
+  /// true and starts a new run.
+  pub(super) fn count_own_pop(&mut self, limit: u32) -> bool {
+    if self.len == 0 {
+      self.streak = 0;
+      return false;
+    }
+    self.streak += 1;
+    if self.streak < limit {
+      return false;
+    }
+    self.streak = 0;
+    true
   }
 
   pub(super) fn push(
@@ -235,6 +255,11 @@ impl LaneQueue {
   pub(super) fn request_recheck(&mut self) -> bool {
     self.recheck = true;
     self.take_notify()
+  }
+
+  /// Whether a recheck request is waiting for the lane's dispatcher.
+  pub(super) fn recheck_pending(&self) -> bool {
+    self.recheck
   }
 
   pub(super) fn take_recheck(&mut self) -> bool {
@@ -808,6 +833,35 @@ mod tests {
     assert!(queue.prepare_sleep());
     assert_eq!(queue.requeue_own(&links, 0), (None, true));
     queue.finish_sleep();
+  }
+
+  #[test]
+  fn own_pop_count_runs_to_the_limit_and_ends_on_an_empty_lane() {
+    let links: Vec<_> = (0..8).map(|_| QueueLink::new()).collect();
+    let mut queue = LaneQueue::new();
+    for index in 0..8 {
+      queue.push(&links, index);
+    }
+    // Three pops that each leave an entry: the third completes a run of
+    // three, and the count starts again.
+    let mut due = Vec::new();
+    for _ in 0..7 {
+      assert!(queue.pop(&links).is_some());
+      due.push(queue.count_own_pop(3));
+    }
+    assert_eq!(due, [false, false, true, false, false, true, false]);
+    // The pop that empties the lane ends the run it was in.
+    assert!(queue.pop(&links).is_some());
+    assert!(!queue.count_own_pop(3));
+    for index in 0..3 {
+      queue.push(&links, index);
+    }
+    assert!(queue.pop(&links).is_some());
+    assert!(!queue.count_own_pop(3));
+    assert!(queue.pop(&links).is_some());
+    assert!(!queue.count_own_pop(3));
+    assert!(queue.pop(&links).is_some());
+    assert!(!queue.count_own_pop(3));
   }
 
   #[test]

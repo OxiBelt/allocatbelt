@@ -32,6 +32,23 @@ impl Default for ParkSpin {
   }
 }
 
+/// When a dispatcher wakes a parked dispatcher to search other lanes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SearchWake {
+  /// Whenever work remains queued behind it, and for newly ready work
+  /// placed on the lane of an awake dispatcher. The default.
+  #[default]
+  Eager,
+  /// Only after work remained on its own lane at a fixed number of its
+  /// consecutive pops there. Newly ready work and steals wake no searcher.
+  /// One parked dispatcher at a time wakes on a fixed period instead and
+  /// takes work from a lane whose dispatcher completed no turn since its
+  /// previous look, so an entry behind a poll that does not return is
+  /// reached within about two periods rather than at once.
+  AfterStreak,
+}
+
 // Configuration is accepted but ignored when Loom compiles spinning out.
 #[cfg_attr(loom, allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
@@ -40,6 +57,7 @@ pub(super) struct Policy {
   pub(super) max_spinners: Option<usize>,
   /// Search admission cap; `None` uses half the workers, rounded up.
   pub(super) max_searchers: Option<usize>,
+  pub(super) search_wake: SearchWake,
 }
 
 impl Default for Policy {
@@ -49,6 +67,7 @@ impl Default for Policy {
       rounds,
       max_spinners: None,
       max_searchers: None,
+      search_wake: SearchWake::Eager,
     }
   }
 }
