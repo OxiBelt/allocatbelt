@@ -1603,7 +1603,9 @@ impl Distributed {
           queue.len() - before
         };
         if count != 0 {
-          self.search_wake();
+          // Cleanup placed on overflow makes its wake attempt under every
+          // `SearchWake`, as in `push_cleanup`.
+          self.search_wake_now();
         }
       }
       #[cfg(all(test, not(loom)))]
@@ -1855,40 +1857,55 @@ impl Distributed {
         // The entry a look took, to dispatch before anything else.
         #[cfg_attr(loom, expect(unused_mut))]
         let mut taken: Option<usize> = None;
+        // Whether this dispatcher holds the look. It keeps it across a look
+        // that took nothing, so that nobody else is notified to take it up
+        // in between.
+        #[cfg(not(loom))]
+        let mut holding = false;
         loop {
           let guard = match queue.inner.take() {
             Some(guard) => guard,
             None => unreachable!(),
           };
           #[cfg(not(loom))]
-          if self.wake_after_streak
-            && self.looking.0.load(Ordering::SeqCst)
-            && !self.looker.0.swap(true, Ordering::SeqCst)
           {
-            let (guard, timeout) = self.lanes[seat]
-              .cv
-              .wait_timeout(guard, PARKED_LOOK_PERIOD)
-              .unwrap_or_else(PoisonError::into_inner);
-            queue.inner = Some(guard);
-            // Notified, or work or a recheck arrived as the period ended:
-            // leave the park like any notified dispatcher.
-            if !timeout.timed_out() || queue.len() != 0 || queue.recheck_pending() {
+            if holding {
+              if !self.looking.0.load(Ordering::SeqCst) {
+                // The looks stopped: wait without the period.
+                self.looker.0.store(false, Ordering::SeqCst);
+                holding = false;
+              }
+            } else {
+              holding = self.wake_after_streak
+                && self.looking.0.load(Ordering::SeqCst)
+                && !self.looker.0.swap(true, Ordering::SeqCst);
+            }
+            if holding {
+              let (guard, timeout) = self.lanes[seat]
+                .cv
+                .wait_timeout(guard, PARKED_LOOK_PERIOD)
+                .unwrap_or_else(PoisonError::into_inner);
+              queue.inner = Some(guard);
+              // Notified, or work or a recheck arrived as the period ended:
+              // leave the park like any notified dispatcher.
+              if !timeout.timed_out() || queue.len() != 0 || queue.recheck_pending() {
+                self.looker.0.store(false, Ordering::SeqCst);
+                break;
+              }
+              // The period passed. Look with the lane lock released; this
+              // dispatcher stays advertised as parked meanwhile.
+              queue.finish_sleep();
+              drop(queue);
+              taken = self.parked_look(shared, seat, random);
+              queue = self.lane(seat);
+              // A look that took nothing goes straight back to the park:
+              // no search of this lane, of other lanes or of overflow.
+              if taken.is_none() && queue.prepare_sleep() {
+                continue;
+              }
               self.looker.0.store(false, Ordering::SeqCst);
               break;
             }
-            // The period passed. Look with the lane lock released; this
-            // dispatcher stays advertised as parked meanwhile.
-            queue.finish_sleep();
-            drop(queue);
-            taken = self.parked_look(shared, seat, random);
-            self.looker.0.store(false, Ordering::SeqCst);
-            queue = self.lane(seat);
-            // A look that took nothing goes straight back to the park:
-            // no search of this lane, of other lanes or of overflow.
-            if taken.is_none() && queue.prepare_sleep() {
-              continue;
-            }
-            break;
           }
           queue.inner = Some(
             self.lanes[seat]
