@@ -1187,6 +1187,51 @@ can receive proportionally more polls, and scope readiness order can change
 across lanes. Each task still polls exclusively, and ready tasks make
 progress if every poll returns; there is no time bound.
 
+`AsyncRuntimeOptions::search_wake(SearchWake::AfterStreak)` changes when a
+search wake is sent. The default, `SearchWake::Eager`, is the behaviour
+described above; the choice is fixed at construction. With `AfterStreak`,
+inserting ready work wakes no searcher, and neither does work that remains
+after a steal or when a searcher leaves. A dispatcher makes the one search
+wake attempt only after work remained on its own lane at 8 consecutive pops
+there (`SEARCH_WAKE_STREAK`, a compile-time constant). The count is kept
+with the lane, counts only pops by the lane's own dispatcher, including the
+entry an end-of-poll requeue takes, and starts again at a pop that leaves
+the lane empty. It reads no other lane, no clock and no average. The attempt
+is the ordinary search wake with its usual suppression. An insertion that
+claims a parked lane still notifies that lane's dispatcher, and cancellation
+cleanup placed on overflow still makes its wake attempt. Lane placement,
+stealing, parking, the searcher and spinner caps and the spin rounds are
+the same under both settings.
+
+An entry behind a poll that does not return is then no longer announced
+when it is queued. In its place, one parked dispatcher at a time waits with
+a fixed period of 0.5 ms (`PARKED_LOOK_PERIOD`, a compile-time constant)
+instead of without a timeout. When the period passes, that dispatcher reads
+each lane's published depth and each seat's count of completed turns and
+compares the count with the one it read at its previous look. If a lane
+holds entries and its dispatcher completed no turn in between, it makes one
+ordinary bounded steal attempt, in the usual pseudo-random victim order
+among such lanes only, and dispatches what it took before it looks at
+overflow. A look that takes nothing goes straight back to the timed park:
+it searches neither its own lane nor other lanes nor overflow. The look
+itself sends no wake; cleanup entries that its steal moves to overflow make
+the usual cleanup wake attempt. It changes no setting and reads no clock,
+task or thread; the task being polled on that lane is not touched.
+After two consecutive looks that find every lane empty, no dispatcher waits
+with the period. The next lane insertion then notifies one parked
+dispatcher, which searches like any notified dispatcher and holds the look
+when it parks again. A dispatcher that finds work while nobody holds the
+look notifies one parked dispatcher, the first in the parked mask's usual
+order, which takes the look up itself when it parks again; nothing is
+handed to it. With nothing queued the runtime
+makes no periodic wake-ups. Loom builds omit the timed wait.
+
+Under `AfterStreak`, an entry queued behind a poll that does not return is
+therefore reached after about one period, and at the latest after about
+two, rather than at once, and a burst of work that needs every dispatcher
+brings them in over a few runs of 8 pops rather than at the first
+insertion. A poll that blocks should still use `try_block_in_place`.
+
 A binding scope keeps quota-blocked entries in FIFO order. Each release passes
 its permit directly to the oldest blocked entry, which reenters a lane without
 reacquiring the permit. At most `max_outstanding - 1` other scope tasks receive
@@ -1892,7 +1937,9 @@ count adds no limit. Zero skips spinning. A dispatcher that cannot acquire a
 spinner slot proceeds directly to the existing park handshake. A guard
 releases its slot on every spin exit, including work, closing, handoff
 yield, exhaustion and unwinding. Releasing a slot sends no wake. Closing and
-handoff yield hints stop the spin early. The condvar park remains untimed.
+handoff yield hints stop the spin early. The condvar park is untimed, except
+for the one parked dispatcher that holds the periodic look under
+`SearchWake::AfterStreak` (see "Owned asynchronous tasks").
 Loom builds omit spinning and the spinner slot counter; search admission and
 wake decisions remain.
 
@@ -1929,7 +1976,8 @@ searching other lanes, spinning and search kicks; an entry can then wait
 behind a blocking poll on its own lane until that poll returns.
 
 For `--lane async --executor bounded`, the latency benchmark accepts
-`--park-spin fixed:N`, `--max-spinners K` and `--max-searchers K`. CSV
+`--park-spin fixed:N`, `--max-spinners K`, `--max-searchers K` and
+`--search-wake eager|after-streak`. CSV
 columns are unchanged; record the selected flags alongside benchmark
 results.
 

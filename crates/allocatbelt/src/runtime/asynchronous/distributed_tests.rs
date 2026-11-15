@@ -28,6 +28,7 @@ fn each_spin_configuration(mut test: impl FnMut()) {
       rounds,
       max_spinners: Some(1),
       max_searchers: TEST_SEARCH_CAP.get(),
+      ..Policy::default()
     });
     test();
   }
@@ -164,6 +165,8 @@ fn selected(shared: &Arc<Shared>, seat: usize) -> Option<Selected> {
 }
 #[path = "distributed_requeue_tests.rs"]
 mod requeue;
+#[path = "distributed_search_wake_tests.rs"]
+mod search_wake;
 
 fn run(shared: &Arc<Shared>, work: Selected) {
   let d = engine(shared);
@@ -396,6 +399,7 @@ fn work_arriving_during_spin_runs_without_a_park() {
       rounds,
       max_spinners: Some(1),
       max_searchers: TEST_SEARCH_CAP.get(),
+      ..Policy::default()
     });
     work_arriving_during_spin_runs_without_a_park_case();
   }
@@ -746,7 +750,7 @@ fn stealing_last_entry_does_not_wake_or_lock_a_parked_dispatcher_case() {
     d.parked.advertise(2);
     assert!(d.lane(2).prepare_sleep());
     let before = d.lane_locks.load(Ordering::Relaxed);
-    let index = d.try_steal(&shared, 0, &mut 1).unwrap();
+    let index = d.try_steal(&shared, 0, &mut 1, None).unwrap();
     let locks = d.lane_locks.load(Ordering::Relaxed) - before;
     // Only the victim lock, plus the kick of a parked dispatcher while
     // entries remain; the lone stolen entry never enters the thief's lane.
@@ -784,7 +788,7 @@ fn single_stolen_entry_is_returned_without_entering_the_thief_lane_case() {
       .collect();
     let queued = d.lane(1).check(&d.links());
     let steals = d.steals.load(Ordering::Relaxed);
-    let index = d.try_steal(&shared, 0, &mut 1).unwrap();
+    let index = d.try_steal(&shared, 0, &mut 1, None).unwrap();
     assert_eq!(d.steals.load(Ordering::Relaxed) - steals, 1);
     // The oldest entry is returned; only a multi-entry steal reaches lane 0.
     assert_eq!(index, queued[0]);
@@ -832,7 +836,7 @@ fn single_stolen_cleanup_entry_moves_to_overflow_and_is_cancelled_case() {
     // The entry stays queued on the word, so this abort routes nothing.
     assert!(slot.protocol.abort());
   }
-  assert_eq!(d.try_steal(&shared, 0, &mut 1), None);
+  assert_eq!(d.try_steal(&shared, 0, &mut 1, None), None);
   assert!(d.lane(0).check(&d.links()).is_empty());
   assert!(d.lane(1).check(&d.links()).is_empty());
   assert_eq!(
@@ -3147,6 +3151,7 @@ fn fixed_rounds_are_unchanged_by_repeated_idle_parks() {
       rounds,
       max_spinners: Some(1),
       max_searchers: TEST_SEARCH_CAP.get(),
+      ..Policy::default()
     });
     let (shared, root) = shared(config(1, 1));
     let d = engine(&shared);
@@ -3217,6 +3222,7 @@ fn spinner_limit_binds_only_below_the_worker_seat_count() {
         rounds,
         max_spinners: cap,
         max_searchers: TEST_SEARCH_CAP.get(),
+        ..Policy::default()
       },
     )
     .unwrap();
@@ -3243,6 +3249,7 @@ fn burst_respects_spinner_cap_and_denied_dispatchers_park_immediately() {
       rounds: 4096,
       max_spinners: Some(cap),
       max_searchers: TEST_SEARCH_CAP.get(),
+      ..Policy::default()
     });
     let (shared, root) = shared(config(4, 64));
     let d = engine(&shared);
@@ -3334,6 +3341,7 @@ fn dispatcher_unwind_inside_spin_releases_its_slot() {
     rounds: 128,
     max_spinners: Some(1),
     max_searchers: TEST_SEARCH_CAP.get(),
+    ..Policy::default()
   });
   let (shared, _) = shared(config(2, 1));
   SPIN_HOOK.with(|hook| {

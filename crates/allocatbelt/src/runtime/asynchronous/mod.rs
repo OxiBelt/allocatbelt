@@ -85,7 +85,7 @@ pub use local::{
 };
 use metrics::MetricsBuildError;
 pub use metrics::{AsyncThreadMetrics, RuntimeMetrics, RuntimeMetricsSnapshot};
-pub use park_spin::ParkSpin;
+pub use park_spin::{ParkSpin, SearchWake};
 pub use scheduler::{OwnedTaskScope, ScopeClose};
 pub use task_set::{JoinNext, SetTaskId, TaskSet, TaskSetError};
 pub use thread_options::{AsyncThreadContext, AsyncThreadOptions, AsyncThreadRole};
@@ -197,6 +197,15 @@ impl AsyncRuntimeOptions {
   #[must_use]
   pub const fn max_searching_dispatchers(mut self, max: usize) -> Self {
     self.park_spin.max_searchers = Some(max);
+    self
+  }
+
+  /// Chooses when a dispatcher wakes a parked dispatcher to search; see
+  /// [`SearchWake`]. Fixed at construction. The default is
+  /// [`SearchWake::Eager`].
+  #[must_use]
+  pub const fn search_wake(mut self, policy: SearchWake) -> Self {
+    self.park_spin.search_wake = policy;
     self
   }
 

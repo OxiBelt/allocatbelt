@@ -241,6 +241,11 @@ enum SpinPolicy {
   Fixed(u32),
 }
 
+/// `--search-wake after-streak`: the bounded executor is built with
+/// `SearchWake::AfterStreak`. Set once while the arguments are parsed.
+static SEARCH_WAKE_AFTER_STREAK: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
+
 impl Default for SpinPolicy {
   fn default() -> Self {
     Self::Fixed(128)
@@ -303,6 +308,7 @@ impl Options {
     let mut park_spin = None;
     let mut max_spinners = None;
     let mut max_searchers = None;
+    let mut search_wake_after_streak = None;
     let mut handoffs_explicit = false;
     let mut block_explicit = false;
     let mut workers_explicit = false;
@@ -400,6 +406,13 @@ impl Options {
         "--max-spinners" => max_spinners = Some(parse_usize("--max-spinners", &value()?)?),
         "--max-searchers" => max_searchers = Some(parse_usize("--max-searchers", &value()?)?),
         "--park-spin" => park_spin = Some(SpinPolicy::parse(&value()?)?),
+        "--search-wake" => {
+          search_wake_after_streak = Some(match value()?.as_str() {
+            "eager" => false,
+            "after-streak" => true,
+            _ => return Err("--search-wake needs eager or after-streak".to_owned()),
+          });
+        }
         "--handoffs" => {
           handoffs_explicit = true;
           handoffs = parse_usize(&arg, &value()?)?;
@@ -568,6 +581,15 @@ impl Options {
           .to_owned(),
       );
     }
+    if search_wake_after_streak.is_some()
+      && !(lane == Lane::Async && executor == Some(ExecutorKind::Bounded))
+    {
+      return Err("--search-wake applies only to --lane async --executor bounded".to_owned());
+    }
+    SEARCH_WAKE_AFTER_STREAK.store(
+      search_wake_after_streak.unwrap_or(false),
+      std::sync::atomic::Ordering::Relaxed,
+    );
     Ok(Self {
       park_spin: park_spin.unwrap_or_default(),
       max_spinners,
@@ -596,7 +618,7 @@ impl Options {
 fn usage() -> &'static str {
   "usage: bench-latency-* --lane allocator|blocking|async [--workload local|aligned|mixed|ready|yielding|head-of-line|handoff] \\
    [--mode latency|throughput|capacity] [--executor bounded|tokio|inline] [--ops N|--jobs N] \\
-   [--workers N] [--arrival-rate JOBS_PER_SECOND] [--window N] [--bytes N] [--block-us N] [--handoffs N] [--park-spin fixed:N] [--max-spinners K] [--max-searchers K] \\
+   [--workers N] [--arrival-rate JOBS_PER_SECOND] [--window N] [--bytes N] [--block-us N] [--handoffs N] [--park-spin fixed:N] [--max-spinners K] [--max-searchers K] [--search-wake eager|after-streak] \\
    [--harness-notify always|waiting] [--harness-observer-spin N] [--pin-workers CPUS] [--pin-harness CPU,CPU]\n\n   The bounded async executor uses distributed dispatch.\n   --executor inline (async lane only) runs every future to completion on the producer thread, measuring the harness without an executor.\n   --harness-notify waiting (the default) notifies the harness event queue and capacity window only while a thread waits on them; always notifies on every event, as earlier releases of this harness did.\n   --harness-observer-spin N (default 0) makes the observer spin up to N rounds of 64 spin-loop hints on an empty event queue before it sleeps, so the producer rarely pays a wake; use it to compare executors without the harness's own sleep and wake cost.\n   --pin-workers pins each executor thread (bounded: workers then handoff helpers; tokio: workers) to one CPU by its index; CPUS is a comma list of ids or ranges such as 2-5,8. --pin-harness pins the producer and observer threads. Linux only."
 }
 
@@ -1299,6 +1321,10 @@ impl AsyncExecutors {
             }
             if let Some(cap) = max_searchers {
               options = options.max_searching_dispatchers(cap);
+            }
+            if SEARCH_WAKE_AFTER_STREAK.load(std::sync::atomic::Ordering::Relaxed) {
+              options =
+                options.search_wake(allocatbelt::runtime::asynchronous::SearchWake::AfterStreak);
             }
             if let Some(cpus) = pin_workers {
               let failures = Arc::clone(&pin_failures);
